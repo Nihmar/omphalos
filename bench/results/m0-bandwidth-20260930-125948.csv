@@ -1,0 +1,2 @@
+device,buffer_gib,bytes_read,passes,best_ms,median_ms,worst_ms,best_gb_s,median_gb_s,worst_gb_s
+AMD Radeon RX 9060 XT,10.00,10737418240,10,33.725,33.733,33.751,318.4,318.3,318.1
