@@ -96,10 +96,57 @@ def write_module(tables: list[tuple[str, np.ndarray]], out: Path, source: str) -
     out.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_cpp(tables: list[tuple[str, np.ndarray]], out: Path, source: str) -> None:
+    ctype_map = {
+        "uint8": "uint8_t",
+        "int8": "int8_t",
+        "uint16": "uint16_t",
+        "uint32": "uint32_t",
+        "uint64": "uint64_t",
+    }
+
+    def cname(name: str) -> str:
+        return "k" + "".join(part.capitalize() for part in name.split("_"))
+
+    lines = [
+        "// ggml quantization tables — generated, do not edit by hand.",
+        f"// Source: {source}",
+        "// Generator: tools/extract_quant_tables.py",
+        "#pragma once",
+        "",
+        "#include <cstdint>",
+        "",
+        "namespace omph::quant {",
+        "",
+    ]
+    for name, arr in tables:
+        ctype = ctype_map[arr.dtype.name]
+        lines.append(f"inline constexpr {ctype} {cname(name)}[{arr.size}] = {{")
+        row: list[str] = []
+        for value in arr.tolist():
+            if arr.dtype.name == "uint64":
+                row.append(f"0x{value:016x}ULL")
+            elif arr.dtype.name == "uint32":
+                row.append(f"0x{value:08x}u")
+            else:
+                row.append(str(value))
+            if len(row) == 8:
+                lines.append("    " + ", ".join(row) + ",")
+                row = []
+        if row:
+            lines.append("    " + ", ".join(row) + ",")
+        lines.append("};")
+        lines.append("")
+    lines.append("} // namespace omph::quant")
+    lines.append("")
+    out.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Extract ggml quantization tables")
     ap.add_argument("header", type=Path, help="path to ggml-common.h")
     ap.add_argument("-o", "--out", type=Path, default=None)
+    ap.add_argument("--cpp", type=Path, default=None, help="also write a C++ header")
     args = ap.parse_args()
 
     tables = parse_tables(args.header)
@@ -107,6 +154,9 @@ def main() -> None:
     write_module(tables, out, str(args.header))
     total = sum(a.nbytes for _, a in tables)
     print(f"wrote {out} ({len(tables)} tables, {total / 1024:.1f} KiB of data)")
+    if args.cpp:
+        write_cpp(tables, args.cpp, str(args.header))
+        print(f"wrote {args.cpp}")
 
 
 if __name__ == "__main__":
