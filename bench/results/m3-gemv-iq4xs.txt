@@ -11,13 +11,35 @@ idle (PLAN.md §17). Ceiling: 318.3 GB/s measured (`bench/results/m0-bandwidth.c
 
 | measurement | time | bytes read | effective bandwidth | vs ceiling |
 |---|---:|---:|---:|---:|
-| all 96 IQ4_XS tensors, one pass | **18.13 ms** | 2924.4 MiB | **169.1 GB/s** | **53.1 %** |
+| all 96 IQ4_XS tensors, one pass | **16.49 ms** | 2924.4 MiB | **186.0 GB/s** | **58.4 %** |
 | single tensor `blk.63.ffn_up` (45.2 MiB) | 0.268 ms | 45.8 MiB | 179.4 GB/s | 56.4 % |
 | *(reference: Q4_K `output.weight`, M3.1)* | 2.90 ms | 701.0 MiB | 253.2 GB/s | 79.6 % |
 
 Repacking verified lossless for all 96 tensors (rebuild of the source block
 stream compared byte for byte). Accuracy against the f16 dequant + hipBLASLt
 path: max |d| 7e-4 (2.4e-4 relative), mean |d| 1e-4.
+
+## Optimisation attempts (measured)
+
+| change | result | kept? |
+|---|---:|---|
+| baseline | 169.1 GB/s (53.1 %) | — |
+| **activation staging in chunks of 256 sub-blocks** (16 KiB LDS) instead of the whole k | **186.0 GB/s (58.4 %)** | **yes** |
+| activation read as `__half2` (16 LDS ops per 16 weight bytes instead of 32) | 80.8 GB/s (25.4 %) | no |
+| activation read as `uint4` + chunked staging | 82.3 GB/s (25.9 %) | no |
+| *diagnostic:* codebook lookup replaced by an arithmetic placeholder (wrong values, same loads) | 201.9 GB/s (63.4 %) | n/a |
+
+The chunked staging is kept: with it, the k = 17408 tensors stage 16 KiB instead of
+34 KiB of LDS, which lifts the workgroup-per-CU limit. It is worth +10 % over the
+whole type.
+
+Both attempts to read the activation with vector loads made things **2x worse**, and
+the reason is not yet understood — 32 lanes stepping one 64-byte sub-block each means
+the LDS addresses are 64 B apart, i.e. every lane lands on the same couple of banks
+(16-way conflict), and a wider load apparently serialises harder instead of helping.
+The obvious follow-up is a padded/transposed LDS layout for the activation
+(sub-block stride 33 halves instead of 32) so that consecutive lanes hit consecutive
+banks, and re-testing the vectorised reads on top of that.
 
 ## Why it is slower than Q4_K
 
