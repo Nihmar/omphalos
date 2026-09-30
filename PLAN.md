@@ -504,7 +504,7 @@ Listed in order of how much runtime they account for.
 ### 10.1 Quantized GEMV (decode) — ~85–90% of decode time
 
 - One kernel per quant type present in the allocation (templated), **fused dequant + dot**; dequantized weights never touch memory.
-- ⚠️ **RDNA4 has no int8 dot-product instructions** (measured in M3.1: gfx1200 does not advertise `dot1-insts`, `__builtin_amdgcn_sdot4` does not compile — the same fact that makes INT8 hipBLASLt 0.57× FP16 in §10.5). So: **dequantize in registers and accumulate with f16/f32 FMA**. Decode is bandwidth-bound, so the extra ALU work is irrelevant; only the bytes read per weight matter.
+- ⚠️ **No int8 *matrix* path on RDNA4.** `v_wmma_i32_16x16x16_iu8` is not in the gfx1200 ISA (it is in gfx1100's); gfx1200 gained the fp16/f32 WMMA tile instead — that is where the measured 46 TFLOPS fp16 comes from. The *vector* int8 dot `v_dot4_i32_i8` **does** exist and computes correctly on gfx1200, but LLVM does not expose `__builtin_amdgcn_sdot4` for this target (`dot1-insts` is not advertised) and it runs at ~14 TOPS (measured, `bench/results/m3-isa-probe.txt`) — well under the fp16 matrix path. So: **dequantize in registers and accumulate with f16/f32 FMA**. Decode is bandwidth-bound (measured 0.88 TFLOPS while reading 701 MiB in 2.90 ms), so the ALU has ~5× headroom and only the bytes per weight matter.
 - Activations stay f16 (the milestone-2 kernels already produce f16 activations), so no activation quantization step is needed.
 - Scales applied per sub-block in FP32 (a per-32-weight sub-block term); codebook/grid values are dequantized in registers.
 - Codebooks + sign tables in LDS (loaded once per workgroup).
@@ -549,7 +549,7 @@ plus short causal conv1d on q/k/v (keep the conv tail as state), gates/normaliza
 Two options:
 
 - **FP16 path**: dequantize weight tiles to FP16 in LDS, `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (or rocWMMA). Numerically closest to reference.
-- **INT8 path**: IQ grid values × signs are int8, activations quantized to int8 → int8 WMMA (~2× FP16 throughput). Scales are per 32-weight sub-block → accumulate int32 per sub-block, convert and FMA with scale into FP32 accumulators. Faster, but activation quantization introduces a small error → validate with KL. **⚠️ M0 measured the opposite on this stack: INT8 via hipBLASLt ≈ 26 TOPS vs ≈ 46 TFLOPS fp16 (0.57×), not 2× — settle with a raw WMMA / int8-dot microbench before choosing this path.**
+- **INT8 path: dead on this hardware [resolved, M3].** There is no int8 WMMA tile on gfx1200 (`v_wmma_i32_16x16x16_iu8` assembles for gfx1100, not for gfx1200), and the vector int8 dot `v_dot4_i32_i8` runs at ~14 TOPS (measured, `bench/results/m3-isa-probe.txt`), far under the 46 TFLOPS fp16 matrix path. That fully explains the M0 measurement of INT8 hipBLASLt at 0.57× FP16: the library has no int8 matrix hardware to use. **Use the FP16 WMMA path.**
 - Double-buffer LDS tiles; overlap global loads, dequant and WMMA; tune tile sizes for 32 CUs. Start slow and correct.
 
 ### 10.6 Small ops

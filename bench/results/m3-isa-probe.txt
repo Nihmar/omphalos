@@ -1,0 +1,31 @@
+# M3 — ISA probe: what dot/matrix hardware gfx1200 actually has (2026-09-30)
+
+Source: `tools/native/isa_probe.cpp`, built with `hipcc --offload-arch=gfx1200 -O3`.
+Context: PLAN.md §10.1 (decode GEMV) and §10.5 (prefill GEMM, the INT8 option).
+
+## Instruction availability (LLVM assembler, per target)
+
+| instruction | gfx1100 (RDNA3) | gfx1200 (RDNA4) |
+|---|---|---|
+| `v_dot4_i32_i8` — int8 dot, vector | yes | **yes** |
+| `v_dot2_f32_f16` — fp16 dot, vector | yes | yes |
+| `v_wmma_i32_16x16x16_iu8` — int8 **matrix** | yes | **NO** |
+| `v_wmma_f32_16x16x16_f16` — fp16 matrix | NO | **yes** |
+
+## On-device verification
+
+```
+device: AMD Radeon RX 9060 XT (gfx1200)
+v_dot4_i32_i8 via inline asm: 70 (expected 70) -> works
+throughput (raw, 16 chains x 256 lanes x 256 workgroups):
+  v_dot4_i32_i8     :   14.3 TOPS
+  __hfma2 (half2)   :    8.4 TFLOPS
+  fmaf (f32)        :    4.5 TFLOPS
+```
+
+## Conclusions
+
+- **There is no int8 matrix path on gfx1200.** The int8 WMMA tile exists on RDNA3 and was *removed* in RDNA4; RDNA4 gained the fp16/f32 WMMA tile instead. This is where hipBLASLt's measured 46 TFLOPS fp16 comes from.
+- The **vector** int8 dot `v_dot4_i32_i8` does exist and computes correctly on gfx1200 (inline asm). LLVM simply does not expose `__builtin_amdgcn_sdot4` for this target (`dot1-insts` is not advertised), which is what the M3.1 note hit.
+- Raw vector rates (16 independent chains, so vector-ALU-bound): int8 dot 14.3 TOPS, half2 8.4 TFLOPS, f32 4.4 TFLOPS. The int8 vector path is well under the fp16 matrix path.
+- **PLAN.md §10.5 INT8 prefill option: dead.** Use the FP16 WMMA path. **PLAN.md §10.1 decode GEMV: unchanged** — it is bandwidth-bound (measured 0.88 TFLOPS while reading 701 MiB in 2.90 ms), so dequant-in-register + f16/f32 FMA is the right shape and the ALU has 5x headroom for small-batch work.
