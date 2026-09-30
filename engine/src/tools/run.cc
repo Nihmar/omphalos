@@ -941,6 +941,23 @@ private:
         if (use_gemv_ && T > 1) {
             const auto it = gems_.find(name);
             if (it != gems_.end() && it->second.rows == n_out && it->second.k == k &&
+                !it->second.has_b4 && has_gemv_type(it->second.type)) {
+                // Types with a single-token kernel but no small-batch form: run one
+                // per token. No staging, so a long prefill stays inside VRAM — it
+                // just does not amortize the weight read (the b4 port is the fix).
+                const uint8_t * w = static_cast<const uint8_t *>(dev_weights_) + it->second.off;
+                const auto * xb = static_cast<const uint8_t *>(x16);
+                timer_gemv_.start();
+                bool ok = true;
+                for (int64_t t0 = 0; t0 < T && ok; ++t0) {
+                    ok = gemv_one(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k);
+                }
+                timer_gemv_.stop(t_gemv_);
+                if (ok) {
+                    return true;
+                }
+            }
+            if (it != gems_.end() && it->second.rows == n_out && it->second.k == k &&
                 it->second.has_b4) {
                 const uint8_t * w = static_cast<const uint8_t *>(dev_weights_) + it->second.off;
                 const auto * xb = static_cast<const uint8_t *>(x16);

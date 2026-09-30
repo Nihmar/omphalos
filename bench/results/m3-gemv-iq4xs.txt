@@ -917,3 +917,35 @@ reasoning about it: the block amax was reduced over 8 lanes while the Q4 writers
 are 16 (`vmax` was 0 for half of them, storing zeros), and the KV cache stride
 used the model layer index instead of the attention-layer index — the pointers
 printed 175104 into a 147456-byte buffer.
+
+# M5 validation — what works, and what the long context is actually blocked by
+
+Unblocked while validating: the prefill's f16 fallback stages a whole weight
+tensor, which at 2048 tokens no longer fit the scratch (`error: ffn failed`). For
+the types that have a single-token kernel but no small-batch form, `matmul` now
+runs one GEMV per token instead — no staging at all. 2048 tokens now runs (it did
+not before); 8192 still does not, and not for the KV's sake:
+
+| context | f32 KV | q8q4 KV |
+|---|---|---|
+| 2048 | runs | runs |
+| 8192 | out of VRAM | **out of VRAM** |
+
+At 8192 the activations alone are ~3 GB — `tmp_logits_` is T-scaled at 1.07 GB and
+`ffn1_`/`ffn2_` at 570 MB each — against 12.4 GiB of weights. The KV quantization
+saves 0.84 GB there and it does not matter yet: the prefill has to be chunked
+before any 32k number means anything.
+
+KL against the f32 KV, measured at the lengths that run:
+
+| context | KL | argmax | note |
+|---|---:|---|---|
+| 10 (real prompt) | 0.139 | preserved | the golden prompt, greedy tokens identical |
+| 512 | 0.0837 | diverges | random prompt |
+| 2048 | 0.164 | diverges | random prompt |
+
+The 512/2048 rows are pessimistic by construction: a random prompt gives the model
+a nearly flat distribution (top-10 mass 0.007), so the KL is measuring noise on
+the tails rather than a change in what the model believes. The real-prompt number
+to quote is the 10-token one, and the honest statement is that the long-context
+validation is still open.
