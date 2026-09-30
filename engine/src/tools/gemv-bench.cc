@@ -40,6 +40,9 @@ bool repack_tensor(const uint32_t type, const void * src, const int64_t n_blocks
     } else if (type == 21) {
         dst.resize((size_t) omph::format::iq3s_layout(n_blocks).total);
         omph::format::repack_iq3_s(src, n_blocks, dst.data());
+    } else if (type == 10) {
+        dst.resize((size_t) omph::format::q2k_layout(n_blocks).total);
+        omph::format::repack_q2k(src, n_blocks, dst.data());
     } else {
         return false;
     }
@@ -56,6 +59,8 @@ bool unrepack_tensor(const uint32_t type, const void * src, const int64_t n_bloc
         omph::format::unrepack_iq3_xxs(src, n_blocks, dst.data());
     } else if (type == 21) {
         omph::format::unrepack_iq3_s(src, n_blocks, dst.data());
+    } else if (type == 10) {
+        omph::format::unrepack_q2k(src, n_blocks, dst.data());
     } else {
         return false;
     }
@@ -174,7 +179,7 @@ int main(int argc, char ** argv) {
                 if ((int) t.type != repack_only) {
                     continue;
                 }
-                const int64_t n_blocks = (int64_t) (t.nbytes / (t.type == 12 ? 144 : t.type == 23 ? 136 : t.type == 21 ? 110 : 98));
+                const int64_t n_blocks = (int64_t) (t.nbytes / (t.type == 12 ? 144 : t.type == 23 ? 136 : t.type == 21 ? 110 : t.type == 10 ? 84 : 98));
                 std::vector<uint8_t> packed;
                 std::vector<uint8_t> rebuilt((size_t) t.nbytes);
                 if (!repack_tensor(t.type, file.tensor_data(t), n_blocks, packed) ||
@@ -221,11 +226,7 @@ int main(int argc, char ** argv) {
             if (t == nullptr) {
                 return fail("tensor not found");
             }
-            if (t->type != 12 && t->type != 23) {
-                std::fprintf(stderr, "tensor %s type %u not supported yet\n", name.c_str(),
-                             t->type);
-                return 1;
-            }
+
             Case c;
             if (!prepare(file, t, c)) {
                 return fail("repack failed");
@@ -298,6 +299,14 @@ int main(int argc, char ** argv) {
         }
         std::printf("accuracy   : %s  max|d| %.4f (%.2e rel), mean|d| %.4f, |ref| up to %.1f\n",
                     t->name.c_str(), max_abs, max_abs / ref_max, mean_abs / c.rows, ref_max);
+        int shown = 0;
+        for (int64_t i = 0; i < c.rows && shown < 4; ++i) {
+            if (std::fabs(got[i] - want[i]) > 1e-3) {
+                std::printf("  row %lld: got %.5f want %.5f (idx_in_row? no) d=%.5f\n",
+                            (long long) i, got[i], want[i], got[i] - want[i]);
+                ++shown;
+            }
+        }
     } catch (const std::exception & exc) {
         std::fprintf(stderr, "error: %s\n", exc.what());
         return 1;

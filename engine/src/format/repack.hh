@@ -116,4 +116,28 @@ Iq3sLayout iq3s_layout(int64_t n_blocks);
 void repack_iq3_s(const void * src, int64_t n_blocks, void * dst);
 void unrepack_iq3_s(const void * src, int64_t n_blocks, void * dst);
 
+// ------------------------------------------------------------------ Q2_K
+//
+// GGUF Q2_K: 84-byte blocks — 16 bytes of packed 4-bit scales (low nibble
+// scale, high nibble min), 64 bytes of 2-bit quants, then f16 `d` and `dmin`.
+// The repack only splits the fields into aligned streams; the size is unchanged
+// and the kernel decodes the scale nibbles itself.
+//
+//   [ sc   ] 16 B/block
+//   [ qs   ] 64 B/block
+//   [ d    ]  2 B/block
+//   [ dmin ]  2 B/block
+struct Q2kLayout {
+    int64_t n_blocks = 0;
+    int64_t sc_off = 0;
+    int64_t qs_off = 0;
+    int64_t d_off = 0;
+    int64_t dmin_off = 0;
+    int64_t total = 0;
+};
+
+Q2kLayout q2k_layout(int64_t n_blocks);
+void repack_q2k(const void * src, int64_t n_blocks, void * dst);
+void unrepack_q2k(const void * src, int64_t n_blocks, void * dst);
+
 } // namespace omph::format

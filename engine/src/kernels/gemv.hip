@@ -389,6 +389,7 @@ __global__ void gemv_iq3s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
     }
 }
 
+
 } // namespace
 
 bool gemv_q4k(const void * packed, const void * x_f16, float * y, const int64_t rows,
