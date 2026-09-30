@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Milestone 0 — hipBLASLt FP16 GEMM ceiling at the model's projection shapes (M = 512).
+# Milestone 0 — hipBLASLt GEMM ceiling (fp16 + int8) at the model's projection
+# shapes (M = 512).
 #
 # The distro rocBLAS is built without hipBLASLt (~3.7 TFLOPS flat, unusable);
 # hipBLASLt itself is installed with gfx1200 Tensile kernels but ships no bench
@@ -21,7 +22,7 @@ fi
 
 ts="$(date +%Y%m%d-%H%M%S)"
 csv="$outdir/m0-gemm-hipblaslt-$ts.csv"
-echo "label,m,n,k,median_ms,best_ms,worst_ms,tflops,workspace_mb" > "$csv"
+echo "label,m,n,k,dtype,median_ms,best_ms,worst_ms,tflops,workspace_mb" > "$csv"
 
 # model: hidden 5120, ffn 17408, qkv 8192, vocab 248320
 shapes=(
@@ -31,9 +32,11 @@ shapes=(
   "lm_head 512 248320 5120"
 )
 
-for shape in "${shapes[@]}"; do
-  # shellcheck disable=SC2086
-  "$bin" $shape | tee -a "$csv"
+for dtype in fp16 int8; do
+  for shape in "${shapes[@]}"; do
+    # shellcheck disable=SC2086
+    "$bin" $shape 20 "$dtype" | tee -a "$csv"
+  done
 done
 
 echo "results: $csv"
