@@ -504,12 +504,18 @@ Listed in order of how much runtime they account for.
 ### 10.1 Quantized GEMV (decode) — ~85–90% of decode time
 
 - One kernel per quant type present in the allocation (templated), **fused dequant + dot**; dequantized weights never touch memory.
-- Activation vector quantized to **int8 once per input** (like llama.cpp's `mmvq`), then `v_dot4_i32_i8` against unpacked codebook values (IQ grid values are small integers → int8 with sign applied); scales applied per sub-block in FP32.
+- ⚠️ **RDNA4 has no int8 dot-product instructions** (measured in M3.1: gfx1200 does not advertise `dot1-insts`, `__builtin_amdgcn_sdot4` does not compile — the same fact that makes INT8 hipBLASLt 0.57× FP16 in §10.5). So: **dequantize in registers and accumulate with f16/f32 FMA**. Decode is bandwidth-bound, so the extra ALU work is irrelevant; only the bytes read per weight matter.
+- Activations stay f16 (the milestone-2 kernels already produce f16 activations), so no activation quantization step is needed.
+- Scales applied per sub-block in FP32 (a per-32-weight sub-block term); codebook/grid values are dequantized in registers.
 - Codebooks + sign tables in LDS (loaded once per workgroup).
 - **Small-batch variant N = 1…5 from day one** (templated on N): MTP verification reads the weights once for all N tokens → almost free when memory-bound.
-- Fusions: RMSNorm folded into the prologue (norm the activation while quantizing it to int8), SwiGLU in the epilogue of interleaved gate/up, residual add in the epilogue of output/down projections.
+- Fusions: RMSNorm in the prologue, SwiGLU in the epilogue of interleaved gate/up, residual add in the epilogue of output/down projections.
 - Enough loads in flight: several outstanding 128-bit loads per lane (unrolling) rather than relying only on occupancy.
 - Grid sizing: 32 CUs → make sure the number of workgroups divides evenly (avoid a partial last wave, "tail effect"); use split-K for small matrices so all CUs are busy.
+
+Measured so far (M3.1, `bench/results/m3-gemv-q4k.txt`): fused Q4_K on `output.weight`
+= 253.2 GB/s = **79.6 %** of the 318.3 GB/s ceiling (target ≥ 60 %), 28.6× the
+f16 dequant + hipBLASLt path.
 
 ### 10.2 Gated DeltaNet — decode
 

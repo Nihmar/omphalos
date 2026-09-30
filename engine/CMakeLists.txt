@@ -15,6 +15,7 @@ find_package(hipblaslt REQUIRED)
 
 add_library(omphalos SHARED
     src/format/gguf.cc
+    src/format/repack.cc
     src/runtime/context.cc
     src/runtime/matmul.cc
     src/kernels/probe.hip
@@ -22,6 +23,7 @@ add_library(omphalos SHARED
     src/kernels/elementwise.hip
     src/kernels/attn.hip
     src/kernels/gdn.hip
+    src/kernels/gemv.hip
 )
 target_include_directories(omphalos
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -56,3 +58,7 @@ target_link_libraries(omph-gdn PRIVATE omphalos hip::host roc::hipblaslt)
 add_executable(omph-run src/tools/run.cc)
 target_include_directories(omph-run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(omph-run PRIVATE omphalos hip::host roc::hipblaslt)
+
+add_executable(omph-gemv-bench src/tools/gemv-bench.cc)
+target_include_directories(omph-gemv-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(omph-gemv-bench PRIVATE omphalos hip::host roc::hipblaslt)
