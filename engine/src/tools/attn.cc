@@ -223,10 +223,17 @@ int main(int argc, char ** argv) {
             read_back(t1, kf, (size_t) tokens * kv_out);
             write_f32(prefix + "-k.f32", t1);
         }
-        if (!omph::kernels::attention((const float *) q, (const float *) kf, (const float *) vf,
-                                      (const float *) gate, (float *) attn, tokens, tokens, n_head,
-                                      n_head_kv, head_dim, 1.0f / std::sqrt((float) head_dim),
-                                      nullptr)) {
+        omph::kernels::KvCache kv;
+        kv.k_f32 = (const float *) kf;
+        kv.v_f32 = (const float *) vf;
+        const size_t work_bytes =
+            omph::kernels::attention_gqa_work_bytes(tokens, n_head, n_head_kv, head_dim);
+        void * work = nullptr;
+        if (hipMalloc(&work, work_bytes) != hipSuccess ||
+            !omph::kernels::attention_gqa((const float *) q, kv, (const float *) gate,
+                                          (float *) attn, tokens, tokens, n_head, n_head_kv,
+                                          head_dim, 1.0f / std::sqrt((float) head_dim), false,
+                                          work, work_bytes, nullptr)) {
             return fail("attention failed");
         }
 

@@ -1,0 +1,25 @@
+# Decode step (GPU time, OMPH_TIMING "step gpu", median of the last 5 of 6 steps)
+# against context, wikitext-2 test prompt, --gemv --generate 7 --last-logits (issue #59)
+# before: per-(token, head) flash kernels (feat/58-long-context-kl @ 1c79662 + #58)
+# after:  attention_gqa (GQA-grouped, split-K, merge kernel)
+kv     context   before (ms)   after (ms)
+Q8/Q4  512       60.49         58.41
+Q8/Q4  2k        68.33         59.22
+Q8/Q4  4k        78.59         60.04
+Q8/Q4  8k        99.02         61.72
+Q8/Q4  16k       -             65.01
+f32    512       59.46         58.16
+f32    2k        63.86         58.82
+f32    4k        69.77         59.67
+# (f32 KV does not fit in VRAM at 8k)
+
+# Attention alone, decode-shaped (tokens = 1), Q8/Q4, one layer, 50-launch average
+# (scratch micro-benchmark, both kernels):
+# context   first attention_gqa   final attention_gqa
+# 512       119.6 us              37.4 us
+# 8192      1255.9 us             288.9 us
+# 32768     4868.2 us             1182.1 us
+# (the old per-(token, head) kernel cost ~2.5 ms per layer at 8k, from the step times)
+
+# Prefill wall time, 4096-token prompt, --logits-tail 512, no --gemv
+# f32 KV: 35 s -> 16 s      Q8/Q4 KV: 19 s -> 17 s

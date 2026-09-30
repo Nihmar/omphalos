@@ -312,6 +312,9 @@ public:
             alloc(&kv_k16_, (size_t) n_kv * kv_window_ * attn_kv * 2);
             alloc(&kv_v16_, (size_t) n_kv * kv_window_ * attn_kv * 2);
         }
+        attn_work_bytes_ = omph::kernels::attention_gqa_work_bytes(T, h_.n_head, h_.n_head_kv,
+                                                                   h_.head_dim);
+        alloc(&attn_work_, attn_work_bytes_);
         conv_flip_.assign((size_t) h_.n_layer, 0);
         for (int64_t il = 0; il < h_.n_layer; ++il) {
             void * st = nullptr;
@@ -772,8 +775,8 @@ private:
         return true;
     }
 
-    // KV write + attention, on either the f32 cache (memcpy + flash attention) or
-    // the Q8/Q4 one (quantize, then flash attention that dequantizes on the fly).
+    // KV write + attention, on either the f32 cache (memcpy) or the Q8/Q4 one
+    // (quantize); attention_gqa then reads either, dequantizing on the fly.
     bool attn_impl(const int64_t il, float * k_cache, float * v_cache, const int64_t pos0,
                    const int64_t T) {
         const int64_t kv_out = h_.n_head_kv * h_.head_dim;
@@ -795,11 +798,18 @@ private:
                                          nullptr)) {
                 return false;
             }
-            return omph::kernels::attention_flash_q8q4(
-                static_cast<const float *>(q_), kq, ksc, vq, vsc, k16, v16,
-                static_cast<const float *>(gate_), static_cast<float *>(attn_), T, pos0 + T,
-                h_.n_head, h_.n_head_kv, h_.head_dim, scale, h_.n_head / h_.n_head_kv,
-                kv_window_, nullptr);
+            omph::kernels::KvCache kv;
+            kv.k_q8 = kq;
+            kv.k_scales = ksc;
+            kv.v_q4 = vq;
+            kv.v_scales = vsc;
+            kv.k16 = kv_window_ > 0 ? k16 : nullptr;
+            kv.v16 = kv_window_ > 0 ? v16 : nullptr;
+            kv.window = kv_window_;
+            return omph::kernels::attention_gqa(
+                static_cast<const float *>(q_), kv, static_cast<const float *>(gate_),
+                static_cast<float *>(attn_), T, pos0 + T, h_.n_head, h_.n_head_kv, h_.head_dim,
+                scale, true, attn_work_, attn_work_bytes_, nullptr);
         }
         if (k_cache == nullptr || v_cache == nullptr) {
             return false;
@@ -821,10 +831,14 @@ private:
             k_cache = static_cast<float *>(kv_stage_k_);
             v_cache = static_cast<float *>(kv_stage_v_);
         }
-        return omph::kernels::attention(static_cast<const float *>(q_), k_cache, v_cache,
-                                        static_cast<const float *>(gate_),
-                                        static_cast<float *>(attn_), T, pos0 + T, h_.n_head,
-                                        h_.n_head_kv, h_.head_dim, scale, nullptr);
+        omph::kernels::KvCache kv;
+        kv.k_f32 = k_cache;
+        kv.v_f32 = v_cache;
+        return omph::kernels::attention_gqa(static_cast<const float *>(q_), kv,
+                                            static_cast<const float *>(gate_),
+                                            static_cast<float *>(attn_), T, pos0 + T, h_.n_head,
+                                            h_.n_head_kv, h_.head_dim, scale, false, attn_work_,
+                                            attn_work_bytes_, nullptr);
     }
 
     // One fused GEMV launch for a single token, dispatched on the GGUF type.
@@ -1096,6 +1110,8 @@ private:
     bool kv_q8q4_ = false;
     bool kv_host_ = false;  // f32 KV in pinned host RAM (validation reference)
     void * kv_stage_k_ = nullptr;
+    void * attn_work_ = nullptr;  // split-K partials of attention_gqa
+    size_t attn_work_bytes_ = 0;
     void * kv_stage_v_ = nullptr;
     void * dev_weights_ = nullptr;
     void * x_ = nullptr;
