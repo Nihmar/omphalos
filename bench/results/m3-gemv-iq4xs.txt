@@ -478,3 +478,29 @@ The dominant piece is the delta rule as **five tiny launches per token per
 layer** (48 layers x 5 = 240 per step, each on a 48-head grid with LDS-heavy
 state access). That is exactly what PLAN §10.2 prescribes fusing into one kernel
 per layer — and it is now the top decode item, ahead of HIP graphs.
+
+# M3.14 — fused one-token delta rule: decode 127 -> 84 ms/token
+
+PLAN §10.2's "one fused kernel per layer" for the sequential part: one launch per
+token per layer does the decay, `sk = S^T k`, `d = (v - sk) * beta`,
+`S += k (x) d` and `o = scale * S^T q`, with one workgroup per head (256 threads,
+two per column) and the state touched twice instead of five times.
+
+| path | before | after |
+|---|---:|---:|
+| fused GEMV decode | 127 ms/token | **84 ms/token** |
+| f16 decode | 831 ms/token | 630 ms/token |
+| f16 prefill (10 tokens) | 2145 ms | 1983 ms |
+
+The f16 numbers move too because the prefill's per-token loop was five launches
+as well.
+
+Correctness: the greedy sequence is unchanged (198 760 3841 ...) and the logits
+differ from the f16 path by max |d| 0.0104 with the same argmax — only the
+summation order changed.
+
+That is **9.9x the milestone-2 decode** (831 -> 84 ms/token), and the ablation
+predicts the next step: of the 84 ms, ~48 is the fused GEMVs (already at the
+bandwidth ceiling) and ~36 is the remaining glue — attention kernels, per-layer
+norms, residuals, casts and the ~500 launches per step that HIP graphs (M4)
+would collapse.

@@ -587,21 +587,13 @@ private:
             return fail("gdn preprocessing failed");
         }
         for (int64_t t = 0; t < T; ++t) {
-            if (!omph::kernels::delta_decay(seq_state,
-                                            static_cast<const float *>(alpha_) + t * n_vh, n_vh, s,
-                                            nullptr) ||
-                !omph::kernels::delta_sk(seq_state, static_cast<const float *>(k_) + t * k_dims,
-                                         static_cast<float *>(sk_), n_vh, n_kh, s, nullptr) ||
-                !omph::kernels::delta_d(static_cast<const float *>(v_) + t * v_dims,
-                                        static_cast<const float *>(sk_),
-                                        static_cast<const float *>(beta_) + t * n_vh,
-                                        static_cast<float *>(dvec_), n_vh, s, nullptr) ||
-                !omph::kernels::delta_update(seq_state, static_cast<const float *>(k_) + t * k_dims,
-                                             static_cast<const float *>(dvec_), n_vh, n_kh, s,
-                                             nullptr) ||
-                !omph::kernels::delta_o(seq_state, static_cast<const float *>(q_) + t * q_dims,
-                                        static_cast<float *>(o_) + t * v_dims, n_vh, n_kh, s,
-                                        l2_scale, nullptr)) {
+            if (!omph::kernels::delta_step_fused(
+                    seq_state, static_cast<const float *>(q_) + t * q_dims,
+                    static_cast<const float *>(k_) + t * k_dims,
+                    static_cast<const float *>(v_) + t * v_dims,
+                    static_cast<const float *>(beta_) + t * n_vh,
+                    static_cast<const float *>(alpha_) + t * n_vh,
+                    static_cast<float *>(o_) + t * v_dims, n_vh, n_kh, s, l2_scale, nullptr)) {
                 return fail("delta rule failed");
             }
         }

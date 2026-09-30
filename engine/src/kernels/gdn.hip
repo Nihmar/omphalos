@@ -198,6 +198,64 @@ __global__ void gated_norm_kernel(const float * __restrict__ o, const float * __
     }
 }
 
+// Fused one-token delta rule: one workgroup per head, 256 threads (two per
+// column, each covering half of the rows). The state stays in global memory but
+// is touched twice instead of five times, and the whole rule is one launch.
+//
+//   tid = 0..255; col = tid & (s-1); half = tid >> 7 -> rows [half*s/2, ...)
+//   decay and the S^T k partial touch the same elements, so no barrier is needed
+//   between them; then d, the update, and the S^T q partial.
+__global__ void delta_step_kernel(float * __restrict__ state, const float * __restrict__ q,
+                                  const float * __restrict__ k, const float * __restrict__ v,
+                                  const float * __restrict__ beta, const float * __restrict__ gate,
+                                  float * __restrict__ o, const long long n_kh,
+                                  const long long s, const float scale) {
+    extern __shared__ float sh[];
+    float * part = sh;        // 2 * s partial sums
+    float * dd = sh + 2 * s;  // s, the delta vector
+    const long long h = blockIdx.x;
+    float * S = state + h * s * s;
+    const float * kr = k + (h % n_kh) * s;
+    const float * qr = q + (h % n_kh) * s;
+    const int tid = (int) threadIdx.x;
+    const int col = tid & (int) (s - 1);
+    const int half = tid >> 7;
+    const long long lo = (long long) half * (s / 2);
+    const long long rows = s / 2;
+    const float decay = expf(gate[h]);
+    const float b = beta[h];
+
+    float acc = 0.0f;
+    for (long long r = 0; r < rows; ++r) {
+        const long long i = lo + r;
+        float * e = S + i * s + col;
+        *e *= decay;
+        acc += *e * kr[i];
+    }
+    part[half * s + col] = acc;
+    __syncthreads();
+    if (half == 0) {
+        const float sk = part[col] + part[s + col];
+        dd[col] = (v[h * s + col] - sk) * b;
+    }
+    __syncthreads();
+    for (long long r = 0; r < rows; ++r) {
+        const long long i = lo + r;
+        S[i * s + col] += kr[i] * dd[col];
+    }
+    __syncthreads();
+    float acc2 = 0.0f;
+    for (long long r = 0; r < rows; ++r) {
+        acc2 += S[(lo + r) * s + col] * qr[lo + r];
+    }
+    part[half * s + col] = acc2;
+    __syncthreads();
+    if (half == 0) {
+        o[h * s + col] = scale * (part[col] + part[s + col]);
+    }
+}
+
+
 unsigned grid_for(const long long n) {
     return (unsigned) ((n + kBlock - 1) / kBlock);
 }
@@ -334,6 +392,20 @@ bool gated_norm(const float * o, const float * w, const float * z, float * out, 
     gated_norm_kernel<<<(unsigned) rows, kBlock, kBlock * sizeof(float), stream>>>(o, w, z, out,
                                                                                    (long long) n,
                                                                                    eps);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool delta_step_fused(float * state, const float * q, const float * k, const float * v,
+                      const float * beta, const float * gate, float * o, const int64_t heads,
+                      const int64_t n_kh, const int64_t s, const float scale,
+                      hipStream_t stream) {
+    if (state == nullptr || q == nullptr || k == nullptr || v == nullptr || beta == nullptr ||
+        gate == nullptr || o == nullptr || heads <= 0 || s <= 0 || (s & (s - 1)) != 0) {
+        return false;
+    }
+    const size_t smem = (size_t) 3 * s * sizeof(float);
+    delta_step_kernel<<<(unsigned) heads, 256, smem, stream>>>(state, q, k, v, beta, gate, o,
+                                                               n_kh, s, scale);
     return hipGetLastError() == hipSuccess;
 }
 

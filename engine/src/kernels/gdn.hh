@@ -58,4 +58,12 @@ bool delta_o(const float * state, const float * q, float * o, int64_t heads, int
 bool gated_norm(const float * o, const float * w, const float * z, float * out, int64_t rows,
                 int64_t n, float eps, hipStream_t stream);
 
+// One-token delta rule in a single launch (PLAN.md §10.2): decay, sk = S^T k,
+// d = (v - sk) * beta, S += k (x) d and o = scale * S^T q for every head.
+//   state: (heads, s, s); q/k: (n_kh, s); v/o: (heads, s); gate: (heads,)
+//   beta: (heads,); one workgroup per head, 256 threads.
+bool delta_step_fused(float * state, const float * q, const float * k, const float * v,
+                      const float * beta, const float * gate, float * o, int64_t heads,
+                      int64_t n_kh, int64_t s, float scale, hipStream_t stream);
+
 } // namespace omph::kernels
