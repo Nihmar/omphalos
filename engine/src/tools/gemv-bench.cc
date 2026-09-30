@@ -60,6 +60,9 @@ bool launch(const Case & c, const void * x, float * y, hipStream_t stream) {
     if (c.t->type == 10) {
         return omph::kernels::gemv_q2k(c.dev, x, y, c.rows, c.k, stream);
     }
+    if (c.t->type == 14) {
+        return omph::kernels::gemv_q6k(c.dev, x, y, c.rows, c.k, stream);
+    }
     return false;
 }
 
@@ -151,7 +154,8 @@ int main(int argc, char ** argv) {
                 if ((int) t.type != repack_only) {
                     continue;
                 }
-                const int64_t n_blocks = (int64_t) (t.nbytes / (t.type == 12 ? 144 : t.type == 23 ? 136 : t.type == 21 ? 110 : t.type == 10 ? 84 : 98));
+                const int64_t n_blocks =
+                    (int64_t) (t.nbytes / (uint64_t) omph::format::quant_block_bytes(t.type));
                 std::vector<uint8_t> packed;
                 std::vector<uint8_t> rebuilt((size_t) t.nbytes);
                 if (!repack_tensor(t.type, file.tensor_data(t), n_blocks, packed) ||

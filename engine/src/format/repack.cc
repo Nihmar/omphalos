@@ -363,6 +363,7 @@ int64_t quant_block_bytes(const uint32_t type) {
     switch (type) {
         case 10: return 84;    // Q2_K   (layout only, no kernel yet)
         case 12: return 144;   // Q4_K
+        case 14: return 210;   // Q6_K
         case 18: return 98;    // IQ3_XXS
         case 21: return 110;   // IQ3_S
         case 23: return 136;   // IQ4_XS
@@ -384,6 +385,9 @@ bool repack_any(const uint32_t type, const void * src, const int64_t n_blocks,
     } else if (type == 21) {
         dst.resize((size_t) iq3s_layout(n_blocks).total);
         repack_iq3_s(src, n_blocks, dst.data());
+    } else if (type == 14) {
+        dst.resize((size_t) q6k_layout(n_blocks).total);
+        repack_q6k(src, n_blocks, dst.data());
     } else if (type == 10) {
         dst.resize((size_t) q2k_layout(n_blocks).total);
         repack_q2k(src, n_blocks, dst.data());
@@ -399,9 +403,59 @@ bool unrepack_any(const uint32_t type, const void * src, const int64_t n_blocks,
     else if (type == 23) unrepack_iq4_xs(src, n_blocks, dst.data());
     else if (type == 18) unrepack_iq3_xxs(src, n_blocks, dst.data());
     else if (type == 21) unrepack_iq3_s(src, n_blocks, dst.data());
+    else if (type == 14) unrepack_q6k(src, n_blocks, dst.data());
     else if (type == 10) unrepack_q2k(src, n_blocks, dst.data());
     else return false;
     return true;
+}
+
+// ------------------------------------------------------------------ Q6_K
+
+namespace {
+#pragma pack(push, 1)
+struct BlockQ6K {
+    uint8_t ql[128];
+    uint8_t qh[64];
+    int8_t scales[16];
+    uint16_t d;
+};
+#pragma pack(pop)
+static_assert(sizeof(BlockQ6K) == 210, "Q6_K block must be 210 bytes");
+} // namespace
+
+Q6kLayout q6k_layout(const int64_t n_blocks) {
+    Q6kLayout l;
+    l.n_blocks = n_blocks;
+    l.ql_off = 0;
+    l.qh_off = align128(n_blocks * 128);
+    l.sc_off = align128(l.qh_off + n_blocks * 64);
+    l.d_off = align128(l.sc_off + n_blocks * 16);
+    l.total = align128(l.d_off + n_blocks * 2);
+    return l;
+}
+
+void repack_q6k(const void * src, const int64_t n_blocks, void * dst) {
+    const Q6kLayout l = q6k_layout(n_blocks);
+    const auto * in = static_cast<const BlockQ6K *>(src);
+    uint8_t * out = static_cast<uint8_t *>(dst);
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        std::memcpy(out + l.ql_off + b * 128, in[b].ql, 128);
+        std::memcpy(out + l.qh_off + b * 64, in[b].qh, 64);
+        std::memcpy(out + l.sc_off + b * 16, in[b].scales, 16);
+        std::memcpy(out + l.d_off + 2 * b, &in[b].d, 2);
+    }
+}
+
+void unrepack_q6k(const void * src, const int64_t n_blocks, void * dst) {
+    const Q6kLayout l = q6k_layout(n_blocks);
+    const uint8_t * in = static_cast<const uint8_t *>(src);
+    auto * out = static_cast<BlockQ6K *>(dst);
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        std::memcpy(out[b].ql, in + l.ql_off + b * 128, 128);
+        std::memcpy(out[b].qh, in + l.qh_off + b * 64, 64);
+        std::memcpy(out[b].scales, in + l.sc_off + b * 16, 16);
+        std::memcpy(&out[b].d, in + l.d_off + 2 * b, 2);
+    }
 }
 
 } // namespace omph::format

@@ -478,6 +478,136 @@ __global__ void gemv_q2k_kernel(const uint8_t * __restrict__ sc, const uint8_t *
     }
 }
 
+
+// Q6_K: 210-byte blocks. A lane iteration covers one 128-weight group: 64 bytes
+// of low nibbles, 32 bytes with the upper 2 bits and eight signed scales. The
+// four quarters of a group are contiguous weight runs (l, l+32, l+64, l+96), so
+// each activation is loaded once and the scale of each quarter folds into an
+// 8-entry per-group table (d * sc[i]).
+constexpr long long kQ6kChunkSub = 256;
+constexpr long long kQ6kRows = 4;
+
+__global__ void gemv_q6k_kernel(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
+                                const uint8_t * __restrict__ sc, const uint8_t * __restrict__ d,
+                                const __half * __restrict__ x, float * __restrict__ y,
+                                const long long rows, const long long n_sub,
+                                const long long chunk_sub) {
+    extern __shared__ __half xs[];  // activation chunk
+
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kQ6kRows;
+    const long long blocks = n_sub / 8;
+    const long long rlast = rows - 1;
+
+    float acc[kQ6kRows] = {};
+    for (long long base = 0; base < n_sub; base += chunk_sub) {
+        const long long len = n_sub - base < chunk_sub ? n_sub - base : chunk_sub;
+        for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
+            xs[i] = x[base * 32 + i];
+        }
+        __syncthreads();
+        if (row0 >= rows) {
+            __syncthreads();  // keep the barrier count identical across warps
+            continue;
+        }
+        const long long g_first = base / 4;
+        const long long g_last = (base + len) / 4;
+        for (long long g = g_first + lane; g < g_last; g += 32) {
+            const long long blk = g >> 1;
+            const int half = (int) (g & 1);
+            const __half * xv = xs + (g * 4 - base) * 32;
+            float part[kQ6kRows] = {};
+#pragma unroll
+            for (int r = 0; r < kQ6kRows; ++r) {
+                const long long row = row0 + r <= rlast ? row0 + r : rlast;
+                const uint8_t * pql = ql + row * blocks * 128 + blk * 128 + half * 64;
+                const uint8_t * pqh = qh + row * blocks * 64 + blk * 64 + half * 32;
+                const int8_t * psc =
+                    reinterpret_cast<const int8_t *>(sc + row * blocks * 16 + blk * 16 + half * 8);
+                const float dv = __half2float(
+                    *reinterpret_cast<const __half *>(d + row * blocks * 2 + blk * 2));
+                float dsc[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    dsc[i] = dv * (float) psc[i];
+                }
+                const uint32_t qlw[16] = {
+                    reinterpret_cast<const uint32_t *>(pql)[0],
+                    reinterpret_cast<const uint32_t *>(pql)[1],
+                    reinterpret_cast<const uint32_t *>(pql)[2],
+                    reinterpret_cast<const uint32_t *>(pql)[3],
+                    reinterpret_cast<const uint32_t *>(pql)[4],
+                    reinterpret_cast<const uint32_t *>(pql)[5],
+                    reinterpret_cast<const uint32_t *>(pql)[6],
+                    reinterpret_cast<const uint32_t *>(pql)[7],
+                    reinterpret_cast<const uint32_t *>(pql)[8],
+                    reinterpret_cast<const uint32_t *>(pql)[9],
+                    reinterpret_cast<const uint32_t *>(pql)[10],
+                    reinterpret_cast<const uint32_t *>(pql)[11],
+                    reinterpret_cast<const uint32_t *>(pql)[12],
+                    reinterpret_cast<const uint32_t *>(pql)[13],
+                    reinterpret_cast<const uint32_t *>(pql)[14],
+                    reinterpret_cast<const uint32_t *>(pql)[15]};
+                const uint32_t qhw[8] = {
+                    reinterpret_cast<const uint32_t *>(pqh)[0],
+                    reinterpret_cast<const uint32_t *>(pqh)[1],
+                    reinterpret_cast<const uint32_t *>(pqh)[2],
+                    reinterpret_cast<const uint32_t *>(pqh)[3],
+                    reinterpret_cast<const uint32_t *>(pqh)[4],
+                    reinterpret_cast<const uint32_t *>(pqh)[5],
+                    reinterpret_cast<const uint32_t *>(pqh)[6],
+                    reinterpret_cast<const uint32_t *>(pqh)[7]};
+                float sub[8] = {};
+#pragma unroll
+                for (int l = 0; l < 32; ++l) {
+                    const int wi = l >> 2;
+                    const int bi = 8 * (l & 3);
+                    const uint32_t ql_lo = (qlw[wi] >> bi) & 0xFF;
+                    const uint32_t ql_hi = (qlw[wi + 8] >> bi) & 0xFF;
+                    const uint32_t qh_b = (qhw[wi] >> bi) & 0xFF;
+                    const int is = l >> 4;
+                    const float x0 = __half2float(xv[l]);
+                    const float x1 = __half2float(xv[32 + l]);
+                    const float x2 = __half2float(xv[64 + l]);
+                    const float x3 = __half2float(xv[96 + l]);
+                    sub[0 + is] = fmaf(
+                        (float) (int) ((ql_lo & 0xF) | ((qh_b & 3) << 4)) - 32.0f, x0, sub[0 + is]);
+                    sub[2 + is] = fmaf(
+                        (float) (int) ((ql_hi & 0xF) | (((qh_b >> 2) & 3) << 4)) - 32.0f, x1,
+                        sub[2 + is]);
+                    sub[4 + is] = fmaf(
+                        (float) (int) ((ql_lo >> 4) | (((qh_b >> 4) & 3) << 4)) - 32.0f, x2,
+                        sub[4 + is]);
+                    sub[6 + is] = fmaf(
+                        (float) (int) ((ql_hi >> 4) | (((qh_b >> 6) & 3) << 4)) - 32.0f, x3,
+                        sub[6 + is]);
+                }
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    part[r] = fmaf(dsc[i], sub[i], part[r]);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kQ6kRows; ++r) {
+                acc[r] += part[r];
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < kQ6kRows; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down(v, off);
+        }
+        if (lane == 0 && row0 + r < rows) {
+            y[row0 + r] = v;
+        }
+    }
+}
+
 } // namespace
 
 bool gemv_q4k(const void * packed, const void * x_f16, float * y, const int64_t rows,
@@ -495,6 +625,26 @@ bool gemv_q4k(const void * packed, const void * x_f16, float * y, const int64_t 
     gemv_q4k_kernel<<<grid, 256, smem, stream>>>(
         base + l.qs_off, base + l.sc_off, base + l.mn_off, base + l.d_off, base + l.dmin_off,
         static_cast<const __half *>(x_f16), y, rows, n_sub);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool gemv_q6k(const void * packed, const void * x_f16, float * y, const int64_t rows,
+              const int64_t k, hipStream_t stream) {
+    if (packed == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
+        k % 256 != 0) {
+        return false;
+    }
+    const int64_t n_blocks = rows * (k / 256);
+    const omph::format::Q6kLayout l = omph::format::q6k_layout(n_blocks);
+    const int64_t n_sub = k / 32;
+    const int64_t chunk = n_sub < kQ6kChunkSub ? n_sub : kQ6kChunkSub;
+    const size_t smem = (size_t) chunk * 64;
+    const auto * base = static_cast<const uint8_t *>(packed);
+    const dim3 grid((unsigned) ((rows + 8 * kQ6kRows - 1) / (8 * kQ6kRows)));
+    gemv_q6k_kernel<<<grid, 256, smem, stream>>>(base + l.ql_off, base + l.qh_off,
+                                                 base + l.sc_off, base + l.d_off,
+                                                 static_cast<const __half *>(x_f16), y, rows,
+                                                 n_sub, chunk);
     return hipGetLastError() == hipSuccess;
 }
 
