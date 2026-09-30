@@ -925,7 +925,12 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 | 9 | Offline converter + final format | Layouts frozen, bit-exact verification in the converter |
 | 10 | Polish | C ABI, OpenAI-compatible server, prompt-prefix cache in host RAM, breadcrumbs |
 
-Status: **M0, M1, M2 and M3 are complete**; M4 is in progress (issue #41): the decode was at
+Status: **M0-M4 are complete**; M5 (quantized KV) has its core landed (issue #43):
+K Q8 + V Q4 with the Hadamard rotation, 4.92x less KV VRAM (4.29 GB -> 0.87 GB at
+32k), KL(f32 || q8q4) 0.0837 nats at 512 tokens with the greedy tokens identical at
+short context. Left in M5: the FP16 windows of §13.4, the per-layer selection of
+§13.5 and the validation at 32k, which needs a prefill that runs there at all.
+Before that, M4's status: the decode was at
 73.3 % of the ceiling (57 ms/token) when M3 closed, and the two defects above put it at
 ~75.6 % (55.2 ms/token) — at the milestone's criterion. What is left of the criterion is
 whatever the remaining ~15 us-per-launch kernels cost.

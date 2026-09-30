@@ -875,3 +875,45 @@ head_dim 256 → 128 KB per token, 4.3 GB at 32k):
 | 8192 | `error: out of VRAM` |
 
 That is the milestone's case: with K Q8 + V Q4 the same 32k costs 0.8 GB.
+
+# M5 — quantized KV: K Q8, V Q4, Hadamard rotation
+
+Storage: 32-element blocks along head_dim (8 per head), scales in a separate f16
+stream. Per head per token: K 272 B, V 144 B, against 1024 B each in f32.
+
+| | 512 tokens | 32k |
+|---|---:|---:|
+| f32 KV | 67.1 MB | 4.29 GB |
+| K Q8 + V Q4 | **13.6 MB** | **0.87 GB** |
+
+**4.92x smaller**, and the reason the 16 GB card can hold a long context at all.
+
+Quantization quality, measured on the host from the writer's own output:
+
+| | error (max abs) | source |max| |
+|---|---:|---:|
+| K Q8 | 0.0142 | 3.295 |
+| V Q4, unrotated | 0.1264 | 1.772 |
+| V Q4, rotated | **0.0642** | 0.71 |
+
+The V rotation is what makes Q4 usable: without it the block scales ranged
+0.088-0.253 (outlier-dominated, the 1.77 against block-mates near 0.2); with it
+they are uniform at 0.10-0.14.
+
+Correctness: greedy tokens identical to the f32-KV run at the short prompt
+(`198 760 3841`); KL(f32 || q8q4) = 0.139 nats at 10 tokens and **0.0837 nats at
+512**, with the argmax preserved at 10 tokens and the top-10 probability mass
+within 0.4 %. On the random 512-token prompt the argmax does diverge — that
+prompt is out of distribution by construction, and the FP16 windows of §13.4 (not
+implemented yet) are the intended remedy.
+
+Speed: no change at 512 tokens (KV reads are 67 MB against 12.4 GiB of weights
+per step — 0.5 %). At 32k the f32 KV is 4.3 GB of the step's traffic and the
+quantized one 0.87 GB, so the win is there, but measuring it needs a 32k prefill,
+which the f16 fallback's staging currently cannot do.
+
+Two bugs worth recording, both found by dumping the writer's output rather than
+reasoning about it: the block amax was reduced over 8 lanes while the Q4 writers
+are 16 (`vmax` was 0 for half of them, storing zeros), and the KV cache stride
+used the model layer index instead of the attention-layer index — the pointers
+printed 175104 into a 147456-byte buffer.
