@@ -557,9 +557,10 @@ public:
     const HParams & hparams() const { return h_; }
 
 private:
-    static int fail(const char * msg) {
+    // Returns false: every caller is a bool function that reports failure.
+    static bool fail(const char * msg) {
         std::fprintf(stderr, "%s\n", msg);
-        return 1;
+        return false;
     }
 
     static HParams read_hparams(const omph::gguf::File & f) {
