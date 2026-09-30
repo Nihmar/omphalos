@@ -47,4 +47,9 @@ GemvOccupancy gemv_occupancy();
 bool gemv_q2k(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
               hipStream_t stream);
 
+// Same contract for a tensor in the repacked Q6_K layout (6-bit quants split
+// over ql/qh, signed 8-bit scales per 16 weights).
+bool gemv_q6k(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
+              hipStream_t stream);
+
 } // namespace omph::kernels

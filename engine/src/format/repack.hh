@@ -148,4 +148,22 @@ int64_t quant_block_bytes(uint32_t type);
 bool repack_any(uint32_t type, const void * src, int64_t n_blocks, std::vector<uint8_t> & dst);
 bool unrepack_any(uint32_t type, const void * src, int64_t n_blocks, std::vector<uint8_t> & dst);
 
+// ------------------------------------------------------------------ Q6_K
+//
+// GGUF Q6_K: 210-byte blocks — 128 bytes of low nibbles, 64 bytes carrying the
+// upper 2 bits, 16 signed 8-bit scales (one per 16 weights) and f16 `d`.
+// Streams are split for alignment; size unchanged.
+//   [ ql ] 128 B   [ qh ] 64 B   [ sc ] 16 B   [ d ] 2 B
+struct Q6kLayout {
+    int64_t n_blocks = 0;
+    int64_t ql_off = 0;
+    int64_t qh_off = 0;
+    int64_t sc_off = 0;
+    int64_t d_off = 0;
+    int64_t total = 0;
+};
+Q6kLayout q6k_layout(int64_t n_blocks);
+void repack_q6k(const void * src, int64_t n_blocks, void * dst);
+void unrepack_q6k(const void * src, int64_t n_blocks, void * dst);
+
 } // namespace omph::format

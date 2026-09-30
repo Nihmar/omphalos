@@ -261,3 +261,27 @@ IQ2_XS/XXS, BF16/F32/IQ1_M = 14 % of the weights), which is read at 2 bytes per
 weight instead of ~0.5 plus its dequant and staging. The next lever is therefore
 not a faster kernel, it is **removing the fallback**: a GEMV for Q6_K and IQ2_S
 covers most of it.
+
+# M3.8 — fused Q6_K GEMV (0.32 GiB, but MTP-only)
+
+| measurement | result |
+|---|---:|
+| all 8 Q6_K tensors (218.3 MiB) | **157.3 GB/s = 49.4 %** of the ceiling |
+| accuracy vs the f16 dequant path | max \|d\| 6e-4 (**6.4e-5 relative** — the best of the five) |
+| repack round-trip | byte-identical, source size (332.2 MiB) |
+| rows per warp 2 / 4 / 8 | 142.9 / **157.3** / 79.5 GB/s |
+
+The slowest kernel of the set. Each 128-weight group needs 96 quant bytes
+extracted through two levels of shifts (16 `ql` words + 8 `qh` words held in
+registers) plus a 4-quarter sub-accumulation, so it is heavier per value than
+Q4_K/IQ4_XS and the register count shows it.
+
+**Finding that matters more than the number: every Q6_K tensor in this model
+lives in `blk.64.*`, the MTP block.** The normal decode path never touches them,
+so this kernel is an M6 (MTP) enabler, not a decode win — and it does *not* help
+the f16 fallback that dominates the current 174 ms/token.
+
+That also corrects the previous estimate of the fallback: of the 1.46 GiB of
+uncovered types, ~0.75 GiB is the token embedding (a row gather, not a GEMV) and
+0.32 GiB is MTP. The fallback actually on the decode path is roughly 0.7 GiB
+(6 % of the weights): IQ2_S outside the embedding, IQ2_XS/XXS and IQ1_M.
