@@ -615,13 +615,6 @@ private:
         if (!matmul(p + "attn_q.weight", h16_, static_cast<float *>(fused_), q_out, ne, T) ||
             !matmul(p + "attn_k.weight", h16_, static_cast<float *>(k_), kv_out, ne, T) ||
             !matmul(p + "attn_v.weight", h16_, static_cast<float *>(v_), kv_out, ne, T) ||
-            (kv_q8q4_ &&
-             (!omph::kernels::hadamard_f32(static_cast<float *>(q_), T * h_.n_head,
-                                           h_.head_dim, nullptr) ||
-              !omph::kernels::hadamard_f32(static_cast<float *>(k_), T * h_.n_head_kv,
-                                           h_.head_dim, nullptr) ||
-              !omph::kernels::hadamard_f32(static_cast<float *>(v_), T * h_.n_head_kv,
-                                           h_.head_dim, nullptr))) ||
             !omph::kernels::split_qg(static_cast<const float *>(fused_),
                                      static_cast<float *>(q_), static_cast<float *>(gate_), T,
                                      h_.n_head, h_.head_dim, nullptr) ||
@@ -635,6 +628,16 @@ private:
                                       (float) h_.freq_base, pos0, nullptr) ||
             !omph::kernels::rope_neox(static_cast<float *>(k_), T, h_.n_head_kv, h_.head_dim,
                                       h_.n_rot, (float) h_.freq_base, pos0, nullptr) ||
+            // Quantized KV: rotate Q and K after QK-norm and RoPE, neither of which
+            // commutes with H, so that (HQ)·(HK) = Q·K (PLAN.md §13.3). V has no
+            // norm or RoPE; the attention epilogue un-rotates it.
+            (kv_q8q4_ &&
+             (!omph::kernels::hadamard_f32(static_cast<float *>(q_), T * h_.n_head,
+                                           h_.head_dim, nullptr) ||
+              !omph::kernels::hadamard_f32(static_cast<float *>(k_), T * h_.n_head_kv,
+                                           h_.head_dim, nullptr) ||
+              !omph::kernels::hadamard_f32(static_cast<float *>(v_), T * h_.n_head_kv,
+                                           h_.head_dim, nullptr))) ||
             hipMemcpy(k_cache + pos0 * kv_out, k_, (size_t) T * kv_out * 4,
                       hipMemcpyDeviceToDevice) != hipSuccess ||
             hipMemcpy(v_cache + pos0 * kv_out, v_, (size_t) T * kv_out * 4,
