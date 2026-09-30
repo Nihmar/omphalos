@@ -55,6 +55,32 @@ Priorities, in order: **1) VRAM savings — 2) decode speed — 3) prefill speed
 - Profiling and reference builds: `rocprofv3`, `hipblaslt-bench`, `rocminfo` / `amd-smi`, llama.cpp (HIP/Vulkan/CPU), `gguf-dump` (PLAN.md §6–§7).
 - Once build/test/bench entry points exist, their exact commands are documented here.
 
+## Entry points
+
+Model path used below: `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (local, git-ignored).
+
+```sh
+# build
+cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release
+cmake --build engine/build -j
+
+# full forward pass: prefill + greedy decode (GPU, naive path)
+engine/build/omph-run <model.gguf> models/golden/cpu/tokens.txt <out-logits.f32> \
+    --generate 3 --gen-out /tmp/gen.txt [--trace-dir DIR] [--tokens N]
+
+# per-block checks against the golden dump (models/golden/cpu, local)
+cd tools
+uv run python check_gpu_dequant.py                 # dequant kernels vs ggml
+uv run python check_gpu_linear.py                 # matmul path
+uv run python check_gpu_attn.py <model> <layer>   # attention layers 3 / 7 / 63
+uv run python check_gpu_gdn.py  <model> <layer>   # delta-net layers 0 / 1 / 20
+uv run python check_gpu_run.py  <model> --layers  # 64-layer stack vs the dump
+uv run python check_gpu_decode.py                 # greedy decode vs the NumPy reference
+
+# regenerating the golden dump (CPU backend, needs a llama.cpp build)
+tools/native/build.sh <llama.cpp-dir> && tools/native/dump_tensors ...
+```
+
 ## Working agreements
 
 - PLAN.md is the source of truth for architecture; deviations are proposed in an issue first.
