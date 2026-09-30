@@ -599,6 +599,23 @@ Two options:
 
 RMSNorm, residuals, SwiGLU, gating, RoPE: never standalone kernels in the final engine — fused into prologues/epilogues of the GEMVs/GEMMs.
 
+Measured on the decode step (M4, issue #41):
+
+- **HIP graphs are worth ~1 ms, not the 25 ms a kernel trace suggests.** `omph-graph-probe`
+  launches a chain of 1861 tiny dependent kernels — a decode step's length — one by one
+  (6.755 ms) and replayed from a captured graph (5.773 ms): a graph recovers 15 % of the
+  3.63 us per-kernel cost. The device-side token/position refactor that capture needs is
+  therefore not worth doing, and §11's "graphs for the per-token forward pass" is dropped
+  for the decode.
+- **Fusions into the prologue/epilogue of the GEMV are the right shape** (this section), but
+  fusing two or three small kernels at a time measures as noise: three rounds gave 0-1 ms.
+- **The non-GEMV quarter of the step is dominated by per-launch latency, not work.** The
+  GEMVs are 82 % of the step and run near the achievable rate; the rest is ~165 calls of
+  ~15 us each. Two of those were bugs, not tuning: a 178 MB f16 conversion of one IQ1_M
+  tensor repeated every token (1.83 ms per step, now cached once at load) and a
+  shared-memory tree reduction with eight barriers in `rms_norm_f16`, which the decode
+  calls with a single row.
+
 ### 10.7 Head and sampling
 
 - Final RMSNorm ⊕ `lm_head` GEMV ⊕ per-workgroup partial argmax / top-k in one kernel, final reduction in a tiny second kernel.
@@ -610,8 +627,10 @@ RMSNorm, residuals, SwiGLU, gating, RoPE: never standalone kernels in the final 
 ## 11. Runtime and decode loop
 
 - **Preallocate everything** at load (memory arena): weights, KV, states, snapshots, scratch. No allocations in the loop; peak VRAM is deterministic.
-- **HIP graphs** for the per-token forward pass. Keep the position / sequence length / KV length in **device memory** so the *same* graph replays every token without re-instantiation or parameter updates.
-- Separate graphs for: decode N=1, MTP draft step, verification N=k+1, and prefill ubatch.
+- **HIP graphs: measured and dropped for the decode** (see §10.6). A graph is worth ~1 ms of a
+  57 ms step, so the device-side position/token refactor the original plan called for is not
+  worth its complexity. Revisit only if a future step becomes launch-bound — the probe
+  (`omph-graph-probe`) is the instrument that decides it.
 - **Two streams**: main compute stream + auxiliary stream for deferred MTP KV fill (§12.3) and uploads (image embeddings, prompt-cache restores).
 - Host thread pinned to a P-core; the only per-token host work is reading back the token id and detokenizing/streaming (can be on another thread).
 - Advanced (later): **persistent "megakernel"** for decode — one long-running kernel that walks the layers, removing inter-kernel bubbles and tail effects. High complexity; only after everything else.
@@ -898,7 +917,7 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 | 1 | Inspection + CPU reference | `gguf-dump` facts recorded; NumPy/PyTorch-CPU reference matches llama.cpp logits (KL ≈ 0) |
 | 2 | Naive GPU path | One kernel per op, dequant to FP16, correct tokens, greedy output = reference |
 | 3 | Custom layout + fused int8-dot GEMV | Bit-exact load-time repacking; decode ≥ 60% of measured bandwidth |
-| 4 | Graphs + fusions | Decode ≥ 75% of measured bandwidth |
+| 4 | Remove the non-GEMV waste | Decode ≥ 75% of measured bandwidth (55.7 ms/token over 12.38 GiB). Graphs measured at ~2 % and dropped, see §10.6 |
 | 5 | Quantized KV | K Q8/V Q4 with Hadamard + windows; KL within budget at 32k |
 | 6 | MTP | KV-only shadow prefill (prefill within ~2% of non-MTP), snapshots, truncated-vocab drafts, adaptive k; greedy identity |
 | 7 | Vision on CPU | libmtmd CPU encoding, M-RoPE, embedding cache |
@@ -906,7 +925,10 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 | 9 | Offline converter + final format | Layouts frozen, bit-exact verification in the converter |
 | 10 | Polish | C ABI, OpenAI-compatible server, prompt-prefix cache in host RAM, breadcrumbs |
 
-Status: **M0, M1, M2 and M3 are complete.**
+Status: **M0, M1, M2 and M3 are complete**; M4 is in progress (issue #41): the decode was at
+73.3 % of the ceiling (57 ms/token) when M3 closed, and the two defects above put it at
+~75.6 % (55.2 ms/token) — at the milestone's criterion. What is left of the criterion is
+whatever the remaining ~15 us-per-launch kernels cost.
 
 - **M3 (custom layout + fused GEMV).** Every quant type in the allocation except
   IQ1_M (0.02 GiB) has a fused dequant+dot kernel, each with a repacked layout

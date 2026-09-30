@@ -282,6 +282,9 @@ public:
     }
 
     ~Runner() {
+        for (void * p : f16_cache_owned_) {
+            (void) hipFree(p);
+        }
         if (dev_weights_ != nullptr) {
             (void) hipFree(dev_weights_);
         }
@@ -782,14 +785,60 @@ private:
         return raw_stage_;
     }
 
+    // Types that have a fused GEMV kernel: for these the f16 form is never worth
+    // keeping (it would be two to four times the quantized size, and they are the
+    // bulk of the model).
+    static bool has_gemv_type(const uint32_t type) {
+        switch (type) {
+            case 10:
+            case 12:
+            case 14:
+            case 16:
+            case 17:
+            case 18:
+            case 21:
+            case 22:
+            case 23:
+            case 30: return true;
+            default: return false;
+        }
+    }
+
     void * stage_w(const std::string & name) {
-        timer_stage_.start();
         const omph::gguf::TensorInfo * t = file_.tensor(name);
         if (t == nullptr) {
             throw std::runtime_error("missing tensor " + name);
         }
+        // Small tensors that never got a quantized kernel (IQ1_M) were being
+        // converted to f16 on every call — 1.6 ms of every decode step for one
+        // 18.6 MiB tensor. Convert once, keep it: at most 64 MiB, which keeps the
+        // big repacked weights (whose f16 form would not fit VRAM) out.
+        const int64_t n_elems = numel(*t);
+        const bool cacheable = std::getenv("OMPH_NO_F16_CACHE") == nullptr &&
+                              !has_gemv_type(t->type) && n_elems * 2 <= (256 << 20);
+        if (cacheable) {
+            const auto it = f16_cache_.find(name);
+            if (it != f16_cache_.end()) {
+                if (std::getenv("OMPH_TRACE_STAGE") != nullptr) {
+                    std::fprintf(stderr, "stage %-40s CACHED\n", name.c_str());
+                }
+                return it->second;
+            }
+        }
+        if (std::getenv("OMPH_TRACE_STAGE") != nullptr) {
+            std::fprintf(stderr, "stage %-40s type %u %lld B cacheable %d\n", name.c_str(),
+                         (unsigned) t->type, (long long) t->nbytes, cacheable ? 1 : 0);
+        }
+        timer_stage_.start();
         const int64_t n = numel(*t);
-        void * dst = scratch_.alloc((size_t) n * 2);
+        void * dst = nullptr;
+        if (cacheable) {
+            if (hipMalloc(&dst, (size_t) n * 2) != hipSuccess) {
+                throw std::runtime_error("cannot cache f16 for " + name);
+            }
+        } else {
+            dst = scratch_.alloc((size_t) n * 2);
+        }
         if (std::getenv("OMPH_TRACE_ALLOC") != nullptr) {
             std::fprintf(stderr, "stage %-40s %10lld elems  ne=[", name.c_str(), (long long) n);
             for (const uint64_t d : t->ne) {
@@ -801,6 +850,10 @@ private:
             throw std::runtime_error("dequant failed for " + name);
         }
         timer_stage_.stop(t_stage_);
+        if (cacheable) {
+            f16_cache_[name] = dst;
+            f16_cache_owned_.push_back(dst);
+        }
         return dst;
     }
 
@@ -869,6 +922,8 @@ private:
     void * tmp_logits_ = nullptr;
     void * head16_ = nullptr;
     void * raw_stage_ = nullptr;
+    std::map<std::string, void *> f16_cache_;
+    std::vector<void *> f16_cache_owned_;
 };
 
 } // namespace
