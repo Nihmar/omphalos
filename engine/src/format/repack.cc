@@ -445,6 +445,7 @@ void unrepack_q2k(const void * src, const int64_t n_blocks, void * dst) {
 int64_t quant_block_bytes(const uint32_t type) {
     switch (type) {
         case 10: return 84;    // Q2_K   (layout only, no kernel yet)
+        case 29: return 56;    // IQ1_M  (identity layout: the GGUF bytes)
         case 12: return 144;   // Q4_K
         case 14: return 210;   // Q6_K
         case 16: return 66;    // IQ2_XXS
@@ -468,6 +469,7 @@ int64_t repacked_bytes(const uint32_t type, const int64_t n_blocks) {
         case 21: return iq3s_layout(n_blocks).total;
         case 22: return iq2s_layout(n_blocks).total;
         case 23: return iq4_layout(n_blocks).total;
+        case 29: return n_blocks * 56;  // IQ1_M: kept as in the GGUF
         default: return 0;
     }
 }
@@ -501,6 +503,11 @@ bool repack_any(const uint32_t type, const void * src, const int64_t n_blocks,
     } else if (type == 10) {
         dst.resize((size_t) q2k_layout(n_blocks).total);
         repack_q2k(src, n_blocks, dst.data());
+    } else if (type == 29) {
+        // IQ1_M: one small tensor in this model; its GEMV reads the GGUF blocks
+        // as they are (56-byte blocks, 8-byte aligned fields).
+        dst.resize((size_t) n_blocks * 56);
+        std::memcpy(dst.data(), src, dst.size());
     } else {
         return false;
     }
@@ -518,6 +525,7 @@ bool unrepack_any(const uint32_t type, const void * src, const int64_t n_blocks,
     else if (type == 22) unrepack_iq2_s(src, n_blocks, dst.data());
     else if (type == 16) unrepack_iq2_xxs(src, n_blocks, dst.data());
     else if (type == 10) unrepack_q2k(src, n_blocks, dst.data());
+    else if (type == 29) std::memcpy(dst.data(), src, (size_t) n_blocks * 56);
     else return false;
     return true;
 }

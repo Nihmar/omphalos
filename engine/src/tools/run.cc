@@ -865,6 +865,7 @@ private:
             case 21: return omph::kernels::gemv_iq3_s(w, x, y, n_out, k, nullptr);
             case 22: return omph::kernels::gemv_iq2_s(w, x, y, n_out, k, nullptr);
             case 23: return omph::kernels::gemv_iq4_xs(w, x, y, n_out, k, nullptr);
+            case 29: return omph::kernels::gemv_iq1_m(w, x, y, n_out, k, nullptr);
             default: return false;
         }
     }
@@ -1017,6 +1018,7 @@ private:
             case 21:
             case 22:
             case 23:
+            case 29:
             case 30: return true;
             default: return false;
         }
