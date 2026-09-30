@@ -235,6 +235,20 @@ File::File(const std::string & path) {
     if (data_offset_ > size_) {
         fail("data section starts beyond the end of the file");
     }
+    // Every tensor must have a known type and lie inside the mapping: a
+    // truncated file would otherwise fault at upload instead of failing here.
+    const uint64_t data_bytes = size_ - data_offset_;
+    for (const TensorInfo & t : tensors_) {
+        if (type_info(t.type) == nullptr) {
+            fail("unknown type " + std::to_string(t.type) + " for tensor " + t.name);
+        }
+        if (t.nbytes == 0) {
+            fail("row size is not a whole number of blocks for tensor " + t.name);
+        }
+        if (t.offset > data_bytes || t.nbytes > data_bytes - t.offset) {
+            fail("data of tensor " + t.name + " extends beyond the end of the file");
+        }
+    }
 }
 
 File::~File() {
