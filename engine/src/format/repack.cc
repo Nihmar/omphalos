@@ -307,4 +307,56 @@ void unrepack_iq3_s(const void * src, const int64_t n_blocks, void * dst) {
     }
 }
 
+// ------------------------------------------------------------------ Q2_K
+
+namespace {
+
+#pragma pack(push, 1)
+struct BlockQ2K {
+    uint8_t scales[16];
+    uint8_t qs[64];
+    uint16_t d;
+    uint16_t dmin;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(BlockQ2K) == 84, "Q2_K block must be 84 bytes");
+
+} // namespace
+
+Q2kLayout q2k_layout(const int64_t n_blocks) {
+    Q2kLayout l;
+    l.n_blocks = n_blocks;
+    l.sc_off = 0;
+    l.qs_off = align128(n_blocks * 16);
+    l.d_off = align128(l.qs_off + n_blocks * 64);
+    l.dmin_off = align128(l.d_off + n_blocks * 2);
+    l.total = align128(l.dmin_off + n_blocks * 2);
+    return l;
+}
+
+void repack_q2k(const void * src, const int64_t n_blocks, void * dst) {
+    const Q2kLayout l = q2k_layout(n_blocks);
+    const auto * in = static_cast<const BlockQ2K *>(src);
+    uint8_t * out = static_cast<uint8_t *>(dst);
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        std::memcpy(out + l.sc_off + b * 16, in[b].scales, 16);
+        std::memcpy(out + l.qs_off + b * 64, in[b].qs, 64);
+        std::memcpy(out + l.d_off + 2 * b, &in[b].d, 2);
+        std::memcpy(out + l.dmin_off + 2 * b, &in[b].dmin, 2);
+    }
+}
+
+void unrepack_q2k(const void * src, const int64_t n_blocks, void * dst) {
+    const Q2kLayout l = q2k_layout(n_blocks);
+    const uint8_t * in = static_cast<const uint8_t *>(src);
+    auto * out = static_cast<BlockQ2K *>(dst);
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        std::memcpy(out[b].scales, in + l.sc_off + b * 16, 16);
+        std::memcpy(out[b].qs, in + l.qs_off + b * 64, 64);
+        std::memcpy(&out[b].d, in + l.d_off + 2 * b, 2);
+        std::memcpy(&out[b].dmin, in + l.dmin_off + 2 * b, 2);
+    }
+}
+
 } // namespace omph::format
