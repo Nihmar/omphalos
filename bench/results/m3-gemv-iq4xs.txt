@@ -130,3 +130,30 @@ thing to tune (chunk size and rows-per-warp for that shape).
 
 `--all-of-type <ggml-type>` measures every `blk.*` tensor of one type in a single
 timed pass (generalises `--iq4-all`).
+
+# M3.4 — fused IQ3_XXS GEMV (1.93 GiB, 78 tensors)
+
+Format: 98-byte blocks — f16 `d`, 64 bytes of 4-byte grid indices into
+`iq3xxs_grid`, 32 bytes of words holding a 4-bit scale plus four 7-bit sign
+indices per 32-weight sub-block. The kernel resolves the signs with the
+128-byte table and the grid with a 1 KiB LDS copy (`kernels/iq_tables.hh`).
+
+| measurement | time | bytes read | effective bandwidth | vs ceiling |
+|---|---:|---:|---:|---:|
+| all 78 IQ3_XXS tensors, one pass | **11.87 ms** | 2787.0 MiB | **246.1 GB/s** | **77.3 %** |
+
+Accuracy against the f16 dequant + hipBLASLt path: max |d| 5e-4 (2.4e-4
+relative) — the same level as Q4_K and IQ4_XS, which is what validates the
+grid + sign decoding.
+
+Optimisations measured:
+
+| change | result |
+|---|---:|
+| first version (scale applied per value) | 233.5 GB/s (73.3 %) |
+| scale factored out of the per-sub-block sum | **246.1 GB/s (77.3 %)** |
+| rows per warp 2 / 6 | 235.7 / 232.1 GB/s |
+
+Repacking verified byte-identical for all 78 tensors, and the layout keeps
+the source size (1979.1 -> 1979.1 MiB, the sign resolution and the stream
+splitting are free).
