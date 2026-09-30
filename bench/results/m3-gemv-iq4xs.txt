@@ -409,3 +409,28 @@ the weights, so a 20-66 % kernel gain is worth ~4 ms. The value here is that the
 slowest kernels are no longer an outlier — IQ2_XXS/S now sit with IQ4_XS and
 IQ3_XXS — and that the same instruction replaces the extraction in any future
 grid kernel.
+
+# M3.12 — prefill phase breakdown (OMPH_TIMING=1)
+
+10-token pass, f16 path, 2.0 s wall clock of which ~0.56 s is the one-time
+weight upload over PCIe; the pass itself is ~1.45 s (~7 t/s).
+
+| phase | time | share |
+|---|---:|---:|
+| dequant each layer's weights to f16 (`stage_w`) | 830 ms | 57 % |
+| f16 GEMMs (hipBLASLt) | 339 ms | 23 % |
+| attention / gated delta net kernels | 43 ms | 3 % |
+| small ops, casts, launches (residual) | ~200 ms | 14 % |
+
+Two conclusions for milestone 8:
+
+- **80 % of the pass is the two things M8 replaces** (f16 materialization and
+  small-M GEMMs), which is the quantitative version of the §4.2 argument.
+- the block kernels are only 3 % *at T = 10* because the delta net is
+  sequential today; they are exactly what grows with T, so the chunked form
+  (§10.3) is what keeps a 512-token prompt from being delta-net bound.
+
+Also fixed while measuring: `Linear` was constructed per matmul call (one
+hipBLASLt handle created and destroyed ~500 times per pass). Hoisting it to a
+Runner member is worth ~7 % of the pass — worth doing, but it was not the missing
+time.

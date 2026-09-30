@@ -112,6 +112,43 @@ void write_f32(const std::string & path, const std::vector<float> & data) {
     out.write(reinterpret_cast<const char *>(data.data()), (std::streamsize) (data.size() * 4));
 }
 
+// Phase timing: record an event pair per call, resolve them all after the run.
+class PhaseTimer {
+public:
+    PhaseTimer() : on_(std::getenv("OMPH_TIMING") != nullptr) {
+        if (on_) {
+            (void) hipEventCreate(&a_);
+            (void) hipEventCreate(&b_);
+        }
+    }
+    void start() {
+        if (on_) {
+            (void) hipEventRecord(a_, nullptr);
+        }
+    }
+    void stop(std::vector<std::pair<hipEvent_t, hipEvent_t>> & sink) {
+        if (on_) {
+            (void) hipEventRecord(b_, nullptr);
+            sink.emplace_back(a_, b_);
+        }
+    }
+    static double total_ms(const std::vector<std::pair<hipEvent_t, hipEvent_t>> & v) {
+        double ms = 0.0;
+        for (const auto & p : v) {
+            float d = 0.0f;
+            if (hipEventElapsedTime(&d, p.first, p.second) == hipSuccess) {
+                ms += d;
+            }
+        }
+        return ms;
+    }
+
+private:
+    bool on_ = false;
+    hipEvent_t a_{};
+    hipEvent_t b_{};
+};
+
 class Runner {
 public:
     explicit Runner(const std::string & path, const int64_t max_tokens, const bool use_gemv)
@@ -284,11 +321,13 @@ public:
                 return fail("attn_norm failed");
             }
             scratch_.reset();
+            timer_gemm_.start();
             if (recurrent) {
                 if (!gdn_layer(il, p, T)) return false;
             } else {
                 if (!attn_layer(il, p, T, start_pos)) return false;
             }
+            timer_gemm_.stop(t_block_);
             // x = ffn(rms_norm(block + x)) + (block + x)
             if (!omph::kernels::add_out(static_cast<const float *>(blk_),
                                         static_cast<const float *>(x_),
@@ -354,15 +393,19 @@ public:
                                        : static_cast<const uint8_t *>(dev_weights_) +
                                              off_.at(head->name);
         const int64_t chunk = std::min<int64_t>(h_.n_vocab, 32768);
-        omph::runtime::Linear linear;
         for (int64_t v0 = 0; v0 < h_.n_vocab; v0 += chunk) {
             const int64_t rows = std::min(chunk, h_.n_vocab - v0);
             void * wh = head16_;
-            if (!omph::kernels::dequantize(
-                    head->type,
-                    head_src + v0 * head_row_bytes,
-                    wh, rows * ne, true, nullptr) ||
-                !linear.run(wh, h16_, static_cast<float *>(tmp_logits_), rows, ne, T) ||
+            timer_stage_.start();
+            const bool head_dq = omph::kernels::dequantize(head->type,
+                                                           head_src + v0 * head_row_bytes, wh,
+                                                           rows * ne, true, nullptr);
+            timer_stage_.stop(t_stage_);
+            timer_gemm_.start();
+            const bool head_gm =
+                linear_.run(wh, h16_, static_cast<float *>(tmp_logits_), rows, ne, T);
+            timer_gemm_.stop(t_gemm_);
+            if (!head_dq || !head_gm ||
                 hipMemcpy2D(static_cast<uint8_t *>(logits_) + v0 * 4, (size_t) h_.n_vocab * 4,
                             tmp_logits_, (size_t) rows * 4, (size_t) rows * 4, (size_t) T,
                             hipMemcpyDeviceToDevice) != hipSuccess) {
@@ -374,6 +417,18 @@ public:
         }
         logits.resize((size_t) T * h_.n_vocab);
         (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
+        if (std::getenv("OMPH_TIMING") != nullptr) {
+            (void) hipDeviceSynchronize();
+            std::fprintf(stderr,
+                         "phases: stage_w %.1f ms  gemm(f16) %.1f ms  blocks %.1f ms  "
+                         "calls: %zu/%zu/%zu\n",
+                         PhaseTimer::total_ms(t_stage_), PhaseTimer::total_ms(t_gemm_),
+                         PhaseTimer::total_ms(t_block_), t_stage_.size(), t_gemm_.size(),
+                         t_block_.size());
+            t_stage_.clear();
+            t_gemm_.clear();
+            t_block_.clear();
+        }
         return true;
     }
 
@@ -575,8 +630,10 @@ private:
             }
         }
         void * w = stage_w(name);
-        omph::runtime::Linear linear;
-        return linear.run(w, x16, y, n_out, k, T);
+        timer_gemm_.start();
+        const bool ok = linear_.run(w, x16, y, n_out, k, T);
+        timer_gemm_.stop(t_gemm_);
+        return ok;
     }
 
     // Device pointer to the original GGUF bytes: they live in the image unless
@@ -595,6 +652,7 @@ private:
     }
 
     void * stage_w(const std::string & name) {
+        timer_stage_.start();
         const omph::gguf::TensorInfo * t = file_.tensor(name);
         if (t == nullptr) {
             throw std::runtime_error("missing tensor " + name);
@@ -611,6 +669,7 @@ private:
         if (!omph::kernels::dequantize(t->type, raw_bytes(name), dst, n, true, nullptr)) {
             throw std::runtime_error("dequant failed for " + name);
         }
+        timer_stage_.stop(t_stage_);
         return dst;
     }
 
@@ -634,6 +693,12 @@ private:
     omph::gguf::File file_;
     HParams h_;
     bool use_gemv_ = false;
+    omph::runtime::Linear linear_;  // one hipBLASLt handle for the whole run
+    PhaseTimer timer_stage_;
+    PhaseTimer timer_gemm_;
+    std::vector<std::pair<hipEvent_t, hipEvent_t>> t_stage_;
+    std::vector<std::pair<hipEvent_t, hipEvent_t>> t_gemm_;
+    std::vector<std::pair<hipEvent_t, hipEvent_t>> t_block_;
     std::unordered_map<std::string, size_t> off_;
     std::unordered_map<std::string, GemvEntry> gems_;
     Scratch scratch_;
