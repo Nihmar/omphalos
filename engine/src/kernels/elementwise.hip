@@ -75,24 +75,42 @@ __global__ void add_out_kernel(const float * __restrict__ x, const float * __res
 __global__ void rms_norm_f16_kernel(const float * __restrict__ x, const float * __restrict__ w,
                                     __half * __restrict__ y, const long long n, const float eps,
                                     const float scale) {
-    extern __shared__ float sdata[];
+    // The decode calls this with one row, i.e. one workgroup, so the reduction
+    // latency is the whole cost: the twelve-step shared-memory tree cost eight
+    // barriers and 15 us a call. Shuffles plus two barriers is what actually
+    // matters here, not the arithmetic.
+    __shared__ float warp_sums[32];
     const long long row = blockIdx.x;
     const float * xr = x + row * n;
     __half * yr = y + row * n;
     float acc = 0.0f;
     for (long long i = threadIdx.x; i < n; i += blockDim.x) {
         const float v = xr[i];
-        acc += v * v;
+        acc = fmaf(v, v, acc);
     }
-    sdata[threadIdx.x] = acc;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off);
+    }
+    const int lane = (int) threadIdx.x & 31;
+    const int warp = (int) threadIdx.x >> 5;
+    const int nwarp = (int) (blockDim.x >> 5);
+    if (lane == 0) {
+        warp_sums[warp] = acc;
+    }
     __syncthreads();
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if ((int) threadIdx.x < stride) {
-            sdata[threadIdx.x] += sdata[threadIdx.x + stride];
+    if (warp == 0) {
+        float v = lane < nwarp ? warp_sums[lane] : 0.0f;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down(v, off);
         }
-        __syncthreads();
+        if (lane == 0) {
+            warp_sums[0] = v;
+        }
     }
-    const float inv = 1.0f / sqrtf(sdata[0] / (float) n + eps);
+    __syncthreads();
+    const float inv = 1.0f / sqrtf(warp_sums[0] / (float) n + eps);
     for (long long i = threadIdx.x; i < n; i += blockDim.x) {
         yr[i] = __float2half(xr[i] * inv * (w != nullptr ? w[i] : 1.0f) * scale);
     }
@@ -161,7 +179,7 @@ bool rms_norm_f16(const float * x, const float * w, void * y_f16, const int64_t 
     if (x == nullptr || y_f16 == nullptr || rows <= 0 || n <= 0) {
         return false;
     }
-    rms_norm_f16_kernel<<<(unsigned) rows, kBlock, kBlock * sizeof(float), stream>>>(
+    rms_norm_f16_kernel<<<(unsigned) rows, kBlock, 0, stream>>>(
         x, w, reinterpret_cast<__half *>(y_f16), (long long) n, eps, scale);
     return hipGetLastError() == hipSuccess;
 }
