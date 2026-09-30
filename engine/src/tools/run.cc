@@ -117,41 +117,43 @@ void write_f32(const std::string & path, const std::vector<float> & data) {
     out.write(reinterpret_cast<const char *>(data.data()), (std::streamsize) (data.size() * 4));
 }
 
-// Phase timing: record an event pair per call, resolve them all after the run.
+// Phase timing: record a fresh event pair per call, resolve them all after the
+// run (reusing one pair made every total `calls x last interval`, #64).
 class PhaseTimer {
 public:
-    PhaseTimer() : on_(std::getenv("OMPH_TIMING") != nullptr) {
-        if (on_) {
-            (void) hipEventCreate(&a_);
-            (void) hipEventCreate(&b_);
-        }
-    }
+    PhaseTimer() : on_(std::getenv("OMPH_TIMING") != nullptr) {}
     void start() {
         if (on_) {
+            (void) hipEventCreate(&a_);
             (void) hipEventRecord(a_, nullptr);
         }
     }
     void stop(std::vector<std::pair<hipEvent_t, hipEvent_t>> & sink) {
         if (on_) {
-            (void) hipEventRecord(b_, nullptr);
-            sink.emplace_back(a_, b_);
+            hipEvent_t b{};
+            (void) hipEventCreate(&b);
+            (void) hipEventRecord(b, nullptr);
+            sink.emplace_back(a_, b);
         }
     }
-    static double total_ms(const std::vector<std::pair<hipEvent_t, hipEvent_t>> & v) {
+    // Sums and destroys the recorded pairs.
+    static double total_ms(std::vector<std::pair<hipEvent_t, hipEvent_t>> & v) {
         double ms = 0.0;
         for (const auto & p : v) {
             float d = 0.0f;
             if (hipEventElapsedTime(&d, p.first, p.second) == hipSuccess) {
                 ms += d;
             }
+            (void) hipEventDestroy(p.first);
+            (void) hipEventDestroy(p.second);
         }
+        v.clear();
         return ms;
     }
 
 private:
     bool on_ = false;
     hipEvent_t a_{};
-    hipEvent_t b_{};
 };
 
 class Runner {
@@ -592,16 +594,18 @@ public:
             return;
         }
         (void) hipDeviceSynchronize();
+        const size_t n_stage = t_stage_.size();
+        const size_t n_gemm = t_gemm_.size();
+        const size_t n_gemv = t_gemv_.size();
+        const size_t n_block = t_block_.size();
+        const double ms_stage = PhaseTimer::total_ms(t_stage_);
+        const double ms_gemm = PhaseTimer::total_ms(t_gemm_);
+        const double ms_gemv = PhaseTimer::total_ms(t_gemv_);
+        const double ms_block = PhaseTimer::total_ms(t_block_);
         std::fprintf(stderr,
                      "phases: stage_w %.1f ms  gemm(f16) %.1f ms  gemv %.1f ms  blocks %.1f ms "
                      "| calls %zu/%zu/%zu/%zu\n",
-                     PhaseTimer::total_ms(t_stage_), PhaseTimer::total_ms(t_gemm_),
-                     PhaseTimer::total_ms(t_gemv_), PhaseTimer::total_ms(t_block_),
-                     t_stage_.size(), t_gemm_.size(), t_gemv_.size(), t_block_.size());
-        t_stage_.clear();
-        t_gemm_.clear();
-        t_gemv_.clear();
-        t_block_.clear();
+                     ms_stage, ms_gemm, ms_gemv, ms_block, n_stage, n_gemm, n_gemv, n_block);
     }
 
     void step_event(hipEvent_t a, hipEvent_t b) {
