@@ -745,3 +745,24 @@ seen everywhere else — and the decode unchanged at 57 ms/token.
 The remaining ~32 % of the weights (IQ3_XXS 1.93 GiB, then Q6_K, Q2_K and the
 IQ2 family) are the same recipe: read the single-token kernel's inner loop, keep
 its index arithmetic verbatim, and verify against four single-token GEMVs.
+
+# M3.24 — IQ3_XXS ported, and what the b4 path is worth (measured by ablation)
+
+IQ3_XXS joins the small-batch family (bit-identical to four single-token GEMVs,
+0.026 ms/token vs 0.131 ms/token single — 5.0x). Wiring it in makes the coverage
+5.0 GiB of ~11.2 GiB on this model (Q4_K, IQ3_S, IQ4_XS, IQ3_XXS).
+
+With `OMPH_NO_B4` disabling the small-batch route, the same binary on the same
+run gives a clean comparison (prefill + one token, summed phase timers):
+
+| configuration | stage_w | blocks | total |
+|---|---:|---:|---:|
+| f16 (no repack) | 843 ms | 0 | 843 ms |
+| `--gemv`, no b4 | 1575 ms | 0 | 1575 ms |
+| `--gemv` with b4 | 2 ms | 297 ms | **298 ms** |
+
+**5.3x faster than the gemv fallback, 2.8x faster than the plain f16 prefill**,
+with the greedy tokens unchanged (`198 760 3841`).
+
+The earlier per-section phase numbers were not comparable between runs (timer
+attribution shifts), which is why this is measured by ablation on one binary.

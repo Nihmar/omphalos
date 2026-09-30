@@ -192,6 +192,8 @@ public:
                         e.rows = (int64_t) t.ne[1];
                         e.k = (int64_t) t.ne[0];
                         e.type = t.type;
+                        e.has_b4 = std::getenv("OMPH_NO_B4") == nullptr &&
+                                   (t.type == 12 || t.type == 18 || t.type == 21 || t.type == 23);
                         gems_[t.name] = e;
                         total += (packed.size() + 255) & ~(size_t) 255;
                         places.push_back(p);
@@ -679,6 +681,7 @@ private:
             case 12: return omph::kernels::gemv_q4k_b4(w, x, y, n_out, k, nullptr);
             case 21: return omph::kernels::gemv_iq3s_b4(w, x, y, n_out, k, nullptr);
             case 23: return omph::kernels::gemv_iq4_xs_b4(w, x, y, n_out, k, nullptr);
+            case 18: return omph::kernels::gemv_iq3_xxs_b4(w, x, y, n_out, k, nullptr);
             default: return false;
         }
     }
@@ -706,7 +709,7 @@ private:
         if (use_gemv_ && T > 1) {
             const auto it = gems_.find(name);
             if (it != gems_.end() && it->second.rows == n_out && it->second.k == k &&
-                (it->second.type == 12 || it->second.type == 21 || it->second.type == 23)) {
+                it->second.has_b4) {
                 const uint8_t * w = static_cast<const uint8_t *>(dev_weights_) + it->second.off;
                 const auto * xb = static_cast<const uint8_t *>(x16);
                 timer_gemv_.start();
@@ -786,6 +789,7 @@ private:
         int64_t rows = 0;
         int64_t k = 0;
         uint32_t type = 0;
+        bool has_b4 = false;  // a small-batch kernel exists for this type
     };
 
     omph::gguf::File file_;

@@ -257,8 +257,8 @@ int main(int argc, char ** argv) {
             // Small-batch path: four tokens per weight read, verified against four
             // single-token GEMVs and reported per token.
             const Case & c = cases.front();
-            if (c.t->type != 12 && c.t->type != 21 && c.t->type != 23) {
-                return fail("--batch4 needs a Q4_K, IQ3_S or IQ4_XS tensor");
+            if (c.t->type != 12 && c.t->type != 21 && c.t->type != 23 && c.t->type != 18) {
+                return fail("--batch4 needs a Q4_K, IQ3_S, IQ4_XS or IQ3_XXS tensor");
             }
             void * x4 = nullptr;
             void * y1 = nullptr;
@@ -279,7 +279,10 @@ int main(int argc, char ** argv) {
                 if (c.t->type == 21) {
                     return omph::kernels::gemv_iq3s_b4(c.dev, xa, ya, c.rows, c.k, nullptr);
                 }
-                return omph::kernels::gemv_iq4_xs_b4(c.dev, xa, ya, c.rows, c.k, nullptr);
+                if (c.t->type == 23) {
+                    return omph::kernels::gemv_iq4_xs_b4(c.dev, xa, ya, c.rows, c.k, nullptr);
+                }
+                return omph::kernels::gemv_iq3_xxs_b4(c.dev, xa, ya, c.rows, c.k, nullptr);
             };
             for (int i = 0; i < 5; ++i) {
                 (void) launch_b4(x4, (float *) y4);
