@@ -1,0 +1,18 @@
+Here is a machine-generated access log. Every line follows the same shape.
+
+```
+2026-09-01T00:00:01Z id=000001 user=u0042 path=/api/v1/items status=200 ms=12 size=3451
+2026-09-01T00:00:02Z id=000002 user=u0017 path=/api/v1/items status=200 ms=9 size=3512
+2026-09-01T00:00:03Z id=000003 user=u0231 path=/api/v1/items status=200 ms=15 size=3488
+2026-09-01T00:00:04Z id=000004 user=u0008 path=/api/v1/items status=200 ms=11 size=3501
+2026-09-01T00:00:05Z id=000005 user=u0129 path=/api/v1/items status=200 ms=8 size=3496
+2026-09-01T00:00:06Z id=000006 user=u0074 path=/api/v1/items status=200 ms=13 size=3520
+2026-09-01T00:00:07Z id=000007 user=u0195 path=/api/v1/items status=200 ms=10 size=3477
+2026-09-01T00:00:08Z id=000008 user=u0056 path=/api/v1/items status=200 ms=14 size=3508
+2026-09-01T00:00:09Z id=000009 user=u0210 path=/api/v1/items status=200 ms=9 size=3493
+2026-09-01T00:00:10Z id=000010 user=u0033 path=/api/v1/items status=200 ms=12 size=3511
+2026-09-01T00:00:11Z id=000011 user=u0177 path=/api/v1/items status=200 ms=10 size=3482
+2026-09-01T00:00:12Z id=000012 user=u0091 path=/api/v1/items status=200 ms=13 size=3524
+```
+
+Continue the log with the next 40 lines, exactly in the same format.

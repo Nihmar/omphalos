@@ -1,0 +1,10 @@
+config,prompt,pred_t_s,prompt_t_s,prompt_ms,predicted_n,draft_n,draft_accepted,acceptance_pct
+off,code,19.86,592.33,4880.8,192,0,0,0.0
+off,prose,20.22,238.62,255.6,192,0,0,0.0
+off,repetitive,20.16,537.78,1314.7,192,0,0,0.0
+mtp-n2,code,34.88,568.23,5087.7,192,144,119,82.6
+mtp-n2,prose,34.13,223.8,272.6,192,150,115,76.7
+mtp-n2,repetitive,36.24,520.68,1357.8,192,140,120,85.7
+mtp-n4,code,31.64,566.83,5100.3,192,210,138,65.7
+mtp-n4,prose,30.12,221.4,275.5,192,228,134,58.8
+mtp-n4,repetitive,35.47,518.55,1363.4,192,191,143,74.9
