@@ -49,6 +49,71 @@ __global__ void rope_neox_kernel(float * __restrict__ x, const long long tokens,
 
 // One thread per (token, head, dim); the scores are recomputed per pass, which
 // is deliberately naive — decode speed work comes in M3+.
+
+// Flash-style attention: one workgroup per (query token, head) with one thread
+// per head dimension. Each cache row's score is computed once and staged in LDS,
+// instead of being recomputed for every (row, dimension) pair three times over
+// (which is what the naive kernel above did). The cache is walked in blocks of
+// hd rows with online softmax rescaling.
+__global__ void attention_flash_kernel(const float * __restrict__ q,
+                                       const float * __restrict__ k_cache,
+                                       const float * __restrict__ v_cache,
+                                       const float * __restrict__ gate, float * __restrict__ out,
+                                       const long long tokens, const long long seq,
+                                       const long long nh, const long long nkv, const long long hd,
+                                       const float scale, const long long head_ratio) {
+    extern __shared__ float sh[];
+    float * sc = sh;  // hd scores, then the weights
+    const long long h = blockIdx.y;
+    const long long t = blockIdx.x;
+    const int d = (int) threadIdx.x;
+    const long long kvh = h / head_ratio;
+    const long long q_row = seq - tokens + t;
+    const float * qr = q + (t * nh + h) * hd;
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc = 0.0f;
+    for (long long s0 = 0; s0 <= q_row; s0 += hd) {
+        const long long bs = q_row - s0 + 1 < hd ? q_row - s0 + 1 : hd;
+        if (d < bs) {
+            const float * ks = k_cache + ((s0 + d) * nkv + kvh) * hd;
+            float dot = 0.0f;
+            for (long long i = 0; i < hd; ++i) {
+                dot += qr[i] * ks[i];
+            }
+            sc[d] = dot * scale;
+        }
+        __syncthreads();
+        float bm = -INFINITY;
+        for (long long j = 0; j < bs; ++j) {
+            bm = fmaxf(bm, sc[j]);
+        }
+        const float m_new = fmaxf(m, bm);
+        const float corr = expf(m - m_new);
+        if (d < bs) {
+            sc[d] = expf(sc[d] - m_new);
+        }
+        __syncthreads();
+        float lsum = 0.0f;
+        float a = 0.0f;
+        for (long long j = 0; j < bs; ++j) {
+            const float wj = sc[j];
+            lsum += wj;
+            a += wj * v_cache[((s0 + j) * nkv + kvh) * hd + d];
+        }
+        l = l * corr + lsum;
+        acc = acc * corr + a;
+        m = m_new;
+        __syncthreads();
+    }
+    float val = acc / l;
+    if (gate != nullptr) {
+        val *= 1.0f / (1.0f + expf(-gate[(t * nh + h) * hd + d]));
+    }
+    out[(t * nh + h) * hd + d] = val;
+}
+
 __global__ void attention_kernel(const float * __restrict__ q, const float * __restrict__ k_cache,
                                  const float * __restrict__ v_cache,
                                  const float * __restrict__ gate, float * __restrict__ out,
@@ -138,12 +203,14 @@ bool attention(const float * q, const float * k_cache, const float * v_cache, co
         seq < tokens || nh <= 0 || nkv <= 0 || hd <= 0 || nh % nkv != 0) {
         return false;
     }
-    const long long n = (long long) tokens * nh * hd;
-    const unsigned grid = (unsigned) ((n + kBlock - 1) / kBlock);
-    attention_kernel<<<grid, kBlock, 0, stream>>>(q, k_cache, v_cache, gate, out,
-                                                  (long long) tokens, (long long) seq,
-                                                  (long long) nh, (long long) nkv, (long long) hd,
-                                                  scale, (long long) (nh / nkv));
+    if (hd > 1024) {
+        return false;  // the flash layout needs one thread per head dimension
+    }
+    const dim3 grid((unsigned) tokens, (unsigned) nh);
+    const size_t smem = (size_t) hd * sizeof(float);
+    attention_flash_kernel<<<grid, (unsigned) hd, smem, stream>>>(
+        q, k_cache, v_cache, gate, out, (long long) tokens, (long long) seq, (long long) nh,
+        (long long) nkv, (long long) hd, scale, (long long) (nh / nkv));
     return hipGetLastError() == hipSuccess;
 }
 

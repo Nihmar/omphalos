@@ -314,6 +314,8 @@ public:
         for (int64_t il = 0; il < h_.n_layer; ++il) {
             const std::string p = "blk." + std::to_string(il) + ".";
             const bool recurrent = file_.tensor(p + "ssm_a") != nullptr;
+            const bool skip_attn = !recurrent && std::getenv("OMPH_SKIP_ATTN") != nullptr;
+            const bool skip_ffn = std::getenv("OMPH_SKIP_FFN") != nullptr;
             const float * attn_norm = vec(p + "attn_norm.weight");
             const float * post_norm = vec(p + "post_attention_norm.weight");
             if (attn_norm == nullptr || post_norm == nullptr) {
@@ -331,10 +333,13 @@ public:
             timer_block_.start();
             if (recurrent) {
                 if (!gdn_layer(il, p, T)) return false;
-            } else {
+            } else if (!skip_attn) {
                 if (!attn_layer(il, p, T, start_pos)) return false;
             }
             timer_block_.stop(t_block_);
+            if (skip_ffn) {
+                continue;
+            }
             // x = ffn(rms_norm(block + x)) + (block + x)
             if (!omph::kernels::add_out(static_cast<const float *>(blk_),
                                         static_cast<const float *>(x_),
@@ -572,16 +577,10 @@ private:
                                                   nullptr) ||
             !omph::kernels::mul_row_inplace(static_cast<float *>(alpha_), ssm_a, T, n_vh,
                                             nullptr) ||
-            !omph::kernels::conv1d_state(static_cast<const float *>(fused_), conv_w, conv_cur,
-                                         static_cast<float *>(conv_out_), T, channels,
-                                         h_.ssm_conv_k, nullptr) ||
-            !omph::kernels::conv_state_update(static_cast<const float *>(fused_), conv_cur,
-                                              conv_new, T, channels, h_.ssm_conv_k, nullptr) ||
-            !omph::kernels::silu_inplace(static_cast<float *>(conv_out_), T * channels, nullptr) ||
-            !omph::kernels::split_qkv(static_cast<const float *>(conv_out_),
-                                      static_cast<float *>(q_), static_cast<float *>(k_),
-                                      static_cast<float *>(v_), T, q_dims, k_dims, v_dims,
-                                      nullptr) ||
+            !omph::kernels::conv_silu_split_fused(
+                static_cast<const float *>(fused_), conv_w, conv_cur, conv_new,
+                static_cast<float *>(q_), static_cast<float *>(k_), static_cast<float *>(v_), T,
+                channels, h_.ssm_conv_k, q_dims, k_dims, v_dims, nullptr) ||
             !omph::kernels::rms_norm(static_cast<const float *>(q_), nullptr,
                                      static_cast<float *>(q_), T * n_kh, s,
                                      (float) (h_.eps / (double) s), l2_scale, nullptr) ||
@@ -807,7 +806,9 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "--generate also needs --gen-out\n");
             return 2;
         }
-        Runner runner(model, (int64_t) toks.size() + generate + 8, use_gemv);
+        // Repacking only pays off when the decode runs: a prefill-only run is
+        // better off with the raw bytes in place (no staging fallback).
+        Runner runner(model, (int64_t) toks.size() + generate + 8, use_gemv && generate > 0);
         const HParams & h = runner.hparams();
         std::vector<float> logits;
         if (!runner.forward(toks, logits, trace_dir, 0)) {

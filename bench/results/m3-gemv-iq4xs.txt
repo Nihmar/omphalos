@@ -523,3 +523,32 @@ is glue (attention kernels, per-layer norms, residuals, casts, launches).
 Same class of waste still applies to the prefill with `--gemv` (the f16 fallback
 stages every repacked tensor, ~1.6 GB per pass); the fix there is the small-batch
 GEMV, not more staging.
+
+# M3.16 — flash attention: decode 70 -> 59 ms/token
+
+The attention attribution (skip-the-attention ablation: 16 ms/step, ~1 ms per
+layer at T = 1) pointed at the naive kernel, which recomputed each Q·K dot
+**three times** (max, sum, weighted) and, worse, **per output dimension** — ~768x
+redundant work at the tested shapes.
+
+Replaced with a flash-style kernel (PLAN §10.4): one workgroup per (query token,
+head), one thread per head dimension, each cache row's score computed once and
+staged in LDS, the cache walked in blocks of hd rows with online softmax
+rescaling. The old kernel is gone.
+
+| path | before | after |
+|---|---:|---:|
+| fused GEMV decode | 70 ms/token | **59 ms/token** |
+| f16 decode | 630 ms/token | 621 ms/token |
+
+Tokens identical, logits within max |d| 0.0106 of the f16 path (summation order).
+
+Also this round:
+- the delta net's front end (conv + state shift + silu + split) is now one launch
+  instead of four — logits bit-identical, no measurable time change, which is
+  itself a finding: in that path it is not the launch count that costs.
+- a prefill-only run with `--gemv` no longer repacks anything: 8100 -> 2100 ms.
+
+**Decode is now 59 ms/token = 14.1x the milestone-2 f16 path.** Of that, ~48 ms
+are the fused GEMVs at the bandwidth ceiling and ~11 ms is the remaining glue —
+the attention's own GEMMs plus per-layer norms, casts and launches.
