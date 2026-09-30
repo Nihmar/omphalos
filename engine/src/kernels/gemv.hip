@@ -16,6 +16,37 @@
 namespace omph::kernels {
 namespace {
 
+// v_cvt_f32_ubyteN converts byte N of a word to float in one instruction; the
+// builtin is not exposed for gfx1200, so it goes through inline asm. Built
+// explicitly into float arrays (a switch helper folds badly and cost 40 %).
+__device__ inline float cvt_ubyte0(const uint32_t x) {
+    float r;
+    asm("v_cvt_f32_ubyte0_e32 %0, %1" : "=v"(r) : "v"(x));
+    return r;
+}
+__device__ inline float cvt_ubyte1(const uint32_t x) {
+    float r;
+    asm("v_cvt_f32_ubyte1_e32 %0, %1" : "=v"(r) : "v"(x));
+    return r;
+}
+__device__ inline float cvt_ubyte2(const uint32_t x) {
+    float r;
+    asm("v_cvt_f32_ubyte2_e32 %0, %1" : "=v"(r) : "v"(x));
+    return r;
+}
+__device__ inline float cvt_ubyte3(const uint32_t x) {
+    float r;
+    asm("v_cvt_f32_ubyte3_e32 %0, %1" : "=v"(r) : "v"(x));
+    return r;
+}
+__device__ inline void grid4(const uint32_t g, float * f) {
+    f[0] = cvt_ubyte0(g);
+    f[1] = cvt_ubyte1(g);
+    f[2] = cvt_ubyte2(g);
+    f[3] = cvt_ubyte3(g);
+}
+
+
 constexpr long long kQ4kChunkSub = 256;  // 8192 weights staged per LDS refill
 constexpr long long kQ4kRows = 4;        // output rows computed per warp
 
@@ -355,10 +386,14 @@ __global__ void gemv_iq3s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
                     const uint32_t g1 = grid[i1];
                     const uint32_t g2 = grid[i2];
                     const uint8_t sm = sgp[r][l];
+                    float g1f[4];
+                    float g2f[4];
+                    grid4(g1, g1f);
+                    grid4(g2, g2f);
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {
-                        float v1 = (float) ((g1 >> (8 * j)) & 0xFF);
-                        float v2 = (float) ((g2 >> (8 * j)) & 0xFF);
+                        float v1 = g1f[j];
+                        float v2 = g2f[j];
                         if (sm & (1u << j)) {
                             v1 = -v1;
                         }
@@ -675,9 +710,14 @@ __global__ void gemv_iq2xs_kernel(const uint8_t * __restrict__ qs, const uint8_t
                     const uint32_t e = ent[r][l >> 1] >> (16 * (l & 1));
                     const uint8_t sg = stab[(e >> 9) & 127];
                     const uint64_t g = grid[e & 511];
+                    const uint32_t glo = (uint32_t) g;
+                    const uint32_t ghi = (uint32_t) (g >> 32);
+                    float gf[8];
+                    grid4(glo, gf);
+                    grid4(ghi, gf + 4);
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
-                        float v = (float) ((g >> (8 * j)) & 0xFF);
+                        float v = gf[j];
                         if (sg & (1u << j)) {
                             v = -v;
                         }
@@ -767,9 +807,14 @@ __global__ void gemv_iq2xxs_kernel(const uint8_t * __restrict__ qs,
                     const uint32_t idx_byte = (aux0[r] >> (8 * l)) & 0xFF;
                     const uint8_t sg = stab[(aux1[r] >> (7 * l)) & 127];
                     const uint64_t g = grid[idx_byte];
+                    const uint32_t glo = (uint32_t) g;
+                    const uint32_t ghi = (uint32_t) (g >> 32);
+                    float gf[8];
+                    grid4(glo, gf);
+                    grid4(ghi, gf + 4);
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
-                        float v = (float) ((g >> (8 * j)) & 0xFF);
+                        float v = gf[j];
                         if (sg & (1u << j)) {
                             v = -v;
                         }
@@ -862,9 +907,14 @@ __global__ void gemv_iq2s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
                     const uint32_t hi = ((qhb[r] >> (2 * l)) & 3) << 8;
                     const uint32_t sg = (sgw[r] >> (8 * l)) & 0xFF;
                     const uint64_t g = grid[lo | hi];
+                    const uint32_t glo = (uint32_t) g;
+                    const uint32_t ghi = (uint32_t) (g >> 32);
+                    float gf[8];
+                    grid4(glo, gf);
+                    grid4(ghi, gf + 4);
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
-                        float v = (float) ((g >> (8 * j)) & 0xFF);
+                        float v = gf[j];
                         if (sg & (1u << j)) {
                             v = -v;
                         }

@@ -365,3 +365,47 @@ job.
 Only IQ1_M (0.02 GiB) and the BF16/F32 norm vectors are left outside, and neither
 is GEMV-shaped. The remaining decode levers are therefore kernel quality (IQ2_S
 and IQ6_K are the two slow ones) rather than coverage.
+
+# M3.11 — the two questions: grid residency, and the cost of the sign
+
+## (a) Does the grid's LDS residency matter?
+
+No. Moving the IQ2_S grid (8 KiB) out of LDS into a const table (L1-resident,
+freeing the LDS for occupancy) changed the kernel by 140.5 -> 139.6 GB/s, i.e.
+nothing. So the kernel is not occupancy- or LDS-bound, and shrinking the grid's
+footprint is not a lever.
+
+## (b) Can the per-value sign select fold into the grid lookup?
+
+The sign is *expensive* (removing it as a diagnostic — wrong results, valid
+timing — gives 140.5 -> 189.1 GB/s, so it is worth ~26 % of the kernel), but it
+does **not** fold away:
+
+- it is a per-value mask (8 bits per 8-value group), not a per-group scalar, so
+  it cannot go into the scale;
+- folding it into the activation is impossible: the activation is shared by the
+  four rows of a warp while each row has its own mask;
+- the alternatives (pre-negated grid copies, `copysign`, ±1 tables, per-byte
+  XOR masks) all cost at least the one op they would replace.
+
+What *did* pay is the same class of win next to it: the byte extraction. The
+compiler was emitting shift+mask+convert — three instructions per value — for
+what the ISA does in one. `v_cvt_f32_ubyteN` is not exposed as a builtin for
+gfx1200, so it goes through inline asm, built explicitly into float arrays (a
+switch helper folded badly and cost 40 % everywhere).
+
+| type | before | after |
+|---|---:|---:|
+| IQ2_S | 140.5 GB/s (44.1 %) | **233.6 GB/s (73.4 %)** |
+| IQ2_XXS | 171.0 GB/s (53.7 %) | **231.2 GB/s (72.7 %)** |
+| IQ2_XS | 166.1 GB/s (52.2 %) | **200.1 GB/s (62.9 %)** |
+| IQ3_S | 219.5 GB/s (68.9 %) | 220.6 GB/s (69.3 %) |
+| IQ3_XXS | 246.1 GB/s (77.3 %) | *reverted* — the array form cost 4 % there |
+
+Accuracy is unchanged in every case (2.0-2.4e-4 relative).
+
+End to end the decode stays at ~128 ms/token: those three types are only ~6 % of
+the weights, so a 20-66 % kernel gain is worth ~4 ms. The value here is that the
+slowest kernels are no longer an outlier — IQ2_XXS/S now sit with IQ4_XS and
+IQ3_XXS — and that the same instruction replaces the extraction in any future
+grid kernel.
