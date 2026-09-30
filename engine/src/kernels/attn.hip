@@ -48,13 +48,10 @@ __global__ void rope_neox_kernel(float * __restrict__ x, const long long tokens,
     row[i + half] = x0 * s + x1 * c;
 }
 
-// One thread per (token, head, dim); the scores are recomputed per pass, which
-// is deliberately naive — decode speed work comes in M3+.
-
 // Flash-style attention: one workgroup per (query token, head) with one thread
 // per head dimension. Each cache row's score is computed once and staged in LDS,
 // instead of being recomputed for every (row, dimension) pair three times over
-// (which is what the naive kernel above did). The cache is walked in blocks of
+// (which is what the first, naive kernel did). The cache is walked in blocks of
 // hd rows with online softmax rescaling.
 __global__ void attention_flash_kernel(const float * __restrict__ q,
                                        const float * __restrict__ k_cache,
@@ -116,58 +113,6 @@ __global__ void attention_flash_kernel(const float * __restrict__ q,
         val *= 1.0f / (1.0f + expf(-gate[(t * nh + h) * hd + d]));
     }
     out[(t * nh + h) * hd + d] = val;
-}
-
-__global__ void attention_kernel(const float * __restrict__ q, const float * __restrict__ k_cache,
-                                 const float * __restrict__ v_cache,
-                                 const float * __restrict__ gate, float * __restrict__ out,
-                                 const long long tokens, const long long seq, const long long nh,
-                                 const long long nkv, const long long hd, const float scale,
-                                 const long long head_ratio) {
-    const long long e = (long long) blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= tokens * nh * hd) {
-        return;
-    }
-    const long long d = e % hd;
-    const long long h = (e / hd) % nh;
-    const long long t = e / (hd * nh);
-    const long long kvh = h / head_ratio;
-    const long long q_row = seq - tokens + t;
-
-    const float * qr = q + (t * nh + h) * hd;
-
-    float max_score = -INFINITY;
-    for (long long s = 0; s <= q_row; ++s) {
-        const float * ks = k_cache + (s * nkv + kvh) * hd;
-        float dot = 0.0f;
-        for (long long i = 0; i < hd; ++i) {
-            dot += qr[i] * ks[i];
-        }
-        max_score = fmaxf(max_score, dot * scale);
-    }
-    float sum = 0.0f;
-    for (long long s = 0; s <= q_row; ++s) {
-        const float * ks = k_cache + (s * nkv + kvh) * hd;
-        float dot = 0.0f;
-        for (long long i = 0; i < hd; ++i) {
-            dot += qr[i] * ks[i];
-        }
-        sum += expf(dot * scale - max_score);
-    }
-    float acc = 0.0f;
-    for (long long s = 0; s <= q_row; ++s) {
-        const float * ks = k_cache + (s * nkv + kvh) * hd;
-        float dot = 0.0f;
-        for (long long i = 0; i < hd; ++i) {
-            dot += qr[i] * ks[i];
-        }
-        const float w = expf(dot * scale - max_score) / sum;
-        acc += w * v_cache[(s * nkv + kvh) * hd + d];
-    }
-    if (gate != nullptr) {
-        acc *= 1.0f / (1.0f + expf(-gate[(t * nh + h) * hd + d]));
-    }
-    out[e] = acc;
 }
 
 } // namespace
@@ -260,7 +205,6 @@ __global__ void kv_quant_kernel(const float * __restrict__ k_src, const float * 
                                 const long long pos, const long long n_rows,
                                 const long long nkv, const long long hd,
                                 const long long window) {
-    __shared__ float amax_sh[8];
     const long long row = blockIdx.x;  // token * nkv + kv head
     if (row >= n_rows) {
         return;
@@ -294,7 +238,7 @@ __global__ void kv_quant_kernel(const float * __restrict__ k_src, const float * 
             }
         }
 #pragma unroll
-        for (int s = 16; s > 0; s >>= 1) {  // all 32 lanes: the writers are 16 of them
+        for (int s = 16; s > 0; s >>= 1) {  // all 32 lanes, so every writer sees it
             amax = fmaxf(amax, __shfl_xor(amax, s));
         }
         const float sc = amax / 127.0f;
@@ -317,7 +261,7 @@ __global__ void kv_quant_kernel(const float * __restrict__ k_src, const float * 
             }
         }
 #pragma unroll
-        for (int s = 16; s > 0; s >>= 1) {  // all 32 lanes: the writers are 16 of them
+        for (int s = 16; s > 0; s >>= 1) {  // all 32 lanes: 16 of them write V bytes
             vmax = fmaxf(vmax, __shfl_xor(vmax, s));
         }
         const float vsc = vmax / 7.0f;
@@ -334,7 +278,6 @@ __global__ void kv_quant_kernel(const float * __restrict__ k_src, const float * 
                 (uint8_t) (((c0 + 8) & 0xF) | (((c1 + 8) & 0xF) << 4));
         }
     }
-    (void) amax_sh;
 }
 
 __global__ void attention_flash_q8q4_kernel(

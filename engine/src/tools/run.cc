@@ -453,6 +453,9 @@ public:
             logits.resize((size_t) h_.n_vocab);
             (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
             report_phases();
+            if (time_step) {
+                step_event(step_a, step_b);
+            }
             return true;
         }
         // Small-batch head: for a Q4_K head with 2+ tokens, run four tokens per
@@ -756,120 +759,11 @@ private:
                                          nullptr)) {
                 return false;
             }
-            if (std::getenv("OMPH_TRACE_KV") != nullptr) {
-                std::fprintf(stderr,
-                             "kv ptrs il=%lld: kq %p ks %p vq %p vs %p | bases %p %p %p %p | "
-                             "kout %lld nblk %lld\n",
-                             (long long) il, (void *) kq, (void *) ksc, (void *) vq, (void *) vsc,
-                             kv_kq_, kv_ks_, kv_vq_, kv_vs_, (long long) kv_out, (long long) nblk);
-            }
-            if (std::getenv("OMPH_TRACE_KV") != nullptr) {
-                if (hipDeviceSynchronize() != hipSuccess) {
-                    std::fprintf(stderr, "kv: QUANTIZE faulted il=%lld\n", (long long) il);
-                    return false;
-                }
-                std::fprintf(stderr, "kv: quantize ok il=%lld\n", (long long) il);
-            }
-            if (std::getenv("OMPH_DUMP_KV") != nullptr && il == 3) {
-                // Verify the writer on the host before blaming the reader.
-                const int64_t row = 0;  // token 0, kv head 0
-                std::vector<uint8_t> kq_host((size_t) h_.head_dim);
-                std::vector<uint16_t> ks_host((size_t) nblk);
-                std::vector<uint8_t> vq_host((size_t) h_.head_dim / 2);
-                std::vector<uint16_t> vs_host((size_t) nblk);
-                std::vector<float> ksrc((size_t) h_.head_dim);
-                std::vector<float> vsrc((size_t) h_.head_dim);
-                (void) hipMemcpy(kq_host.data(), kq + (size_t) row * h_.head_dim,
-                                 kq_host.size(), hipMemcpyDeviceToHost);
-                (void) hipMemcpy(ks_host.data(), ksc + (size_t) row * nblk * 2, ks_host.size() * 2,
-                                 hipMemcpyDeviceToHost);
-                (void) hipMemcpy(vq_host.data(), vq + (size_t) row * h_.head_dim / 2,
-                                 vq_host.size(), hipMemcpyDeviceToHost);
-                (void) hipMemcpy(vs_host.data(), vsc + (size_t) row * nblk * 2, vs_host.size() * 2,
-                                 hipMemcpyDeviceToHost);
-                (void) hipMemcpy(ksrc.data(), static_cast<const float *>(k_) + row * h_.head_dim,
-                                 ksrc.size() * 4, hipMemcpyDeviceToHost);
-                (void) hipMemcpy(vsrc.data(), static_cast<const float *>(v_) + row * h_.head_dim,
-                                 vsrc.size() * 4, hipMemcpyDeviceToHost);
-                auto h2f = [](const uint16_t b) {
-                    const uint32_t e = (uint32_t) (b & 0x8000) << 16;
-                    const uint32_t m = (uint32_t) (b & 0x3FF) << 13;
-                    uint32_t ex = (b >> 10) & 0x1F;
-                    ex = (ex == 0) ? 0u : (ex == 31 ? 255u : ex + 112u);
-                    return __builtin_bit_cast(float, e | (ex << 23) | m);
-                };
-                double kerr = 0.0;
-                double verr = 0.0;
-                for (int i = 0; i < h_.head_dim; ++i) {
-                    const double kq_val = (double) (int8_t) kq_host[(size_t) i] *
-                                          (double) h2f(ks_host[(size_t) (i / 32)]);
-                    kerr = std::max(kerr, std::fabs(kq_val - (double) ksrc[(size_t) i]));
-                    const uint8_t byte = vq_host[(size_t) ((i / 32) * 16 + (i & 15))];
-                    const int nib = (i & 16) ? (byte >> 4) : (byte & 0xF);
-                    const double vq_val =
-                        (double) (nib - 8) * (double) h2f(vs_host[(size_t) (i / 32)]);
-                    verr = std::max(verr, std::fabs(vq_val - (double) vsrc[(size_t) i]));
-                }
-                std::fprintf(stderr, "kv dump: k err %.5f (src |max| %.3f), v err %.5f\n", kerr,
-                             (double) *std::max_element(ksrc.begin(), ksrc.end()), verr);
-                double worst = 0.0;
-                int wi = -1;
-                for (int i = 0; i < h_.head_dim; ++i) {
-                    const uint8_t byte = vq_host[(size_t) ((i / 32) * 16 + (i & 15))];
-                    const int nib = (i & 16) ? (byte >> 4) : (byte & 0xF);
-                    const double vq_val = (double) (nib - 8) * (double) h2f(vs_host[(size_t) (i / 32)]);
-                    const double e = std::fabs(vq_val - (double) vsrc[(size_t) i]);
-                    if (e > worst) {
-                        worst = e;
-                        wi = i;
-                    }
-                }
-                if (std::getenv("OMPH_DUMP_KV") != nullptr) {
-                    std::fprintf(stderr, "  v block 4 bytes:");
-                    for (int k = 0; k < 16; ++k) {
-                        std::fprintf(stderr, " %02x", vq_host[(size_t) (64 + k)]);
-                    }
-                    std::fprintf(stderr, "\n  v src[128..135]:");
-                    for (int k = 128; k < 136; ++k) {
-                        std::fprintf(stderr, " %.3f", (double) vsrc[(size_t) k]);
-                    }
-                    std::fprintf(stderr, "   src[136..143]:");
-                    for (int k = 136; k < 144; ++k) {
-                        std::fprintf(stderr, " %.3f", (double) vsrc[(size_t) k]);
-                    }
-                    std::fprintf(stderr, "\n  v scales:");
-                    for (int k = 0; k < 8; ++k) {
-                        std::fprintf(stderr, " %.4f", (double) h2f(vs_host[(size_t) k]));
-                    }
-                    std::fprintf(stderr, "\n  k scales:");
-                    for (int k = 0; k < 8; ++k) {
-                        std::fprintf(stderr, " %.4f", (double) h2f(ks_host[(size_t) k]));
-                    }
-                    std::fprintf(stderr, "\n");
-                }
-                if (wi >= 0) {
-                    const uint8_t byte = vq_host[(size_t) ((wi / 32) * 16 + (wi & 15))];
-                    std::fprintf(stderr,
-                                 "  worst v[%d] src %.4f deq %.4f nib %d scale %.5f (block %d)\n",
-                                 wi, (double) vsrc[(size_t) wi],
-                                 (double) ((wi & 16) ? (byte >> 4) : (byte & 0xF)) - 8,
-                                 (int) ((wi & 16) ? (byte >> 4) : (byte & 0xF)),
-                                 (double) h2f(vs_host[(size_t) (wi / 32)]), wi / 32);
-                }
-            }
-            if (std::getenv("OMPH_TRACE_KV") != nullptr) {
-                std::fprintf(stderr, "kv: quant ok il=%lld pos=%lld T=%lld\n", (long long) il,
-                             (long long) pos0, (long long) T);
-            }
-            const bool ok = omph::kernels::attention_flash_q8q4(
+            return omph::kernels::attention_flash_q8q4(
                 static_cast<const float *>(q_), kq, ksc, vq, vsc, k16, v16,
                 static_cast<const float *>(gate_), static_cast<float *>(attn_), T, pos0 + T,
                 h_.n_head, h_.n_head_kv, h_.head_dim, scale, h_.n_head / h_.n_head_kv,
                 kv_window_, nullptr);
-            if (hipDeviceSynchronize() != hipSuccess) {
-                return false;
-            }
-            return ok;
         }
         if (k_cache == nullptr || v_cache == nullptr) {
             return false;
