@@ -228,7 +228,7 @@ Our design (§12) keeps prefill within ~1–2% of the non-MTP number.
 | Build | **CMake** (≥ 3.21, native HIP language support) | `CMAKE_HIP_ARCHITECTURES=gfx1200` |
 | Offline converter, inspection, reference model, validation, frequency tables | **Python via `uv`** + NumPy | Runs rarely; NumPy is fast enough for bit repacking of 12 GB if vectorized |
 | Vision encoder | C/C++ on CPU: llama.cpp's `libmtmd` (CPU-only build) first, optionally own ViT later | Preprocessing is the easiest thing to get silently wrong |
-| Public interface | **C ABI** shared library (`libqengine.so`) + small **OpenAI-compatible HTTP server** | C ABI is callable from anything (Python `ctypes`, Delphi on Linux64, …); HTTP server lets existing clients/agents work unchanged |
+| Public interface | **C ABI** shared library (`libomphalos.so`) + small **OpenAI-compatible HTTP server** | C ABI is callable from anything (Python `ctypes`, Delphi on Linux64, …); HTTP server lets existing clients/agents work unchanged |
 
 Optional prototyping language for kernels: Triton on ROCm, via `uv` (**[verify]** gfx12 support in the Triton version you get). Useful to try tiling ideas quickly; final kernels stay in HIP.
 
@@ -256,8 +256,8 @@ Rules:
 sudo pacman -S uv                       # uv itself from the repos is fine (it's a static binary)
 
 uv python install 3.12
-mkdir -p ~/dev/qengine/tools && cd ~/dev/qengine/tools
-uv init --name qengine-tools --python 3.12
+mkdir -p ~/Projects/omphalos/tools && cd ~/Projects/omphalos/tools
+uv init --name omphalos-tools --python 3.12
 uv add numpy gguf huggingface_hub tokenizers
 
 # inspect GGUF metadata and tensor list
@@ -308,9 +308,9 @@ A PyTorch **CPU** reference is often enough (and simpler) for correctness work; 
 ### 6.5 Suggested repository layout
 
 ```
-qengine/
+omphalos/
 ├── engine/                 # C++/HIP, CMake
-│   ├── include/qengine.h   # C ABI
+│   ├── include/omphalos.h   # C ABI
 │   ├── src/
 │   │   ├── format/         # custom format reader (+ load-time repacker during development)
 │   │   ├── kernels/        # gemv_iq3s.hip, gemv_iq2s.hip, deltanet_decode.hip, attn_decode.hip, ...
@@ -327,18 +327,18 @@ Minimal CMake skeleton:
 
 ```cmake
 cmake_minimum_required(VERSION 3.21)
-project(qengine LANGUAGES CXX HIP)
+project(omphalos LANGUAGES CXX HIP)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_HIP_STANDARD 20)
 set(CMAKE_HIP_ARCHITECTURES gfx1200)
 set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -O3 -Rpass-analysis=kernel-resource-usage")
 
-add_library(qengine SHARED
+add_library(omphalos SHARED
   src/format/reader.cpp
   src/kernels/gemv_iq3s.hip
   # ...
 )
-target_include_directories(qengine PUBLIC include)
+target_include_directories(omphalos PUBLIC include)
 ```
 
 ---
@@ -348,7 +348,7 @@ target_include_directories(qengine PUBLIC include)
 Before writing any engine code, establish the bar and the numerical reference.
 
 ```bash
-cd ~/dev/qengine/third_party
+cd ~/Projects/omphalos/third_party
 git clone https://github.com/ggml-org/llama.cpp.git && cd llama.cpp
 
 # HIP / ROCm build
@@ -440,7 +440,7 @@ Codebook tables (**[verify]** sizes): IQ2_XS grid 512 × 8 B, IQ2_S grid 1024 ×
 
 ```
 [Header]
-  magic "QENG", format version, layout version
+  magic "OMPH", format version, layout version
   source GGUF sha256 (+ mtp/mmproj sha256)
   model hyperparameters (copied from GGUF metadata)
   tokenizer + chat template (or pointer to source GGUF)

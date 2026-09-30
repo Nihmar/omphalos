@@ -1,0 +1,22 @@
+# Build directories (CMake)
+build/
+build-*/
+cmake-build-*/
+
+# Model files and converted weights — local only (PLAN.md)
+models/
+*.gguf
+
+# Python tooling (managed via uv)
+.venv/
+__pycache__/
+*.py[cod]
+
+# Command Code local session data
+.commandcode/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*~
