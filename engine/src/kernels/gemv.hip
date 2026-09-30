@@ -47,6 +47,39 @@ __device__ inline void grid4(const uint32_t g, float * f) {
 }
 
 
+// Packed-f16 helpers for the codebook GEMVs: a u32 holds two halves; the sign
+// of each half is its bit 15, so a (positive) codebook value is negated by
+// OR-ing its sign in, and v_dot2_f32_f16 does two exact products (small
+// integers times f16) accumulated in f32 per instruction.
+typedef _Float16 half2_v __attribute__((ext_vector_type(2)));
+
+__device__ inline float dot2(const uint32_t w, const uint32_t x, const float acc) {
+    return __builtin_amdgcn_fdot2(__builtin_bit_cast(half2_v, w), __builtin_bit_cast(half2_v, x),
+                                  acc, false);
+}
+
+// Two unsigned byte codebook values (the bytes Sel picks from g) as a packed
+// half2: the f16 with exponent field 25 and mantissa b is 1024 + b, so one byte
+// permute builds 1024 + b and one packed add removes the 1024 (exact, b < 256).
+template <uint32_t Sel>
+__device__ inline uint32_t grid_pair_to_half2(const uint32_t g) {
+    const uint32_t biased = __builtin_amdgcn_perm(0x64646464u, g, Sel);
+    const half2_v v =
+        __builtin_bit_cast(half2_v, biased) - half2_v{(_Float16) 1024, (_Float16) 1024};
+    return __builtin_bit_cast(uint32_t, v);
+}
+
+// IQ3_XXS: the pair-ordered sign word (weight 2i at bit 15 - i, 2i + 1 at
+// 31 - i, as for IQ3_S) of group l from the repacked aux word (repack.hh):
+// even-weight bits land with one shift, odd ones with another, and weight 7's
+// sign is the parity of the group's seven stored bits.
+__device__ inline uint32_t iq3xxs_group_signs(const uint32_t a, const int l) {
+    const uint32_t even = (a >> (4 * l)) & 0xFu;
+    const uint32_t odd = (a >> (16 + 3 * l)) & 0x7u;
+    const uint32_t par = (uint32_t) __builtin_popcount(even | (odd << 4)) & 1u;
+    return (even << 12) | (odd << 29) | (par << 28);
+}
+
 constexpr long long kQ4kChunkSub = 256;  // 8192 weights staged per LDS refill
 constexpr long long kQ4kRows = 4;        // output rows computed per warp
 
@@ -225,7 +258,7 @@ __global__ void gemv_iq4_kernel(const uint8_t * __restrict__ qs, const uint8_t *
 // Same outer-product shape as the other kernels: kIq3Rows rows per warp, the
 // activation read scalar, the grid (1 KiB) and the sign table (128 B) in LDS.
 constexpr long long kIq3ChunkSub = 256;  // 8192 weights staged per LDS refill
-constexpr long long kIq3Rows = 4;        // output rows computed per warp        // output rows per warp        // output rows per warp        // output rows computed per warp
+constexpr long long kIq3Rows = 4;        // output rows computed per warp
 
 __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ aux,
                                 const uint8_t * __restrict__ d, const __half * __restrict__ x,
@@ -234,12 +267,8 @@ __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t *
     extern __shared__ uint8_t smem[];
     __half * xs = reinterpret_cast<__half *>(smem);  // activation chunk
     uint32_t * grid = reinterpret_cast<uint32_t *>(smem + chunk_sub * 64);
-    uint8_t * stab = reinterpret_cast<uint8_t *>(grid + 256);
     for (int i = threadIdx.x; i < 256; i += blockDim.x) {
         grid[i] = omph::quant::kIq3xxsGrid[i];
-    }
-    if (threadIdx.x < 128) {
-        stab[threadIdx.x] = omph::quant::kKsignsIq2xs[threadIdx.x];
     }
 
     const int warp = (int) threadIdx.x / 32;
@@ -260,7 +289,7 @@ __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t *
             continue;
         }
         for (long long s = base + lane; s < base + len; s += 32) {
-            const __half * xv = xs + (s - base) * 32;
+            const uint4 * xv = reinterpret_cast<const uint4 *>(xs + (s - base) * 32);
             uint2 q[kIq3Rows];
             uint32_t a[kIq3Rows];
             float db[kIq3Rows];
@@ -276,26 +305,21 @@ __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t *
             float part[kIq3Rows] = {};
 #pragma unroll
             for (int l = 0; l < 4; ++l) {
+                const uint4 xq = xv[l];  // the 8 activations of this group, packed
 #pragma unroll
                 for (int r = 0; r < kIq3Rows; ++r) {
-                    const uint8_t * bytes = reinterpret_cast<const uint8_t *>(&q[r]);
-                    const uint8_t sg = stab[(a[r] >> (7 * l)) & 127];
-                    uint32_t smk[8];
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        smk[j] = ((sg >> j) & 1u) ? 0x80000000u : 0u;
-                    }
-                    const uint32_t g1 = grid[bytes[2 * l]];
-                    const uint32_t g2 = grid[bytes[2 * l + 1]];
-#pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        float g1v = __uint_as_float(
-                            __float_as_uint((float) ((g1 >> (8 * j)) & 0xFF)) ^ smk[j]);
-                        float g2v = __uint_as_float(
-                            __float_as_uint((float) ((g2 >> (8 * j)) & 0xFF)) ^ smk[4 + j]);
-                        part[r] = fmaf(g1v, __half2float(xv[8 * l + j]), part[r]);
-                        part[r] = fmaf(g2v, __half2float(xv[8 * l + 4 + j]), part[r]);
-                    }
+                    // same scheme as IQ3_S: byte pairs -> half2, signs OR-ed in
+                    const uint32_t word = (l < 2 ? q[r].x : q[r].y) >> (16 * (l & 1));
+                    const uint32_t b1 = grid[word & 0xFFu];
+                    const uint32_t b2 = grid[(word >> 8) & 0xFFu];
+                    const uint32_t sgn = iq3xxs_group_signs(a[r], l);
+                    constexpr uint32_t kSign2 = 0x80008000u;
+                    float p = part[r];
+                    p = dot2((sgn & kSign2) | grid_pair_to_half2<0x04010400u>(b1), xq.x, p);
+                    p = dot2(((sgn << 1) & kSign2) | grid_pair_to_half2<0x04030402u>(b1), xq.y, p);
+                    p = dot2(((sgn << 2) & kSign2) | grid_pair_to_half2<0x04010400u>(b2), xq.z, p);
+                    p = dot2(((sgn << 3) & kSign2) | grid_pair_to_half2<0x04030402u>(b2), xq.w, p);
+                    part[r] = p;
                 }
             }
 #pragma unroll
@@ -328,28 +352,6 @@ __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t *
 // a float-per-weight loop (#63).
 constexpr long long kIq3sChunkSub = 256;  // 8192 weights staged per LDS refill
 constexpr long long kIq3sRows = 4;        // output rows computed per warp
-
-// Packed-f16 helpers for the codebook GEMVs: a u32 holds two halves; the sign
-// of each half is its bit 15, so a (positive) codebook value is negated by
-// OR-ing its sign in, and v_dot2_f32_f16 does two exact products (small
-// integers times f16) accumulated in f32 per instruction.
-typedef _Float16 half2_v __attribute__((ext_vector_type(2)));
-
-__device__ inline float dot2(const uint32_t w, const uint32_t x, const float acc) {
-    return __builtin_amdgcn_fdot2(__builtin_bit_cast(half2_v, w), __builtin_bit_cast(half2_v, x),
-                                  acc, false);
-}
-
-// Two unsigned byte codebook values (the bytes Sel picks from g) as a packed
-// half2: the f16 with exponent field 25 and mantissa b is 1024 + b, so one byte
-// permute builds 1024 + b and one packed add removes the 1024 (exact, b < 256).
-template <uint32_t Sel>
-__device__ inline uint32_t grid_pair_to_half2(const uint32_t g) {
-    const uint32_t biased = __builtin_amdgcn_perm(0x64646464u, g, Sel);
-    const half2_v v =
-        __builtin_bit_cast(half2_v, biased) - half2_v{(_Float16) 1024, (_Float16) 1024};
-    return __builtin_bit_cast(uint32_t, v);
-}
 
 __global__ void gemv_iq3s_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ qh,
                                  const uint8_t * __restrict__ signs,
@@ -1264,7 +1266,6 @@ __global__ void gemv_iq3_b4_kernel(const uint8_t * __restrict__ qs,
     const long long blocks = n_sub / 8;
     const long long rlast = rows - 1;
     const uint32_t * grid = omph::quant::kIq3xxsGrid;
-    const uint8_t * stab = omph::quant::kKsignsIq2xs;
 
     float acc[kB4Rows * kB4Nt] = {};
     if (row0 < rows) {
@@ -1291,11 +1292,14 @@ __global__ void gemv_iq3_b4_kernel(const uint8_t * __restrict__ qs,
 #pragma unroll
                     for (int r = 0; r < kB4Rows; ++r) {
                         const uint8_t * bytes = reinterpret_cast<const uint8_t *>(&qw[r]);
-                        const uint8_t sg = stab[(aw[r] >> (7 * l)) & 127];
+                        // weight j of the group: its sign sits at 15 - j/2 (even j)
+                        // or 31 - j/2 (odd j) of the pair-ordered word
+                        const uint32_t sgn = iq3xxs_group_signs(aw[r], l);
                         uint32_t smk[8];
 #pragma unroll
                         for (int j = 0; j < 8; ++j) {
-                            smk[j] = ((sg >> j) & 1u) ? 0x80000000u : 0u;
+                            const int pos = (j & 1) ? 31 - j / 2 : 15 - j / 2;
+                            smk[j] = ((sgn >> pos) & 1u) << 31;
                         }
                         const uint32_t g1 = grid[bytes[2 * l]];
                         const uint32_t g2 = grid[bytes[2 * l + 1]];
@@ -1560,7 +1564,7 @@ bool gemv_iq3_xxs(const void * packed, const void * x_f16, float * y, const int6
     const omph::format::Iq3XxsLayout l = omph::format::iq3_xxs_layout(n_blocks);
     const int64_t n_sub = k / 32;
     const int64_t chunk = n_sub < kIq3ChunkSub ? n_sub : kIq3ChunkSub;
-    const size_t smem = (size_t) chunk * 64 + 256 * 4 + 128;
+    const size_t smem = (size_t) chunk * 64 + 256 * 4;
     const auto * base = static_cast<const uint8_t *>(packed);
     const dim3 grid((unsigned) ((rows + 8 * kIq3Rows - 1) / (8 * kIq3Rows)));
     gemv_iq3_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.aux_off,
@@ -1598,7 +1602,7 @@ GemvOccupancy gemv_occupancy() {
                                (const void *) gemv_iq3_kernel, (const void *) gemv_iq3s_kernel};
     o.smem_q4k = 0;
     o.smem_iq4 = (size_t) kIq4ChunkSub * 64 + 16 * sizeof(float);
-    o.smem_iq3 = (size_t) kIq3ChunkSub * 64 + 256 * 4 + 128;
+    o.smem_iq3 = (size_t) kIq3ChunkSub * 64 + 256 * 4;
     o.smem_iq3s = (size_t) kIq3sChunkSub * 64 + 512 * 4;
     int n = 0;
     const size_t smems[4] = {o.smem_q4k, o.smem_iq4, o.smem_iq3, o.smem_iq3s};

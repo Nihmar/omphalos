@@ -221,6 +221,45 @@ Iq3XxsLayout iq3_xxs_layout(const int64_t n_blocks) {
     return l;
 }
 
+namespace {
+
+// GGUF IQ3_XXS aux word: four 7-bit sign indices s_l at bits [7l, 7l + 7) and a
+// 4-bit scale at [28, 32). Repacked: for group l, the even-weight sign bits
+// (s_l bits 0, 2, 4, 6 = weights 0, 2, 4, 6) reversed in [4l, 4l + 4) and the
+// odd ones (bits 1, 3, 5) reversed in [16 + 3l, 16 + 3l + 3); scale unchanged.
+// The kernel then shifts each field straight into the pair-ordered sign word
+// of repack.hh (weight 7's sign, the parity, it computes). Lossless.
+uint32_t iq3xxs_aux_to_pairs(const uint32_t a) {
+    uint32_t t = a & 0xF0000000u;
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t sl = (a >> (7 * l)) & 127u;
+        for (int k = 0; k < 4; ++k) {
+            t |= ((sl >> (2 * k)) & 1u) << (4 * l + 3 - k);
+        }
+        for (int k = 0; k < 3; ++k) {
+            t |= ((sl >> (2 * k + 1)) & 1u) << (16 + 3 * l + 2 - k);
+        }
+    }
+    return t;
+}
+
+uint32_t iq3xxs_pairs_to_aux(const uint32_t t) {
+    uint32_t a = t & 0xF0000000u;
+    for (int l = 0; l < 4; ++l) {
+        uint32_t sl = 0;
+        for (int k = 0; k < 4; ++k) {
+            sl |= ((t >> (4 * l + 3 - k)) & 1u) << (2 * k);
+        }
+        for (int k = 0; k < 3; ++k) {
+            sl |= ((t >> (16 + 3 * l + 2 - k)) & 1u) << (2 * k + 1);
+        }
+        a |= sl << (7 * l);
+    }
+    return a;
+}
+
+} // namespace
+
 void repack_iq3_xxs(const void * src, const int64_t n_blocks, void * dst) {
     const Iq3XxsLayout l = iq3_xxs_layout(n_blocks);
     const auto * in = static_cast<const BlockIq3Xxs *>(src);
@@ -232,7 +271,12 @@ void repack_iq3_xxs(const void * src, const int64_t n_blocks, void * dst) {
     for (int64_t b = 0; b < n_blocks; ++b) {
         std::memcpy(d + 2 * b, &in[b].d, 2);
         std::memcpy(qs + b * 64, in[b].qs, 64);
-        std::memcpy(aux + b * 32, in[b].qs + 64, 32);
+        for (int sub = 0; sub < 8; ++sub) {
+            uint32_t a = 0;
+            std::memcpy(&a, in[b].qs + 64 + 4 * sub, 4);
+            a = iq3xxs_aux_to_pairs(a);
+            std::memcpy(aux + b * 32 + 4 * sub, &a, 4);
+        }
     }
 }
 
@@ -247,7 +291,12 @@ void unrepack_iq3_xxs(const void * src, const int64_t n_blocks, void * dst) {
     for (int64_t b = 0; b < n_blocks; ++b) {
         std::memcpy(&out[b].d, d + 2 * b, 2);
         std::memcpy(out[b].qs, qs + b * 64, 64);
-        std::memcpy(out[b].qs + 64, aux + b * 32, 32);
+        for (int sub = 0; sub < 8; ++sub) {
+            uint32_t t = 0;
+            std::memcpy(&t, aux + b * 32 + 4 * sub, 4);
+            t = iq3xxs_pairs_to_aux(t);
+            std::memcpy(out[b].qs + 64 + 4 * sub, &t, 4);
+        }
     }
 }
 
