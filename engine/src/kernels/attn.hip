@@ -271,8 +271,11 @@ __global__ void kv_quant_kernel(const float * __restrict__ k_src, const float * 
 
     // FP16 window (PLAN §13.4): the most recent `window` tokens keep an exact K
     // and V in the rotated basis, in a ring, so the attention can read them
-    // instead of the quantized form.
-    if (k16 != nullptr) {
+    // instead of the quantized form. Only the last `window` tokens of this launch
+    // are written: in a prefill chunk longer than the window, earlier tokens
+    // would share a slot with later ones (a write race), and the ring must end
+    // up holding exactly the last `window` positions of the sequence.
+    if (k16 != nullptr && token + window >= pos + n_rows / nkv) {
         const long long slot = (token % window) * nkv + head;
         for (long long i = lane; i < hd; i += 32) {
             k16[slot * hd + i] = __float2half(k_src[row * hd + i]);
@@ -357,7 +360,10 @@ __global__ void attention_flash_q8q4_kernel(
         if (d < bs) {
             const long long p = s0 + d;
             float dot = 0.0f;
-            if (k16 != nullptr && p + window > q_row + 1) {
+            // The ring holds positions [seq - window, seq): relative to the
+            // sequence, not to this query, since later tokens of the same
+            // chunk have already replaced the slots of earlier ones.
+            if (k16 != nullptr && p + window >= seq) {
                 const __half * kw = k16 + ((p % window) * nkv + kvh) * hd;
                 for (long long i = 0; i < hd; ++i) {
                     dot = fmaf(qr[i], __half2float(kw[i]), dot);
@@ -393,7 +399,7 @@ __global__ void attention_flash_q8q4_kernel(
             const float wj = sc[j];
             const long long p = s0 + j;
             float vval;
-            if (v16 != nullptr && p + window > q_row + 1) {
+            if (v16 != nullptr && p + window >= seq) {
                 vval = __half2float(v16[((p % window) * nkv + kvh) * hd + d]);
             } else {
                 const long long kv = p * nkv + kvh;
