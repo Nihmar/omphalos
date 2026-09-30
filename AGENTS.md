@@ -75,7 +75,10 @@ uv run python check_gpu_linear.py                 # matmul path
 uv run python check_gpu_attn.py <model> <layer>   # attention layers 3 / 7 / 63
 uv run python check_gpu_gdn.py  <model> <layer>   # delta-net layers 0 / 1 / 20
 uv run python check_gpu_run.py  <model> --layers  # 64-layer stack vs the dump
-uv run python check_gpu_decode.py                 # greedy decode vs the NumPy reference
+uv run python check_gpu_decode.py [--gemv]        # greedy decode vs the NumPy reference
+                                                  # (cached in models/golden/cpu; --refresh)
+uv run python compare_logits.py ref.f32 test.f32  # KL + top-1 agreement over every
+                                                  # position (e.g. f32 KV vs OMPH_KV_Q8Q4=1)
 
 # regenerating the golden dump (CPU backend, needs a llama.cpp build)
 tools/native/build.sh <llama.cpp-dir> && tools/native/dump_tensors ...
