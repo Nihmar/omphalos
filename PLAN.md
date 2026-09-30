@@ -1,0 +1,895 @@
+# Custom Inference Engine — Qwen3.8-27B (GSQ-RCO GGUF) on AMD RX 9060 XT 16 GB (ROCm, Linux)
+
+*Design notes and summary of the discussion — 30 September 2026*
+
+> **Conventions used in this document**
+> - `~` marks an estimate. Estimates are there to reason about orders of magnitude, not as promises.
+> - **[verify]** marks something that must be checked against GGUF metadata, the reference implementation, AMD specs, or a measurement before relying on it.
+> - Model dimensions used in examples (hidden size 5120, 16 full-attention layers, 4 KV heads, head_dim 256, …) are **illustrative placeholders**. Read the real values with `gguf-dump`.
+
+---
+
+## Table of contents
+
+1. [Goals and constraints](#1-goals-and-constraints)
+2. [Hardware facts](#2-hardware-facts)
+3. [Model facts](#3-model-facts)
+4. [Performance model](#4-performance-model)
+5. [Engine architecture overview](#5-engine-architecture-overview)
+6. [Toolchain, languages and tools](#6-toolchain-languages-and-tools)
+7. [Step 0 — Baseline with llama.cpp](#7-step-0--baseline-with-llamacpp)
+8. [Custom weight format (lossless)](#8-custom-weight-format-lossless)
+9. [Loader, reference implementation, validation](#9-loader-reference-implementation-validation)
+10. [GPU kernels](#10-gpu-kernels)
+11. [Runtime and decode loop](#11-runtime-and-decode-loop)
+12. [MTP speculative decoding without hurting prefill](#12-mtp-speculative-decoding-without-hurting-prefill)
+13. [KV cache quantization](#13-kv-cache-quantization)
+14. [Vision encoder on CPU](#14-vision-encoder-on-cpu)
+15. [VRAM budget](#15-vram-budget)
+16. [Performance "breadcrumbs"](#16-performance-breadcrumbs)
+17. [Measurement methodology](#17-measurement-methodology)
+18. [Milestones](#18-milestones)
+19. [Open questions / verification checklist](#19-open-questions--verification-checklist)
+20. [References](#20-references)
+
+---
+
+## 1. Goals and constraints
+
+**Scope.** Single user, batch size 1 (plus small batches of 2–5 tokens for speculative verification), one model, one GPU, Linux (CachyOS). The engine is deliberately *not* generic: it only has to run this model, with this quantization allocation, on this card.
+
+**Priorities, in order:**
+
+1. **VRAM savings** — the card has 16 GB, shared with the desktop (no iGPU, see §2).
+2. **Decode speed** (tokens/s during generation).
+3. **Prefill speed** (prompt processing tokens/s).
+4. Vision latency is **irrelevant**; vision must work but can be slow.
+
+**Hard constraints:**
+
+| Constraint | Consequence |
+|---|---|
+| Weights must stay **bit-exact** with the GSQ-RCO GGUF | Any custom format may only *reorder / re-layout* bits. No re-quantization. Verified by per-tensor dequantization comparison. |
+| **Vision must be kept**, running on **CPU** | `mmproj` never touches VRAM; image embeddings are uploaded to the GPU (a few MB). |
+| **KV cache quantizable** to Q8 and Q4, with **mixed** types | Per-K/V and per-layer types; rotation + FP16 window to make Q4 viable. |
+| **MTP must not slow down prefill** | KV-only "shadow" pass or deferred fill; no `lm_head` over the prompt. |
+| **ROCm / HIP** is the reference backend | C++/HIP engine, gfx1200 target. |
+| **Python only through `uv`** | Never touch the CachyOS system Python (no `sudo pip`, no `--break-system-packages`). See §6.3. |
+
+---
+
+## 2. Hardware facts
+
+### GPU — AMD Radeon RX 9060 XT 16 GB
+
+| Property | Value | Notes |
+|---|---|---|
+| Architecture | RDNA4, `gfx1200` | ROCm target string |
+| Compute units | 32 | wave32 execution |
+| VRAM | 16 GB GDDR6, 128-bit bus | |
+| Memory bandwidth (spec) | ~320 GB/s | Real achievable streaming bandwidth is typically ~85–90% of spec → **measure it** (§7) |
+| FP16 matrix (WMMA) throughput | ~100 TFLOPS dense | **[verify]** on AMD spec sheet; INT8 matrix ~2× |
+| LDS | 64 KB per workgroup | Enough for IQ codebook tables + GEMM tiles |
+| Bus | PCIe 5.0 x16 | Host↔device transfers of embeddings/logits are cheap |
+
+### CPU — Intel Core i5-13400F
+
+| Property | Value | Consequence |
+|---|---|---|
+| Cores | 6 P-cores + 4 E-cores, 16 threads | Pin vision encoder to P-cores, keep one P-core for the GPU driver thread |
+| SIMD | AVX2, FMA, AVX-VNNI | Good int8 dot products on CPU |
+| Missing | **No AVX-512, no native BF16** | Vision weights converted BF16 → FP32 at load (~1.8 GB RAM) |
+| Graphics | **None ("F" SKU)** | **The desktop runs on the RX 9060 XT** → compositor, browser, editor eat VRAM |
+
+### OS
+
+- **CachyOS** (Arch-based). ROCm from the distro repos; Python tooling exclusively through `uv`.
+
+---
+
+## 3. Model facts
+
+Source: `ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF` model card.
+
+### Files
+
+| File | bpw | Size | Notes from model card |
+|---|---|---|---|
+| `Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf` | 2.50 | 8.4 GB | Smallest |
+| `Qwen3.8-27B-GSQ-RCO-IQ2_S.gguf` | 2.75 | 9.3 GB | Matches base on AIME25 |
+| `Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf` | 3.00 | 10.1 GB | Strong all-round point |
+| `Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf` | 3.50 | 11.8 GB | Recommended, "task-lossless" |
+| `*-mtp` variants | | +~0.35 GB | Same weights + MTP head (15 extra tensors) |
+| `mmproj-Qwen3.8-27B-BF16.gguf` | 16 | 0.9 GB | Vision encoder + projector, BF16 |
+| `tensor-allocation/<model>.rco-allocation.txt` | | | Quant type of **every** tensor + histogram |
+| `imatrix-qwen3.8-27b.gguf` | | | Importance matrix used for quantization |
+
+### What matters for the engine
+
+1. **Non-uniform, per-tensor quantization (RCO).** Each tensor has its own GGUF quant type. The allocation file is the authoritative list of which dequantization kernels the engine needs (IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S plus whatever higher-precision types sensitive tensors received, e.g. Q4_K/Q5_K/Q6_K/Q8_0/F16 **[verify]**).
+2. **GSQ grid assignments are the value of this model.** They were learned to minimize error inside the standard IQ codebooks. Re-quantizing destroys this → everything must be lossless.
+3. **Architecture `qwen35`** = Qwen3.5-style hybrid: most layers are **Gated DeltaNet** (linear attention with a recurrent state + short causal conv1d), a minority are **full gated attention** layers with a KV cache. **[verify]** the exact layer pattern, head counts, head dims, RoPE configuration (possibly partial rotary and M-RoPE sections), norm variants, and whether embeddings are tied to `lm_head`.
+4. **MTP head** (in `-mtp` builds): one extra decoder layer + `fc` projection, sharing final norm and `lm_head` with the main model. Enables self-speculative decoding.
+5. **Multimodal** via `mmproj` (ViT encoder + projector), image tokens use multi-dimensional rotary positions (M-RoPE) in the attention layers **[verify]**.
+
+---
+
+## 4. Performance model
+
+### 4.1 Decode is memory-bandwidth-bound
+
+At batch 1, every generated token reads (almost) all weights once. Bytes read per token ≈ file size − token embedding table (only one row of the embedding is read per token) − MTP tensors (if not used) − `mmproj` (not on GPU).
+
+Assuming the token embedding table is ~0.5–1 GB **[verify]**:
+
+| File | ~Bytes/token | Ceiling @ 320 GB/s (spec) | Measured llama.cpp: 19–20 t/s is… |
+|---|---|---|---|
+| IQ3_S | ~11.1 GB | ~29 t/s | ~68% of spec |
+| IQ3_XXS | ~9.4 GB | ~34 t/s | ~57% |
+| IQ2_S | ~8.6 GB | ~37 t/s | ~52% |
+
+**Measured baseline (llama.cpp):** decode **19–20 t/s** without MTP. *Which quant file this was measured on is still to be recorded* **[verify]**.
+
+**Interpretation.** The real 100% is not 320 GB/s but the bandwidth a simple streaming-read kernel achieves (typically ~85–90% of spec). If the baseline was IQ3_S, llama.cpp is at ~75–80% of what is achievable; a custom engine could plausibly reach ~22–24 t/s from kernel work alone. The larger lever is MTP (§4.3).
+
+Other per-token traffic (small but not zero):
+
+- Gated DeltaNet recurrent states: read + write every token (state stays FP32). Size per layer = heads × d_k × d_v × 4 bytes (+ conv tail). Likely ~1–3% of weight traffic **[verify]**.
+- KV cache reads in full-attention layers: grows with context; this is where KV quantization also *speeds up* decode at long contexts.
+
+### 4.2 Prefill is compute-bound
+
+During prefill, weights are read once per micro-batch (e.g. 512 tokens) and reused for every token in it. At 750 t/s with ~11 GB of weights, the card reads only ~16 GB/s (~5% of bandwidth).
+
+- Dense FLOPs ≈ 2 × params per token ≈ 2 × 27 B = **~54 GFLOP/token**.
+- **Measured baseline (llama.cpp):** **~750 t/s** prefill at empty context → 750 × 54 GFLOP ≈ **~40 TFLOPS achieved**.
+- Against ~100 TFLOPS FP16 dense matrix peak **[verify]** → **~40% of peak** (less if the path uses INT8).
+- Realistic target for a well-tuned dequant + WMMA path: **~50–60% of peak → ~900–1100 t/s**. Hard: IQ decoding (codebook lookups, sign unpacking, scales) competes with the matrix units; DeltaNet chunked prefill and attention add FLOPs that are less matrix-friendly.
+- Find the real ceiling with `hipblaslt-bench` on FP16 GEMMs with the model's projection shapes (e.g. MLP up-proj at M = 512).
+
+### 4.3 What MTP can give on decode
+
+With `k` draft tokens and per-token acceptance rate `α`, one verification step yields on average:
+
+```
+E[tokens/step] = (1 − α^(k+1)) / (1 − α)
+```
+
+Step cost = verification pass (batch k+1, only slightly more expensive than batch 1 because decode is memory-bound) + k draft passes.
+
+**Hidden cost of drafting:** each draft pass runs the MTP layer **and the full `lm_head`** (vocab × hidden, ~0.7–1.3 GB depending on its quant type **[verify]** in allocation file) → each draft re-reads ~10% of the model. **Truncated-vocab drafting** (only the ~32k most frequent tokens, see §12.5) makes the draft `lm_head` ~5–8× cheaper.
+
+Illustrative, α = 0.7, baseline 19.5 t/s:
+
+| Setup | Tokens/step | Relative step cost | ~Decode |
+|---|---|---|---|
+| k=2, full `lm_head` in drafts | 2.19 | ~1.35 | ~32 t/s |
+| k=2, truncated-vocab drafts | 2.19 | ~1.20 | ~36 t/s |
+| k=3, truncated-vocab drafts | 2.53 | ~1.30 | ~38 t/s |
+
+α depends heavily on content: code and structured text accept well, creative prose less. Measure per workload.
+
+### 4.4 Why llama.cpp prefill drops from ~750 to ~500 t/s with MTP
+
+Prefill is compute-bound, so extra MTP work costs time roughly proportional to its FLOPs. Rough cost of MTP work per prompt token, relative to the main model:
+
+| MTP work per prompt token | ~Relative cost |
+|---|---|
+| `fc` + K/V projections only (what is actually *needed*) | ~0.2–0.3% |
+| Full MTP layer (attention + MLP) | ~1.5–2% |
+| Full MTP layer + `lm_head` on every token | ~6–7% |
+
+Even the most naive variant should give ~700 t/s, not 500. The remaining ~25–30% is **scheduling overhead** in the current implementation. Candidates (to confirm with `rocprofv3 --kernel-trace`, with vs. without the `-mtp` file):
+
+- Outputs requested for **all** tokens → the *main* `lm_head` also runs over the whole prompt.
+- MTP forces smaller micro-batches.
+- MTP graph runs as a separate pass with host syncs / copies of hidden states.
+- MTP invoked per token or per ubatch instead of batched.
+
+Our design (§12) keeps prefill within ~1–2% of the non-MTP number.
+
+---
+
+## 5. Engine architecture overview
+
+```
+                        ┌──────────────────────────── CPU (i5-13400F) ─────────────────────────────┐
+  prompt text ─────────►│ tokenizer ─┐                                                            │
+  image(s) ────────────►│ preprocess ─► ViT encoder + projector (FP32, P-cores) ─► image embeds   │
+                        │            │                                   (cache by image hash)   │
+                        │ host thread (pinned P-core): graph replay, sampling result readback,   │
+                        │   detokenize/stream, token_embd rows (pinned RAM, if untied)            │
+                        └──────────────┬───────────────────────────────────────────┬─────────────┘
+                                       │ token ids / embeddings (KB–MB)             │ token id (4 B)
+                                       ▼                                            │
+┌────────────────────────────────── GPU (RX 9060 XT, HIP) ─────────────────────────┴────────────────┐
+│ Weights: custom lossless layout (SoA, tile-major, rows reordered for fusion)                      │
+│                                                                                                   │
+│  per layer:  [RMSNorm⊕GEMV-in] → DeltaNet (conv1d + gated delta rule, FP32 state, snapshots)      │
+│              or                  Gated full attention (RoPE/M-RoPE, Hadamard, quantized KV)      │
+│              → [GEMV-out ⊕ residual] → [RMSNorm⊕gate/up interleaved ⊕ SwiGLU] → [down ⊕ residual]│
+│                                                                                                   │
+│  head:       final norm ⊕ lm_head (row-sorted by token frequency) ⊕ argmax / sampling on GPU     │
+│  MTP:        fc ⊕ MTP layer (own quantized KV) ⊕ truncated lm_head prefix → k drafts             │
+│  verify:     same kernels with N = k+1 (small-batch GEMV) + DeltaNet per-position snapshots      │
+│  prefill:    dequant→WMMA GEMM, chunked DeltaNet, flash attention, KV-only MTP shadow pass       │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 6. Toolchain, languages and tools
+
+### 6.1 Languages
+
+| Component | Language | Why |
+|---|---|---|
+| Engine runtime + kernels | **C++20 + HIP** | Direct access to RDNA4 intrinsics (`v_dot4_i32_i8`, gfx12 WMMA builtins), HIP graphs, rocprof tooling; CUDA knowledge transfers directly |
+| Build | **CMake** (≥ 3.21, native HIP language support) | `CMAKE_HIP_ARCHITECTURES=gfx1200` |
+| Offline converter, inspection, reference model, validation, frequency tables | **Python via `uv`** + NumPy | Runs rarely; NumPy is fast enough for bit repacking of 12 GB if vectorized |
+| Vision encoder | C/C++ on CPU: llama.cpp's `libmtmd` (CPU-only build) first, optionally own ViT later | Preprocessing is the easiest thing to get silently wrong |
+| Public interface | **C ABI** shared library (`libqengine.so`) + small **OpenAI-compatible HTTP server** | C ABI is callable from anything (Python `ctypes`, Delphi on Linux64, …); HTTP server lets existing clients/agents work unchanged |
+
+Optional prototyping language for kernels: Triton on ROCm, via `uv` (**[verify]** gfx12 support in the Triton version you get). Useful to try tiling ideas quickly; final kernels stay in HIP.
+
+### 6.2 ROCm on CachyOS
+
+```bash
+# ROCm HIP SDK + tools (package names per Arch repos — [verify] on CachyOS)
+sudo pacman -S rocm-hip-sdk rocminfo rocprofiler-sdk amdsmi cmake ninja
+
+rocminfo | grep -i gfx          # expect gfx1200
+amd-smi static                  # card info
+```
+
+ROCm has official RDNA4 support since the 6.4.x series **[verify]** exact minimum version for the 9060 XT; ROCm 7.x recommended if available.
+
+### 6.3 Python — strictly through `uv`
+
+Rules:
+
+- **Never** `sudo pip`, never `pip install --break-system-packages`, never install Python packages with `pacman` for this project.
+- Every Python command runs via `uv run …` (project env) or `uvx …` (one-off tools).
+- The interpreter itself is managed by `uv` (`uv python install`), independent of the system Python.
+
+```bash
+sudo pacman -S uv                       # uv itself from the repos is fine (it's a static binary)
+
+uv python install 3.12
+mkdir -p ~/dev/qengine/tools && cd ~/dev/qengine/tools
+uv init --name qengine-tools --python 3.12
+uv add numpy gguf huggingface_hub tokenizers
+
+# inspect GGUF metadata and tensor list
+uv run gguf-dump ../models/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf | less
+
+# download only what is needed
+uv run hf download ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF \
+    --include "*IQ3_S*" "mmproj*" "tensor-allocation/*" \
+    --local-dir ../models
+
+# one-off tool without adding it to the project
+uvx --from gguf gguf-dump --help
+```
+
+Optional: PyTorch (ROCm wheels) for a GPU-side reference or GEMM experiments. The ROCm wheels bundle their own ROCm runtime and do not touch the system ROCm. In `pyproject.toml`:
+
+```toml
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm6.4"   # [verify] current ROCm wheel index on pytorch.org
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-rocm" }
+```
+
+```bash
+uv add torch
+uv run python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+A PyTorch **CPU** reference is often enough (and simpler) for correctness work; keep the GPU wheel optional.
+
+### 6.4 Profiling and inspection tools
+
+| Tool | Use |
+|---|---|
+| `rocprofv3` (rocprofiler-sdk) | Kernel traces, per-kernel timings, counters. First tool to reach for. |
+| `rocprof-compute` (ex Omniperf) | Roofline / detailed counter analysis — **[verify]** RDNA4 support level |
+| Radeon GPU Profiler (RGP) | Very detailed wave-level analysis, mainly for Vulkan/DX12 |
+| Radeon GPU Analyzer (RGA) / `--save-temps` | Inspect generated ISA: check vectorized loads (`global_load_b128`), VGPR count, spills |
+| `-Rpass-analysis=kernel-resource-usage` | Compiler report of VGPR/SGPR/LDS/occupancy per kernel |
+| `amd-smi` / sysfs `mem_info_vram_used` | VRAM usage, clocks, power, temperature |
+| LACT | GPU clocks, power limit, fan curve, (memory) overclocking on Linux — **[verify]** RDNA4 memory OC support |
+| `perf`, `htop` | CPU side (vision encoder, host thread) |
+| llama.cpp (`llama-bench`, `llama-perplexity --kl-divergence`, `llama-eval-callback`) | Baseline speed, quality reference, intermediate tensor dumps |
+
+### 6.5 Suggested repository layout
+
+```
+qengine/
+├── engine/                 # C++/HIP, CMake
+│   ├── include/qengine.h   # C ABI
+│   ├── src/
+│   │   ├── format/         # custom format reader (+ load-time repacker during development)
+│   │   ├── kernels/        # gemv_iq3s.hip, gemv_iq2s.hip, deltanet_decode.hip, attn_decode.hip, ...
+│   │   ├── runtime/        # graphs, streams, memory arena, sampling, MTP scheduler
+│   │   └── server/         # OpenAI-compatible HTTP server
+│   └── tests/              # per-kernel tests vs golden tensors
+├── tools/                  # uv project: converter, gguf inspection, reference model, validation
+├── third_party/llama.cpp   # CPU-only build for libmtmd + reference builds (HIP/Vulkan)
+├── models/                 # GGUF + converted files (git-ignored)
+└── bench/                  # benchmark scripts + results (CSV)
+```
+
+Minimal CMake skeleton:
+
+```cmake
+cmake_minimum_required(VERSION 3.21)
+project(qengine LANGUAGES CXX HIP)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_HIP_STANDARD 20)
+set(CMAKE_HIP_ARCHITECTURES gfx1200)
+set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -O3 -Rpass-analysis=kernel-resource-usage")
+
+add_library(qengine SHARED
+  src/format/reader.cpp
+  src/kernels/gemv_iq3s.hip
+  # ...
+)
+target_include_directories(qengine PUBLIC include)
+```
+
+---
+
+## 7. Step 0 — Baseline with llama.cpp
+
+Before writing any engine code, establish the bar and the numerical reference.
+
+```bash
+cd ~/dev/qengine/third_party
+git clone https://github.com/ggml-org/llama.cpp.git && cd llama.cpp
+
+# HIP / ROCm build
+cmake -B build-hip -G Ninja -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1200 -DCMAKE_BUILD_TYPE=Release
+cmake --build build-hip
+
+# Vulkan (RADV) build — sometimes faster than HIP on RDNA, worth comparing
+cmake -B build-vk -G Ninja -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-vk
+
+# CPU-only build (for libmtmd / vision encoder and CPU references)
+cmake -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-cpu
+```
+
+Benchmarks to record (headless or at least with a minimal desktop, see §17):
+
+```bash
+M=../../models/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf
+
+# decode + prefill, flash attention on
+./build-hip/bin/llama-bench -m $M -ngl 99 -fa 1 -p 512 -n 128
+./build-vk/bin/llama-bench  -m $M -ngl 99 -fa 1 -p 512 -n 128
+
+# decode at longer contexts
+./build-hip/bin/llama-bench -m $M -ngl 99 -fa 1 -n 128 -d 4096,16384
+
+# KV cache quantization baselines
+./build-hip/bin/llama-bench -m $M -ngl 99 -fa 1 -ctk q8_0 -ctv q8_0 -n 128 -d 16384
+./build-hip/bin/llama-bench -m $M -ngl 99 -fa 1 -ctk q8_0 -ctv q4_0 -n 128 -d 16384
+```
+
+Also record:
+
+- The same runs with the `-mtp` file (decode t/s → lets us back out llama.cpp's acceptance rate; prefill t/s → the 750 → 500 drop).
+- `rocprofv3 --kernel-trace` of one prefill with and without MTP (§4.4).
+- **Achievable bandwidth**: a trivial HIP kernel that sums a ~10 GB buffer with 128-bit loads. That number is the real 100% for decode.
+- **Achievable FP16 GEMM throughput**: `hipblaslt-bench` with the model's projection shapes at M = 512. That is the real 100% for prefill (minus dequant overhead).
+- Reference logits / KL baseline: `llama-perplexity --kl-divergence-base` on a fixed text, used later to compare the engine.
+
+---
+
+## 8. Custom weight format (lossless)
+
+### 8.1 Principle
+
+**Reorder and re-layout bits freely; never change a dequantized value.** Every converted tensor is verified by dequantizing both the original GGUF tensor and the converted tensor and comparing **bit-exactly**. This gives a mathematical guarantee that GSQ-RCO quality is untouched.
+
+Rejected ideas:
+
+- **Re-quantizing** into a GPU-"native" format → destroys GSQ grid assignments and RCO allocation.
+- **Expanding** IQ indices into wider, easier-to-decode encodings → more bytes per weight → directly slower decode (bandwidth-bound).
+
+### 8.2 Why the GGUF block layout is GPU-unfriendly
+
+GGUF stores each block as an array-of-structs. Block sizes for 256 weights (**[verify]** against `ggml-common.h`):
+
+| Type | Block bytes | Fields |
+|---|---|---|
+| IQ2_XS | 74 | `d` (fp16), `qs[32]` (uint16: grid idx + signs), `scales[8]` |
+| IQ2_S | 82 | `d`, `qs[64]`, `qh[8]`, `scales[8]` |
+| IQ3_XXS | 98 | `d`, `qs[96]` (grid indices + packed sign/scale words) |
+| IQ3_S | 110 | `d`, `qs[64]`, `qh[8]`, `signs[32]`, `scales[4]` |
+
+None of these is a multiple of 16 bytes → misaligned loads, no clean 128-bit vector loads, fields interleaved so a wave's lanes don't read contiguous streams.
+
+Codebook tables (**[verify]** sizes): IQ2_XS grid 512 × 8 B, IQ2_S grid 1024 × 8 B, IQ3_XXS grid 256 × 4 B, IQ3_S grid 512 × 4 B, plus sign tables → all fit comfortably in LDS.
+
+### 8.3 Transformations (all lossless)
+
+1. **Array-of-structs → struct-of-arrays.** Separate streams per field: all `qs`, all `qh`, all `signs`, all `scales`, all `d`. Each stream aligned to 256 B (or more). Lanes issue aligned `global_load_b128`, perfectly coalesced.
+2. **Tile-major / kernel-order layout.**
+   - For GEMV: interleave rows so a workgroup reads one contiguous strip; each lane's chunk is 16 B-aligned; the order matches exactly the loop order of the kernel.
+   - For prefill GEMM: tiles laid out as they are loaded into LDS for WMMA.
+   - Possibly two layouts are not affordable (VRAM) → pick the GEMV-optimal layout and make the GEMM kernel adapt (decode is the priority).
+3. **Row reordering (free: blocks run along K, the input dimension).** Permuting *rows* (outputs) never touches a block.
+   - **Interleave `gate` and `up`** row by row → one workgroup produces `gate_i` and `up_i` and applies SwiGLU in its epilogue. No separate activation pass, no intermediate write.
+   - **Group Q/K/V by GQA group** (and the output gate of gated attention) → one workgroup computes the query heads and their KV head together → fuse RoPE, QK-norm, Hadamard rotation, KV quantization + cache write.
+   - Same idea for the DeltaNet input projections (q/k/v/gates/β grouped per head).
+   - **Sort `lm_head` rows by token frequency** (store the permutation): truncated-vocab MTP drafting becomes "read the first N rows of the same matrix". Zero extra VRAM. If embeddings are tied to `lm_head`, the embedding lookup uses the same permutation.
+   - ⚠️ If RCO assigned **different quant types** to `gate` and `up` (or to Q/K/V), they cannot become one homogeneous matrix. Then the interleaved kernel must handle two types in one launch (e.g. per-row-group type tag). Check the allocation file first **[verify]**.
+4. **Placement decisions baked into the file.**
+   - `token_embd` → **host pinned RAM** (only one row per token is needed) if not tied **[verify]**. Saves ~0.5–1 GB VRAM.
+   - MTP tensors in their own section → not loaded when MTP is off.
+   - Vision tensors in a host-only section (or keep reading `mmproj` GGUF via libmtmd).
+5. **Execution order and alignment.** Tensors stored in the order they are used, sections aligned to 2 MB → streaming load, simple mmap.
+
+### 8.4 Proposed file structure
+
+```
+[Header]
+  magic "QENG", format version, layout version
+  source GGUF sha256 (+ mtp/mmproj sha256)
+  model hyperparameters (copied from GGUF metadata)
+  tokenizer + chat template (or pointer to source GGUF)
+[Tensor table]   one entry per tensor:
+  name, GGUF quant type, logical shape, layout id, row-permutation id,
+  placement (GPU / host / MTP / vision), section, offset, size, xxhash of converted bytes,
+  "verified bit-exact" flag + hash of dequantized values
+[Permutation tables]   e.g. lm_head frequency order, gate/up interleave maps
+[Constant tables]      IQ grids and sign tables (or compiled into the engine)
+[Section: GPU weights]        2 MB aligned, execution order
+[Section: host weights]       token_embd (if untied)
+[Section: MTP weights]
+[Section: vision weights]     optional
+```
+
+### 8.5 Offline vs. load-time conversion
+
+- Load-time speed is **not** the argument: a GPU repack kernel transforms 12 GB in well under a second, negligible versus reading from NVMe.
+- Real benefits of offline: bit-exact verification done **once**; expensive transformations (frequency statistics, per-tensor layout choices) outside the engine; a simpler engine that reads exactly what the kernels expect.
+- Cost: one more component with its own versioning.
+
+**Plan:** implement **load-time repacking first** (fast iteration on layouts while writing kernels), then move the same logic into an offline converter (Python + NumPy via `uv`, or C++) once layouts stabilize. Don't freeze a format you'll change ten times while optimizing kernels.
+
+---
+
+## 9. Loader, reference implementation, validation
+
+1. **GGUF reader** (engine side, C++): header → KV metadata → tensor infos → aligned data. `mmap`, register as pinned (`hipHostRegister`) or copy in chunks with `hipMemcpyAsync`. Only one model to support → hardcode what can be hardcoded.
+2. **Architecture sanity pass** (Python, `uv run gguf-dump`): record layer pattern (which layers are DeltaNet vs full attention), dims, head counts, RoPE params and sections, norm eps, tied embeddings, MTP tensor names, chat template, special tokens.
+3. **Reference forward pass** (Python, NumPy or PyTorch CPU):
+   - Dequantization ported **exactly** from `ggml-quants.c` (grids, sign tables, scale formulas).
+   - Classic silent bugs to watch: RMSNorm variant (e.g. `(1 + w)` zero-centered weights vs `w`), partial rotary dimension, M-RoPE section layout, QK-norm placement, gated attention's sigmoid gate, DeltaNet gate parametrization (α/β activations, L2-norm of q/k), conv1d padding and activation.
+4. **Golden tensors**: dump intermediate tensors from llama.cpp (`llama-eval-callback`) for a few fixed prompts; compare layer by layer with the reference, then with each GPU kernel.
+5. **Validation tiers:**
+   - Dequantization: **bit-exact**.
+   - Single kernels: tolerance vs FP32 reference (accumulation order differs).
+   - End-to-end: top-1 agreement and **KL divergence** of logits vs llama.cpp over a fixed text corpus; perplexity on a small wikitext slice.
+   - Speculative decoding: greedy output with MTP must be **identical** to greedy output without MTP.
+
+---
+
+## 10. GPU kernels
+
+Listed in order of how much runtime they account for.
+
+### 10.1 Quantized GEMV (decode) — ~85–90% of decode time
+
+- One kernel per quant type present in the allocation (templated), **fused dequant + dot**; dequantized weights never touch memory.
+- Activation vector quantized to **int8 once per input** (like llama.cpp's `mmvq`), then `v_dot4_i32_i8` against unpacked codebook values (IQ grid values are small integers → int8 with sign applied); scales applied per sub-block in FP32.
+- Codebooks + sign tables in LDS (loaded once per workgroup).
+- **Small-batch variant N = 1…5 from day one** (templated on N): MTP verification reads the weights once for all N tokens → almost free when memory-bound.
+- Fusions: RMSNorm folded into the prologue (norm the activation while quantizing it to int8), SwiGLU in the epilogue of interleaved gate/up, residual add in the epilogue of output/down projections.
+- Enough loads in flight: several outstanding 128-bit loads per lane (unrolling) rather than relying only on occupancy.
+- Grid sizing: 32 CUs → make sure the number of workgroups divides evenly (avoid a partial last wave, "tail effect"); use split-K for small matrices so all CUs are busy.
+
+### 10.2 Gated DeltaNet — decode
+
+Per head, recurrent state `S` (d_k × d_v), per token (Gated Delta rule):
+
+```
+S_t = α_t · S_{t-1} · (I − β_t k_t k_tᵀ) + β_t v_t k_tᵀ
+o_t = S_t q_t
+```
+
+plus short causal conv1d on q/k/v (keep the conv tail as state), gates/normalization per the reference implementation **[verify]**.
+
+- One fused kernel per layer: conv1d update + gate computation + state update + output (+ output gate/norm).
+- State stays **FP32** (errors would accumulate recurrently).
+- **Snapshot output mode** for MTP verification: when processing N = k+1 tokens, write the state (and conv tail) **after each position** to a small ring of k+1 snapshot buffers. On acceptance of j tokens, just point to snapshot j. Design this in from the start; retrofitting is painful.
+
+### 10.3 Gated DeltaNet — prefill (chunked)
+
+- Chunkwise-parallel formulation (WY / UT-transform representation), chunks of 64 tokens: intra-chunk work as small matmuls (WMMA), inter-chunk recurrence sequential over chunks.
+- Hardest algorithm of the project. Reference implementations: `flash-linear-attention` (fla-org, Triton) and llama.cpp's implementation; read them side by side with the Gated DeltaNet paper.
+- Can start with a slow but correct sequential version (prefill speed is priority 3).
+
+### 10.4 Full (gated) attention
+
+- Decode: **flash-decoding** with split-K over the sequence, GQA-aware (one workgroup per KV head serving its query heads), online softmax, dequantize quantized KV on the fly (§13). With int8 K, quantize Q to int8 and use `dot4`.
+- Prefill: flash-attention style tiles with WMMA; the tokens of the current ubatch can use their FP16 values directly before being quantized into the cache.
+- RoPE / M-RoPE, QK-norm, Hadamard rotation fused into the Q/K projection epilogue (§8.3, §13).
+
+### 10.5 Prefill GEMM (dequant → WMMA)
+
+Two options:
+
+- **FP16 path**: dequantize weight tiles to FP16 in LDS, `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (or rocWMMA). Numerically closest to reference.
+- **INT8 path**: IQ grid values × signs are int8, activations quantized to int8 → int8 WMMA (~2× FP16 throughput). Scales are per 32-weight sub-block → accumulate int32 per sub-block, convert and FMA with scale into FP32 accumulators. Faster, but activation quantization introduces a small error → validate with KL.
+- Double-buffer LDS tiles; overlap global loads, dequant and WMMA; tune tile sizes for 32 CUs. Start slow and correct.
+
+### 10.6 Small ops
+
+RMSNorm, residuals, SwiGLU, gating, RoPE: never standalone kernels in the final engine — fused into prologues/epilogues of the GEMVs/GEMMs.
+
+### 10.7 Head and sampling
+
+- Final RMSNorm ⊕ `lm_head` GEMV ⊕ per-workgroup partial argmax / top-k in one kernel, final reduction in a tiny second kernel.
+- **Sampling on GPU**: only the chosen token id (4 bytes) goes back to the host, never 150–250k logits per token.
+- For temperature > 0: top-k/top-p/temperature on GPU; with speculative decoding, the acceptance rule of §12.6.
+
+---
+
+## 11. Runtime and decode loop
+
+- **Preallocate everything** at load (memory arena): weights, KV, states, snapshots, scratch. No allocations in the loop; peak VRAM is deterministic.
+- **HIP graphs** for the per-token forward pass. Keep the position / sequence length / KV length in **device memory** so the *same* graph replays every token without re-instantiation or parameter updates.
+- Separate graphs for: decode N=1, MTP draft step, verification N=k+1, and prefill ubatch.
+- **Two streams**: main compute stream + auxiliary stream for deferred MTP KV fill (§12.3) and uploads (image embeddings, prompt-cache restores).
+- Host thread pinned to a P-core; the only per-token host work is reading back the token id and detokenizing/streaming (can be on another thread).
+- Advanced (later): **persistent "megakernel"** for decode — one long-running kernel that walks the layers, removing inter-kernel bubbles and tail effects. High complexity; only after everything else.
+
+---
+
+## 12. MTP speculative decoding without hurting prefill
+
+### 12.1 What the MTP head needs
+
+In the Qwen3-Next / Qwen3.5 style (**[verify]** details against the reference implementation for `qwen35`, e.g. HF transformers / vLLM):
+
+1. At position *i*, inputs are the main model's final hidden state `h_i` and the embedding of the **next** token `t_{i+1}`. Both are normalized, concatenated, projected 2d → d by `fc`.
+2. The result goes through **one decoder layer with its own attention and its own KV cache**.
+3. Shared final norm + shared `lm_head` → draft logits.
+
+To draft well at position *n*, the MTP layer's attention needs KV entries for positions 0…n−1 → some prompt work is **inherent** if full-context drafting is wanted.
+
+What is **not** needed for prompt positions: Q projection, the attention computation itself, output projection, MLP, final norm and `lm_head` (logits only needed at the last position).
+
+### 12.2 Option A — KV-only "shadow" pass fused per ubatch (default)
+
+```
+for each prefill ubatch [a, b):
+    h[a..b) = main_model_forward(tokens[a..b))             # normal prefill
+    # MTP shadow pass, reusing h while it is still in VRAM:
+    x   = fc( concat( norm(embed(tokens[a+1..b+1))), norm(h[a..b)) ) )
+    x   = mtp_input_norm(x)
+    K,V = mtp_kv_proj(x) → rope(K) → (hadamard, quantize) → append to mtp_kv_cache
+    # no Q, no attention, no O-proj, no MLP, no lm_head
+
+# last prompt position only:
+logits = lm_head(final_norm(h[n-1]))  → sample t_n
+full MTP layer at position n-1 with (h[n-1], embed(t_n)) → first draft(s)
+```
+
+Details:
+
+- **Off-by-one:** position *i* pairs `h_i` with `t_{i+1}`. The last prompt position has no next token until sampling, so its MTP entry is written during the first draft step.
+- **Ubatch boundaries:** the last position of ubatch *k* needs the first token of ubatch *k+1* → index into the full prompt token array (already known).
+- **No extra memory:** `h` of the current ubatch is already in VRAM; hidden states for the whole prompt are never stored.
+- `fc` + K/V projection fused into one kernel → two small GEMMs per ubatch, ~0.2–0.3% of prefill cost.
+
+### 12.3 Option B — deferred fill on a second stream (zero impact on prefill and TTFT)
+
+- Prefill runs **without** the shadow pass but keeps final-layer `h` for the prompt (n × d × 2 bytes, e.g. ~80 MB for 8k tokens at FP16 — costs VRAM temporarily; can also be staged in host RAM).
+- The MTP KV fill runs on the auxiliary stream while the first tokens decode **without** speculation. Decode GEMV is memory-bound and leaves compute units idle; the fill is compute-bound → they overlap well.
+- Speculation turns on once the fill has caught up.
+- Given the VRAM priority, Option A is the default; B is an experiment.
+
+### 12.4 Option C — windowed MTP context
+
+- Fill MTP KV only for the last **W** prompt positions (e.g. 1–2k). Cost becomes constant regardless of prompt length, and the MTP KV cache becomes tiny (VRAM!).
+- Drafting quality probably depends mostly on local context → acceptance may barely drop.
+- **Experiment:** plot acceptance rate vs W ∈ {0, 256, 1k, 4k, full} on real workloads (code, chat, prose). W = 0 (MTP attends only to generated tokens) is the extreme and might be surprisingly usable.
+- Combines with A (shadow pass only for the last W positions) and with aggressive MTP KV quantization (§13.6).
+
+### 12.5 Drafting
+
+- `k` drafts per step by chaining the MTP layer on its own output **[verify]** exactly which hidden state is fed back (pre- or post-norm) in the reference.
+- **Truncated-vocab draft head:** score only the top ~32k most frequent tokens = first rows of the frequency-sorted `lm_head` (§8.3). Build the frequency table from a corpus representative of the real workload (for code-heavy use, a code corpus including the languages you actually use), tokenized with the model's tokenizer (`uv run` + `tokenizers`).
+- **Adaptive k:** track acceptance over the last few steps and pick k ∈ {1, 2, 3, 4} dynamically.
+- Tree drafting (several candidates per position) is attractive for memory-bound verification, but the DeltaNet recurrence needs a separate state per branch → not worth it initially.
+
+### 12.6 Verification and acceptance rule
+
+- Verification = forward pass with N = k+1 tokens using the small-batch GEMV kernels (§10.1), DeltaNet in snapshot mode (§10.2), attention writing KV for all N positions.
+- **Greedy:** accept drafts while `draft_j == argmax(p_j)`; the first mismatch is replaced by the verifier's token; plus one bonus token if all are accepted.
+- **Sampling (temperature > 0):** standard speculative sampling (Leviathan et al. / Chen et al.): accept draft token *x* with probability `min(1, p(x)/q(x))`; on rejection sample from `normalize(max(0, p − q))`. This preserves the target distribution exactly. With a truncated-vocab draft, `q` is zero outside the subset → still valid (those tokens are never drafted and remain reachable via the residual distribution).
+
+### 12.7 Rollback — the hybrid-architecture problem
+
+- Full-attention KV: rollback = truncate the KV length (trivial).
+- **DeltaNet recurrent state cannot be "un-applied".** Options:
+  - **Snapshot per position** (preferred): k+1 copies of all recurrent states + conv tails, written during verification; on acceptance of j tokens, select snapshot j (pointer swap / index in device memory). Memory = (k+1) × total state size **[verify]** — size it from real dims; fine for k = 2–3.
+  - **Checkpoint + replay:** save state before verification; on partial acceptance, re-run only accepted tokens through the DeltaNet layers. Less memory, extra small pass.
+- MTP layer KV: after verification, write entries for accepted positions using the **true** `h` from the verification pass (not the draft-time hidden states).
+- Image positions: the "next token embedding" input of the MTP head at image positions is not a vocabulary embedding → check how the reference handles it, or simply skip image positions in the MTP shadow pass if acceptance does not suffer.
+
+---
+
+## 13. KV cache quantization
+
+### 13.1 Scope
+
+- KV cache exists **only in full-attention layers** (hybrid model) + the MTP layer.
+- Per token: `2 (K,V) × n_attn_layers × n_kv_heads × head_dim × bytes_per_element`.
+
+Illustrative (16 attention layers, 4 KV heads, head_dim 256 — **placeholders**):
+
+| Format | Bytes/token | 32k tokens |
+|---|---|---|
+| FP16 | 64 KB | ~2.0 GB |
+| Q8 (8.5 bpw) | 34 KB | ~1.1 GB |
+| K Q8 + V Q4 | 25 KB | ~0.8 GB |
+| Q4 (4.5 bpw) | 18 KB | ~0.55 GB |
+
+At long contexts attention decode is bound by KV reads → smaller KV is also **faster**.
+
+### 13.2 K is more sensitive than V
+
+Errors in K change the pre-softmax scores (i.e. *where* the model looks); errors in V are averaged by the weighted sum. K also tends to have outlier channels that break block quantization. Default: **K Q8, V Q4**.
+
+### 13.3 Hadamard rotation (makes K at Q4 viable)
+
+- After RoPE (and QK-norm), apply a fast Walsh–Hadamard transform along head_dim to **both Q and K**. H is orthogonal → `(HQ)·(HK) = Q·K`, scores unchanged; outliers get spread across channels → much better quantization.
+- Cost O(d log d) per head, fused into the kernel that writes the cache (head_dim is a power of two **[verify]**).
+- V can be rotated too, applying Hᵀ to the attention output at runtime. **Cannot** be folded into `o_proj` offline — that would require re-quantizing its weights (violates the lossless rule).
+
+### 13.4 FP16 windows
+
+- **Recent window:** last N tokens (e.g. 64–128) kept in FP16, quantized in blocks as the window fills. Better quality where it matters most, and allows **per-channel K quantization over groups of tokens** (KIVI-style), more accurate than per-token for K.
+- **Initial tokens:** first few positions in FP16 (they often receive a lot of attention; gated attention should reduce this "sink" effect, but keeping a few in FP16 is almost free).
+
+### 13.5 Mixed precision per layer
+
+- With few attention layers, measure sensitivity **one layer at a time**: quantize a single layer to Q4, measure KL increase vs FP16 KV at long context. Assign Q8/Q4 per layer (K and V separately) under a VRAM budget — RCO spirit in miniature.
+
+### 13.6 MTP layer KV can be aggressive
+
+Errors in the MTP path only lower acceptance, never correctness (verification guarantees exactness) → Q4 or lower + windowing (§12.4). Tune by measuring acceptance.
+
+### 13.7 DeltaNet states are **not** quantized
+
+Recurrently read and rewritten every token → errors accumulate. Small, fixed-size → keep FP32 (BF16 only after measuring), snapshots included.
+
+### 13.8 Layout, kernels, validation
+
+- Struct-of-arrays: quantized values contiguous per (layer, KV head, token block), scales in a separate stream, aligned for 128-bit loads.
+- Flash-decoding dequantizes on the fly; int8 K × int8 Q with `dot4`.
+- Validation at **long context** (16–32k; short prompts hide KV errors): KL divergence vs FP16 KV, needle-in-a-haystack style retrieval tests. Compare against llama.cpp's `-ctk/-ctv` options as a baseline. Our margin over llama.cpp: rotation, FP16 windows, per-layer choice.
+
+---
+
+## 14. Vision encoder on CPU
+
+### 14.1 Why
+
+- `mmproj` is ~0.9 GB BF16 (~450 M params) → **0.9 GB VRAM saved**, plus the ViT activations (attention over thousands of patches) which can be large.
+- The encoder runs once per image; output is small: e.g. 1024 image tokens × 5120 × 2 B ≈ 10 MB → negligible over PCIe 5.0.
+- Latency is irrelevant for this project.
+
+### 14.2 Flow
+
+1. CPU: preprocessing (resize, patching, normalization) → ViT → projector → embeddings in the LLM hidden dimension.
+2. Upload embeddings to the GPU; they replace the image placeholder tokens in the sequence.
+3. GPU prefill as usual (image tokens count as prompt tokens: ~1024 tokens ≈ ~1.4 s at 750 t/s).
+
+### 14.3 On the i5-13400F
+
+- No AVX-512, no native BF16 → convert weights BF16 → FP32 at load (~1.8 GB RAM).
+- AVX2/FMA GEMMs (and AVX-VNNI if an int8 path is ever wanted — avoid quantizing the vision encoder: vision encoders are sensitive and RAM is not a constraint).
+- Pin encoder threads to the **6 P-cores**, leave one free for the GPU host thread (prevents jitter in kernel launches during concurrent decode). E-cores optional.
+- Rough cost: ~2 × params × patches + attention ≈ ~4 TFLOP for a ~1 MP image with 16×16 patches → seconds to tens of seconds on this CPU. Acceptable.
+
+### 14.4 Resolution
+
+- The main lever for both encoder time and GPU prefill tokens: halving the side → ~4× fewer patches.
+- For UI screenshots (e.g. forms to be converted to code/DFM), small text and dense controls need resolution → measure quality at several resolutions on the real use case before fixing a limit.
+
+### 14.5 Implementation
+
+- **Pragmatic:** llama.cpp `libmtmd` / `clip` built **CPU-only**, used only for encoding; take its output embeddings and feed them to the engine. It already implements the correct preprocessing for this architecture (the part most likely to go silently wrong) and doubles as numerical reference. **[verify]** current `mtmd.h` API for encode + output-embedding access.
+- **Custom (later, optional):** own ViT in C++ with AOCL-BLIS / OpenBLAS / oneDNN GEMMs in FP32.
+
+### 14.6 Engine-side details
+
+- **M-RoPE positions** for image tokens (temporal/height/width sections) in the full-attention layers' RoPE kernel **[verify]** sections in metadata. DeltaNet layers have no positional encoding.
+- **Overlap:** the GPU can prefill the text *before* the image while the CPU encodes; text *after* the image waits (its positions depend on the number of image tokens, known right after preprocessing).
+- **Embedding cache** keyed by image hash (multi-turn conversations don't re-encode).
+- MTP at image positions: see §12.7.
+
+---
+
+## 15. VRAM budget
+
+Illustrative, with IQ3_S + MTP and 32k context (**all rows [verify]** with real dims and measurements):
+
+| Item | ~Size |
+|---|---|
+| Weights IQ3_S-mtp | 12.1 GB |
+| − `token_embd` moved to host RAM (if untied) | −0.5 … −1.0 GB |
+| KV cache 32k, K Q8 / V Q4 (placeholder dims) | ~0.8 GB |
+| MTP layer KV (Q4, windowed) | < 0.05 GB |
+| DeltaNet states + (k+1) snapshots | ~0.1–0.5 GB |
+| Prefill scratch / activations (ubatch 512) | ~0.3–0.6 GB |
+| HIP runtime / context | ~0.2–0.4 GB |
+| Desktop (no iGPU!) | ~0.3–1.0 GB |
+| Vision | **0** (CPU) |
+| **Total** | **~13.3–15.4 GB** |
+
+Levers if tight:
+
+- **IQ3_XXS** instead of IQ3_S: −1.7 GB (quality still close to base per the model card).
+- Smaller prefill ubatch (256): less scratch, slightly slower prefill.
+- KV fully Q4 with Hadamard + windows; shorter max context.
+- Headless benchmarking / lightweight desktop session.
+- Prompt-prefix cache kept in **host RAM** instead of VRAM (§16.6).
+
+---
+
+## 16. Performance "breadcrumbs"
+
+Small gains, a few percent each at most, but they add up. Rough expected impact in brackets.
+
+### 16.1 System / hardware
+
+- **VRAM overclock** (LACT, requires `amdgpu.ppfeaturemask=0xffffffff`): decode scales ~linearly with memory clock → often the single biggest "free" gain [+3–8% decode]. GDDR6 errors can be *silent* (error correction/retry masks them as lower performance, or worse, corrupt values) → validate with the KL test after any OC, and benchmark to confirm speed actually went up. **[verify]** RDNA4 memory OC support in LACT.
+- **Undervolt / raise power limit** so the core keeps boosting during prefill (compute-bound) [prefill +x%].
+- **Power profile COMPUTE** (`pp_power_profile_mode`) and/or `power_dpm_force_performance_level=high` during benchmarks; check that memory clock stays at max in decode.
+- **Thermals:** fan curve so the card never throttles during long runs.
+- **Headless / minimal desktop** while running: frees VRAM *and* removes compositor contention.
+- Host thread pinned to a P-core; vision threads kept off that core.
+
+### 16.2 Memory access (decode)
+
+- Struct-of-arrays, 128-bit aligned loads, fully coalesced (§8.3) [several %].
+- Several independent 128-bit loads in flight per lane (unrolling / software pipelining) [latency hiding].
+- **Non-temporal loads for weights** (`__builtin_nontemporal_load`, streaming cache policy): weights are read once per token and should not evict KV/state/activations from caches **[verify]** effect on RDNA4 [small].
+- Keep activations in FP16/int8, accumulate in FP32.
+- Codebook tables in LDS, loaded once per workgroup.
+- Put all tiny per-token state (norm weights, gates, biases) contiguous so they come in few cache lines.
+
+### 16.3 Kernel launch / scheduling
+
+- **HIP graphs** with device-side position counters (§11) [removes a few % of launch overhead].
+- **Fusion everywhere** (norm in prologues, SwiGLU/residual in epilogues, RoPE/Hadamard/KV-write in QKV epilogue) → fewer kernels, fewer intermediate writes.
+- **Tail effects**: workgroup counts that divide evenly across 32 CUs; split-K for small matrices (DeltaNet projections, MTP `fc`).
+- **Per-shape autotuning table**: the model is fixed, so autotune tile/unroll/workgroup size per (tensor shape, quant type) offline once, and store the best config (can even live in the custom file format).
+- Check ISA for register spills and VGPR usage (`-Rpass-analysis=kernel-resource-usage`, `--save-temps`); `__launch_bounds__` where useful.
+- Later: persistent decode megakernel (no inter-kernel bubbles).
+
+### 16.4 Head, sampling, host
+
+- Sampling on GPU, only 4 bytes back per token [avoids ~1 MB logits copy + sync per token].
+- Fused final norm + `lm_head` + partial argmax.
+- Detokenization and streaming on a separate host thread.
+- Tokenizer work for the next request overlapped with GPU work.
+
+### 16.5 MTP-specific
+
+- Truncated-vocab drafts via frequency-sorted `lm_head` prefix [big: −5–8× draft `lm_head` cost].
+- Adaptive k based on recent acceptance.
+- Small-batch GEMV kernels specialized for N = 2…5 (not generic GEMM).
+- Snapshot-based DeltaNet rollback (no replay pass).
+- Aggressive MTP KV quantization + windowing (VRAM + speed).
+- Frequency table built from the *actual* workload's text distribution.
+
+### 16.6 VRAM-specific
+
+- `token_embd` in host pinned RAM (if untied).
+- Vision on CPU.
+- MTP section loaded only when used.
+- **Prompt-prefix cache in host RAM**: store quantized KV + DeltaNet state checkpoint at the end of a system prompt / common prefix; restore with an upload (PCIe 5.0) instead of re-running prefill.
+- Preallocated arena → no fragmentation, predictable peak.
+- Extreme option (slow): offload old KV blocks to host RAM for very long contexts.
+
+### 16.7 Prefill-specific
+
+- INT8 WMMA path (IQ values fit int8) vs FP16 path — measure speed vs KL.
+- Double-buffered LDS tiles, overlapping load / dequant / WMMA.
+- Tune ubatch size (512 vs 1024 vs 2048) against VRAM scratch.
+- KV-only MTP shadow pass instead of full MTP layer (§12.2).
+
+---
+
+## 17. Measurement methodology
+
+- Fixed conditions: headless (or fixed minimal desktop), same power profile, card warmed up, fixed fan curve.
+- Warm-up runs discarded; report **median of ≥5 runs**.
+- Decode t/s at context depths **0 / 4k / 16k / 32k**; prefill t/s at **512 / 4k** prompt lengths; **peak VRAM**; time to first token.
+- Report efficiency, not just speed: decode as % of *measured* achievable bandwidth; prefill as % of *measured* hipBLASLt FP16 GEMM throughput.
+- MTP: acceptance rate per workload type (code / chat / prose), tokens per step, effective t/s.
+- Quality: KL divergence vs llama.cpp reference (and vs FP16 KV for KV experiments), top-1 agreement, perplexity on a fixed slice; greedy-output identity with/without MTP.
+- Keep results as CSV in `bench/` with git commit hash of the engine.
+
+---
+
+## 18. Milestones
+
+| # | Milestone | Exit criterion |
+|---|---|---|
+| 0 | Baselines | llama.cpp HIP/Vulkan numbers (with/without MTP, KV types), measured bandwidth and GEMM ceilings, kernel traces of the MTP prefill drop |
+| 1 | Inspection + CPU reference | `gguf-dump` facts recorded; NumPy/PyTorch-CPU reference matches llama.cpp logits (KL ≈ 0) |
+| 2 | Naive GPU path | One kernel per op, dequant to FP16, correct tokens, greedy output = reference |
+| 3 | Custom layout + fused int8-dot GEMV | Bit-exact load-time repacking; decode ≥ 60% of measured bandwidth |
+| 4 | Graphs + fusions | Decode ≥ 75% of measured bandwidth |
+| 5 | Quantized KV | K Q8/V Q4 with Hadamard + windows; KL within budget at 32k |
+| 6 | MTP | KV-only shadow prefill (prefill within ~2% of non-MTP), snapshots, truncated-vocab drafts, adaptive k; greedy identity |
+| 7 | Vision on CPU | libmtmd CPU encoding, M-RoPE, embedding cache |
+| 8 | Fast prefill | Dequant→WMMA GEMM, chunked DeltaNet; target ~900+ t/s |
+| 9 | Offline converter + final format | Layouts frozen, bit-exact verification in the converter |
+| 10 | Polish | C ABI, OpenAI-compatible server, prompt-prefix cache in host RAM, breadcrumbs |
+
+---
+
+## 19. Open questions / verification checklist
+
+- [ ] Which quant file produced the 19–20 t/s decode and 750 t/s prefill baselines?
+- [ ] llama.cpp decode t/s **with** the `-mtp` build → back out acceptance rate.
+- [ ] Root cause of the 750 → 500 t/s MTP prefill drop (kernel trace).
+- [ ] Real model dims: hidden size, layer count, DeltaNet vs attention layer pattern, head counts, head dims, vocab size.
+- [ ] RoPE: partial rotary factor, M-RoPE sections, theta.
+- [ ] Norm variants (zero-centered RMSNorm?), QK-norm, gated attention gate, DeltaNet gate/β parametrization, conv1d kernel size.
+- [ ] Tied embeddings? (decides whether `token_embd` can go to host RAM separately).
+- [ ] Allocation file: all quant types present; do `gate`/`up` and Q/K/V share types? `lm_head` type?
+- [ ] MTP: exact inputs (`h` pre- or post-norm), chaining for k > 1, handling of image positions.
+- [ ] RDNA4 specs: FP16/INT8 matrix peak, LDS size, cache sizes; ROCm version on CachyOS.
+- [ ] `mtmd.h` API for extracting image embeddings.
+- [ ] RDNA4 memory OC support in LACT.
+
+---
+
+## 20. References
+
+**Model and quantization**
+
+- Model card: `https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF`
+- GSQ: *Highly-Accurate Low-Precision Scalar Quantization for LLMs via Gumbel-Softmax Sampling*, arXiv:2604.18556 — code: `IST-DASLab/GSQ`
+- RCO: *Model Compression with Exact Budget Constraints via Riemannian Manifolds*, arXiv:2605.00649 — code: `IST-DASLab/RCO`
+
+**Architecture**
+
+- Gated Delta Networks: *Improving Mamba2 with Delta Rule* (Yang, Kautz, Hatamizadeh), ICLR 2025
+- `flash-linear-attention` (fla-org) — reference kernels for (Gated) DeltaNet
+- Qwen3-Next / Qwen3.5 technical material and HF transformers / vLLM implementations of `qwen35`
+
+**Speculative decoding / MTP**
+
+- Leviathan et al., *Fast Inference from Transformers via Speculative Decoding* (2023)
+- Chen et al., *Accelerating Large Language Model Decoding with Speculative Sampling* (2023)
+- DeepSeek-V3 technical report (MTP modules)
+- EAGLE-3; FR-Spec (frequency-ranked vocabulary for draft heads)
+
+**KV cache quantization**
+
+- KIVI (per-channel K, per-token V quantization)
+- QuaRot / SpinQuant (Hadamard / rotation-based outlier removal)
+- KVQuant
+
+**Kernels**
+
+- Flash-Decoding (Dao et al., 2023)
+- llama.cpp: `ggml/src/ggml-common.h` (block structs), `ggml-quants.c` (dequantization), `ggml-cuda` (HIP build: `mmvq`, `mmq`, flash attention), `tools/mtmd` (vision)
+- AMD: RDNA4 ISA reference, rocWMMA, hipBLASLt, rocprofiler-sdk documentation
