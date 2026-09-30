@@ -3,8 +3,10 @@
 // usage: omph-run <model.gguf> <tokens.txt> <out-logits.f32> [--trace-dir DIR]
 //   tokens.txt: token ids separated by whitespace.
 //   Logits are written as tokens x n_vocab f32 for the whole prompt (one row
-//   with --last-logits); with --trace-dir the per-layer outputs are dumped as
-//   l_out-<layer>.f32 (single-chunk prompts only).
+//   with --last-logits, the last N with --logits-tail N); with --trace-dir the
+//   per-layer outputs are dumped as l_out-<layer>.f32 (single-chunk prompts only).
+//   OMPH_KV_Q8Q4=1 quantizes the KV (OMPH_KV_WINDOW=N: FP16 ring of N tokens);
+//   OMPH_KV_HOST=1 keeps the exact f32 KV in host RAM (long-context reference).
 //
 // The whole quantized tensor block lives in VRAM; the weights of the current
 // layer are dequantized to f16 into a reusable scratch buffer, and every op is
@@ -279,7 +281,19 @@ public:
         // The KV cache is sized by the whole sequence, the activations by the
         // chunk: that is what lets a long prompt run in pieces.
         kv_q8q4_ = std::getenv("OMPH_KV_Q8Q4") != nullptr;
-        if (!kv_q8q4_) {
+        kv_host_ = !kv_q8q4_ && std::getenv("OMPH_KV_HOST") != nullptr;
+        if (kv_host_) {
+            // Validation reference only: the exact f32 cache in pinned host RAM
+            // (4.29 GB at 32k does not fit beside the weights), and one layer's
+            // worth of it staged into VRAM before each attention.
+            const size_t bytes = (size_t) n_kv * kvcap * attn_kv * 4;
+            if (hipHostMalloc(&kv_k_, bytes) != hipSuccess ||
+                hipHostMalloc(&kv_v_, bytes) != hipSuccess) {
+                throw std::runtime_error("cannot allocate the host KV cache");
+            }
+            alloc(&kv_stage_k_, (size_t) kvcap * attn_kv * 4);
+            alloc(&kv_stage_v_, (size_t) kvcap * attn_kv * 4);
+        } else if (!kv_q8q4_) {
             alloc(&kv_k_, (size_t) n_kv * kvcap * attn_kv * 4);
             alloc(&kv_v_, (size_t) n_kv * kvcap * attn_kv * 4);
         } else {
@@ -312,6 +326,10 @@ public:
     }
 
     ~Runner() {
+        if (kv_host_) {
+            (void) hipHostFree(kv_k_);
+            (void) hipHostFree(kv_v_);
+        }
         for (void * p : f16_cache_owned_) {
             (void) hipFree(p);
         }
@@ -320,8 +338,11 @@ public:
         }
     }
 
+    // want_logits = false runs the layers only (a prefill chunk whose logits
+    // nobody reads): no final norm, no lm_head.
     bool forward(const std::vector<int32_t> & toks, std::vector<float> & logits,
-                 const std::string & trace_dir, const int64_t start_pos = 0) {
+                 const std::string & trace_dir, const int64_t start_pos = 0,
+                 const bool want_logits = true) {
         const int64_t T = (int64_t) toks.size();
         // The activations hold max_tokens_ rows and the KV cache max_seq_
         // positions: anything past either is an out-of-bounds write.
@@ -412,6 +433,17 @@ public:
             }
         }
 
+        if (!want_logits) {
+            logits.clear();
+            if (hipDeviceSynchronize() != hipSuccess) {
+                return fail("forward failed");
+            }
+            report_phases();
+            if (time_step) {
+                step_event(step_a, step_b);
+            }
+            return true;
+        }
         const float * out_norm = vec("output_norm.weight");
         if (out_norm == nullptr ||
             !omph::kernels::rms_norm(static_cast<const float *>(x_), out_norm,
@@ -772,11 +804,22 @@ private:
         if (k_cache == nullptr || v_cache == nullptr) {
             return false;
         }
-        if (hipMemcpy(k_cache + pos0 * kv_out, k_, (size_t) T * kv_out * 4,
-                      hipMemcpyDeviceToDevice) != hipSuccess ||
-            hipMemcpy(v_cache + pos0 * kv_out, v_, (size_t) T * kv_out * 4,
-                      hipMemcpyDeviceToDevice) != hipSuccess) {
+        // hipMemcpyDefault: the cache is device memory, or pinned host memory
+        // with OMPH_KV_HOST.
+        if (hipMemcpy(k_cache + pos0 * kv_out, k_, (size_t) T * kv_out * 4, hipMemcpyDefault) !=
+                hipSuccess ||
+            hipMemcpy(v_cache + pos0 * kv_out, v_, (size_t) T * kv_out * 4, hipMemcpyDefault) !=
+                hipSuccess) {
             return false;
+        }
+        if (kv_host_) {
+            const size_t bytes = (size_t) (pos0 + T) * kv_out * 4;
+            if (hipMemcpy(kv_stage_k_, k_cache, bytes, hipMemcpyHostToDevice) != hipSuccess ||
+                hipMemcpy(kv_stage_v_, v_cache, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+                return false;
+            }
+            k_cache = static_cast<float *>(kv_stage_k_);
+            v_cache = static_cast<float *>(kv_stage_v_);
         }
         return omph::kernels::attention(static_cast<const float *>(q_), k_cache, v_cache,
                                         static_cast<const float *>(gate_),
@@ -1051,6 +1094,9 @@ private:
     void * kv_v16_ = nullptr;
     int64_t kv_window_ = 0;  // off by default: measured neutral at 512 tokens (M5)
     bool kv_q8q4_ = false;
+    bool kv_host_ = false;  // f32 KV in pinned host RAM (validation reference)
+    void * kv_stage_k_ = nullptr;
+    void * kv_stage_v_ = nullptr;
     void * dev_weights_ = nullptr;
     void * x_ = nullptr;
     void * cur_ = nullptr;
@@ -1086,7 +1132,8 @@ private:
 int main(int argc, char ** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: %s <model.gguf> <tokens.txt> <out-logits.f32> "
-                             "[--trace-dir DIR] [--tokens N] [--generate N --gen-out FILE]\n",
+                             "[--trace-dir DIR] [--tokens N] [--last-logits | --logits-tail N] "
+                             "[--generate N --gen-out FILE] [--gemv]\n",
                      argv[0]);
         return 2;
     }
@@ -1097,6 +1144,7 @@ int main(int argc, char ** argv) {
     std::string gen_path;
     int64_t max_tokens = 0;
     bool last_logits = false;
+    int64_t logits_tail = 0;
     int64_t generate = 0;
     bool use_gemv = false;
     for (int i = 4; i < argc; ++i) {
@@ -1104,6 +1152,8 @@ int main(int argc, char ** argv) {
             trace_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--last-logits") == 0) {
             last_logits = true;
+        } else if (std::strcmp(argv[i], "--logits-tail") == 0 && i + 1 < argc) {
+            logits_tail = std::atoll(argv[++i]);
         } else if (std::strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
             max_tokens = std::atoll(argv[++i]);
         } else if (std::strcmp(argv[i], "--generate") == 0 && i + 1 < argc) {
@@ -1154,20 +1204,28 @@ int main(int argc, char ** argv) {
         Runner runner(model, act_chunk, use_gemv && generate > 0, last_logits, total_len);
         const HParams & h = runner.hparams();
         // Every chunk's rows are kept, so the file is the whole prompt's logits;
-        // with --last-logits each forward returns one row and the last one wins.
+        // with --last-logits only the last row, with --logits-tail N the last N.
+        // Chunks that do not reach the rows being kept skip the lm_head.
+        const int64_t n_toks = (int64_t) toks.size();
+        const int64_t keep = last_logits ? 1 : (logits_tail > 0 ? std::min(logits_tail, n_toks)
+                                                                : n_toks);
         std::vector<float> logits;
         std::vector<float> part_logits;
-        for (int64_t off = 0; off < (int64_t) toks.size(); off += act_chunk) {
-            const int64_t n = std::min<int64_t>(act_chunk, (int64_t) toks.size() - off);
+        for (int64_t off = 0; off < n_toks; off += act_chunk) {
+            const int64_t n = std::min<int64_t>(act_chunk, n_toks - off);
             const std::vector<int32_t> part(toks.begin() + (size_t) off,
                                             toks.begin() + (size_t) (off + n));
-            if (!runner.forward(part, part_logits, trace_dir, off)) {
+            const bool want = off + n > n_toks - keep;
+            if (!runner.forward(part, part_logits, trace_dir, off, want)) {
                 return 1;
             }
             if (last_logits) {
                 logits.swap(part_logits);
-            } else {
-                logits.insert(logits.end(), part_logits.begin(), part_logits.end());
+            } else if (want) {
+                // rows of this chunk inside the tail
+                const int64_t first = std::max<int64_t>(0, (n_toks - keep) - off);
+                logits.insert(logits.end(), part_logits.begin() + (size_t) (first * h.n_vocab),
+                              part_logits.end());
             }
         }
         write_f32(logits_path, logits);
