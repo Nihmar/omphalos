@@ -10,8 +10,8 @@ namespace omph::kernels {
 // dst[i] = (half)src[i]
 bool cast_f32_to_f16(const float * src, void * dst, int64_t n, hipStream_t stream);
 
-// y[row, :] = x[row, :] / sqrt(mean(x^2) + eps) * w[:]
+// y[row, :] = x[row, :] / sqrt(mean(x^2) + eps) * w[:] * scale
 bool rms_norm(const float * x, const float * w, float * y, int64_t rows, int64_t n, float eps,
-              hipStream_t stream);
+              float scale, hipStream_t stream);
 
 } // namespace omph::kernels
