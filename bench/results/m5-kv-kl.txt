@@ -8,3 +8,6 @@ config                                   KL mean    KL median  KL p99     KL max
 K Q8 / V Q4, rotation before norm/RoPE   0.802911   0.247214   6.422287   9.811840   65.23 %   (main @ ceddd52, bug #46)
 K Q8 / V Q4, rotation after RoPE         0.001639   0.000602   0.018926   0.076354   96.29 %
 FP16 window 512 (whole context in f16)   0.000114   0.000007   0.001746   0.010940   99.22 %
+
+# after #55 (barrier in the flash softmax): both paths are now bit-identical run to run
+K Q8 / V Q4 vs f32 KV, both with #55     0.001378   0.000582   0.014189   0.037545   96.48 %

@@ -92,6 +92,9 @@ __global__ void attention_flash_kernel(const float * __restrict__ q,
         }
         const float m_new = fmaxf(m, bm);
         const float corr = expf(m - m_new);
+        // Every thread must finish scanning the scores before any of them is
+        // replaced by its weight, or threads disagree on the block max.
+        __syncthreads();
         if (d < bs) {
             sc[d] = expf(sc[d] - m_new);
         }
@@ -389,6 +392,9 @@ __global__ void attention_flash_q8q4_kernel(
         }
         const float m_new = fmaxf(m, bm);
         const float corr = expf(m - m_new);
+        // Every thread must finish scanning the scores before any of them is
+        // replaced by its weight, or threads disagree on the block max.
+        __syncthreads();
         if (d < bs) {
             sc[d] = expf(sc[d] - m_new);
         }
