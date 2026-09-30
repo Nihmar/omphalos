@@ -459,3 +459,22 @@ attention, and ~900 launches per step. The next decode work is not faster GEMVs
 — it is PLAN §10.6 (fold norms and residuals into GEMV prologues/epilogues),
 §10.2 (one fused delta-net decode kernel instead of five tiny launches) and then
 HIP graphs (M4).
+
+## Second ablation: the layer body
+
+| run (prefill + 20 decode steps, --gemv) | wall clock |
+|---|---:|
+| full | 10017 ms |
+| without the layer body (block + residual + FFN) | 7470 ms |
+| without the fused GEMVs | 9041 ms |
+
+The layer body costs 2547 ms = **127 ms per decode step — the entire step** — of
+which 48 ms is the fused GEMVs. So **~79 ms per step is the body without its
+matrix multiplies**: the attention/delta-net kernels, the per-layer norms,
+residuals and casts, spread over roughly 600 launches per step. At ~130 us per
+kernel that is not launch overhead; the kernels themselves are latency-bound.
+
+The dominant piece is the delta rule as **five tiny launches per token per
+layer** (48 layers x 5 = 240 per step, each on a 48-head grid with LDS-heavy
+state access). That is exactly what PLAN §10.2 prescribes fusing into one kernel
+per layer — and it is now the top decode item, ahead of HIP graphs.

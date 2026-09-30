@@ -321,6 +321,9 @@ public:
                 return fail("attn_norm failed");
             }
             scratch_.reset();
+            if (std::getenv("OMPH_SKIP_BLOCKS") != nullptr) {
+                continue;  // ablation only: the layer output is the normed input
+            }
             timer_block_.start();
             if (recurrent) {
                 if (!gdn_layer(il, p, T)) return false;
