@@ -1,0 +1,19 @@
+# omphalos M0 llama.cpp baselines
+# label: vulkan
+# build: /home/alessandro/Projects/llama.cpp-RX9060XT-16GB/build-vulkan
+# model: models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+# date:  2026-09-30T13:14:18+02:00
+# note:  desktop session active during run
++ llama-bench -p 512 -n 128 -d 0,4096,16384
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+ggml_vulkan: Found 1 Vulkan devices:
+ggml_vulkan: 0 = AMD Radeon RX 9060 XT (RADV GFX1200) (radv) | uma: 0 | fp16: dot2 | bf16: 1 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat
++ llama-bench -p 512 -n 128 -ctk q8_0 -ctv q8_0 -d 16384,32768
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+ggml_vulkan: Found 1 Vulkan devices:
+ggml_vulkan: 0 = AMD Radeon RX 9060 XT (RADV GFX1200) (radv) | uma: 0 | fp16: dot2 | bf16: 1 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat
++ llama-bench -p 512 -n 128 -ctk q8_0 -ctv q4_0 -d 16384,32768
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+ggml_vulkan: Found 1 Vulkan devices:
+ggml_vulkan: 0 = AMD Radeon RX 9060 XT (RADV GFX1200) (radv) | uma: 0 | fp16: dot2 | bf16: 1 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat
+results: /home/alessandro/Projects/omphalos/bench/results/m0-llama-bench-vulkan-20260930-131418.csv

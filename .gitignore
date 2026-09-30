@@ -20,3 +20,6 @@ __pycache__/
 .idea/
 *.swp
 *~
+
+# Benchmark scratch (llama-server run logs; result CSVs are tracked)
+bench/results/*.srv.log
