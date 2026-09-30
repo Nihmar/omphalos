@@ -374,6 +374,21 @@ int64_t quant_block_bytes(const uint32_t type) {
     }
 }
 
+int64_t repacked_bytes(const uint32_t type, const int64_t n_blocks) {
+    switch (type) {
+        case 10: return q2k_layout(n_blocks).total;
+        case 12: return q4k_layout(n_blocks).total;
+        case 14: return q6k_layout(n_blocks).total;
+        case 16: return iq2_xxs_layout(n_blocks).total;
+        case 17: return iq2_xs_layout(n_blocks).total;
+        case 18: return iq3_xxs_layout(n_blocks).total;
+        case 21: return iq3s_layout(n_blocks).total;
+        case 22: return iq2s_layout(n_blocks).total;
+        case 23: return iq4_layout(n_blocks).total;
+        default: return 0;
+    }
+}
+
 bool repack_any(const uint32_t type, const void * src, const int64_t n_blocks,
                 std::vector<uint8_t> & dst) {
     if (type == 12) {

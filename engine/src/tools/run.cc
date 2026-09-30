@@ -186,23 +186,24 @@ public:
                 // bytes in the image so the per-token lookup never stages 388 MiB
                 // over PCIe.
                 const bool embed = t.name == "token_embd.weight";
-                if (use_gemv_ && !embed && bb > 0 && t.nbytes % (uint64_t) bb == 0) {
-                    std::vector<uint8_t> packed;
-                    if (omph::format::repack_any(t.type, file_.tensor_data(t),
-                                                 (int64_t) (t.nbytes / (uint64_t) bb), packed)) {
-                        GemvEntry e;
-                        e.off = total;
-                        e.bytes = packed.size();
-                        e.rows = (int64_t) t.ne[1];
-                        e.k = (int64_t) t.ne[0];
-                        e.type = t.type;
-                        e.has_b4 = std::getenv("OMPH_NO_B4") == nullptr &&
-                                   (t.type == 12 || t.type == 18 || t.type == 21 || t.type == 23);
-                        gems_[t.name] = e;
-                        total += (packed.size() + 255) & ~(size_t) 255;
-                        places.push_back(p);
-                        continue;
-                    }
+                // Sized from the layout: the repack itself runs once, at upload.
+                const int64_t packed_bytes =
+                    use_gemv_ && !embed && bb > 0 && t.nbytes % (uint64_t) bb == 0
+                        ? omph::format::repacked_bytes(t.type, (int64_t) (t.nbytes / (uint64_t) bb))
+                        : 0;
+                if (packed_bytes > 0) {
+                    GemvEntry e;
+                    e.off = total;
+                    e.bytes = (size_t) packed_bytes;
+                    e.rows = (int64_t) t.ne[1];
+                    e.k = (int64_t) t.ne[0];
+                    e.type = t.type;
+                    e.has_b4 = std::getenv("OMPH_NO_B4") == nullptr &&
+                               (t.type == 12 || t.type == 18 || t.type == 21 || t.type == 23);
+                    gems_[t.name] = e;
+                    total += ((size_t) packed_bytes + 255) & ~(size_t) 255;
+                    places.push_back(p);
+                    continue;
                 }
                 total += ((size_t) t.nbytes + 255) & ~(size_t) 255;
                 places.push_back(p);
@@ -219,8 +220,11 @@ public:
                 const void * src = file_.tensor_data(*t);
                 size_t bytes = (size_t) t->nbytes;
                 if (repacked) {
-                    (void) omph::format::repack_any(t->type, src,
-                                                    (int64_t) (t->nbytes / (uint64_t) bb), packed);
+                    if (!omph::format::repack_any(t->type, src,
+                                                  (int64_t) (t->nbytes / (uint64_t) bb), packed) ||
+                        packed.size() != gems_.at(p.name).bytes) {
+                        throw std::runtime_error("repack failed for " + p.name);
+                    }
                     src = packed.data();
                     bytes = packed.size();
                 }

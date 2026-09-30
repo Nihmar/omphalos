@@ -1,0 +1,5 @@
+# omph-run wall time dominated by load: 10-token golden prompt, --gemv --generate 1
+# 5 runs each, model in the page cache, RX 9060 XT (issue #51)
+engine                      runs (s)                        median
+83f96bc (repack twice)      7.45 7.44 7.39 7.36 7.41        7.41 s
+perf/51-repack-once         4.53 4.57 4.60 4.60 4.58        4.58 s

@@ -145,6 +145,8 @@ void unrepack_q2k(const void * src, int64_t n_blocks, void * dst);
 int64_t quant_block_bytes(uint32_t type);
 
 // Dispatch helpers over the types with a repacked layout + GEMV kernel.
+// Size in bytes of repack_any's output, without doing the repack (0: no layout).
+int64_t repacked_bytes(uint32_t type, int64_t n_blocks);
 bool repack_any(uint32_t type, const void * src, int64_t n_blocks, std::vector<uint8_t> & dst);
 bool unrepack_any(uint32_t type, const void * src, int64_t n_blocks, std::vector<uint8_t> & dst);
 
