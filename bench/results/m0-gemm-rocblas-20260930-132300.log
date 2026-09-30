@@ -1,0 +1,95 @@
+# omphalos M0 — rocBLAS FP16 GEMM ceiling (compute f32), M = 512
+# date: 2026-09-30T13:23:00+02:00
+# gpu:  gfx1200 / RX 9060 XT 16GB / ROCm 7.2.4
+== ffn_gate_up: m=512 n=17408 k=5120 ==
+rocBLAS info: client (OPENMP) reduced omp_set_num_threads to 10
+rocBLAS info: Using reference library 'cblas'
+rocBLAS version: 5.2.0.dabb6df2b98-dirty
+rocBLAS-commit-hash: d1b03cfb1a42c3f178f0eee75397c37f7a8b7077
+Tensile-commit-hash: 
+hipBLASLt: N/A, as rocBLAS was built without hipBLASLt
+Query device success: there are 1 devices
+-------------------------------------------------------------------------------
+Device ID 0 : AMD Radeon RX 9060 XT gfx1200
+with 17.1 GB memory, max. SCLK 2620 MHz, max. MCLK 1258 MHz, memoryBusWidth 16 Bytes, compute capability 12.0
+maxGridDimX 2147483647, sharedMemPerBlock 65.5 KB, maxThreadsPerBlock 1024, warpSize 32
+-------------------------------------------------------------------------------
+
+
+rocBLAS info: Time taken to complete rocBLAS library initialization is 142 milliseconds.
+
+rocBLAS info: maximum library size per device is 0.264241 GB.
+rocblas-bench INFO: lda < min_lda, setting lda = 512
+rocblas-bench INFO: ldb < min_ldb, setting ldb = 5120
+rocblas-bench INFO: ldc < min_ldc, setting ldc = 512
+transA,transB,M,N,K,alpha,lda,beta,ldb,ldc,cold_iters,hot_iters,rocblas-Gflops,us
+N,N,512,17408,5120,1,512,0,5120,512, 2, 10, 3958.22, 23057.9
+== ffn_down: m=512 n=5120 k=17408 ==
+rocBLAS info: client (OPENMP) reduced omp_set_num_threads to 10
+rocBLAS info: Using reference library 'cblas'
+rocBLAS version: 5.2.0.dabb6df2b98-dirty
+rocBLAS-commit-hash: d1b03cfb1a42c3f178f0eee75397c37f7a8b7077
+Tensile-commit-hash: 
+hipBLASLt: N/A, as rocBLAS was built without hipBLASLt
+Query device success: there are 1 devices
+-------------------------------------------------------------------------------
+Device ID 0 : AMD Radeon RX 9060 XT gfx1200
+with 17.1 GB memory, max. SCLK 2620 MHz, max. MCLK 1258 MHz, memoryBusWidth 16 Bytes, compute capability 12.0
+maxGridDimX 2147483647, sharedMemPerBlock 65.5 KB, maxThreadsPerBlock 1024, warpSize 32
+-------------------------------------------------------------------------------
+
+
+rocBLAS info: Time taken to complete rocBLAS library initialization is 67 milliseconds.
+
+rocBLAS info: maximum library size per device is 0.264241 GB.
+rocblas-bench INFO: lda < min_lda, setting lda = 512
+rocblas-bench INFO: ldb < min_ldb, setting ldb = 17408
+rocblas-bench INFO: ldc < min_ldc, setting ldc = 512
+transA,transB,M,N,K,alpha,lda,beta,ldb,ldc,cold_iters,hot_iters,rocblas-Gflops,us
+N,N,512,5120,17408,1,512,0,17408,512, 2, 10, 3953.89, 23083.1
+== attn_qkv: m=512 n=8192 k=5120 ==
+rocBLAS info: client (OPENMP) reduced omp_set_num_threads to 10
+rocBLAS info: Using reference library 'cblas'
+rocBLAS version: 5.2.0.dabb6df2b98-dirty
+rocBLAS-commit-hash: d1b03cfb1a42c3f178f0eee75397c37f7a8b7077
+Tensile-commit-hash: 
+hipBLASLt: N/A, as rocBLAS was built without hipBLASLt
+Query device success: there are 1 devices
+-------------------------------------------------------------------------------
+Device ID 0 : AMD Radeon RX 9060 XT gfx1200
+with 17.1 GB memory, max. SCLK 2620 MHz, max. MCLK 1258 MHz, memoryBusWidth 16 Bytes, compute capability 12.0
+maxGridDimX 2147483647, sharedMemPerBlock 65.5 KB, maxThreadsPerBlock 1024, warpSize 32
+-------------------------------------------------------------------------------
+
+
+rocBLAS info: Time taken to complete rocBLAS library initialization is 66 milliseconds.
+
+rocBLAS info: maximum library size per device is 0.264241 GB.
+rocblas-bench INFO: lda < min_lda, setting lda = 512
+rocblas-bench INFO: ldb < min_ldb, setting ldb = 5120
+rocblas-bench INFO: ldc < min_ldc, setting ldc = 512
+transA,transB,M,N,K,alpha,lda,beta,ldb,ldc,cold_iters,hot_iters,rocblas-Gflops,us
+N,N,512,8192,5120,1,512,0,5120,512, 2, 10, 3525.97, 12180.9
+== lm_head: m=512 n=248320 k=5120 ==
+rocBLAS info: client (OPENMP) reduced omp_set_num_threads to 10
+rocBLAS info: Using reference library 'cblas'
+rocBLAS version: 5.2.0.dabb6df2b98-dirty
+rocBLAS-commit-hash: d1b03cfb1a42c3f178f0eee75397c37f7a8b7077
+Tensile-commit-hash: 
+hipBLASLt: N/A, as rocBLAS was built without hipBLASLt
+Query device success: there are 1 devices
+-------------------------------------------------------------------------------
+Device ID 0 : AMD Radeon RX 9060 XT gfx1200
+with 17.1 GB memory, max. SCLK 2620 MHz, max. MCLK 1258 MHz, memoryBusWidth 16 Bytes, compute capability 12.0
+maxGridDimX 2147483647, sharedMemPerBlock 65.5 KB, maxThreadsPerBlock 1024, warpSize 32
+-------------------------------------------------------------------------------
+
+
+rocBLAS info: Time taken to complete rocBLAS library initialization is 66 milliseconds.
+
+rocBLAS info: maximum library size per device is 0.264241 GB.
+rocblas-bench INFO: lda < min_lda, setting lda = 512
+rocblas-bench INFO: ldb < min_ldb, setting ldb = 5120
+rocblas-bench INFO: ldc < min_ldc, setting ldc = 512
+transA,transB,M,N,K,alpha,lda,beta,ldb,ldc,cold_iters,hot_iters,rocblas-Gflops,us
+N,N,512,248320,5120,1,512,0,5120,512, 2, 10, 5524.57, 235659
