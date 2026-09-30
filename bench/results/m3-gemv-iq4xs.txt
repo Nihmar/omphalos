@@ -848,3 +848,30 @@ Where the non-GEMV quarter of the step actually goes, from the kernel trace:
    not solved.
 
 Decode: 57 - 1.83 = **~55.2 ms/token = 240.7 GB/s = 75.6 % of the ceiling.**
+
+# M5 prerequisites — long-context runs were dying on two unrelated things
+
+Before touching the KV, the long-context path had to run at all:
+
+- **The logits buffer.** `--last-logits` computes only the final token's row: the
+  full (T, 248320) f32 buffer is 2 GB at 2k and 33 GB at 32k, so every long-context
+  run was hitting `out of VRAM` on the logits, not on the model. The last-only row
+  uses the single-token GEMV on the final activation (max |d| 6.8e-3 against the
+  four-token b4 head on the same row — a different summation order, not an error).
+- **The f16 cache** added in M4 threw when `hipMalloc` failed, which turns a
+  long-context run that is merely tight on VRAM into a hard failure. It now falls
+  back to the per-call staging buffer: caching is an optimization, never a reason
+  to fail.
+- Also fixed: the summary print walked `toks.size()` logit rows regardless of how
+  many exist.
+
+With those, the measured state of the f32 KV (16 attention layers, 4 KV heads,
+head_dim 256 → 128 KB per token, 4.3 GB at 32k):
+
+| context | result |
+|---|---|
+| 512 | runs; decode step 59.6 ms against 55.2 ms at short context — the KV read |
+| 2048 | `error: ffn failed` — the f16 fallback stages a whole tensor into a scratch that no longer fits |
+| 8192 | `error: out of VRAM` |
+
+That is the milestone's case: with K Q8 + V Q4 the same 32k costs 0.8 GB.

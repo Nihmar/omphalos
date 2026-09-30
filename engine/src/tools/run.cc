@@ -151,7 +151,8 @@ private:
 
 class Runner {
 public:
-    explicit Runner(const std::string & path, const int64_t max_tokens, const bool use_gemv)
+    explicit Runner(const std::string & path, const int64_t max_tokens, const bool use_gemv,
+                    const bool last_logits_only = false)
         : file_(path), h_(read_hparams(file_)), use_gemv_(use_gemv) {
         const int64_t ne = h_.n_embd;
         const int64_t T = max_tokens;
@@ -256,7 +257,8 @@ public:
         alloc(&ffn1_, T * h_.n_ff * 4);
         alloc(&ffn2_, T * h_.n_ff * 4);
         alloc(&ffn16_, T * h_.n_ff * 2);
-        alloc(&logits_, T * h_.n_vocab * 4);
+        last_logits_only_ = last_logits_only;
+        alloc(&logits_, (last_logits_only ? 1 : T) * h_.n_vocab * 4);
         alloc(&tmp_logits_, T * std::min<int64_t>(h_.n_vocab, 32768) * 4);
         alloc(&head16_, (size_t) std::min<int64_t>(h_.n_vocab, 32768) * ne * 2);
         alloc(&raw_stage_, (size_t) 768 * 1024 * 1024);  // raw bytes for the f16 fallback
@@ -397,6 +399,32 @@ public:
             if (time_step) {
                 step_event(step_a, step_b);
             }
+            return true;
+        }
+        // Only the last token's logits: at 32k the full (T, 248320) f32 buffer is
+        // 33 GB, and the long-context KV validation only needs the final row.
+        if (last_logits_only_) {
+            const uint8_t * xlast = static_cast<const uint8_t *>(h16_) + (T - 1) * ne * 2;
+            const omph::gguf::TensorInfo * ht = file_.tensor("output.weight");
+            if (ht == nullptr) {
+                return fail("output.weight missing");
+            }
+            if (use_gemv_ && gems_.count("output.weight") != 0) {
+                const auto & e = gems_.at("output.weight");
+                const void * w = static_cast<const uint8_t *>(dev_weights_) + e.off;
+                if (!gemv_one(e.type, w, xlast, static_cast<float *>(logits_), h_.n_vocab, ne)) {
+                    return fail("lm_head gemv failed");
+                }
+            } else if (!linear_.run(stage_w("output.weight"), xlast, static_cast<float *>(logits_),
+                                    h_.n_vocab, ne, 1)) {
+                return fail("lm_head failed");
+            }
+            if (hipDeviceSynchronize() != hipSuccess) {
+                return fail("lm_head failed");
+            }
+            logits.resize((size_t) h_.n_vocab);
+            (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
+            report_phases();
             return true;
         }
         // Small-batch head: for a Q4_K head with 2+ tokens, run four tokens per
@@ -814,8 +842,8 @@ private:
         // 18.6 MiB tensor. Convert once, keep it: at most 64 MiB, which keeps the
         // big repacked weights (whose f16 form would not fit VRAM) out.
         const int64_t n_elems = numel(*t);
-        const bool cacheable = std::getenv("OMPH_NO_F16_CACHE") == nullptr &&
-                              !has_gemv_type(t->type) && n_elems * 2 <= (256 << 20);
+        bool cacheable = std::getenv("OMPH_NO_F16_CACHE") == nullptr &&
+                         !has_gemv_type(t->type) && n_elems * 2 <= (256 << 20);
         if (cacheable) {
             const auto it = f16_cache_.find(name);
             if (it != f16_cache_.end()) {
@@ -834,7 +862,10 @@ private:
         void * dst = nullptr;
         if (cacheable) {
             if (hipMalloc(&dst, (size_t) n * 2) != hipSuccess) {
-                throw std::runtime_error("cannot cache f16 for " + name);
+                // Long contexts fill VRAM: caching is an optimization, never a
+                // reason to fail. Fall back to the per-call staging buffer.
+                cacheable = false;
+                dst = scratch_.alloc((size_t) n * 2);
             }
         } else {
             dst = scratch_.alloc((size_t) n * 2);
@@ -891,6 +922,7 @@ private:
     std::unordered_map<std::string, GemvEntry> gems_;
     Scratch scratch_;
     std::vector<void *> states_;
+    bool last_logits_only_ = false;
     std::vector<int64_t> kv_index_;
     std::vector<char> conv_flip_;
     int64_t max_seq_ = 0;
@@ -941,11 +973,14 @@ int main(int argc, char ** argv) {
     std::string trace_dir;
     std::string gen_path;
     int64_t max_tokens = 0;
+    bool last_logits = false;
     int64_t generate = 0;
     bool use_gemv = false;
     for (int i = 4; i < argc; ++i) {
         if (std::strcmp(argv[i], "--trace-dir") == 0 && i + 1 < argc) {
             trace_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--last-logits") == 0) {
+            last_logits = true;
         } else if (std::strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
             max_tokens = std::atoll(argv[++i]);
         } else if (std::strcmp(argv[i], "--generate") == 0 && i + 1 < argc) {
@@ -978,7 +1013,8 @@ int main(int argc, char ** argv) {
         }
         // Repacking only pays off when the decode runs: a prefill-only run is
         // better off with the raw bytes in place (no staging fallback).
-        Runner runner(model, (int64_t) toks.size() + generate + 8, use_gemv && generate > 0);
+        Runner runner(model, (int64_t) toks.size() + generate + 8, use_gemv && generate > 0,
+                      last_logits);
         const HParams & h = runner.hparams();
         std::vector<float> logits;
         if (!runner.forward(toks, logits, trace_dir, 0)) {
@@ -998,7 +1034,9 @@ int main(int argc, char ** argv) {
             // greedy decode: one token per step, reusing the KV cache, the conv
             // state and the delta-net state
             std::vector<int32_t> gen;
-            int32_t next = argmax(logits.data() + (toks.size() - 1) * (size_t) h.n_vocab);
+            int32_t next =
+                argmax(logits.data() +
+                       (last_logits ? 0 : (toks.size() - 1) * (size_t) h.n_vocab));
             for (int64_t i = 0; i < generate; ++i) {
                 gen.push_back(next);
                 if (i + 1 == generate) {
@@ -1023,9 +1061,10 @@ int main(int argc, char ** argv) {
             std::printf("\n");
         }
         // greedy tokens for the report
-        std::printf("logits: %lld x %lld -> %s\ngreedy:", (long long) toks.size(),
+        const size_t n_rows = logits.size() / (size_t) h.n_vocab;
+        std::printf("logits: %lld x %lld -> %s\ngreedy:", (long long) n_rows,
                     (long long) h.n_vocab, logits_path.c_str());
-        for (size_t t = 0; t < toks.size(); ++t) {
+        for (size_t t = 0; t < n_rows; ++t) {
             const float * row = logits.data() + t * (size_t) h.n_vocab;
             std::printf(" %lld", (long long) argmax(row));
         }
