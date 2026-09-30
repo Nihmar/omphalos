@@ -130,3 +130,56 @@ thing to tune (chunk size and rows-per-warp for that shape).
 
 `--all-of-type <ggml-type>` measures every `blk.*` tensor of one type in a single
 timed pass (generalises `--iq4-all`).
+
+# M3.4 — fused IQ3_XXS GEMV (1.93 GiB, 78 tensors)
+
+Format: 98-byte blocks — f16 `d`, 64 bytes of 4-byte grid indices into
+`iq3xxs_grid`, 32 bytes of words holding a 4-bit scale plus four 7-bit sign
+indices per 32-weight sub-block. The kernel resolves the signs with the
+128-byte table and the grid with a 1 KiB LDS copy (`kernels/iq_tables.hh`).
+
+| measurement | time | bytes read | effective bandwidth | vs ceiling |
+|---|---:|---:|---:|---:|
+| all 78 IQ3_XXS tensors, one pass | **11.87 ms** | 2787.0 MiB | **246.1 GB/s** | **77.3 %** |
+
+Accuracy against the f16 dequant + hipBLASLt path: max |d| 5e-4 (2.4e-4
+relative) — the same level as Q4_K and IQ4_XS, which is what validates the
+grid + sign decoding.
+
+Optimisations measured:
+
+| change | result |
+|---|---:|
+| first version (scale applied per value) | 233.5 GB/s (73.3 %) |
+| scale factored out of the per-sub-block sum | **246.1 GB/s (77.3 %)** |
+| rows per warp 2 / 6 | 235.7 / 232.1 GB/s |
+
+Repacking verified byte-identical for all 78 tensors, and the layout keeps
+the source size (1979.1 -> 1979.1 MiB, the sign resolution and the stream
+splitting are free).
+
+# M3.5 — fused IQ3_S GEMV (3.39 GiB, 144 tensors — the largest type)
+
+Format: 110-byte blocks — f16 `d`, 64 B of low grid-index bits, 8 B carrying the 9th
+index bit per sub-block, 32 B of sign masks, 4 B of packed 4-bit scales.
+The signs are already masks (no table), the grid is 512 x 4 B in LDS, and the
+layout keeps the source size exactly.
+
+| measurement | time | bytes read | effective bandwidth | vs ceiling |
+|---|---:|---:|---:|---:|
+| all 144 IQ3_S tensors, one pass | **20.82 ms** | 4358.3 MiB | **219.5 GB/s** | **68.9 %** |
+
+Accuracy vs the f16 dequant path: max |d| 7e-4 (2.7e-4 relative). Repack
+verified byte-identical on all 144 tensors (3474.0 -> 3474.0 MiB, 100.0 %).
+
+## Coverage of the allocation after M3.5
+
+| type | GiB | kernel | measured |
+|---|---:|---|---:|
+| IQ3_S | 3.39 | `gemv_iq3_s` | 68.9 % |
+| IQ4_XS | 2.81 | `gemv_iq4_xs` | 82.2 % |
+| IQ3_XXS | 1.93 | `gemv_iq3_xxs` | 77.3 % |
+| Q4_K | 1.47 | `gemv_q4k` | 91.9 % (single 5120-wide tensor) |
+| *remaining* (IQ2_S, Q6_K, Q2_K, IQ2_XS/XXS, BF16, F32, IQ1_M) | 1.68 | — | — |
+
+**9.60 of 11.28 GiB (85 %) now run on fused repacked GEMVs.**

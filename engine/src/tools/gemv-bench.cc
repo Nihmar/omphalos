@@ -37,6 +37,9 @@ bool repack_tensor(const uint32_t type, const void * src, const int64_t n_blocks
     } else if (type == 18) {
         dst.resize((size_t) omph::format::iq3_xxs_layout(n_blocks).total);
         omph::format::repack_iq3_xxs(src, n_blocks, dst.data());
+    } else if (type == 21) {
+        dst.resize((size_t) omph::format::iq3s_layout(n_blocks).total);
+        omph::format::repack_iq3_s(src, n_blocks, dst.data());
     } else {
         return false;
     }
@@ -51,6 +54,8 @@ bool unrepack_tensor(const uint32_t type, const void * src, const int64_t n_bloc
         omph::format::unrepack_iq4_xs(src, n_blocks, dst.data());
     } else if (type == 18) {
         omph::format::unrepack_iq3_xxs(src, n_blocks, dst.data());
+    } else if (type == 21) {
+        omph::format::unrepack_iq3_s(src, n_blocks, dst.data());
     } else {
         return false;
     }
@@ -72,6 +77,12 @@ bool launch(const Case & c, const void * x, float * y, hipStream_t stream) {
     if (c.t->type == 23) {
         return omph::kernels::gemv_iq4_xs(c.dev, x, y, c.rows, c.k, stream);
     }
+    if (c.t->type == 18) {
+        return omph::kernels::gemv_iq3_xxs(c.dev, x, y, c.rows, c.k, stream);
+    }
+    if (c.t->type == 21) {
+        return omph::kernels::gemv_iq3_s(c.dev, x, y, c.rows, c.k, stream);
+    }
     return false;
 }
 
@@ -82,20 +93,10 @@ bool prepare(const omph::gguf::File & file, const omph::gguf::TensorInfo * t, Ca
     const int64_t rows = (int64_t) t->ne[1];
     const int64_t n_blocks = rows * (k / 256);
     std::vector<uint8_t> host;
-    if (t->type == 12) {
-        host.resize((size_t) omph::format::q4k_layout(n_blocks).total);
-        omph::format::repack_q4k(file.tensor_data(*t), n_blocks, host.data());
-    } else if (t->type == 23) {
-        host.resize((size_t) omph::format::iq4_layout(n_blocks).total);
-        omph::format::repack_iq4_xs(file.tensor_data(*t), n_blocks, host.data());
-    } else {
-        return false;
-    }
     std::vector<uint8_t> rebuilt((size_t) t->nbytes);
-    if (t->type == 12) {
-        omph::format::unrepack_q4k(host.data(), n_blocks, rebuilt.data());
-    } else {
-        omph::format::unrepack_iq4_xs(host.data(), n_blocks, rebuilt.data());
+    if (!repack_tensor(t->type, file.tensor_data(*t), n_blocks, host) ||
+        !unrepack_tensor(t->type, host.data(), n_blocks, rebuilt)) {
+        return false;
     }
     if (std::memcmp(rebuilt.data(), file.tensor_data(*t), (size_t) t->nbytes) != 0) {
         std::fprintf(stderr, "repack of %s is not lossless\n", t->name.c_str());
@@ -173,7 +174,7 @@ int main(int argc, char ** argv) {
                 if ((int) t.type != repack_only) {
                     continue;
                 }
-                const int64_t n_blocks = (int64_t) (t.nbytes / (t.type == 12 ? 144 : t.type == 23 ? 136 : 98));
+                const int64_t n_blocks = (int64_t) (t.nbytes / (t.type == 12 ? 144 : t.type == 23 ? 136 : t.type == 21 ? 110 : 98));
                 std::vector<uint8_t> packed;
                 std::vector<uint8_t> rebuilt((size_t) t.nbytes);
                 if (!repack_tensor(t.type, file.tensor_data(t), n_blocks, packed) ||
