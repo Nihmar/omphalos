@@ -388,6 +388,9 @@ public:
                                                 off_.at(t->name));
         };
 
+        // Set when the previous layer's final residual add already wrote this
+        // layer's attn_norm(x) into h16_ (one fused launch instead of two).
+        bool h16_normed = false;
         for (int64_t il = 0; il < h_.n_layer; ++il) {
             const std::string p = "blk." + std::to_string(il) + ".";
             const bool recurrent = file_.tensor(p + "ssm_a") != nullptr;
@@ -398,11 +401,13 @@ public:
             if (attn_norm == nullptr || post_norm == nullptr) {
                 return fail("missing layer norms");
             }
-            if (!omph::kernels::add_rms_norm_f16(static_cast<const float *>(x_), nullptr, nullptr,
+            if (!h16_normed &&
+                !omph::kernels::add_rms_norm_f16(static_cast<const float *>(x_), nullptr, nullptr,
                                                  attn_norm, h16_, T, ne, (float) h_.eps,
                                                  nullptr)) {
                 return fail("attn_norm failed");
             }
+            h16_normed = false;
             scratch_.reset();
             if (std::getenv("OMPH_SKIP_BLOCKS") != nullptr) {
                 continue;  // ablation only: the layer output is the normed input
@@ -429,11 +434,26 @@ public:
                 !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
                                            static_cast<const float *>(ffn2_), ffn16_, T * h_.n_ff,
                                            nullptr) ||
-                !matmul(p + "ffn_down.weight", ffn16_, static_cast<float *>(cur_), ne, h_.n_ff, T) ||
-                !omph::kernels::add_out(static_cast<const float *>(cur_),
-                                        static_cast<const float *>(resid_),
-                                        static_cast<float *>(x_), T * ne, nullptr)) {
+                !matmul(p + "ffn_down.weight", ffn16_, static_cast<float *>(cur_), ne, h_.n_ff, T)) {
                 return fail("ffn failed");
+            }
+            // x = ffn + resid; for all but the last layer, the same launch also
+            // writes the next layer's attn_norm(x) into h16_.
+            const float * next_norm =
+                il + 1 < h_.n_layer ? vec("blk." + std::to_string(il + 1) + ".attn_norm.weight")
+                                    : nullptr;
+            if (next_norm != nullptr) {
+                if (!omph::kernels::add_rms_norm_f16(static_cast<const float *>(cur_),
+                                                     static_cast<const float *>(resid_),
+                                                     static_cast<float *>(x_), next_norm, h16_, T,
+                                                     ne, (float) h_.eps, nullptr)) {
+                    return fail("residual/norm failed");
+                }
+                h16_normed = true;
+            } else if (!omph::kernels::add_out(static_cast<const float *>(cur_),
+                                               static_cast<const float *>(resid_),
+                                               static_cast<float *>(x_), T * ne, nullptr)) {
+                return fail("residual failed");
             }
             if (!trace_dir.empty()) {
                 std::vector<float> host((size_t) T * ne);
