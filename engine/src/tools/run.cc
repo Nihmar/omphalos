@@ -1,0 +1,600 @@
+// omph-run — naive full forward pass of the 64-layer stack (PLAN.md §12, M2).
+//
+// usage: omph-run <model.gguf> <tokens.txt> <out-logits.f32> [--trace-dir DIR]
+//   tokens.txt: token ids separated by whitespace.
+//   Logits are written as tokens x n_vocab f32; with --trace-dir the per-layer
+//   outputs are dumped as l_out-<layer>.f32.
+//
+// The whole quantized tensor block lives in VRAM; the weights of the current
+// layer are dequantized to f16 into a reusable scratch buffer, and every op is
+// a separate kernel launch. Naive by design — this is the M2 correctness path.
+#include "format/gguf.hh"
+#include "kernels/attn.hh"
+#include "kernels/dequant.hh"
+#include "kernels/elementwise.hh"
+#include "kernels/gdn.hh"
+#include "runtime/matmul.hh"
+
+#include <hip/hip_runtime.h>
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+class Scratch {
+public:
+    bool init(const size_t bytes) {
+        cap_ = bytes;
+        return hipMalloc(&base_, bytes) == hipSuccess;
+    }
+    void reset() { used_ = 0; }
+    void * alloc(const size_t bytes) {
+        const size_t off = (used_ + 255) & ~(size_t) 255;
+        if (std::getenv("OMPH_TRACE_ALLOC") != nullptr) {
+            std::fprintf(stderr, "  alloc %8zu MiB (used %8zu MiB)\n", bytes >> 20,
+                         (off + bytes) >> 20);
+        }
+        if (off + bytes > cap_) {
+            std::fprintf(stderr, "scratch: need %zu MiB, have %zu MiB (used %zu MiB)\n",
+                         (off + bytes) >> 20, cap_ >> 20, used_ >> 20);
+            throw std::runtime_error("weight scratch exhausted");
+        }
+        used_ = off + bytes;
+        return static_cast<uint8_t *>(base_) + off;
+    }
+
+private:
+    void * base_ = nullptr;
+    size_t cap_ = 0;
+    size_t used_ = 0;
+};
+
+struct HParams {
+    int64_t n_embd = 0;
+    int64_t n_layer = 0;
+    int64_t n_vocab = 0;
+    int64_t n_head = 0;
+    int64_t n_head_kv = 0;
+    int64_t head_dim = 0;
+    int64_t n_rot = 0;
+    int64_t n_ff = 0;
+    int64_t ssm_n_kh = 0;
+    int64_t ssm_n_vh = 0;
+    int64_t ssm_s = 0;
+    int64_t ssm_inner = 0;
+    int64_t ssm_conv_k = 0;
+    double eps = 1e-6;
+    double freq_base = 10000.0;
+};
+
+bool meta_int(const omph::gguf::File & f, const char * key, int64_t & out) {
+    const omph::gguf::Value * v = f.find(key);
+    uint64_t u = 0;
+    if (v == nullptr || !v->as_u64(u)) {
+        return false;
+    }
+    out = (int64_t) u;
+    return true;
+}
+
+double meta_float(const omph::gguf::File & f, const char * key, const double fallback) {
+    const omph::gguf::Value * v = f.find(key);
+    if (v == nullptr) {
+        return fallback;
+    }
+    if (v->type == omph::gguf::ValueType::FLOAT32 || v->type == omph::gguf::ValueType::FLOAT64) {
+        return v->f;
+    }
+    uint64_t u = 0;
+    return v->as_u64(u) ? (double) u : fallback;
+}
+
+int64_t numel(const omph::gguf::TensorInfo & t) {
+    int64_t n = 1;
+    for (const uint64_t d : t.ne) {
+        n *= (int64_t) d;
+    }
+    return n;
+}
+
+void write_f32(const std::string & path, const std::vector<float> & data) {
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char *>(data.data()), (std::streamsize) (data.size() * 4));
+}
+
+class Runner {
+public:
+    explicit Runner(const std::string & path, const int64_t max_tokens)
+        : file_(path), h_(read_hparams(file_)) {
+        const int64_t ne = h_.n_embd;
+        const int64_t T = max_tokens;
+        const int64_t ssm_q = h_.ssm_n_kh * h_.ssm_s;              // 2048
+        const int64_t ssm_v = h_.ssm_n_vh * (h_.ssm_inner / h_.ssm_n_vh);  // 6144
+        const int64_t attn_q = h_.n_head * h_.head_dim;            // 6144
+        const int64_t attn_kv = h_.n_head_kv * h_.head_dim;        // 1024
+        const int64_t ssm_channels = ssm_q * 2 + ssm_v;            // 10240 (gdn qkv)
+        const int64_t attn_fused = h_.n_head * 2 * h_.head_dim;    // 12288 (q | gate)
+        const int64_t fused = std::max(ssm_channels, attn_fused);
+
+        const size_t total = file_.size() - (size_t) file_.data_offset();
+        if (hipMalloc(&dev_weights_, total) != hipSuccess ||
+            hipMemcpy(dev_weights_, file_.base() + file_.data_offset(), total,
+                      hipMemcpyHostToDevice) != hipSuccess) {
+            throw std::runtime_error("cannot upload the weights to VRAM");
+        }
+
+        if (!scratch_.init((size_t) 1280 * 1024 * 1024)) {
+            throw std::runtime_error("cannot allocate the weight scratch");
+        }
+        const auto alloc = [&](void ** p, const size_t bytes) {
+            if (hipMalloc(p, bytes) != hipSuccess) {
+                throw std::runtime_error("out of VRAM");
+            }
+        };
+        alloc(&x_, T * ne * 4);
+        alloc(&cur_, T * ne * 4);
+        alloc(&resid_, T * ne * 4);
+        alloc(&blk_, T * ne * 4);
+        alloc(&h16_, T * ne * 2);
+        alloc(&fused_, T * fused * 4);
+        alloc(&conv_out_, T * fused * 4);
+        alloc(&z_, T * ssm_v * 4);
+        alloc(&o_, T * ssm_v * 4);
+        alloc(&q_, T * attn_q * 4);
+        alloc(&gate_, T * attn_q * 4);
+        alloc(&attn_, T * attn_q * 4);
+        alloc(&k_, T * std::max(ssm_q, attn_kv) * 4);
+        alloc(&v_, T * std::max(ssm_v, attn_kv) * 4);
+        alloc(&sk_, h_.ssm_n_vh * h_.ssm_s * 4);
+        alloc(&dvec_, h_.ssm_n_vh * h_.ssm_s * 4);
+        alloc(&beta_, T * h_.ssm_n_vh * 4);
+        alloc(&alpha_, T * h_.ssm_n_vh * 4);
+        alloc(&ffn1_, T * h_.n_ff * 4);
+        alloc(&ffn2_, T * h_.n_ff * 4);
+        alloc(&ffn16_, T * h_.n_ff * 2);
+        alloc(&logits_, T * h_.n_vocab * 4);
+        alloc(&tmp_logits_, T * std::min<int64_t>(h_.n_vocab, 32768) * 4);
+        alloc(&head16_, (size_t) std::min<int64_t>(h_.n_vocab, 32768) * ne * 2);
+        for (int64_t il = 0; il < h_.n_layer; ++il) {
+            void * st = nullptr;
+            const int64_t n_state = h_.ssm_n_vh * h_.ssm_s * h_.ssm_s;
+            const int64_t n_conv = (h_.ssm_conv_k - 1) * fused;
+            if (hipMalloc(&st, (n_state + n_conv) * 4) != hipSuccess ||
+                hipMemset(st, 0, (n_state + n_conv) * 4) != hipSuccess) {
+                throw std::runtime_error("out of VRAM (state)");
+            }
+            states_.push_back(st);
+        }
+    }
+
+    ~Runner() {
+        if (dev_weights_ != nullptr) {
+            (void) hipFree(dev_weights_);
+        }
+    }
+
+    bool forward(const std::vector<int32_t> & toks, std::vector<float> & logits,
+                 const std::string & trace_dir) {
+        const int64_t T = (int64_t) toks.size();
+        const int64_t ne = h_.n_embd;
+
+        // token embeddings, one row at a time (the table is quantized)
+        const omph::gguf::TensorInfo * te = file_.tensor("token_embd.weight");
+        if (te == nullptr) return fail("token_embd.weight missing");
+        const int64_t row_bytes = (int64_t) (te->nbytes / te->ne[1]);
+        for (int64_t t = 0; t < T; ++t) {
+            const uint8_t * src = static_cast<const uint8_t *>(dev_weights_) + te->offset +
+                                  (size_t) toks[t] * row_bytes;
+            if (!omph::kernels::dequantize(te->type, src,
+                                           static_cast<uint8_t *>(x_) + t * ne * 4, ne, false,
+                                           nullptr)) {
+                return fail("embedding dequant failed");
+            }
+        }
+
+        const auto vec = [&](const std::string & name) -> const float * {
+            const omph::gguf::TensorInfo * t = file_.tensor(name);
+            return t == nullptr ? nullptr : reinterpret_cast<const float *>(
+                                                static_cast<const uint8_t *>(dev_weights_) +
+                                                t->offset);
+        };
+
+        for (int64_t il = 0; il < h_.n_layer; ++il) {
+            const std::string p = "blk." + std::to_string(il) + ".";
+            const bool recurrent = file_.tensor(p + "ssm_a") != nullptr;
+            const float * attn_norm = vec(p + "attn_norm.weight");
+            const float * post_norm = vec(p + "post_attention_norm.weight");
+            if (attn_norm == nullptr || post_norm == nullptr) {
+                return fail("missing layer norms");
+            }
+            if (!omph::kernels::rms_norm(static_cast<const float *>(x_), attn_norm,
+                                         static_cast<float *>(cur_), T, ne, (float) h_.eps, 1.0f,
+                                         nullptr)) {
+                return fail("attn_norm failed");
+            }
+            scratch_.reset();
+            if (recurrent) {
+                if (!gdn_layer(il, p, T)) return false;
+            } else {
+                if (!attn_layer(il, p, T)) return false;
+            }
+            // x = ffn(rms_norm(block + x)) + (block + x)
+            if (!omph::kernels::add_out(static_cast<const float *>(blk_),
+                                        static_cast<const float *>(x_),
+                                        static_cast<float *>(resid_), T * ne, nullptr) ||
+                !omph::kernels::rms_norm(static_cast<const float *>(resid_), post_norm,
+                                         static_cast<float *>(cur_), T, ne, (float) h_.eps, 1.0f,
+                                         nullptr) ||
+                !omph::kernels::cast_f32_to_f16(static_cast<const float *>(cur_), h16_, T * ne,
+                                                nullptr)) {
+                return fail("residual/norm failed");
+            }
+            void * wg = stage_w(p + "ffn_gate.weight");
+            void * wu = stage_w(p + "ffn_up.weight");
+            void * wd = stage_w(p + "ffn_down.weight");
+            omph::runtime::Linear linear;
+            if (!linear.run(wg, h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T) ||
+                !linear.run(wu, h16_, static_cast<float *>(ffn2_), h_.n_ff, ne, T) ||
+                !omph::kernels::silu_inplace(static_cast<float *>(ffn1_), T * h_.n_ff, nullptr) ||
+                !omph::kernels::mul_inplace(static_cast<float *>(ffn1_),
+                                            static_cast<const float *>(ffn2_), T * h_.n_ff,
+                                            nullptr) ||
+                !omph::kernels::cast_f32_to_f16(static_cast<const float *>(ffn1_), ffn16_,
+                                                T * h_.n_ff, nullptr) ||
+                !linear.run(wd, ffn16_, static_cast<float *>(cur_), ne, h_.n_ff, T) ||
+                !omph::kernels::add_out(static_cast<const float *>(cur_),
+                                        static_cast<const float *>(resid_),
+                                        static_cast<float *>(x_), T * ne, nullptr)) {
+                return fail("ffn failed");
+            }
+            if (!trace_dir.empty()) {
+                std::vector<float> host((size_t) T * ne);
+                (void) hipMemcpy(host.data(), x_, host.size() * 4, hipMemcpyDeviceToHost);
+                write_f32(trace_dir + "/l_out-" + std::to_string(il) + ".f32", host);
+            }
+        }
+
+        const float * out_norm = vec("output_norm.weight");
+        if (out_norm == nullptr ||
+            !omph::kernels::rms_norm(static_cast<const float *>(x_), out_norm,
+                                     static_cast<float *>(cur_), T, ne, (float) h_.eps, 1.0f,
+                                     nullptr) ||
+            !omph::kernels::cast_f32_to_f16(static_cast<const float *>(cur_), h16_, T * ne,
+                                            nullptr)) {
+            return fail("output_norm failed");
+        }
+        // lm head in vocab chunks: the whole f16 head (248k x 5120) would not fit
+        const omph::gguf::TensorInfo * head = file_.tensor("output.weight");
+        if (head == nullptr) {
+            return fail("output.weight missing");
+        }
+        const int64_t head_row_bytes = (int64_t) (head->nbytes / head->ne[1]);
+        const int64_t chunk = std::min<int64_t>(h_.n_vocab, 32768);
+        omph::runtime::Linear linear;
+        for (int64_t v0 = 0; v0 < h_.n_vocab; v0 += chunk) {
+            const int64_t rows = std::min(chunk, h_.n_vocab - v0);
+            void * wh = head16_;
+            if (!omph::kernels::dequantize(
+                    head->type,
+                    static_cast<const uint8_t *>(dev_weights_) + head->offset + v0 * head_row_bytes,
+                    wh, rows * ne, true, nullptr) ||
+                !linear.run(wh, h16_, static_cast<float *>(tmp_logits_), rows, ne, T) ||
+                hipMemcpy2D(static_cast<uint8_t *>(logits_) + v0 * 4, (size_t) h_.n_vocab * 4,
+                            tmp_logits_, (size_t) rows * 4, (size_t) rows * 4, (size_t) T,
+                            hipMemcpyDeviceToDevice) != hipSuccess) {
+                return fail("lm_head failed");
+            }
+        }
+        if (hipDeviceSynchronize() != hipSuccess) {
+            return fail("lm_head failed");
+        }
+        logits.resize((size_t) T * h_.n_vocab);
+        (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
+        return true;
+    }
+
+    const HParams & hparams() const { return h_; }
+
+private:
+    static int fail(const char * msg) {
+        std::fprintf(stderr, "%s\n", msg);
+        return 1;
+    }
+
+    static HParams read_hparams(const omph::gguf::File & f) {
+        HParams h;
+        meta_int(f, "qwen35.embedding_length", h.n_embd);
+        meta_int(f, "qwen35.block_count", h.n_layer);
+        meta_int(f, "qwen35.attention.head_count", h.n_head);
+        meta_int(f, "qwen35.attention.head_count_kv", h.n_head_kv);
+        meta_int(f, "qwen35.attention.key_length", h.head_dim);
+        meta_int(f, "qwen35.rope.dimension_count", h.n_rot);
+        meta_int(f, "qwen35.feed_forward_length", h.n_ff);
+        meta_int(f, "qwen35.ssm.group_count", h.ssm_n_kh);
+        meta_int(f, "qwen35.ssm.time_step_rank", h.ssm_n_vh);
+        meta_int(f, "qwen35.ssm.state_size", h.ssm_s);
+        meta_int(f, "qwen35.ssm.inner_size", h.ssm_inner);
+        meta_int(f, "qwen35.ssm.conv_kernel", h.ssm_conv_k);
+        h.eps = meta_float(f, "qwen35.attention.layer_norm_rms_epsilon", 1e-6);
+        h.freq_base = meta_float(f, "qwen35.rope.freq_base", 10000.0);
+        // the vocab comes from the embedding table; trailing MTP blocks (the
+        // nextn.* group, ignored by the normal decode path) are not part of the
+        // stack we run here
+        if (const omph::gguf::TensorInfo * te = f.tensor("token_embd.weight")) {
+            h.n_vocab = (int64_t) te->ne[1];
+        }
+        while (h.n_layer > 0 &&
+               f.tensor("blk." + std::to_string(h.n_layer - 1) + ".nextn.eh_proj.weight") !=
+                   nullptr) {
+            --h.n_layer;
+        }
+        if (h.n_embd <= 0 || h.n_layer <= 0 || h.n_vocab <= 0 || h.n_head <= 0 ||
+            h.head_dim <= 0 || h.n_ff <= 0) {
+            throw std::runtime_error("incomplete hyperparameters");
+        }
+        return h;
+    }
+
+    bool attn_layer(const int64_t il, const std::string & p, const int64_t T) {
+        const int64_t ne = h_.n_embd;
+        const int64_t q_out = h_.n_head * 2 * h_.head_dim;
+        const int64_t kv_out = h_.n_head_kv * h_.head_dim;
+        void * wq = stage_w(p + "attn_q.weight");
+        void * wk = stage_w(p + "attn_k.weight");
+        void * wv = stage_w(p + "attn_v.weight");
+        void * wo = stage_w(p + "attn_output.weight");
+        const float * q_norm = f32_ref(p + "attn_q_norm.weight");
+        const float * k_norm = f32_ref(p + "attn_k_norm.weight");
+        if (!omph::kernels::cast_f32_to_f16(static_cast<const float *>(cur_), h16_, T * ne, nullptr)) {
+            return fail("cast failed");
+        }
+        omph::runtime::Linear linear;
+        if (!linear.run(wq, h16_, static_cast<float *>(fused_), q_out, ne, T) ||
+            !linear.run(wk, h16_, static_cast<float *>(k_), kv_out, ne, T) ||
+            !linear.run(wv, h16_, static_cast<float *>(v_), kv_out, ne, T) ||
+            !omph::kernels::split_qg(static_cast<const float *>(fused_),
+                                     static_cast<float *>(q_), static_cast<float *>(gate_), T,
+                                     h_.n_head, h_.head_dim, nullptr) ||
+            !omph::kernels::rms_norm(static_cast<const float *>(q_), q_norm,
+                                     static_cast<float *>(q_), T * h_.n_head, h_.head_dim,
+                                     (float) h_.eps, 1.0f, nullptr) ||
+            !omph::kernels::rms_norm(static_cast<const float *>(k_), k_norm,
+                                     static_cast<float *>(k_), T * h_.n_head_kv, h_.head_dim,
+                                     (float) h_.eps, 1.0f, nullptr) ||
+            !omph::kernels::rope_neox(static_cast<float *>(q_), T, h_.n_head, h_.head_dim, h_.n_rot,
+                                      (float) h_.freq_base, 0, nullptr) ||
+            !omph::kernels::rope_neox(static_cast<float *>(k_), T, h_.n_head_kv, h_.head_dim,
+                                      h_.n_rot, (float) h_.freq_base, 0, nullptr) ||
+            !omph::kernels::attention(static_cast<const float *>(q_),
+                                      static_cast<const float *>(k_),
+                                      static_cast<const float *>(v_),
+                                      static_cast<const float *>(gate_),
+                                      static_cast<float *>(attn_), T, T, h_.n_head, h_.n_head_kv,
+                                      h_.head_dim, 1.0f / std::sqrt((float) h_.head_dim), nullptr) ||
+            !omph::kernels::cast_f32_to_f16(static_cast<const float *>(attn_), ffn16_,
+                                            T * h_.n_head * h_.head_dim, nullptr) ||
+            !linear.run(wo, ffn16_, static_cast<float *>(blk_), ne, h_.n_head * h_.head_dim, T)) {
+            return fail("attention layer failed");
+        }
+        return true;
+    }
+
+    bool gdn_layer(const int64_t il, const std::string & p, const int64_t T) {
+        const int64_t ne = h_.n_embd;
+        const int64_t n_kh = h_.ssm_n_kh;
+        const int64_t n_vh = h_.ssm_n_vh;
+        const int64_t s = h_.ssm_s;
+        const int64_t v_dim = h_.ssm_inner / n_vh;
+        const int64_t q_dims = n_kh * s;
+        const int64_t k_dims = n_kh * s;
+        const int64_t v_dims = n_vh * v_dim;
+        const int64_t channels = q_dims + k_dims + v_dims;
+        const float l2_scale = 1.0f / std::sqrt((float) s);
+
+        void * wqkv = stage_w(p + "attn_qkv.weight");
+        void * wz = stage_w(p + "attn_gate.weight");
+        void * wbeta = stage_w(p + "ssm_beta.weight");
+        void * walpha = stage_w(p + "ssm_alpha.weight");
+        void * wout = stage_w(p + "ssm_out.weight");
+        const float * dt_bias = f32_ref(p + "ssm_dt.bias");
+        const float * ssm_a = f32_ref(p + "ssm_a");
+        const float * ssm_norm = f32_ref(p + "ssm_norm.weight");
+        const float * conv_w = f32_ref(p + "ssm_conv1d.weight");
+        uint8_t * st = static_cast<uint8_t *>(states_[il]);
+        float * conv_state = reinterpret_cast<float *>(st);
+        float * seq_state = reinterpret_cast<float *>(st + (h_.ssm_conv_k - 1) * channels * 4);
+
+        if (!omph::kernels::cast_f32_to_f16(static_cast<const float *>(cur_), h16_, T * ne, nullptr)) {
+            return fail("cast failed");
+        }
+        omph::runtime::Linear linear;
+        if (!linear.run(wqkv, h16_, static_cast<float *>(fused_), channels, ne, T) ||
+            !linear.run(wz, h16_, static_cast<float *>(z_), v_dims, ne, T) ||
+            !linear.run(wbeta, h16_, static_cast<float *>(beta_), n_vh, ne, T) ||
+            !linear.run(walpha, h16_, static_cast<float *>(alpha_), n_vh, ne, T)) {
+            return fail("gdn projection failed");
+        }
+        if (!omph::kernels::sigmoid_inplace(static_cast<float *>(beta_), T * n_vh, nullptr) ||
+            !omph::kernels::softplus_bias_inplace(static_cast<float *>(alpha_), dt_bias, T, n_vh,
+                                                  nullptr) ||
+            !omph::kernels::mul_row_inplace(static_cast<float *>(alpha_), ssm_a, T, n_vh,
+                                            nullptr) ||
+            !omph::kernels::conv1d_state(static_cast<const float *>(fused_), conv_w, conv_state,
+                                         static_cast<float *>(conv_out_), T, channels,
+                                         h_.ssm_conv_k, nullptr) ||
+            !omph::kernels::silu_inplace(static_cast<float *>(conv_out_), T * channels, nullptr) ||
+            !omph::kernels::split_qkv(static_cast<const float *>(conv_out_),
+                                      static_cast<float *>(q_), static_cast<float *>(k_),
+                                      static_cast<float *>(v_), T, q_dims, k_dims, v_dims,
+                                      nullptr) ||
+            !omph::kernels::rms_norm(static_cast<const float *>(q_), nullptr,
+                                     static_cast<float *>(q_), T * n_kh, s,
+                                     (float) (h_.eps / (double) s), l2_scale, nullptr) ||
+            !omph::kernels::rms_norm(static_cast<const float *>(k_), nullptr,
+                                     static_cast<float *>(k_), T * n_kh, s,
+                                     (float) (h_.eps / (double) s), l2_scale, nullptr)) {
+            return fail("gdn preprocessing failed");
+        }
+        for (int64_t t = 0; t < T; ++t) {
+            if (!omph::kernels::delta_decay(seq_state,
+                                            static_cast<const float *>(alpha_) + t * n_vh, n_vh, s,
+                                            nullptr) ||
+                !omph::kernels::delta_sk(seq_state, static_cast<const float *>(k_) + t * k_dims,
+                                         static_cast<float *>(sk_), n_vh, n_kh, s, nullptr) ||
+                !omph::kernels::delta_d(static_cast<const float *>(v_) + t * v_dims,
+                                        static_cast<const float *>(sk_),
+                                        static_cast<const float *>(beta_) + t * n_vh,
+                                        static_cast<float *>(dvec_), n_vh, s, nullptr) ||
+                !omph::kernels::delta_update(seq_state, static_cast<const float *>(k_) + t * k_dims,
+                                             static_cast<const float *>(dvec_), n_vh, n_kh, s,
+                                             nullptr) ||
+                !omph::kernels::delta_o(seq_state, static_cast<const float *>(q_) + t * q_dims,
+                                        static_cast<float *>(o_) + t * v_dims, n_vh, n_kh, s,
+                                        l2_scale, nullptr)) {
+                return fail("delta rule failed");
+            }
+        }
+        if (!omph::kernels::gated_norm(static_cast<const float *>(o_), ssm_norm,
+                                       static_cast<const float *>(z_), static_cast<float *>(o_),
+                                       T * n_vh, v_dim, (float) h_.eps, nullptr) ||
+            !omph::kernels::cast_f32_to_f16(static_cast<const float *>(o_), ffn16_, T * v_dims,
+                                            nullptr) ||
+            !linear.run(wout, ffn16_, static_cast<float *>(blk_), ne, v_dims, T)) {
+            return fail("gdn output failed");
+        }
+        return true;
+    }
+
+    void * stage_w(const std::string & name) {
+        const omph::gguf::TensorInfo * t = file_.tensor(name);
+        if (t == nullptr) {
+            throw std::runtime_error("missing tensor " + name);
+        }
+        const int64_t n = numel(*t);
+        void * dst = scratch_.alloc((size_t) n * 2);
+        if (std::getenv("OMPH_TRACE_ALLOC") != nullptr) {
+            std::fprintf(stderr, "stage %-40s %10lld elems  ne=[", name.c_str(), (long long) n);
+            for (const uint64_t d : t->ne) {
+                std::fprintf(stderr, "%llu,", (unsigned long long) d);
+            }
+            std::fprintf(stderr, "] type=%u\n", t->type);
+        }
+        if (!omph::kernels::dequantize(t->type,
+                                       static_cast<const uint8_t *>(dev_weights_) + t->offset, dst,
+                                       n, true, nullptr)) {
+            throw std::runtime_error("dequant failed for " + name);
+        }
+        return dst;
+    }
+
+    const float * f32_ref(const std::string & name) {
+        const omph::gguf::TensorInfo * t = file_.tensor(name);
+        if (t == nullptr) {
+            throw std::runtime_error("missing tensor " + name);
+        }
+        return reinterpret_cast<const float *>(static_cast<const uint8_t *>(dev_weights_) +
+                                               t->offset);
+    }
+
+    omph::gguf::File file_;
+    HParams h_;
+    Scratch scratch_;
+    std::vector<void *> states_;
+    void * dev_weights_ = nullptr;
+    void * x_ = nullptr;
+    void * cur_ = nullptr;
+    void * resid_ = nullptr;
+    void * blk_ = nullptr;
+    void * h16_ = nullptr;
+    void * fused_ = nullptr;
+    void * conv_out_ = nullptr;
+    void * z_ = nullptr;
+    void * o_ = nullptr;
+    void * q_ = nullptr;
+    void * gate_ = nullptr;
+    void * attn_ = nullptr;
+    void * k_ = nullptr;
+    void * v_ = nullptr;
+    void * sk_ = nullptr;
+    void * dvec_ = nullptr;
+    void * beta_ = nullptr;
+    void * alpha_ = nullptr;
+    void * ffn1_ = nullptr;
+    void * ffn2_ = nullptr;
+    void * ffn16_ = nullptr;
+    void * logits_ = nullptr;
+    void * tmp_logits_ = nullptr;
+    void * head16_ = nullptr;
+};
+
+} // namespace
+
+int main(int argc, char ** argv) {
+    if (argc < 4) {
+        std::fprintf(stderr, "usage: %s <model.gguf> <tokens.txt> <out-logits.f32> "
+                             "[--trace-dir DIR] [--tokens N]\n",
+                     argv[0]);
+        return 2;
+    }
+    const std::string model = argv[1];
+    const std::string tok_path = argv[2];
+    const std::string logits_path = argv[3];
+    std::string trace_dir;
+    int64_t max_tokens = 0;
+    for (int i = 4; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--trace-dir") == 0 && i + 1 < argc) {
+            trace_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
+            max_tokens = std::atoll(argv[++i]);
+        }
+    }
+    try {
+        std::vector<int32_t> toks;
+        {
+            std::ifstream in(tok_path);
+            int64_t v = 0;
+            while (in >> v) {
+                toks.push_back((int32_t) v);
+            }
+        }
+        if (toks.empty()) {
+            std::fprintf(stderr, "no tokens read from %s\n", tok_path.c_str());
+            return 1;
+        }
+        if (max_tokens > 0 && (int64_t) toks.size() > max_tokens) {
+            toks.resize((size_t) max_tokens);
+        }
+        Runner runner(model, (int64_t) toks.size());
+        std::vector<float> logits;
+        if (!runner.forward(toks, logits, trace_dir)) {
+            return 1;
+        }
+        write_f32(logits_path, logits);
+        // greedy tokens for the report
+        const HParams & h = runner.hparams();
+        std::printf("logits: %lld x %lld -> %s\ngreedy:", (long long) toks.size(),
+                    (long long) h.n_vocab, logits_path.c_str());
+        for (size_t t = 0; t < toks.size(); ++t) {
+            const float * row = logits.data() + t * (size_t) h.n_vocab;
+            int64_t best = 0;
+            for (int64_t i = 1; i < h.n_vocab; ++i) {
+                if (row[i] > row[best]) {
+                    best = i;
+                }
+            }
+            std::printf(" %lld", (long long) best);
+        }
+        std::printf("\n");
+    } catch (const std::exception & exc) {
+        std::fprintf(stderr, "error: %s\n", exc.what());
+        return 1;
+    }
+    return 0;
+}
