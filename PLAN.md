@@ -67,8 +67,8 @@
 | Architecture | RDNA4, `gfx1200` | ROCm target string |
 | Compute units | 32 | wave32 execution |
 | VRAM | 16 GB GDDR6, 128-bit bus | |
-| Memory bandwidth (spec) | ~320 GB/s | Real achievable streaming bandwidth is typically ~85–90% of spec → **measure it** (§7) |
-| FP16 matrix (WMMA) throughput | ~100 TFLOPS dense | **[verify]** on AMD spec sheet; INT8 matrix ~2× |
+| Memory bandwidth (spec) | ~320 GB/s | **Measured (M0): 318.3 GB/s** streaming read — 99.5% of spec, not the usual 85–90% (`bench/bw_membench.hip`) |
+| FP16 matrix (WMMA) throughput | ~100 TFLOPS dense (spec) | **Measured (M0): ~46 TFLOPS** at the model's M=512 shapes via hipBLASLt; INT8 measured **~26 TOPS (0.57×)**, i.e. *not* ~2× |
 | LDS | 64 KB per workgroup | Enough for IQ codebook tables + GEMM tiles |
 | Bus | PCIe 5.0 x16 | Host↔device transfers of embeddings/logits are cheap |
 
@@ -104,6 +104,16 @@ Source: `ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF` model card.
 | `tensor-allocation/<model>.rco-allocation.txt` | | | Quant type of **every** tensor + histogram |
 | `imatrix-qwen3.8-27b.gguf` | | | Importance matrix used for quantization |
 
+**Measured facts (M0, `gguf-dump` + allocation file, IQ3_S-mtp, 2026-09-30):**
+
+- 65 blocks (64 main + `blk.64` MTP), hidden 5120, FFN 17408, 24 heads / 4 KV heads, head_dim 256 (K = V = 256), vocab 248320.
+- Layer pattern: **48 Gated DeltaNet layers** (fused `attn_qkv` + `ssm_*`, output via `ssm_out`) and **16 full-attention layers** at indices 3, 7, …, 63 (separate `attn_q`/`attn_k`/`attn_v` + `attn_q_norm`/`attn_k_norm` + `attn_output`). `blk.64` (MTP) is a 17th attention-style layer.
+- **Untied embeddings**: separate `output.weight` (Q4_K); `token_embd` is IQ2_S → can go to host RAM (§8.3).
+- RoPE: `freq_base` 1e7, `rope.dimension_count` 64 (partial), M-RoPE `rope.dimension_sections = [11, 11, 10, 0]`.
+- Gated DeltaNet: `ssm.state_size` 128, `ssm.group_count` 16, `ssm.inner_size` 6144, `ssm.time_step_rank` 48, `conv_kernel` 4.
+- Quant mix (866 tensors): BF16 96, F32 360, IQ1_M 1, IQ2_S 17, IQ2_XS 9, IQ2_XXS 5, IQ3_S 144, IQ3_XXS 78, IQ4_XS 96, Q2_K 13, Q4_K 39, Q6_K 8. `lm_head` = Q4_K, MTP-layer weights all Q6_K.
+- **`gate`/`up` do *not* share the quant type in 40 of 65 layers** (e.g. blk.0: IQ2_XS vs IQ2_XXS) → interleaving is only free where the types match (§8.3 ⚠️).
+
 ### What matters for the engine
 
 1. **Non-uniform, per-tensor quantization (RCO).** Each tensor has its own GGUF quant type. The allocation file is the authoritative list of which dequantization kernels the engine needs (IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S plus whatever higher-precision types sensitive tensors received, e.g. Q4_K/Q5_K/Q6_K/Q8_0/F16 **[verify]**).
@@ -128,9 +138,9 @@ Assuming the token embedding table is ~0.5–1 GB **[verify]**:
 | IQ3_XXS | ~9.4 GB | ~34 t/s | ~57% |
 | IQ2_S | ~8.6 GB | ~37 t/s | ~52% |
 
-**Measured baseline (llama.cpp):** decode **19–20 t/s** without MTP. *Which quant file this was measured on is still to be recorded* **[verify]**.
+**Measured baseline (llama.cpp, M0):** decode **20.6 t/s** without MTP (IQ3_S-mtp, f16 KV, d0); the original 19–20 t/s figure is confirmed.
 
-**Interpretation.** The real 100% is not 320 GB/s but the bandwidth a simple streaming-read kernel achieves (typically ~85–90% of spec). If the baseline was IQ3_S, llama.cpp is at ~75–80% of what is achievable; a custom engine could plausibly reach ~22–24 t/s from kernel work alone. The larger lever is MTP (§4.3).
+**Interpretation.** The real 100% is the bandwidth a streaming-read kernel achieves. **Measured (M0): 318.3 GB/s — 99.5% of spec** (`bench/bw_membench.hip`), so for this file (~11.28 GiB of weights per token) the decode ceiling is ~26 t/s. The 19–20 t/s baseline is ~73% of that; a custom engine could plausibly reach ~24–26 t/s from kernel work alone. The larger lever is MTP (§4.3).
 
 Other per-token traffic (small but not zero):
 
@@ -139,13 +149,14 @@ Other per-token traffic (small but not zero):
 
 ### 4.2 Prefill is compute-bound
 
-During prefill, weights are read once per micro-batch (e.g. 512 tokens) and reused for every token in it. At 750 t/s with ~11 GB of weights, the card reads only ~16 GB/s (~5% of bandwidth).
+During prefill, weights are read once per micro-batch (e.g. 512 tokens) and reused for every token in it. At 622.7 t/s with ~11.28 GiB of weights and ubatch 512, the card reads only ~14 GB/s (~4% of bandwidth).
 
 - Dense FLOPs ≈ 2 × params per token ≈ 2 × 27 B = **~54 GFLOP/token**.
-- **Measured baseline (llama.cpp):** **~750 t/s** prefill at empty context → 750 × 54 GFLOP ≈ **~40 TFLOPS achieved**.
-- Against ~100 TFLOPS FP16 dense matrix peak **[verify]** → **~40% of peak** (less if the path uses INT8).
-- Realistic target for a well-tuned dequant + WMMA path: **~50–60% of peak → ~900–1100 t/s**. Hard: IQ decoding (codebook lookups, sign unpacking, scales) competes with the matrix units; DeltaNet chunked prefill and attention add FLOPs that are less matrix-friendly.
-- Find the real ceiling with `hipblaslt-bench` on FP16 GEMMs with the model's projection shapes (e.g. MLP up-proj at M = 512).
+- **Measured baseline (llama.cpp, M0):** **622.7 t/s** prefill at empty context (pp512, f16 KV, `-t 6`) → ≈ **34 TFLOPS achieved**. The historical "~750 t/s" figure did not reproduce.
+- Against the measured fp16 GEMM ceiling (~46 TFLOPS, §2) → **~74% of it**; against the ~100 TFLOPS spec peak → ~34%.
+- Target for a well-tuned dequant + WMMA path: originally **~50–60% of peak → ~900–1100 t/s**; the M0 measurement revises this to **~700–800 t/s**. Hard: IQ decoding (codebook lookups, sign unpacking, scales) competes with the matrix units; DeltaNet chunked prefill and attention add FLOPs that are less matrix-friendly.
+- **M0 update (measured):** the fp16 GEMM ceiling at the model's M=512 shapes is **~46 TFLOPS** (hipBLASLt; §2) — the prefill ceiling for a dequant+WMMA path is ~**850 t/s** before dequant overhead. The INT8 route measured *slower* than fp16 (~26 TOPS, 0.57×) — do not count on a ~2× INT8 speedup until a raw WMMA check confirms it (§10.5).
+- The real ceiling is measured (M0) with `bench/hipblaslt_gemm_bench.hip` at the model's projection shapes (M = 512); `hipblaslt-bench` itself is not packaged on this distro.
 
 ### 4.3 What MTP can give on decode
 
@@ -170,6 +181,8 @@ Illustrative, α = 0.7, baseline 19.5 t/s:
 α depends heavily on content: code and structured text accept well, creative prose less. Measure per workload.
 
 ### 4.4 Why llama.cpp prefill drops from ~750 to ~500 t/s with MTP
+
+> **M0 update (2026-09-30): not reproduced.** With the current build (upstream code @ `6c7a87f7e`, `draft-mtp` n=2, prompt ~2.9k tokens) prefill costs **~3–4%** (client −3/−4%; kernel time 5.268 → 5.427 s under `rocprofv3`). The "750 t/s" figure itself did not reproduce either (622.7 t/s pp512, f16 KV, `-t 6`). The analysis below is kept as historical context.
 
 Prefill is compute-bound, so extra MTP work costs time roughly proportional to its FLOPs. Rough cost of MTP work per prompt token, relative to the main model:
 
@@ -346,6 +359,8 @@ target_include_directories(omphalos PUBLIC include)
 ## 7. Step 0 — Baseline with llama.cpp
 
 Before writing any engine code, establish the bar and the numerical reference.
+
+> **Status (M0, 2026-09-30): done.** Scripts and results under `bench/` (issue #3): HIP/Vulkan llama-bench suites, MTP A/B, bandwidth ceiling, GEMM ceilings, prefill traces, perplexity/KL baseline.
 
 ```bash
 cd ~/Projects/omphalos/third_party
@@ -528,7 +543,7 @@ plus short causal conv1d on q/k/v (keep the conv tail as state), gates/normaliza
 Two options:
 
 - **FP16 path**: dequantize weight tiles to FP16 in LDS, `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (or rocWMMA). Numerically closest to reference.
-- **INT8 path**: IQ grid values × signs are int8, activations quantized to int8 → int8 WMMA (~2× FP16 throughput). Scales are per 32-weight sub-block → accumulate int32 per sub-block, convert and FMA with scale into FP32 accumulators. Faster, but activation quantization introduces a small error → validate with KL.
+- **INT8 path**: IQ grid values × signs are int8, activations quantized to int8 → int8 WMMA (~2× FP16 throughput). Scales are per 32-weight sub-block → accumulate int32 per sub-block, convert and FMA with scale into FP32 accumulators. Faster, but activation quantization introduces a small error → validate with KL. **⚠️ M0 measured the opposite on this stack: INT8 via hipBLASLt ≈ 26 TOPS vs ≈ 46 TFLOPS fp16 (0.57×), not 2× — settle with a raw WMMA / int8-dot microbench before choosing this path.**
 - Double-buffer LDS tiles; overlap global loads, dequant and WMMA; tune tile sizes for 32 CUs. Start slow and correct.
 
 ### 10.6 Small ops
@@ -846,17 +861,17 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 
 ## 19. Open questions / verification checklist
 
-- [ ] Which quant file produced the 19–20 t/s decode and 750 t/s prefill baselines?
-- [ ] llama.cpp decode t/s **with** the `-mtp` build → back out acceptance rate.
-- [ ] Root cause of the 750 → 500 t/s MTP prefill drop (kernel trace).
-- [ ] Real model dims: hidden size, layer count, DeltaNet vs attention layer pattern, head counts, head dims, vocab size.
-- [ ] RoPE: partial rotary factor, M-RoPE sections, theta.
-- [ ] Norm variants (zero-centered RMSNorm?), QK-norm, gated attention gate, DeltaNet gate/β parametrization, conv1d kernel size.
-- [ ] Tied embeddings? (decides whether `token_embd` can go to host RAM separately).
-- [ ] Allocation file: all quant types present; do `gate`/`up` and Q/K/V share types? `lm_head` type?
-- [ ] MTP: exact inputs (`h` pre- or post-norm), chaining for k > 1, handling of image positions.
-- [ ] RDNA4 specs: FP16/INT8 matrix peak, LDS size, cache sizes; ROCm version on CachyOS.
-- [ ] `mtmd.h` API for extracting image embeddings.
+- [x] Which quant file produced the 19–20 t/s decode and 750 t/s prefill baselines? → **M0: IQ3_S-mtp** reproduced (tg128 20.6 t/s f16 @d0); the 750 t/s prefill figure did not reproduce (622.7 t/s pp512).
+- [x] llama.cpp decode t/s **with** the `-mtp` build → back out acceptance rate. → **M0: acceptance 77–86%** (`draft-mtp` n=2), decode ~20 → ~35 t/s.
+- [x] Root cause of the 750 → 500 t/s MTP prefill drop (kernel trace). → **M0: not reproduced**; ~3% cost, kernels unchanged (§4.4).
+- [x] Real model dims: hidden size, layer count, DeltaNet vs attention layer pattern, head counts, head dims, vocab size. → measured, see §3.
+- [x] RoPE: partial rotary factor, M-RoPE sections, theta. → `freq_base` 1e7, rotary dim 64 (partial), sections [11, 11, 10, 0].
+- [ ] Norm variants (zero-centered RMSNorm?), QK-norm, gated attention gate, DeltaNet gate/β parametrization, conv1d kernel size. → M1 (reference implementation).
+- [x] Tied embeddings? (decides whether `token_embd` can go to host RAM separately). → **untied** (separate `output.weight`, Q4_K).
+- [x] Allocation file: all quant types present; do `gate`/`up` and Q/K/V share types? `lm_head` type? → see §3: mix listed; `gate`/`up` differ in 40/65 layers; DeltaNet `attn_qkv` is fused, full-attention layers have separate Q/K/V; `lm_head` = Q4_K.
+- [ ] MTP: exact inputs (`h` pre- or post-norm), chaining for k > 1, handling of image positions. → M1 (the `nextn.eh_proj`/`enorm`/`hnorm`/`shared_head_norm` tensors sketch the structure).
+- [x] RDNA4 specs: FP16/INT8 matrix peak, LDS size, cache sizes; ROCm version on CachyOS. → ROCm 7.2.4; measured fp16 ~46 TFLOPS / INT8 ~26 TOPS at M=512; LDS 64 KB; vendor peak still [verify].
+- [ ] `mtmd.h` API for extracting image embeddings. → M7.
 - [ ] RDNA4 memory OC support in LACT.
 
 ---
