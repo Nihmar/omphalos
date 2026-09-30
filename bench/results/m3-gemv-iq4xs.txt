@@ -1,0 +1,132 @@
+# M3.2 — fused IQ4_XS GEMV + repacking (2026-09-30)
+
+Type IQ4_XS: 4-bit codes into the 16-entry non-linear codebook `kvalues_iq4nl`,
+per-sub-block `d * (scale6 - 32)`. 2.81 GiB of the allocation, 96 tensors — the
+second-largest type after IQ3_S.
+
+Conditions: `omph-gemv-bench`, median of 5 runs, ROCm 7.2.4, gfx1200, desktop
+idle (PLAN.md §17). Ceiling: 318.3 GB/s measured (`bench/results/m0-bandwidth.csv`).
+
+## Summary (median of 5 runs)
+
+| measurement | time | bytes read | effective bandwidth | vs ceiling |
+|---|---:|---:|---:|---:|
+| all 96 IQ4_XS tensors, one pass | **11.72 ms** | 2924.4 MiB | **261.6 GB/s** | **82.2 %** |
+| single tensor `blk.63.ffn_up` (45.2 MiB) | 0.165 ms | 45.8 MiB | 291.5 GB/s | 91.6 % |
+| *(reference: Q4_K `output.weight`, M3.1)* | 2.90 ms | 701.0 MiB | 253.2 GB/s | 79.6 % |
+
+Repacking verified lossless for all 96 tensors (rebuild of the source block
+stream compared byte for byte). Accuracy against the f16 dequant + hipBLASLt
+path: max |d| 7e-4 (2.4e-4 relative), mean |d| 1e-4.
+
+## Optimisation attempts (measured)
+
+Final state: **261.6 GB/s = 82.2 % of the ceiling** over the whole type (169.1 before).
+
+| change | result | kept? |
+|---|---:|---|
+| baseline | 169.1 GB/s (53.1 %) | — |
+| activation staging in chunks of 256 sub-blocks (16 KiB LDS) | 186.0 GB/s (58.4 %) | yes |
+| **outer product: 4 output rows per warp** (one activation value feeds four rows, four independent FMA chains) | **261.6 GB/s (82.2 %)** | **yes** |
+| rows per warp = 2 | 183.1 GB/s (57.5 %) | no |
+| rows per warp = 8 | 146.7 GB/s (46.1 %) | no |
+| activation read as `__half2` | 80.8 GB/s (25.4 %) | no |
+| activation read as `uint4` | 82.3 GB/s (25.9 %) | no |
+| padded LDS stride (34 halves, coprime with the banks) | 126.0 GB/s (39.6 %) | no |
+| *diagnostic:* codebook lookup replaced by an arithmetic placeholder | 201.9 GB/s (63.4 %) at baseline | n/a |
+
+Reading of the evidence: the kernel was **instruction-issue/latency bound**, not
+LDS-conflict bound — the padded layout (which removes the 16-way conflict) made
+things *worse*, while amortising one activation load over four rows and adding FMA
+independence made them 40 % better. The surviving ideas are the ones that reduce
+instructions per weight, not the ones that change the access pattern.
+
+| change | result | kept? |
+|---|---:|---|
+| baseline | 169.1 GB/s (53.1 %) | — |
+| **activation staging in chunks of 256 sub-blocks** (16 KiB LDS) instead of the whole k | **186.0 GB/s (58.4 %)** | **yes** |
+| activation read as `__half2` (16 LDS ops per 16 weight bytes instead of 32) | 80.8 GB/s (25.4 %) | no |
+| activation read as `uint4` + chunked staging | 82.3 GB/s (25.9 %) | no |
+| *diagnostic:* codebook lookup replaced by an arithmetic placeholder (wrong values, same loads) | 201.9 GB/s (63.4 %) | n/a |
+
+The chunked staging is kept: with it, the k = 17408 tensors stage 16 KiB instead of
+34 KiB of LDS, which lifts the workgroup-per-CU limit. It is worth +10 % over the
+whole type.
+
+Both attempts to read the activation with vector loads made things **2x worse**, and
+the reason is not yet understood — 32 lanes stepping one 64-byte sub-block each means
+the LDS addresses are 64 B apart, i.e. every lane lands on the same couple of banks
+(16-way conflict), and a wider load apparently serialises harder instead of helping.
+The obvious follow-up is a padded/transposed LDS layout for the activation
+(sub-block stride 33 halves instead of 32) so that consecutive lanes hit consecutive
+banks, and re-testing the vectorised reads on top of that.
+
+## Why it is slower than Q4_K
+
+The core loop is the same shape, but every value needs a **codebook lookup with
+a divergent index**, which lands in LDS. Two measurements narrow it down:
+
+- Factoring the per-sub-block scale out of the sum (`acc += dl * Σ table[c]·x`
+  instead of `Σ (dl·table[c])·x`) and switching the LDS table from int8 to f32
+  changed the result by 0.2 % (52.8 -> 53.0 %), so the kernel is **not ALU-bound**.
+- The aggregate (2.9 GiB) and the single 45 MiB tensor agree within 2 %, so it
+  is not L2 residency or launch overhead either.
+
+That points at the LDS/bank behaviour of the 16-entry lookup (32 divergent
+lookups per 16 bytes read). Follow-ups to try, in order:
+
+1. Select the codebook entry with byte-permute instructions (`v_perm_b32` over
+   four 32-bit registers holding the 16 int8 values) instead of an LDS gather.
+2. Keep the codes' low/high nibbles in separate streams so each lane's 16-byte
+   load covers one 32-value run of a *single* sub-block (better locality).
+
+## Raw runs
+
+```
+IQ4_XS: 96 tensors, 2924.4 MiB read per pass
+fused      : 18.152 ms  (2924.4 MiB read)  -> 168.9 GB/s  (53.1% of 318.3)
+accuracy   : blk.0.attn_gate.weight  max|d| 0.0007 (2.41e-04 rel), mean|d| 0.0001, |ref| up to 2.9
+IQ4_XS: 96 tensors, 2924.4 MiB read per pass
+fused      : 18.123 ms  (2924.4 MiB read)  -> 169.2 GB/s  (53.2% of 318.3)
+accuracy   : blk.0.attn_gate.weight  max|d| 0.0007 (2.41e-04 rel), mean|d| 0.0001, |ref| up to 2.9
+IQ4_XS: 96 tensors, 2924.4 MiB read per pass
+fused      : 18.109 ms  (2924.4 MiB read)  -> 169.3 GB/s  (53.2% of 318.3)
+accuracy   : blk.0.attn_gate.weight  max|d| 0.0007 (2.41e-04 rel), mean|d| 0.0001, |ref| up to 2.9
+IQ4_XS: 96 tensors, 2924.4 MiB read per pass
+fused      : 18.148 ms  (2924.4 MiB read)  -> 169.0 GB/s  (53.1% of 318.3)
+accuracy   : blk.0.attn_gate.weight  max|d| 0.0007 (2.41e-04 rel), mean|d| 0.0001, |ref| up to 2.9
+IQ4_XS: 96 tensors, 2924.4 MiB read per pass
+fused      : 18.125 ms  (2924.4 MiB read)  -> 169.2 GB/s  (53.2% of 318.3)
+accuracy   : blk.0.attn_gate.weight  max|d| 0.0007 (2.41e-04 rel), mean|d| 0.0001, |ref| up to 2.9
+tensor blk.63.ffn_up.weight: 17408 x 5120, type 23, 45.2 MiB, 348160 blocks
+fused      : 0.268 ms  (45.8 MiB read)  -> 179.4 GB/s  (56.4% of 318.3)
+accuracy   : blk.63.ffn_up.weight  max|d| 0.0005 (1.92e-04 rel), mean|d| 0.0001, |ref| up to 2.5
+```
+
+---
+
+# M3.3 — outer product applied to Q4_K (same round)
+
+| measurement | time | bytes read | effective bandwidth | vs ceiling |
+|---|---:|---:|---:|---:|
+| `output.weight` (248320 x 5120, Q4_K, 682 MiB), before | 2.60 ms | 653.6 MiB | 262.0 GB/s | 82.3 % |
+| `output.weight`, after outer product (4 rows per warp) | **2.34 ms** | 653.6 MiB | **292.4 GB/s** | **91.9 %** |
+| all 38 `blk.*` Q4_K tensors (792.4 MiB) | 3.50 ms | 792.4 MiB | 237.4 GB/s | 74.6 % |
+
+Accuracy after the change is unchanged (max |d| 6e-4, 1.9e-4 relative).
+
+A first attempt at this port used `__half2` reads for the activation and was both
+slow (88.4 GB/s) and, in the form tried, numerically wrong; the version that is
+kept reads the activation **scalar** (two `__half2float` per byte, shared by the
+four rows). That is now the third independent confirmation that vector LDS loads
+of the activation hurt on this target, while reducing instructions per weight
+pays.
+
+The aggregate for the type (74.6 %) is lower than the single 5120-wide tensor
+(91.9 %): the `blk.*` Q4_K set contains k = 17408 tensors, which are the next
+thing to tune (chunk size and rows-per-warp for that shape).
+
+## Bench harness addition
+
+`--all-of-type <ggml-type>` measures every `blk.*` tensor of one type in a single
+timed pass (generalises `--iq4-all`).
