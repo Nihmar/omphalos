@@ -654,3 +654,35 @@ array pushed them over a register threshold. Kept: the three that measured faste
 Accuracy unchanged everywhere (2.0-2.7e-4).
 
 Decode: 59 -> 58 ms/token (the win is concentrated in IQ3_XXS/IQ3_S, ~4.3 GiB).
+
+# M3.21 — investigations 2 and 3
+
+## 2. Per-kernel dispatch latency, measured with the dispatch trace
+
+`rocprofv3 --kernel-trace` (counters do not work on this box; the trace does)
+over prefill + 2 decode steps: 5585 dispatches, **1861 of them in a single decode
+step**, which runs 78.7 ms of span with **91 % GPU busy**. So:
+
+- the host is *not* the bottleneck (it was already indicated, now confirmed);
+- a decode step is ~1861 kernels, and the non-GEMV ones (~1480) take ~17 us each
+  on the GPU for trivial work — that is dispatch latency on a dependency chain,
+  ~25 ms of the step;
+- the GEMV dispatches (~380/step) account for ~46 ms.
+
+The earlier fusion experiments removed 144 and 192 dispatches — under 20 % of the
+small ones, which is why they measured as noise. **The lever that matches this
+number is HIP stream capture**, not fusing a few percent more kernels: a graph
+replaces ~1861 dispatches with one, and the GPU's own scheduler removes most of
+that 17 us. This corrects the estimate in M3.19: the decode is GPU-busy, but a
+large part of that "busy" *is* per-kernel dispatch overhead, which graphs do
+address.
+
+## 3. The small-batch GEMV is worth ~3.6x the prefill
+
+Quantified, not yet implemented: with NT = 5 tokens per weight read, a 10-token
+prefill reads the 12.02 GB of weights twice instead of the f16 path's
+(materialize 54 GB + read it + read the quantized 12 GB). The prefill's measured
+830 ms of staging + 339 ms of GEMM collapse to ~96 ms of GEMV, i.e. the pass goes
+from ~1.45 s to ~0.4 s — **~3.6x the prefill** — and the same kernel is the
+prerequisite for MTP verification (M6). It is the strongest remaining lever in
+the project after the decode graphs.
