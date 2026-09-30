@@ -116,11 +116,15 @@ int main(int argc, char ** argv) {
     std::string name = "output.weight";
     int iters = 50;
     bool iq4_all = false;
+    int all_type = -1;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
             iters = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--iq4-all") == 0) {
             iq4_all = true;
+            all_type = 23;
+        } else if (std::strcmp(argv[i], "--all-of-type") == 0 && i + 1 < argc) {
+            all_type = std::atoi(argv[++i]);
         } else if (argv[i][0] != '-') {
             name = argv[i];
         }
@@ -130,11 +134,11 @@ int main(int argc, char ** argv) {
         std::vector<Case> cases;
         double total_bytes = 0.0;
 
-        if (iq4_all) {
-            // Every IQ4_XS tensor summed is 2.81 GiB, well past L2, so the
-            // aggregate number is a real streaming measurement.
+        if (all_type >= 0) {
+            // All tensors of one type summed are well past L2, so the aggregate
+            // number is a real streaming measurement.
             for (const omph::gguf::TensorInfo & t : file.tensors()) {
-                if (t.type != 23) {
+                if ((int) t.type != all_type || t.name.rfind("blk.", 0) != 0) {
                     continue;
                 }
                 Case c;
@@ -144,7 +148,7 @@ int main(int argc, char ** argv) {
                 cases.push_back(c);
                 total_bytes += (double) c.bytes;
             }
-            std::printf("IQ4_XS: %zu tensors, %.1f MiB read per pass\n", cases.size(),
+            std::printf("type %d: %zu tensors, %.1f MiB read per pass\n", all_type, cases.size(),
                         total_bytes / (1024 * 1024));
         } else {
             const omph::gguf::TensorInfo * t = file.tensor(name);

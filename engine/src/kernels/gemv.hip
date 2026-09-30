@@ -15,59 +15,83 @@
 namespace omph::kernels {
 namespace {
 
+constexpr long long kQ4kChunkSub = 256;  // 8192 weights staged per LDS refill
+constexpr long long kQ4kRows = 4;        // output rows computed per warp
+
 __global__ void gemv_q4k_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ sc,
                                 const uint8_t * __restrict__ mn, const uint8_t * __restrict__ d,
                                 const uint8_t * __restrict__ dmin, const __half * __restrict__ x,
                                 float * __restrict__ y, const long long rows,
                                 const long long n_sub) {
-    extern __shared__ __half xs[];
-    const long long k = n_sub * 32;
-    for (long long i = threadIdx.x; i < k; i += blockDim.x) {
-        xs[i] = x[i];
-    }
-    __syncthreads();
+    extern __shared__ __half xs[];  // activation chunk
 
     const int warp = (int) threadIdx.x / 32;
     const int lane = (int) threadIdx.x % 32;
-    const long long row = (long long) blockIdx.x * (blockDim.x / 32) + warp;
-    if (row >= rows) {
-        return;
-    }
+    // kQ4kRows consecutive output rows per warp: one activation value feeds all
+    // of them and the accumulators give independent FMA chains.
+    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kQ4kRows;
     const long long blocks = n_sub / 8;
-    const uint8_t * rqs = qs + row * blocks * 128;
-    const uint8_t * rsc = sc + row * blocks * 8;
-    const uint8_t * rmn = mn + row * blocks * 8;
-    const uint8_t * rd = d + row * blocks * 2;
-    const uint8_t * rdmin = dmin + row * blocks * 2;
+    const long long rlast = rows - 1;
 
-    float acc = 0.0f;
-    for (long long s = lane; s < n_sub; s += 32) {
-        const long long blk = s / 8;
-        const int sub = (int) (s % 8);
-        const float ds = __half2float(*reinterpret_cast<const __half *>(rd + 2 * blk)) *
-                         (float) rsc[blk * 8 + sub];
-        const float ms = __half2float(*reinterpret_cast<const __half *>(rdmin + 2 * blk)) *
-                         (float) rmn[blk * 8 + sub];
-        const uint4 p = *reinterpret_cast<const uint4 *>(rqs + s * 16);
-        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(&p);
-        const __half * xv = xs + s * 32;
-        float part = 0.0f;
-#pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            const uint8_t b = bytes[i];
-            const float w0 = fmaf(ds, (float) (b & 0xF), -ms);
-            const float w1 = fmaf(ds, (float) (b >> 4), -ms);
-            part = fmaf(w0, __half2float(xv[2 * i]), part);
-            part = fmaf(w1, __half2float(xv[2 * i + 1]), part);
+    float acc[kQ4kRows] = {};
+    for (long long base = 0; base < n_sub; base += kQ4kChunkSub) {
+        const long long len = n_sub - base < kQ4kChunkSub ? n_sub - base : kQ4kChunkSub;
+        for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
+            xs[i] = x[base * 32 + i];
         }
-        acc += part;
+        __syncthreads();
+        if (row0 >= rows) {
+            __syncthreads();  // keep the barrier count identical across warps
+            continue;
+        }
+        for (long long s = base + lane; s < base + len; s += 32) {
+            const long long blk = s / 8;
+            const int sub = (int) (s % 8);
+            const __half * xv = xs + (s - base) * 32;
+            uint4 q[kQ4kRows];
+            float ds[kQ4kRows];
+            float ms[kQ4kRows];
+#pragma unroll
+            for (int r = 0; r < kQ4kRows; ++r) {
+                const long long row = row0 + r <= rlast ? row0 + r : rlast;
+                q[r] = *reinterpret_cast<const uint4 *>(qs + row * blocks * 128 + s * 16);
+                ds[r] = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 +
+                                                                       2 * blk)) *
+                        (float) sc[row * blocks * 8 + blk * 8 + sub];
+                ms[r] = __half2float(
+                            *reinterpret_cast<const __half *>(dmin + row * blocks * 2 + 2 * blk)) *
+                        (float) mn[row * blocks * 8 + blk * 8 + sub];
+            }
+            float part[kQ4kRows] = {};
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                // byte i: value 2i in the low nibble, 2i+1 in the high one
+                const float x0 = __half2float(xv[2 * i]);
+                const float x1 = __half2float(xv[2 * i + 1]);
+#pragma unroll
+                for (int r = 0; r < kQ4kRows; ++r) {
+                    const uint8_t b = reinterpret_cast<const uint8_t *>(&q[r])[i];
+                    part[r] = fmaf(fmaf(ds[r], (float) (b & 0xF), -ms[r]), x0, part[r]);
+                    part[r] = fmaf(fmaf(ds[r], (float) (b >> 4), -ms[r]), x1, part[r]);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kQ4kRows; ++r) {
+                acc[r] += part[r];
+            }
+        }
+        __syncthreads();
     }
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down(acc, off);
-    }
-    if (lane == 0) {
-        y[row] = acc;
+    for (int r = 0; r < kQ4kRows; ++r) {
+        float a = acc[r];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            a += __shfl_down(a, off);
+        }
+        if (lane == 0 && row0 + r < rows) {
+            y[row0 + r] = a;
+        }
     }
 }
 
@@ -173,13 +197,10 @@ bool gemv_q4k(const void * packed, const void * x_f16, float * y, const int64_t 
     }
     const int64_t n_blocks = rows * (k / 256);
     const omph::format::Q4kLayout l = omph::format::q4k_layout(n_blocks);
-    const size_t smem = (size_t) k * 2;
-    if (smem > 64 * 1024) {
-        return false;
-    }
+    const size_t smem = (size_t) kQ4kChunkSub * 64;
     const auto * base = static_cast<const uint8_t *>(packed);
     const int64_t n_sub = k / 32;
-    const dim3 grid((unsigned) ((rows + 7) / 8));
+    const dim3 grid((unsigned) ((rows + 8 * kQ4kRows - 1) / (8 * kQ4kRows)));
     gemv_q4k_kernel<<<grid, 256, smem, stream>>>(
         base + l.qs_off, base + l.sc_off, base + l.mn_off, base + l.d_off, base + l.dmin_off,
         static_cast<const __half *>(x_f16), y, rows, n_sub);

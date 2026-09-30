@@ -102,3 +102,31 @@ tensor blk.63.ffn_up.weight: 17408 x 5120, type 23, 45.2 MiB, 348160 blocks
 fused      : 0.268 ms  (45.8 MiB read)  -> 179.4 GB/s  (56.4% of 318.3)
 accuracy   : blk.63.ffn_up.weight  max|d| 0.0005 (1.92e-04 rel), mean|d| 0.0001, |ref| up to 2.5
 ```
+
+---
+
+# M3.3 — outer product applied to Q4_K (same round)
+
+| measurement | time | bytes read | effective bandwidth | vs ceiling |
+|---|---:|---:|---:|---:|
+| `output.weight` (248320 x 5120, Q4_K, 682 MiB), before | 2.60 ms | 653.6 MiB | 262.0 GB/s | 82.3 % |
+| `output.weight`, after outer product (4 rows per warp) | **2.34 ms** | 653.6 MiB | **292.4 GB/s** | **91.9 %** |
+| all 38 `blk.*` Q4_K tensors (792.4 MiB) | 3.50 ms | 792.4 MiB | 237.4 GB/s | 74.6 % |
+
+Accuracy after the change is unchanged (max |d| 6e-4, 1.9e-4 relative).
+
+A first attempt at this port used `__half2` reads for the activation and was both
+slow (88.4 GB/s) and, in the form tried, numerically wrong; the version that is
+kept reads the activation **scalar** (two `__half2float` per byte, shared by the
+four rows). That is now the third independent confirmation that vector LDS loads
+of the activation hurt on this target, while reducing instructions per weight
+pays.
+
+The aggregate for the type (74.6 %) is lower than the single 5120-wide tensor
+(91.9 %): the `blk.*` Q4_K set contains k = 17408 tensors, which are the next
+thing to tune (chunk size and rows-per-warp for that shape).
+
+## Bench harness addition
+
+`--all-of-type <ggml-type>` measures every `blk.*` tensor of one type in a single
+timed pass (generalises `--iq4-all`).
