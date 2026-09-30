@@ -62,6 +62,22 @@ __global__ void conv1d_kernel(const float * __restrict__ qkv, const float * __re
     out[i] = acc;
 }
 
+__global__ void conv_state_update_kernel(const float * __restrict__ qkv,
+                                         const float * __restrict__ state,
+                                         float * __restrict__ new_state, const long long tokens,
+                                         const long long channels, const long long kernel) {
+    const long long rows = kernel - 1;
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * channels) {
+        return;
+    }
+    const long long r = i / channels;
+    const long long c = i % channels;
+    const long long src = tokens + r;
+    new_state[r * channels + c] = (src < rows) ? state[src * channels + c]
+                                               : qkv[(src - rows) * channels + c];
+}
+
 __global__ void split_qkv_kernel(const float * __restrict__ fused, float * __restrict__ q,
                                  float * __restrict__ k, float * __restrict__ v,
                                  const long long tokens, const long long q_dims,
@@ -233,6 +249,18 @@ bool conv1d_state(const float * qkv, const float * w, const float * state, float
     }
     conv1d_kernel<<<grid_for((long long) tokens * channels), kBlock, 0, stream>>>(
         qkv, w, state, out, (long long) tokens, (long long) channels, (long long) kernel);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool conv_state_update(const float * qkv, const float * state, float * new_state,
+                       const int64_t tokens, const int64_t channels, const int64_t kernel,
+                       hipStream_t stream) {
+    if (qkv == nullptr || state == nullptr || new_state == nullptr || tokens <= 0 ||
+        channels <= 0 || kernel <= 1) {
+        return false;
+    }
+    conv_state_update_kernel<<<grid_for((long long) (kernel - 1) * channels), kBlock, 0, stream>>>(
+        qkv, state, new_state, (long long) tokens, (long long) channels, (long long) kernel);
     return hipGetLastError() == hipSuccess;
 }
 

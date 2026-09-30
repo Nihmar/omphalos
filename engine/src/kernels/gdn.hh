@@ -25,6 +25,12 @@ bool mul_row_inplace(float * x, const float * w, int64_t tokens, int64_t heads,
 bool conv1d_state(const float * qkv, const float * w, const float * state, float * out,
                   int64_t tokens, int64_t channels, int64_t kernel, hipStream_t stream);
 
+// Shifts the conv state: new_state[r, c] = input[tokens + r, c] with
+// input = [state rows (kernel-1); qkv rows (tokens)]. Writes to a separate
+// buffer, so the caller can double-buffer and swap.
+bool conv_state_update(const float * qkv, const float * state, float * new_state, int64_t tokens,
+                       int64_t channels, int64_t kernel, hipStream_t stream);
+
 // Extracts q/k/v from the fused conv output (channel order: q | k | v).
 bool split_qkv(const float * fused, float * q, float * k, float * v, int64_t tokens,
                int64_t q_dims, int64_t kv_dims, int64_t v_dims, hipStream_t stream);

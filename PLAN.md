@@ -857,6 +857,8 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 | 9 | Offline converter + final format | Layouts frozen, bit-exact verification in the converter |
 | 10 | Polish | C ABI, OpenAI-compatible server, prompt-prefix cache in host RAM, breadcrumbs |
 
+Status: **M0, M1 and M2 are complete.** The naive GPU path (`omph-run`) reproduces the NumPy reference: prefill logits rel 3.7e-04, greedy decode identical over 3 generated tokens with persistent KV / conv / delta-net state (see the M2 section of AGENTS.md for the commands). M3 is next.
+
 ---
 
 ## 19. Open questions / verification checklist
@@ -866,11 +868,12 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 - [x] Root cause of the 750 → 500 t/s MTP prefill drop (kernel trace). → **M0: not reproduced**; ~3% cost, kernels unchanged (§4.4).
 - [x] Real model dims: hidden size, layer count, DeltaNet vs attention layer pattern, head counts, head dims, vocab size. → measured, see §3.
 - [x] RoPE: partial rotary factor, M-RoPE sections, theta. → `freq_base` 1e7, rotary dim 64 (partial), sections [11, 11, 10, 0].
-- [ ] Norm variants (zero-centered RMSNorm?), QK-norm, gated attention gate, DeltaNet gate/β parametrization, conv1d kernel size. → M1 (reference implementation).
+- [x] Norm variants (zero-centered RMSNorm?), QK-norm, gated attention gate, DeltaNet gate/β parametrization, conv1d kernel size. → **M1/M2**: plain RMSNorm (eps 1e-6) for every norm; QK-norm per head (head_dim 256 for the attention layers, 128 for the delta net); the attention output gate comes fused in `attn_q` (2·head_dim per head) and is applied as `sigmoid(g)`; DeltaNet gate = `softplus(alpha + dt_bias)·ssm_a`, β = `sigmoid(beta)`; conv kernel 4 with `silu`. All confirmed against the dump.
 - [x] Tied embeddings? (decides whether `token_embd` can go to host RAM separately). → **untied** (separate `output.weight`, Q4_K).
 - [x] Allocation file: all quant types present; do `gate`/`up` and Q/K/V share types? `lm_head` type? → see §3: mix listed; `gate`/`up` differ in 40/65 layers; DeltaNet `attn_qkv` is fused, full-attention layers have separate Q/K/V; `lm_head` = Q4_K.
 - [ ] MTP: exact inputs (`h` pre- or post-norm), chaining for k > 1, handling of image positions. → M1 (the `nextn.eh_proj`/`enorm`/`hnorm`/`shared_head_norm` tensors sketch the structure).
 - [x] RDNA4 specs: FP16/INT8 matrix peak, LDS size, cache sizes; ROCm version on CachyOS. → ROCm 7.2.4; measured fp16 ~46 TFLOPS / INT8 ~26 TOPS at M=512; LDS 64 KB; vendor peak still [verify].
+- [x] llama.cpp `new_state` buffer layout vs the engine kernels → **settled in M2**: the engine keeps the delta-net state as `(n_vh, state_size, state_size)` with the ggml k-head tiling (`h % n_kh`); the per-token outputs match the reference, so the fused kernel's internal (dumped) buffer layout is irrelevant for us.
 - [ ] `mtmd.h` API for extracting image embeddings. → M7.
 - [ ] RDNA4 memory OC support in LACT.
 

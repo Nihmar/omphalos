@@ -162,12 +162,21 @@ public:
         alloc(&logits_, T * h_.n_vocab * 4);
         alloc(&tmp_logits_, T * std::min<int64_t>(h_.n_vocab, 32768) * 4);
         alloc(&head16_, (size_t) std::min<int64_t>(h_.n_vocab, 32768) * ne * 2);
+        max_seq_ = T;
+        int64_t n_kv = 0;
+        for (int64_t il = 0; il < h_.n_layer; ++il) {
+            const bool recurrent = file_.tensor("blk." + std::to_string(il) + ".ssm_a") != nullptr;
+            kv_index_.push_back(recurrent ? -1 : n_kv++);
+        }
+        alloc(&kv_k_, (size_t) n_kv * T * attn_kv * 4);
+        alloc(&kv_v_, (size_t) n_kv * T * attn_kv * 4);
+        conv_flip_.assign((size_t) h_.n_layer, 0);
         for (int64_t il = 0; il < h_.n_layer; ++il) {
             void * st = nullptr;
             const int64_t n_state = h_.ssm_n_vh * h_.ssm_s * h_.ssm_s;
-            const int64_t n_conv = (h_.ssm_conv_k - 1) * fused;
-            if (hipMalloc(&st, (n_state + n_conv) * 4) != hipSuccess ||
-                hipMemset(st, 0, (n_state + n_conv) * 4) != hipSuccess) {
+            const int64_t n_conv = (h_.ssm_conv_k - 1) * ssm_channels;
+            if (hipMalloc(&st, (n_state + 2 * n_conv) * 4) != hipSuccess ||
+                hipMemset(st, 0, (n_state + 2 * n_conv) * 4) != hipSuccess) {
                 throw std::runtime_error("out of VRAM (state)");
             }
             states_.push_back(st);
@@ -181,7 +190,7 @@ public:
     }
 
     bool forward(const std::vector<int32_t> & toks, std::vector<float> & logits,
-                 const std::string & trace_dir) {
+                 const std::string & trace_dir, const int64_t start_pos = 0) {
         const int64_t T = (int64_t) toks.size();
         const int64_t ne = h_.n_embd;
 
@@ -223,7 +232,7 @@ public:
             if (recurrent) {
                 if (!gdn_layer(il, p, T)) return false;
             } else {
-                if (!attn_layer(il, p, T)) return false;
+                if (!attn_layer(il, p, T, start_pos)) return false;
             }
             // x = ffn(rms_norm(block + x)) + (block + x)
             if (!omph::kernels::add_out(static_cast<const float *>(blk_),
@@ -342,10 +351,13 @@ private:
         return h;
     }
 
-    bool attn_layer(const int64_t il, const std::string & p, const int64_t T) {
+    bool attn_layer(const int64_t il, const std::string & p, const int64_t T,
+                    const int64_t pos0) {
         const int64_t ne = h_.n_embd;
         const int64_t q_out = h_.n_head * 2 * h_.head_dim;
         const int64_t kv_out = h_.n_head_kv * h_.head_dim;
+        float * k_cache = static_cast<float *>(kv_k_) + kv_index_[il] * max_seq_ * kv_out;
+        float * v_cache = static_cast<float *>(kv_v_) + kv_index_[il] * max_seq_ * kv_out;
         void * wq = stage_w(p + "attn_q.weight");
         void * wk = stage_w(p + "attn_k.weight");
         void * wv = stage_w(p + "attn_v.weight");
@@ -369,15 +381,18 @@ private:
                                      static_cast<float *>(k_), T * h_.n_head_kv, h_.head_dim,
                                      (float) h_.eps, 1.0f, nullptr) ||
             !omph::kernels::rope_neox(static_cast<float *>(q_), T, h_.n_head, h_.head_dim, h_.n_rot,
-                                      (float) h_.freq_base, 0, nullptr) ||
+                                      (float) h_.freq_base, pos0, nullptr) ||
             !omph::kernels::rope_neox(static_cast<float *>(k_), T, h_.n_head_kv, h_.head_dim,
-                                      h_.n_rot, (float) h_.freq_base, 0, nullptr) ||
-            !omph::kernels::attention(static_cast<const float *>(q_),
-                                      static_cast<const float *>(k_),
-                                      static_cast<const float *>(v_),
+                                      h_.n_rot, (float) h_.freq_base, pos0, nullptr) ||
+            hipMemcpy(k_cache + pos0 * kv_out, k_, (size_t) T * kv_out * 4,
+                      hipMemcpyDeviceToDevice) != hipSuccess ||
+            hipMemcpy(v_cache + pos0 * kv_out, v_, (size_t) T * kv_out * 4,
+                      hipMemcpyDeviceToDevice) != hipSuccess ||
+            !omph::kernels::attention(static_cast<const float *>(q_), k_cache, v_cache,
                                       static_cast<const float *>(gate_),
-                                      static_cast<float *>(attn_), T, T, h_.n_head, h_.n_head_kv,
-                                      h_.head_dim, 1.0f / std::sqrt((float) h_.head_dim), nullptr) ||
+                                      static_cast<float *>(attn_), T, pos0 + T, h_.n_head,
+                                      h_.n_head_kv, h_.head_dim,
+                                      1.0f / std::sqrt((float) h_.head_dim), nullptr) ||
             !omph::kernels::cast_f32_to_f16(static_cast<const float *>(attn_), ffn16_,
                                             T * h_.n_head * h_.head_dim, nullptr) ||
             !linear.run(wo, ffn16_, static_cast<float *>(blk_), ne, h_.n_head * h_.head_dim, T)) {
@@ -408,8 +423,12 @@ private:
         const float * ssm_norm = f32_ref(p + "ssm_norm.weight");
         const float * conv_w = f32_ref(p + "ssm_conv1d.weight");
         uint8_t * st = static_cast<uint8_t *>(states_[il]);
-        float * conv_state = reinterpret_cast<float *>(st);
-        float * seq_state = reinterpret_cast<float *>(st + (h_.ssm_conv_k - 1) * channels * 4);
+        const int64_t n_conv_f = (h_.ssm_conv_k - 1) * channels;
+        float * conv_a = reinterpret_cast<float *>(st);
+        float * conv_b = conv_a + n_conv_f;
+        float * conv_cur = conv_flip_[il] ? conv_b : conv_a;
+        float * conv_new = conv_flip_[il] ? conv_a : conv_b;
+        float * seq_state = reinterpret_cast<float *>(st + 2 * n_conv_f * 4);
 
         if (!omph::kernels::cast_f32_to_f16(static_cast<const float *>(cur_), h16_, T * ne, nullptr)) {
             return fail("cast failed");
@@ -426,9 +445,11 @@ private:
                                                   nullptr) ||
             !omph::kernels::mul_row_inplace(static_cast<float *>(alpha_), ssm_a, T, n_vh,
                                             nullptr) ||
-            !omph::kernels::conv1d_state(static_cast<const float *>(fused_), conv_w, conv_state,
+            !omph::kernels::conv1d_state(static_cast<const float *>(fused_), conv_w, conv_cur,
                                          static_cast<float *>(conv_out_), T, channels,
                                          h_.ssm_conv_k, nullptr) ||
+            !omph::kernels::conv_state_update(static_cast<const float *>(fused_), conv_cur,
+                                              conv_new, T, channels, h_.ssm_conv_k, nullptr) ||
             !omph::kernels::silu_inplace(static_cast<float *>(conv_out_), T * channels, nullptr) ||
             !omph::kernels::split_qkv(static_cast<const float *>(conv_out_),
                                       static_cast<float *>(q_), static_cast<float *>(k_),
@@ -469,6 +490,7 @@ private:
             !linear.run(wout, ffn16_, static_cast<float *>(blk_), ne, v_dims, T)) {
             return fail("gdn output failed");
         }
+        conv_flip_[il] ^= 1;
         return true;
     }
 
@@ -507,6 +529,11 @@ private:
     HParams h_;
     Scratch scratch_;
     std::vector<void *> states_;
+    std::vector<int64_t> kv_index_;
+    std::vector<char> conv_flip_;
+    int64_t max_seq_ = 0;
+    void * kv_k_ = nullptr;
+    void * kv_v_ = nullptr;
     void * dev_weights_ = nullptr;
     void * x_ = nullptr;
     void * cur_ = nullptr;
@@ -539,7 +566,7 @@ private:
 int main(int argc, char ** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: %s <model.gguf> <tokens.txt> <out-logits.f32> "
-                             "[--trace-dir DIR] [--tokens N]\n",
+                             "[--trace-dir DIR] [--tokens N] [--generate N --gen-out FILE]\n",
                      argv[0]);
         return 2;
     }
@@ -547,12 +574,18 @@ int main(int argc, char ** argv) {
     const std::string tok_path = argv[2];
     const std::string logits_path = argv[3];
     std::string trace_dir;
+    std::string gen_path;
     int64_t max_tokens = 0;
+    int64_t generate = 0;
     for (int i = 4; i < argc; ++i) {
         if (std::strcmp(argv[i], "--trace-dir") == 0 && i + 1 < argc) {
             trace_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
             max_tokens = std::atoll(argv[++i]);
+        } else if (std::strcmp(argv[i], "--generate") == 0 && i + 1 < argc) {
+            generate = std::atoll(argv[++i]);
+        } else if (std::strcmp(argv[i], "--gen-out") == 0 && i + 1 < argc) {
+            gen_path = argv[++i];
         }
     }
     try {
@@ -571,25 +604,60 @@ int main(int argc, char ** argv) {
         if (max_tokens > 0 && (int64_t) toks.size() > max_tokens) {
             toks.resize((size_t) max_tokens);
         }
-        Runner runner(model, (int64_t) toks.size());
+        if (generate > 0 && gen_path.empty()) {
+            std::fprintf(stderr, "--generate also needs --gen-out\n");
+            return 2;
+        }
+        Runner runner(model, (int64_t) toks.size() + generate + 8);
+        const HParams & h = runner.hparams();
         std::vector<float> logits;
-        if (!runner.forward(toks, logits, trace_dir)) {
+        if (!runner.forward(toks, logits, trace_dir, 0)) {
             return 1;
         }
         write_f32(logits_path, logits);
-        // greedy tokens for the report
-        const HParams & h = runner.hparams();
-        std::printf("logits: %lld x %lld -> %s\ngreedy:", (long long) toks.size(),
-                    (long long) h.n_vocab, logits_path.c_str());
-        for (size_t t = 0; t < toks.size(); ++t) {
-            const float * row = logits.data() + t * (size_t) h.n_vocab;
+        const auto argmax = [&](const float * row) {
             int64_t best = 0;
             for (int64_t i = 1; i < h.n_vocab; ++i) {
                 if (row[i] > row[best]) {
                     best = i;
                 }
             }
-            std::printf(" %lld", (long long) best);
+            return (int32_t) best;
+        };
+        if (generate > 0) {
+            // greedy decode: one token per step, reusing the KV cache, the conv
+            // state and the delta-net state
+            std::vector<int32_t> gen;
+            int32_t next = argmax(logits.data() + (toks.size() - 1) * (size_t) h.n_vocab);
+            for (int64_t i = 0; i < generate; ++i) {
+                gen.push_back(next);
+                if (i + 1 == generate) {
+                    break;
+                }
+                const std::vector<int32_t> one{next};
+                if (!runner.forward(one, logits, std::string(), (int64_t) toks.size() + i)) {
+                    return 1;
+                }
+                next = argmax(logits.data());
+            }
+            if (FILE * f = std::fopen(gen_path.c_str(), "w")) {
+                for (const int32_t t : gen) {
+                    std::fprintf(f, "%d\n", t);
+                }
+                std::fclose(f);
+            }
+            std::printf("generated:");
+            for (const int32_t t : gen) {
+                std::printf(" %d", t);
+            }
+            std::printf("\n");
+        }
+        // greedy tokens for the report
+        std::printf("logits: %lld x %lld -> %s\ngreedy:", (long long) toks.size(),
+                    (long long) h.n_vocab, logits_path.c_str());
+        for (size_t t = 0; t < toks.size(); ++t) {
+            const float * row = logits.data() + t * (size_t) h.n_vocab;
+            std::printf(" %lld", (long long) argmax(row));
         }
         std::printf("\n");
     } catch (const std::exception & exc) {
