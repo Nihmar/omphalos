@@ -13,4 +13,9 @@ namespace omph::kernels {
 bool gemv_q4k(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
               hipStream_t stream);
 
+// Same contract for a tensor in the repacked IQ4_XS layout. The 16-entry
+// IQ4_NL codebook lives in the kernel (same values as format::kIq4Codebook).
+bool gemv_iq4_xs(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
+                 hipStream_t stream);
+
 } // namespace omph::kernels

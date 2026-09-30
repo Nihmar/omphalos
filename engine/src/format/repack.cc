@@ -17,6 +17,17 @@ struct BlockQ4K {
 
 static_assert(sizeof(BlockQ4K) == 144, "Q4_K block must be 144 bytes");
 
+#pragma pack(push, 1)
+struct BlockIq4Xs {
+    uint16_t d;
+    uint16_t scales_h;
+    uint8_t scales_l[4];
+    uint8_t qs[128];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(BlockIq4Xs) == 136, "IQ4_XS block must be 136 bytes");
+
 // ggml-common.h get_scale_min_k4: eight 6-bit scales and eight 6-bit mins
 // packed into 12 bytes.
 inline void get_scale_min_k4(const int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
@@ -117,6 +128,71 @@ void unrepack_q4k(const void * src, const int64_t n_blocks, void * dst) {
                 g[i] = (uint8_t) ((lo & 0xF) | ((hi & 0xF) << 4));
             }
         }
+    }
+}
+
+// ------------------------------------------------------------------ IQ4_XS
+
+const int8_t kIq4Codebook[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                 1,    13,   25,  38,  53,  69,  89,  113};
+
+namespace {
+
+inline int iq4xs_scale(const int ib, const uint8_t * scales_l, const uint16_t scales_h) {
+    return ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
+}
+
+} // namespace
+
+Iq4Layout iq4_layout(const int64_t n_blocks) {
+    Iq4Layout l;
+    l.n_blocks = n_blocks;
+    l.qs_off = 0;
+    l.sc_off = align128(n_blocks * 128);
+    l.d_off = align128(l.sc_off + n_blocks * 8);
+    l.total = align128(l.d_off + n_blocks * 2);
+    return l;
+}
+
+void repack_iq4_xs(const void * src, const int64_t n_blocks, void * dst) {
+    const Iq4Layout l = iq4_layout(n_blocks);
+    const auto * in = static_cast<const BlockIq4Xs *>(src);
+    uint8_t * out = static_cast<uint8_t *>(dst);
+    uint8_t * qs = out + l.qs_off;
+    uint8_t * sc = out + l.sc_off;
+    uint8_t * d = out + l.d_off;
+
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        std::memcpy(d + 2 * b, &in[b].d, 2);
+        std::memcpy(qs + b * 128, in[b].qs, 128);
+        for (int ib = 0; ib < 8; ++ib) {
+            sc[b * 8 + ib] = (uint8_t) iq4xs_scale(ib, in[b].scales_l, in[b].scales_h);
+        }
+    }
+}
+
+void unrepack_iq4_xs(const void * src, const int64_t n_blocks, void * dst) {
+    const Iq4Layout l = iq4_layout(n_blocks);
+    const uint8_t * in = static_cast<const uint8_t *>(src);
+    const uint8_t * qs = in + l.qs_off;
+    const uint8_t * sc = in + l.sc_off;
+    const uint8_t * d = in + l.d_off;
+    auto * out = static_cast<BlockIq4Xs *>(dst);
+
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        std::memcpy(&out[b].d, d + 2 * b, 2);
+        std::memcpy(out[b].qs, qs + b * 128, 128);
+        out[b].scales_l[0] = 0;
+        out[b].scales_l[1] = 0;
+        out[b].scales_l[2] = 0;
+        out[b].scales_l[3] = 0;
+        uint16_t hi = 0;
+        for (int ib = 0; ib < 8; ++ib) {
+            const uint8_t ls = sc[b * 8 + ib];
+            out[b].scales_l[ib / 2] |= (uint8_t) ((ls & 0xF) << (4 * (ib % 2)));
+            hi |= (uint16_t) ((ls >> 4) & 3) << (2 * ib);
+        }
+        out[b].scales_h = hi;
     }
 }
 

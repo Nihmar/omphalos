@@ -1,0 +1,62 @@
+# M3.2 — fused IQ4_XS GEMV + repacking (2026-09-30)
+
+Type IQ4_XS: 4-bit codes into the 16-entry non-linear codebook `kvalues_iq4nl`,
+per-sub-block `d * (scale6 - 32)`. 2.81 GiB of the allocation, 96 tensors — the
+second-largest type after IQ3_S.
+
+Conditions: `omph-gemv-bench`, median of 5 runs, ROCm 7.2.4, gfx1200, desktop
+idle (PLAN.md §17). Ceiling: 318.3 GB/s measured (`bench/results/m0-bandwidth.csv`).
+
+## Summary (median of 5 runs)
+
+| measurement | time | bytes read | effective bandwidth | vs ceiling |
+|---|---:|---:|---:|---:|
+| all 96 IQ4_XS tensors, one pass | **18.13 ms** | 2924.4 MiB | **169.1 GB/s** | **53.1 %** |
+| single tensor `blk.63.ffn_up` (45.2 MiB) | 0.268 ms | 45.8 MiB | 179.4 GB/s | 56.4 % |
+| *(reference: Q4_K `output.weight`, M3.1)* | 2.90 ms | 701.0 MiB | 253.2 GB/s | 79.6 % |
+
+Repacking verified lossless for all 96 tensors (rebuild of the source block
+stream compared byte for byte). Accuracy against the f16 dequant + hipBLASLt
+path: max |d| 7e-4 (2.4e-4 relative), mean |d| 1e-4.
+
+## Why it is slower than Q4_K
+
+The core loop is the same shape, but every value needs a **codebook lookup with
+a divergent index**, which lands in LDS. Two measurements narrow it down:
+
+- Factoring the per-sub-block scale out of the sum (`acc += dl * Σ table[c]·x`
+  instead of `Σ (dl·table[c])·x`) and switching the LDS table from int8 to f32
+  changed the result by 0.2 % (52.8 -> 53.0 %), so the kernel is **not ALU-bound**.
+- The aggregate (2.9 GiB) and the single 45 MiB tensor agree within 2 %, so it
+  is not L2 residency or launch overhead either.
+
+That points at the LDS/bank behaviour of the 16-entry lookup (32 divergent
+lookups per 16 bytes read). Follow-ups to try, in order:
+
+1. Select the codebook entry with byte-permute instructions (`v_perm_b32` over
+   four 32-bit registers holding the 16 int8 values) instead of an LDS gather.
+2. Keep the codes' low/high nibbles in separate streams so each lane's 16-byte
+   load covers one 32-value run of a *single* sub-block (better locality).
+
+## Raw runs
+
+```
+IQ4_XS: 96 tensors, 2924.4 MiB read per pass
+fused      : 18.152 ms  (2924.4 MiB read)  -> 168.9 GB/s  (53.1% of 318.3)
+accuracy   : blk.0.attn_gate.weight  max|d| 0.0007 (2.41e-04 rel), mean|d| 0.0001, |ref| up to 2.9
+IQ4_XS: 96 tensors, 2924.4 MiB read per pass
+fused      : 18.123 ms  (2924.4 MiB read)  -> 169.2 GB/s  (53.2% of 318.3)
+accuracy   : blk.0.attn_gate.weight  max|d| 0.0007 (2.41e-04 rel), mean|d| 0.0001, |ref| up to 2.9
+IQ4_XS: 96 tensors, 2924.4 MiB read per pass
+fused      : 18.109 ms  (2924.4 MiB read)  -> 169.3 GB/s  (53.2% of 318.3)
+accuracy   : blk.0.attn_gate.weight  max|d| 0.0007 (2.41e-04 rel), mean|d| 0.0001, |ref| up to 2.9
+IQ4_XS: 96 tensors, 2924.4 MiB read per pass
+fused      : 18.148 ms  (2924.4 MiB read)  -> 169.0 GB/s  (53.1% of 318.3)
+accuracy   : blk.0.attn_gate.weight  max|d| 0.0007 (2.41e-04 rel), mean|d| 0.0001, |ref| up to 2.9
+IQ4_XS: 96 tensors, 2924.4 MiB read per pass
+fused      : 18.125 ms  (2924.4 MiB read)  -> 169.2 GB/s  (53.2% of 318.3)
+accuracy   : blk.0.attn_gate.weight  max|d| 0.0007 (2.41e-04 rel), mean|d| 0.0001, |ref| up to 2.9
+tensor blk.63.ffn_up.weight: 17408 x 5120, type 23, 45.2 MiB, 348160 blocks
+fused      : 0.268 ms  (45.8 MiB read)  -> 179.4 GB/s  (56.4% of 318.3)
+accuracy   : blk.63.ffn_up.weight  max|d| 0.0005 (1.92e-04 rel), mean|d| 0.0001, |ref| up to 2.5
+```
