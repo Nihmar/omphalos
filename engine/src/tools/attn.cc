@@ -194,9 +194,9 @@ int main(int argc, char ** argv) {
             return fail("split_qg failed");
         }
         if (!omph::kernels::rms_norm((const float *) q, (const float *) dev_qn, (float *) q,
-                                     tokens * n_head, head_dim, (float) eps, nullptr) ||
+                                     tokens * n_head, head_dim, (float) eps, 1.0f, nullptr) ||
             !omph::kernels::rms_norm((const float *) kf, (const float *) dev_kn, (float *) kf,
-                                     tokens * n_head_kv, head_dim, (float) eps, nullptr)) {
+                                     tokens * n_head_kv, head_dim, (float) eps, 1.0f, nullptr)) {
             return fail("qk-norm failed");
         }
         if (trace) {
