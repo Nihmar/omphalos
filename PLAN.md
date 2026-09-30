@@ -906,7 +906,18 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 | 9 | Offline converter + final format | Layouts frozen, bit-exact verification in the converter |
 | 10 | Polish | C ABI, OpenAI-compatible server, prompt-prefix cache in host RAM, breadcrumbs |
 
-Status: **M0, M1 and M2 are complete.** The naive GPU path (`omph-run`) reproduces the NumPy reference: prefill logits rel 3.7e-04, greedy decode identical over 3 generated tokens with persistent KV / conv / delta-net state (see the M2 section of AGENTS.md for the commands). M3 is next.
+Status: **M0, M1, M2 and M3 are complete.**
+
+- **M3 (custom layout + fused GEMV).** Every quant type in the allocation except
+  IQ1_M (0.02 GiB) has a fused dequant+dot kernel, each with a repacked layout
+  verified byte-identical against the source block stream. Decode: **59 ms/token**
+  — 14.1x the naive f16 path — reading 11.19 GiB of weights, i.e.
+  **~204 GB/s = 64 % of the measured 318.3 GB/s ceiling** (the GEMV launches alone:
+  250 GB/s = 79 %). The milestone criterion was >= 60 %. Greedy output is still
+  identical to the NumPy reference on the optimized path (prefill logits
+  rel 4.9e-04).
+- The prefill is *not* part of M3 and is untouched: ~2 s per 10-token pass
+  (~7 t/s), to be rebuilt in M8 (see §4.2 for where its time goes). The naive GPU path (`omph-run`) reproduces the NumPy reference: prefill logits rel 3.7e-04, greedy decode identical over 3 generated tokens with persistent KV / conv / delta-net state (see the M2 section of AGENTS.md for the commands). M4 (graphs + fusions) is next.
 
 ---
 
