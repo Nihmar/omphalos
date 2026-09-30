@@ -552,3 +552,31 @@ Also this round:
 **Decode is now 59 ms/token = 14.1x the milestone-2 f16 path.** Of that, ~48 ms
 are the fused GEMVs at the bandwidth ceiling and ~11 ms is the remaining glue —
 the attention's own GEMMs plus per-layer norms, casts and launches.
+
+# M3.17 — the optimized path reproduces the reference greedy output
+
+`check_gpu_decode.py --gemv --generate 3` (fused GEMV decode, flash attention,
+fused delta rule, 7 quant types):
+
+- engine generated `[198, 760, 3841]`, NumPy reference `[198, 760, 3841]` —
+  **greedy sequences identical**, prefill logits rel **4.9e-04**.
+- verdict: PASS.
+
+So the milestone-2 exit criterion still holds on the optimized path, not just on
+the f16 correctness path.
+
+## Where the 59 ms/token sits
+
+The fused GEMVs cost 48 ms, which matches the weighted average of the per-type
+efficiencies (Q4_K 92 %, IQ4_XS 82 %, IQ3_XXS 77 %, IQ3_S 69 %, IQ2_S 73 %,
+IQ2_XS 63 %, Q2_K 66 % -> ~77 %) against the 318 GB/s ceiling. So the GEMV path
+is at its *own* weighted ceiling: further decode gains have to come from the slow
+types or from the ~11 ms of glue, not from the fast ones.
+
+## Method note worth keeping
+
+Two attribution mistakes cost real time in this milestone and both are recorded
+here: event-based per-phase sums are meaningless when the same event objects are
+re-recorded (every pair points at the last recording), and a Python simulation of
+a kernel written *from the kernel* instead of from the spec will happily agree
+with a bug. Ablation switches and spec-derived simulations are what worked.
