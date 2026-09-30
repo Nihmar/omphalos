@@ -1,0 +1,589 @@
+W20260930 13:41:32.018029 139876183108736 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000790 sec
+W20260930 13:41:32.033718 139876183108736 simple_timer.cpp:55] [rocprofv3] '/home/alessandro/Projects/llama.cpp-RX9060XT-16GB/build-hip/bin/llama-cli -m models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -ngl 99 -fa on -c 4096 -n 0 -t 8 -st -p Here is a C++ source file from the llama.cpp project (ggml CUDA/HIP backend):
+
+```cpp
+#include "common.cuh"
+#include "mmq.cuh"
+#include "quantize.cuh"
+#include "mmid.cuh"
+
+#include <cstdint>
+
+static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
+    switch (args.type_x) {
+        case GGML_TYPE_Q1_0:
+            mul_mat_q_case<GGML_TYPE_Q1_0>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q2_0:
+            mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q4_0:
+            mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q4_1:
+            mul_mat_q_case<GGML_TYPE_Q4_1>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q5_0:
+            mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q5_1:
+            mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q8_0:
+            mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, args, stream);
+            break;
+// -----------------------------------------------------------------------
+        case GGML_TYPE_Q2_K:
+            mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q3_K:
+            mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q4_K:
+            mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q5_K:
+            mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q6_K:
+            mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, args, stream);
+            break;
+// -----------------------------------------------------------------------
+        case GGML_TYPE_IQ1_S:
+            mul_mat_q_case<GGML_TYPE_IQ1_S>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ2_XXS:
+            mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ2_XS:
+            mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ2_S:
+            mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ3_XXS:
+            mul_mat_q_case<GGML_TYPE_IQ3_XXS>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ3_S:
+            mul_mat_q_case<GGML_TYPE_IQ3_S>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ4_XS:
+            mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, args, stream);
+            break;
+// -----------------------------------------------------------------------
+        case GGML_TYPE_MXFP4:
+            // src1 at Q4 uses the native FP4 instructions, which are Blackwell-only
+            if (prec_src1 == GGML_PREC_Q4) {
+                mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_Q4>(ctx, args, stream);
+                break;
+            }
+            mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
+            break;
+        case GGML_TYPE_NVFP4:
+            if (prec_src1 == GGML_PREC_Q4) {
+                mul_mat_q_case<GGML_TYPE_NVFP4, GGML_PREC_Q4>(ctx, args, stream);
+                break;
+            }
+            mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+            break;
+    }
+}
+
+// overrides the src1 precision requested by the graph, "auto" keeps the requested one
+static ggml_prec ggml_cuda_mmq_get_prec_env() {
+    const char * env_c = getenv("GGML_CUDA_MMQ_PREC");
+    if (env_c == nullptr) {
+        return GGML_PREC_UNDEFINED;
+    }
+    std::string env_cpp = env_c;
+    for (char & c : env_cpp) {
+        c = std::tolower(c);
+    }
+    if (env_cpp == "q4") {
+        return GGML_PREC_Q4;
+    }
+    if (env_cpp == "q8") {
+        return GGML_PREC_Q8;
+    }
+    if (env_cpp != "auto") {
+        GGML_LOG_WARN("%s: Unknown value for GGML_CUDA_MMQ_PREC: '%s'. Available: 'q4', 'q8', 'auto'.\n", __func__, env_cpp.c_str());
+    }
+    return GGML_PREC_UNDEFINED;
+}
+
+// src1 is quantized to Q8_1 unless the FP4 types can use 4-bit activations, in which case they
+// default to the native W4A4 instructions on Blackwell.
+static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, const int cc) {
+    static const ggml_prec prec_env = ggml_cuda_mmq_get_prec_env();
+
+    ggml_prec prec = prec_env;
+    if (prec == GGML_PREC_UNDEFINED) {
+        prec = (ggml_prec) ggml_get_op_params_i32(dst, 3);
+    }
+
+    // Q4 only for the FP4 types on Blackwell
+    GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
+    const bool can_use_q4 = (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) && blackwell_mma_available(cc);
+    if (prec == GGML_PREC_Q8 || !can_use_q4) {
+        return GGML_PREC_Q8;
+    }
+    return GGML_PREC_Q4;
+}
+
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    cudaStream_t stream = ctx.stream();
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const size_t ts_dst  = ggml_type_size(dst->type);
+
+    GGML_ASSERT(        nb00       == ts_src0);
+    GGML_ASSERT(        nb10       == ts_src1);
+    GGML_ASSERT(        nb0        == ts_dst);
+    GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
+
+    const char  * src0_d = (const char  *) src0->data;
+    const float * src1_d = (const float *) src1->data;
+    float       *  dst_d = (float       *)  dst->data;
+
+    // If src0 is a temporary compute buffer, clear any potential padding.
+    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        const size_t size_data  = ggml_nbytes(src0);
+        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+        if (size_alloc > size_data) {
+            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
+            GGML_ASSERT(!src0->view_src);
+            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+        }
+    }
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+
+    const int64_t s01 = src0->nb[1] / ts_src0;
+    const int64_t s1  =  dst->nb[1] / ts_dst;
+    const int64_t s02 = src0->nb[2] / ts_src0;
+    const int64_t s2  =  dst->nb[2] / ts_dst;
+    const int64_t s03 = src0->nb[3] / ts_src0;
+    const int64_t s3  =  dst->nb[3] / ts_dst;
+
+    const bool fallback = ne01 % 128 != 0;
+
+    const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0, dst, cc);
+
+    const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
+    const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
+    const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
+
+    if (!ids) {
+        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
+            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
+        if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
+            src1_scale.alloc(ne13*ne12*ne11);
+        }
+
+        {
+            const int64_t s11 = src1->nb[1] / ts_src1;
+            const int64_t s12 = src1->nb[2] / ts_src1;
+            const int64_t s13 = src1->nb[3] / ts_src1;
+            if (use_native_fp4) {
+                static constexpr size_t align_float8 = 32;
+                const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
+                static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
+                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                                        ne11, ne12, ne13, stream);
+
+            } else {
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                                       ne11, ne12, ne13, stream);
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        // Stride depends on quantization format
+        const int64_t s12 = use_native_fp4 ?
+                                ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
+               
+```
+
+Continue by writing the next function of this file. Output only code.' ::     0.000000 sec
+W20260930 13:41:32.039532 139876183108736 tool.cpp:2423] HSA version 1.18.0 initialized (instance=0)
+
+
+Loading model... |-\|/-\|/-\|/-\|/ 
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b11235-6c7a87f7e
+model      : models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+ftype      : IQ3_S - 3.4375 bpw
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> Here is a C++ source file from the llama.cpp project (ggml CUDA/HIP backend):
+
+```cpp
+#include "common.cuh"
+#include "mmq.cuh"
+#include "quantize.cuh"
+#include "mmid.cuh"
+
+#include <cstdint>
+
+static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
+    switch (args.type_x) {
+        case GGML_TYPE_Q1_0:
+            mul_mat_q_case<GGML_TYPE_Q1_0>(ctx, args, stream);
+            break;
+        case GGML_TY ... (truncated)
+
+[Start thinking]
+
+We
+W20260930 13:41:39.023521 139876183108736 simple_timer.cpp:55] [rocprofv3] '/home/alessandro/Projects/llama.cpp-RX9060XT-16GB/build-hip/bin/llama-cli -m models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -ngl 99 -fa on -c 4096 -n 0 -t 8 -st -p Here is a C++ source file from the llama.cpp project (ggml CUDA/HIP backend):
+
+```cpp
+#include "common.cuh"
+#include "mmq.cuh"
+#include "quantize.cuh"
+#include "mmid.cuh"
+
+#include <cstdint>
+
+static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
+    switch (args.type_x) {
+        case GGML_TYPE_Q1_0:
+            mul_mat_q_case<GGML_TYPE_Q1_0>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q2_0:
+            mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q4_0:
+            mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q4_1:
+            mul_mat_q_case<GGML_TYPE_Q4_1>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q5_0:
+            mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q5_1:
+            mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q8_0:
+            mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, args, stream);
+            break;
+// -----------------------------------------------------------------------
+        case GGML_TYPE_Q2_K:
+            mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q3_K:
+            mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q4_K:
+            mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q5_K:
+            mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q6_K:
+            mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, args, stream);
+            break;
+// -----------------------------------------------------------------------
+        case GGML_TYPE_IQ1_S:
+            mul_mat_q_case<GGML_TYPE_IQ1_S>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ2_XXS:
+            mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ2_XS:
+            mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ2_S:
+            mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ3_XXS:
+            mul_mat_q_case<GGML_TYPE_IQ3_XXS>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ3_S:
+            mul_mat_q_case<GGML_TYPE_IQ3_S>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ4_XS:
+            mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, args, stream);
+            break;
+// -----------------------------------------------------------------------
+        case GGML_TYPE_MXFP4:
+            // src1 at Q4 uses the native FP4 instructions, which are Blackwell-only
+            if (prec_src1 == GGML_PREC_Q4) {
+                mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_Q4>(ctx, args, stream);
+                break;
+            }
+            mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
+            break;
+        case GGML_TYPE_NVFP4:
+            if (prec_src1 == GGML_PREC_Q4) {
+                mul_mat_q_case<GGML_TYPE_NVFP4, GGML_PREC_Q4>(ctx, args, stream);
+                break;
+            }
+            mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+            break;
+    }
+}
+
+// overrides the src1 precision requested by the graph, "auto" keeps the requested one
+static ggml_prec ggml_cuda_mmq_get_prec_env() {
+    const char * env_c = getenv("GGML_CUDA_MMQ_PREC");
+    if (env_c == nullptr) {
+        return GGML_PREC_UNDEFINED;
+    }
+    std::string env_cpp = env_c;
+    for (char & c : env_cpp) {
+        c = std::tolower(c);
+    }
+    if (env_cpp == "q4") {
+        return GGML_PREC_Q4;
+    }
+    if (env_cpp == "q8") {
+        return GGML_PREC_Q8;
+    }
+    if (env_cpp != "auto") {
+        GGML_LOG_WARN("%s: Unknown value for GGML_CUDA_MMQ_PREC: '%s'. Available: 'q4', 'q8', 'auto'.\n", __func__, env_cpp.c_str());
+    }
+    return GGML_PREC_UNDEFINED;
+}
+
+// src1 is quantized to Q8_1 unless the FP4 types can use 4-bit activations, in which case they
+// default to the native W4A4 instructions on Blackwell.
+static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, const int cc) {
+    static const ggml_prec prec_env = ggml_cuda_mmq_get_prec_env();
+
+    ggml_prec prec = prec_env;
+    if (prec == GGML_PREC_UNDEFINED) {
+        prec = (ggml_prec) ggml_get_op_params_i32(dst, 3);
+    }
+
+    // Q4 only for the FP4 types on Blackwell
+    GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
+    const bool can_use_q4 = (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) && blackwell_mma_available(cc);
+    if (prec == GGML_PREC_Q8 || !can_use_q4) {
+        return GGML_PREC_Q8;
+    }
+    return GGML_PREC_Q4;
+}
+
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    cudaStream_t stream = ctx.stream();
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const size_t ts_dst  = ggml_type_size(dst->type);
+
+    GGML_ASSERT(        nb00       == ts_src0);
+    GGML_ASSERT(        nb10       == ts_src1);
+    GGML_ASSERT(        nb0        == ts_dst);
+    GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
+
+    const char  * src0_d = (const char  *) src0->data;
+    const float * src1_d = (const float *) src1->data;
+    float       *  dst_d = (float       *)  dst->data;
+
+    // If src0 is a temporary compute buffer, clear any potential padding.
+    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        const size_t size_data  = ggml_nbytes(src0);
+        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+        if (size_alloc > size_data) {
+            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
+            GGML_ASSERT(!src0->view_src);
+            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+        }
+    }
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+
+    const int64_t s01 = src0->nb[1] / ts_src0;
+    const int64_t s1  =  dst->nb[1] / ts_dst;
+    const int64_t s02 = src0->nb[2] / ts_src0;
+    const int64_t s2  =  dst->nb[2] / ts_dst;
+    const int64_t s03 = src0->nb[3] / ts_src0;
+    const int64_t s3  =  dst->nb[3] / ts_dst;
+
+    const bool fallback = ne01 % 128 != 0;
+
+    const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0, dst, cc);
+
+    const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
+    const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
+    const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
+
+    if (!ids) {
+        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
+            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
+        if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
+            src1_scale.alloc(ne13*ne12*ne11);
+        }
+
+        {
+            const int64_t s11 = src1->nb[1] / ts_src1;
+            const int64_t s12 = src1->nb[2] / ts_src1;
+            const int64_t s13 = src1->nb[3] / ts_src1;
+            if (use_native_fp4) {
+                static constexpr size_t align_float8 = 32;
+                const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
+                static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
+                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                                        ne11, ne12, ne13, stream);
+
+            } else {
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                                       ne11, ne12, ne13, stream);
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        // Stride depends on quantization format
+        const int64_t s12 = use_native_fp4 ?
+                                ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
+               
+```
+
+Continue by writing the next function of this file. Output only code.' ::     6.989804 sec
+E20260930 13:41:39.030498 139876183108736 output_stream.cpp:111] Opened result file: /home/alessandro/Projects/omphalos/bench/traces/m0-prefillonly-off_kernel_trace.csv
+E20260930 13:41:39.068243 139876183108736 output_stream.cpp:111] Opened result file: /home/alessandro/Projects/omphalos/bench/traces/m0-prefillonly-off_agent_info.csv
+
+[ Prompt: 554,8 t/s | Generation: 0,0 t/s ]
+
+
+Exiting...
+
+    ROCPROFV3 SUMMARY:
+
+    |                                                                                                                                                                                                                                                                                                                   NAME                                                                                                                                                                                                                                                                                                                   |     DOMAIN      |      CALLS      | DURATION (nsec) | AVERAGE (nsec)  | PERCENT (INC) |   MIN (nsec)    |   MAX (nsec)    |     STDDEV      |
+    |------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------|-----------------|-----------------|-----------------|---------------|-----------------|-----------------|-----------------|
+    | void mul_mat_q<(ggml_type)21, 128, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                         | KERNEL_DISPATCH |             720 |       929832445 |       1.291e+06 |     17,650167 |          112317 |         2980122 |       6.353e+05 |
+    | void mul_mat_q<(ggml_type)18, 128, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                         | KERNEL_DISPATCH |             390 |       591023504 |       1.515e+06 |     11,218864 |          110717 |         2973442 |       6.032e+05 |
+    | void mul_mat_q<(ggml_type)23, 128, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                         | KERNEL_DISPATCH |             480 |       527483674 |       1.099e+06 |     10,012745 |          100238 |         2537334 |       5.653e+05 |
+    | void gated_delta_net_cuda<128, false, false>(float const*, float const*, float const*, float const*, float const*, float const*, float*, float*, long, long, long, long, long, long, long, long, long, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, float, long, int)                                                                                                                                                                                                                                                                                                                         | KERNEL_DISPATCH |             480 |       477252292 |       9.943e+05 |      9,059248 |           16039 |         2649691 |       7.984e+05 |
+    | void mul_mat_q<(ggml_type)10, 80, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                          | KERNEL_DISPATCH |              78 |       324919212 |       4.166e+06 |      6,167647 |         1610638 |         9606589 |       1.671e+06 |
+    | Cijk_Alik_Bljk_BSS_BH_MT128x32x16_SE_1LDSB0_APM1_ABV0_ACED0_AF0EM1_AF1EM1_AMAS0_ASE_ASGT_ASLT_ASM_ASAE01_ASCE01_ASEM1_AAC0_BL1_BS1_CLR0_DTLA0_DTLB0_DTVA0_DTVB0_DVO0_ETSP_EPS0_ELFLR0_EMLL0_FSSC10_FL0_GLVWA1_GLVWB1_GRCGA1_GRCGB1_GRPM1_GRVW1_GSU3_GSUAMB_GLS0_ISA000_IU1_K1_KLS_LBSPPA0_LBSPPB0_LPA0_LPB0_LDL1_LRVW1_LWPMn1_LDW0_FMA_MIAV0_MDA2_MO40_MMFSC_MKFGSU256_NTA0_NTB0_NTC0_NTD0_NEPBS0_NLCA1_NLCB1_ONLL1_OPLV0_PK0_PAP0_PGR0_PLR1_PKA0_SIA1_SLW1_SS0_SU32_SUM0_SUS256_SCIUI1_SPO0_SRVW0_SSO0_SVW4_SNLL0_TSGRA0_TSGRB0_TT8_2_TLDS0_UMLDSA0_UMLDSB0_U64SL1_USFGROn1_VAW1_VSn1_VW1_VWB1_VFLRP0_WSGRA0_WSGRB0_WS64_WG16_16_1_WGM8 | KERNEL_DISPATCH |             768 |       213999672 |       2.786e+05 |      4,062162 |          130517 |          484507 |       7.113e+04 |
+    | void mul_mat_q<(ggml_type)22, 128, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                         | KERNEL_DISPATCH |              80 |       192647081 |       2.408e+06 |      3,656845 |          151996 |         4125092 |       9.936e+05 |
+    | void mul_mat_q<(ggml_type)12, 128, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                         | KERNEL_DISPATCH |             190 |       177830596 |       9.360e+05 |      3,375597 |          118197 |         2327260 |       7.865e+05 |
+    | void unary_gated_op_kernel<&(op_silu(float)), float>(float const*, float const*, float*, long, long, long, long)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | KERNEL_DISPATCH |            1120 |       154806404 |       1.382e+05 |      2,938550 |            1640 |          355951 |       1.414e+05 |
+    | Cijk_Alik_Bljk_HSS_BH_MT64x32x8_SE_1LDSB0_APM1_ABV0_ACED0_AF0EM1_AF1EM1_AMAS2_ASE_ASGT_ASLT_ASM_ASAE01_ASCE01_ASEM1_AAC0_BL1_BS1_CLR0_DTLA0_DTLB0_DTVA0_DTVB0_DVO0_ETSP_EPS0_ELFLR0_EMLL0_FSSC10_FL0_GLVWA2_GLVWB1_GRCGA1_GRCGB1_GRPM1_GRVW2_GSU1_GSUASB_GLS0_ISA000_IU1_K1_KLS_LBSPPA0_LBSPPB0_LPA0_LPB0_LDL1_LRVW2_LWPMn1_LDW0_FMA_MIAV0_MDA2_MO40_MMFSC_MKFGSU256_NTA0_NTB0_NTC0_NTD0_NEPBS0_NLCA1_NLCB1_ONLL1_OPLV0_PK0_PAP0_PGR0_PLR1_PKA0_SIA1_SLW1_SS0_SU32_SUM0_SUS256_SCIUI1_SPO0_SRVW0_SSO0_SVW4_SNLL0_TSGRA0_TSGRB0_TT4_2_TLDS0_UMLDSA0_UMLDSB0_U64SL1_USFGROn1_VAW2_VSn1_VW2_VWB2_VFLRP0_WSGRA0_WSGRB0_WS64_WG16_16_1_WGM8   | KERNEL_DISPATCH |               6 |       128903094 |       2.148e+07 |      2,446851 |        13276458 |        34643135 |       7.025e+06 |
+    | void mul_mat_q<(ggml_type)21, 112, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                         | KERNEL_DISPATCH |             144 |       127482992 |       8.853e+05 |      2,419894 |          103918 |         1420004 |       4.265e+05 |
+    | void mul_mat_q<(ggml_type)17, 128, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                         | KERNEL_DISPATCH |              45 |       120917900 |       2.687e+06 |      2,295275 |         1445643 |         4136132 |       6.728e+05 |
+    | void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)0, false>(float const*, int const*, void*, long, long, long, long, long, int, int, int)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | KERNEL_DISPATCH |            2436 |       112345180 |       4.612e+04 |      2,132547 |            4400 |          174796 |       4.636e+04 |
+    | void concat_non_cont<unsigned int, 0>(char const*, char const*, char*, long, long, long, long, unsigned long, unsigned long, unsigned long, unsigned long, long, long, long, long, unsigned long, unsigned long, unsigned long, unsigned long, long, long, long, long, unsigned long, unsigned long, unsigned long, unsigned long)                                                                                                                                                                                                                                                                                                       | KERNEL_DISPATCH |             480 |       112194095 |       2.337e+05 |      2,129679 |           22119 |          523667 |       1.693e+05 |
+    | void flash_attn_ext_f16<256, 256, 32, 2, false, false, false>(char const*, char const*, char const*, char const*, char const*, int const*, float*, HIP_vector_type<float, 2u>*, float, float, float, float, unsigned int, float, int, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, int, int, int, int, int, int, long, int, int, long, int, int, int, int, int, long)                                                                                                                                                                                                                                                     | KERNEL_DISPATCH |             112 |       109182253 |       9.748e+05 |      2,072508 |           67399 |         1775794 |       4.932e+05 |
+    | void mul_mat_q<(ggml_type)18, 112, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                         | KERNEL_DISPATCH |              78 |        76636902 |       9.825e+05 |      1,454729 |          100317 |         1319326 |       3.599e+05 |
+    | void mul_mat_q<(ggml_type)23, 112, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                         | KERNEL_DISPATCH |              96 |        73136238 |       7.618e+05 |      1,388279 |           90318 |         1192970 |       3.931e+05 |
+    | void k_bin_bcast<&(op_add(float, float)), float, float, float, float const*>(float const*, float const*, float*, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float const*)                                                                                                                        | KERNEL_DISPATCH |            1760 |        69754019 |       3.963e+04 |      1,324077 |            1680 |          100558 |       4.260e+04 |
+    | void rms_norm_f32<256, true, false, false>(float const*, float*, int, long, long, long, float, float const*, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, float const*, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, float)                                                                                                                                                                            | KERNEL_DISPATCH |             800 |        57485172 |       7.186e+04 |      1,091189 |            1920 |          233674 |       6.860e+04 |
+    | void ssm_conv_long_token_f32<true, 128ul, 4ul, 32l>(float const*, float const*, float const*, int, int, int, int, float*, int, int, int, long)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | KERNEL_DISPATCH |             336 |        45875491 |       1.365e+05 |      0,870813 |           17999 |          202315 |       5.270e+04 |
+    | void mul_mat_vec_q<(ggml_type)21, 2, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |             288 |        45079259 |       1.565e+05 |      0,855699 |           16520 |          310592 |       7.502e+04 |
+    | void mul_mat_q<(ggml_type)21, 48, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                          | KERNEL_DISPATCH |             144 |        44416761 |       3.084e+05 |      0,843123 |           54679 |          515466 |       1.394e+05 |
+    | void mul_mat_q<(ggml_type)16, 128, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                         | KERNEL_DISPATCH |              25 |        42649213 |       1.706e+06 |      0,809571 |         1080332 |         2863765 |       5.204e+05 |
+    | void rms_norm_f32<1024, true, false, false>(float const*, float*, int, long, long, long, float, float const*, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, float const*, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, float)                                                                                                                                                                           | KERNEL_DISPATCH |            1290 |        37508764 |       2.908e+04 |      0,711995 |            3680 |           80397 |       1.988e+04 |
+    | void rms_norm_f32<256, false, false, true>(float const*, float*, int, long, long, long, float, float const*, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, float const*, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, float)                                                                                                                                                                            | KERNEL_DISPATCH |             960 |        29294551 |       3.052e+04 |      0,556072 |            1839 |           75678 |       2.320e+04 |
+    | void mul_mat_q<(ggml_type)18, 48, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                          | KERNEL_DISPATCH |              78 |        27944193 |       3.583e+05 |      0,530439 |           54238 |          493507 |       1.220e+05 |
+    | void mul_mat_vec_q<(ggml_type)18, 2, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |             156 |        26999368 |       1.731e+05 |      0,512505 |           15559 |          506867 |       6.971e+04 |
+    | void rope_multi<true, false, float>(float const*, float*, int, int, int, int, int, int, int, int, int, int, int, int const*, float, float, float, rope_corr_dims, float, float const*, mrope_sections, bool, bool)                                                                                                                                                                                                                                                                                                                                                                                                                       | KERNEL_DISPATCH |             320 |        26643675 |       8.326e+04 |      0,505753 |            2360 |          371871 |       9.871e+04 |
+    | void mul_mat_q<(ggml_type)12, 112, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                         | KERNEL_DISPATCH |              38 |        25893492 |       6.814e+05 |      0,491513 |          111637 |         1576760 |       5.667e+05 |
+    | void mul_mat_q<(ggml_type)22, 112, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                         | KERNEL_DISPATCH |              16 |        25105312 |       1.569e+06 |      0,476551 |          141996 |         1925190 |       5.598e+05 |
+    | void cpy_scalar<&(void cpy_1_scalar<float, float>(char const*, char*))>(char const*, char*, long, long, long, long, long, long, long, long, long, long, long, long, long, long, long)                                                                                                                                                                                                                                                                                                                                                                                                                                                    | KERNEL_DISPATCH |             640 |        25016301 |       3.909e+04 |      0,474862 |            2920 |          354191 |       7.591e+04 |
+    | void mul_mat_q<(ggml_type)23, 48, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                          | KERNEL_DISPATCH |              96 |        23935974 |       2.493e+05 |      0,454355 |           46118 |          404909 |       1.210e+05 |
+    | void mul_mat_vec_q<(ggml_type)21, 4, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |             144 |        21670644 |       1.505e+05 |      0,411354 |           14520 |          249114 |       7.314e+04 |
+    | void mul_mat_vec_q<(ggml_type)23, 2, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |             192 |        21645605 |       1.127e+05 |      0,410879 |           14640 |          213994 |       5.312e+04 |
+    | void convert_unary_cont_vec4<float, __hip_bfloat16>(void const*, __hip_bfloat16*, long)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | KERNEL_DISPATCH |             768 |        19918990 |       2.594e+04 |      0,378104 |            1320 |           54199 |       2.028e+04 |
+    | void mul_mat_q<(ggml_type)17, 112, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                         | KERNEL_DISPATCH |               9 |        15754872 |       1.751e+06 |      0,299060 |         1041893 |         1942710 |       2.711e+05 |
+    | void mul_mat_vec_q<(ggml_type)18, 4, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |              78 |        13353782 |       1.712e+05 |      0,253483 |           14880 |          242314 |       6.315e+04 |
+    | void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)1, false>(float const*, int const*, void*, long, long, long, long, long, int, int, int)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | KERNEL_DISPATCH |             266 |        12904657 |       4.851e+04 |      0,244957 |            4520 |          167676 |       4.539e+04 |
+    | void mul_mat_q<(ggml_type)10, 48, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                          | KERNEL_DISPATCH |              13 |        12718309 |       9.783e+05 |      0,241420 |          519587 |         1712476 |       3.804e+05 |
+    | void mul_mat_vec_q<(ggml_type)23, 4, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |              96 |        10877965 |       1.133e+05 |      0,206487 |           13280 |          175996 |       5.663e+04 |
+    | __amd_rocclr_fillBufferAligned                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | KERNEL_DISPATCH |               9 |        10515963 |       1.168e+06 |      0,199615 |          494307 |         3075799 |       7.847e+05 |
+    | void mul_mat_q<(ggml_type)22, 48, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                          | KERNEL_DISPATCH |              16 |         8792491 |       5.495e+05 |      0,166900 |           69958 |          708301 |       1.900e+05 |
+    | void mul_mat_vec_q<(ggml_type)12, 1, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |               3 |         8640135 |       2.880e+06 |      0,164008 |         2269462 |         3221635 |       5.300e+05 |
+    | void unary_gated_op_kernel<&(op_sigmoid(float)), float>(float const*, float const*, float*, long, long, long, long)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | KERNEL_DISPATCH |             160 |         8271460 |       5.170e+04 |      0,157010 |            1960 |          105197 |       4.051e+04 |
+    | void mul_mat_q<(ggml_type)12, 48, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                          | KERNEL_DISPATCH |              38 |         8062030 |       2.122e+05 |      0,153034 |           58518 |          474348 |       1.547e+05 |
+    | void k_get_rows_float_vec<float>(float const*, int const*, float*, long, long, HIP_vector_type<unsigned int, 3u>, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)                                                                                                                                                                                                                                                                                                                                                                                 | KERNEL_DISPATCH |             480 |         7721393 |       1.609e+04 |      0,146568 |           10200 |           50958 |       3.780e+03 |
+    | void mul_mat_vec_q<(ggml_type)12, 2, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |              76 |         7625638 |       1.003e+05 |      0,144751 |           16079 |          219314 |       7.930e+04 |
+    | Cijk_Alik_Bljk_HSS_BH_MT128x32x16_SE_1LDSB0_APM1_ABV0_ACED0_AF0EM1_AF1EM1_AMAS0_ASE_ASGT_ASLT_ASM_ASAE01_ASCE01_ASEM1_AAC0_BL1_BS1_CLR0_DTLA0_DTLB0_DTVA0_DTVB0_DVO0_ETSP_EPS0_ELFLR0_EMLL0_FSSC10_FL0_GLVWA1_GLVWB1_GRCGA1_GRCGB1_GRPM1_GRVW1_GSU3_GSUAMB_GLS0_ISA000_IU1_K1_KLS_LBSPPA0_LBSPPB0_LPA0_LPB0_LDL1_LRVW1_LWPMn1_LDW0_FMA_MIAV0_MDA2_MO40_MMFSC_MKFGSU256_NTA0_NTB0_NTC0_NTD0_NEPBS0_NLCA1_NLCB1_ONLL1_OPLV0_PK0_PAP0_PGR0_PLR1_PKA0_SIA1_SLW1_SS0_SU32_SUM0_SUS256_SCIUI1_SPO0_SRVW0_SSO0_SVW4_SNLL0_TSGRA0_TSGRB0_TT8_2_TLDS0_UMLDSA0_UMLDSB0_U64SL1_USFGROn1_VAW1_VSn1_VW1_VWB1_VFLRP0_WSGRA0_WSGRB0_WS64_WG16_16_1_WGM8 | KERNEL_DISPATCH |               1 |         6889940 |       6.890e+06 |      0,130785 |         6889940 |         6889940 |       0.000e+00 |
+    | void mul_mat_vec_q<(ggml_type)22, 2, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |              32 |         6072639 |       1.898e+05 |      0,115271 |           16399 |          271713 |       6.500e+04 |
+    | void mul_mat_q<(ggml_type)17, 48, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                          | KERNEL_DISPATCH |               9 |         5579055 |       6.199e+05 |      0,105902 |          373950 |          691542 |       9.758e+04 |
+    | void mul_mat_q<(ggml_type)16, 112, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                         | KERNEL_DISPATCH |               5 |         5392580 |       1.079e+06 |      0,102362 |          743540 |         1268287 |       2.470e+05 |
+    | void mul_mat_vec_q<(ggml_type)10, 2, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |              26 |         4227369 |       1.626e+05 |      0,080244 |           85198 |          461708 |       7.982e+04 |
+    | void dequantize_block_iq1_m<__half>(void const*, __half*)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | KERNEL_DISPATCH |               7 |         4029935 |       5.757e+05 |      0,076497 |          550785 |          586265 |       1.580e+04 |
+    | void mul_mat_vec_q<(ggml_type)17, 2, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |              18 |         3958896 |       2.199e+05 |      0,075148 |          118997 |          427789 |       7.361e+04 |
+    | void k_set_rows<float, long, __half>(float const*, long const*, __half*, long, long, long, long, long, long, long, long, long, long, long, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                                                                                              | KERNEL_DISPATCH |             320 |         3889616 |       1.216e+04 |      0,073833 |            1520 |           29800 |       8.212e+03 |
+    | void mul_mat_vec_q<(ggml_type)12, 4, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |              38 |         3635826 |       9.568e+04 |      0,069016 |           15320 |          208035 |       7.675e+04 |
+    | void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)2, false>(float const*, int const*, void*, long, long, long, long, long, int, int, int)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | KERNEL_DISPATCH |              91 |         3330433 |       3.660e+04 |      0,063219 |            5119 |          176275 |       3.581e+04 |
+    | void mul_mat_vec_q<(ggml_type)22, 4, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |              16 |         3244877 |       2.028e+05 |      0,061595 |           14640 |          267073 |       7.408e+04 |
+    | scale_f32(float const*, float*, float, float, long)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | KERNEL_DISPATCH |             288 |         3048013 |       1.058e+04 |      0,057858 |            1720 |          144316 |       1.111e+04 |
+    | quantize_q8_1(float const*, void*, long, long, long, long, long, unsigned int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | KERNEL_DISPATCH |            1203 |         2785725 |       2.316e+03 |      0,052879 |            1720 |           14240 |       7.295e+02 |
+    | void mul_mat_vec_q<(ggml_type)10, 4, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |              13 |         1977306 |       1.521e+05 |      0,037533 |           87397 |          239274 |       5.227e+04 |
+    | void mul_mat_q<(ggml_type)16, 48, false, (ggml_prec)30>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)                                                                                                                                                                                                                          | KERNEL_DISPATCH |               5 |         1936429 |       3.873e+05 |      0,036757 |          273433 |          456348 |       8.655e+04 |
+    | void mul_mat_vec_q<(ggml_type)17, 4, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |               9 |         1879472 |       2.088e+05 |      0,035676 |          123076 |          240994 |       3.617e+04 |
+    | void mul_mat_vec_q<(ggml_type)16, 2, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |              10 |         1719277 |       1.719e+05 |      0,032635 |          117397 |          217754 |       3.907e+04 |
+    | Cijk_S_PostGSU3_VW2                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | KERNEL_DISPATCH |             577 |         1442693 |       2.500e+03 |      0,027385 |            1680 |           36080 |       1.542e+03 |
+    | void k_get_rows_float<float, float>(float const*, int const*, float*, long, long, HIP_vector_type<unsigned int, 3u>, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)                                                                                                                                                                                                                                                                                                                                                                              | KERNEL_DISPATCH |             483 |         1284321 |       2.659e+03 |      0,024379 |            2080 |            7200 |       3.695e+02 |
+    | void flash_attn_tile<256, 256, 4, 2, false>(char const*, char const*, char const*, char const*, char const*, int const*, float*, HIP_vector_type<float, 2u>*, float, float, float, float, unsigned int, float, int, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, int, int, int, int, int, int, long, int, int, long, int, int, int, int, int, long)                                                                                                                                                                                                                                                                       | KERNEL_DISPATCH |              16 |         1239488 |       7.747e+04 |      0,023528 |           76198 |           79438 |       7.596e+02 |
+    | void mul_mat_vec_f<__hip_bfloat16, float, 2, 256, false, false>(__hip_bfloat16 const*, float const*, int const*, ggml_cuda_mm_fusion_args_device, float*, int, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, int, int, int, int)                                                                                                                                                                                                                                                                                                                | KERNEL_DISPATCH |             192 |         1163574 |       6.060e+03 |      0,022087 |            5320 |           29480 |       2.063e+03 |
+    | void k_bin_bcast<&(op_mul(float, float)), float, float, float, float const*>(float const*, float const*, float*, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float const*)                                                                                                                        | KERNEL_DISPATCH |             480 |         1125614 |       2.345e+03 |      0,021367 |            1920 |            3480 |       2.601e+02 |
+    | void unary_op_kernel<&(op_softplus(float)), float>(float const*, float*, int)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | KERNEL_DISPATCH |             480 |          971768 |       2.025e+03 |      0,018446 |            1440 |            2920 |       2.045e+02 |
+    | void unary_op_kernel<&(op_sigmoid(float)), float>(float const*, float*, int)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | KERNEL_DISPATCH |             480 |          884897 |       1.844e+03 |      0,016797 |            1319 |           14559 |       6.116e+02 |
+    | void mul_mat_vec_q<(ggml_type)16, 4, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |               5 |          822420 |       1.645e+05 |      0,015611 |          109317 |          207115 |       4.073e+04 |
+    | __amd_rocclr_copyBuffer                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | KERNEL_DISPATCH |             221 |          622627 |       2.817e+03 |      0,011819 |            2200 |            4520 |       3.522e+02 |
+    | void convert_unary_cont_vec4<float, __half>(void const*, __half*, long)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | KERNEL_DISPATCH |               7 |          514426 |       7.349e+04 |      0,009765 |           10520 |           89238 |       2.979e+04 |
+    | void ssm_conv_f32<true, 128ul, 4ul>(float const*, float const*, float const*, int, int, int, int, float*, int, int, int, long)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | KERNEL_DISPATCH |             144 |          422830 |       2.936e+03 |      0,008026 |            2360 |           12800 |       8.839e+02 |
+    | Cijk_S_PostGSU3                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | KERNEL_DISPATCH |             192 |          394668 |       2.056e+03 |      0,007492 |            1600 |            3320 |       3.397e+02 |
+    | void flash_attn_tile<256, 256, 2, 2, false>(char const*, char const*, char const*, char const*, char const*, int const*, float*, HIP_vector_type<float, 2u>*, float, float, float, float, unsigned int, float, int, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, int, int, int, int, int, int, long, int, int, long, int, int, int, int, int, long)                                                                                                                                                                                                                                                                       | KERNEL_DISPATCH |              32 |          380834 |       1.190e+04 |      0,007229 |           11360 |           13440 |       4.223e+02 |
+    | void mul_mat_vec_q<(ggml_type)29, 2, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |               2 |          285912 |       1.430e+05 |      0,005427 |          142836 |          143076 |       1.697e+02 |
+    | void flash_attn_combine_results<256>(float const*, HIP_vector_type<float, 2u> const*, float*, int)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | KERNEL_DISPATCH |              48 |          162875 |       3.393e+03 |      0,003092 |            3160 |            4200 |       2.589e+02 |
+    | void mul_mat_vec_q<(ggml_type)29, 4, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int)                                                                                                                                                                                                                              | KERNEL_DISPATCH |               1 |          137317 |       1.373e+05 |      0,002607 |          137317 |          137317 |       0.000e+00 |
+
+W20260930 13:41:39.068707 139876183108736 simple_timer.cpp:55] [rocprofv3] output generation ::     0.043037 sec
+W20260930 13:41:39.068999 139876183108736 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.043346 sec

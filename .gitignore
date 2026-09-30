@@ -23,3 +23,6 @@ __pycache__/
 
 # Benchmark scratch (llama-server run logs; result CSVs are tracked)
 bench/results/*.srv.log
+
+# Raw profiler traces (summaries are kept in bench/results/)
+bench/traces/

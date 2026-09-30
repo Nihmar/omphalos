@@ -1,0 +1,32 @@
+# M0 — reference quality baseline (llama.cpp, IQ3_S-mtp)
+
+Corpus: **wikitext-2-raw**, test split, from the `ggml-org/ci` HF dataset
+(`wikitext-2-raw-v1.zip`), extracted to `models/datasets/wikitext-2-raw/`
+(local only, git-ignored; see `bench/get_corpus.sh`).
+
+Commands (llama.cpp `build-hip` @ 6c7a87f7e, `-ngl 99 -fa on`):
+
+```
+llama-perplexity -m models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf \
+    -f models/datasets/wikitext-2-raw/wiki.test.raw -c 512 --chunks 20
+=> PPL = 7.0533 +/- 0.24415          (log: m0-perplexity-20260930-134048.txt)
+
+llama-perplexity ... -c 512 --chunks 1 \
+    --kl-divergence-base models/datasets/kl/wikitext2-512tok.kld
+=> PPL(1 chunk) = 4.4856 (single chunk, noisy)
+                                     (log: m0-kl-base-20260930-134048.txt)
+```
+
+KL base file (local only, not committed):
+
+```
+models/datasets/kl/wikitext2-512tok.kld
+size    126,647,308 bytes (512 tokens, fp16-ish logits)
+sha256  a81ec91698a28f9e9150d74ee3cbe9284a70626d44dd2125a12682f1f62bd20b
+```
+
+Later use (M1+): compare the engine's logits against this base with
+
+```
+llama-perplexity --kl-divergence --kl-divergence-base models/datasets/kl/wikitext2-512tok.kld ...
+```
