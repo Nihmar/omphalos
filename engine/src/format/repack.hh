@@ -100,9 +100,15 @@ void unrepack_iq3_xxs(const void * src, int64_t n_blocks, void * dst);
 //
 //   [ qs     ] 64 B/block
 //   [ qh     ]  8 B/block
-//   [ signs  ] 32 B/block
+//   [ signs  ] 32 B/block, one u32 per 32-weight sub-block, bits permuted (below)
 //   [ scales ]  4 B/block
 //   [ d      ]  2 B/block
+//
+// Sign bits (#63): in the GGUF, bit w of a sub-block's four sign bytes is the
+// sign of weight w. Here the sign of weight 2p sits at bit 15 - p and that of
+// weight 2p + 1 at bit 31 - p, so the kernel gets the f16 sign bits of the
+// weight pair p (bits 15 and 31 of a packed half2) as (S << p) & 0x80008000.
+// A lossless permutation: unrepack restores the GGUF order.
 struct Iq3sLayout {
     int64_t n_blocks = 0;
     int64_t qs_off = 0;

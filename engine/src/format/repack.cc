@@ -281,6 +281,30 @@ Iq3sLayout iq3s_layout(const int64_t n_blocks) {
     return l;
 }
 
+namespace {
+
+// GGUF sign order (bit w = weight w) <-> the pair order of the repacked IQ3_S
+// signs (weight 2p at bit 15 - p, weight 2p + 1 at bit 31 - p).
+uint32_t iq3s_signs_to_pairs(const uint32_t s) {
+    uint32_t t = 0;
+    for (int w = 0; w < 32; ++w) {
+        const int pos = (w & 1) ? 31 - w / 2 : 15 - w / 2;
+        t |= ((s >> w) & 1u) << pos;
+    }
+    return t;
+}
+
+uint32_t iq3s_pairs_to_signs(const uint32_t t) {
+    uint32_t s = 0;
+    for (int w = 0; w < 32; ++w) {
+        const int pos = (w & 1) ? 31 - w / 2 : 15 - w / 2;
+        s |= ((t >> pos) & 1u) << w;
+    }
+    return s;
+}
+
+} // namespace
+
 void repack_iq3_s(const void * src, const int64_t n_blocks, void * dst) {
     const Iq3sLayout l = iq3s_layout(n_blocks);
     const auto * in = static_cast<const BlockIq3S *>(src);
@@ -289,7 +313,12 @@ void repack_iq3_s(const void * src, const int64_t n_blocks, void * dst) {
         std::memcpy(out + l.d_off + 2 * b, &in[b].d, 2);
         std::memcpy(out + l.qs_off + b * 64, in[b].qs, 64);
         std::memcpy(out + l.qh_off + b * 8, in[b].qh, 8);
-        std::memcpy(out + l.signs_off + b * 32, in[b].signs, 32);
+        for (int sub = 0; sub < 8; ++sub) {
+            uint32_t sg = 0;
+            std::memcpy(&sg, in[b].signs + 4 * sub, 4);
+            sg = iq3s_signs_to_pairs(sg);
+            std::memcpy(out + l.signs_off + b * 32 + 4 * sub, &sg, 4);
+        }
         std::memcpy(out + l.scales_off + b * 4, in[b].scales, 4);
     }
 }
@@ -302,7 +331,12 @@ void unrepack_iq3_s(const void * src, const int64_t n_blocks, void * dst) {
         std::memcpy(&out[b].d, in + l.d_off + 2 * b, 2);
         std::memcpy(out[b].qs, in + l.qs_off + b * 64, 64);
         std::memcpy(out[b].qh, in + l.qh_off + b * 8, 8);
-        std::memcpy(out[b].signs, in + l.signs_off + b * 32, 32);
+        for (int sub = 0; sub < 8; ++sub) {
+            uint32_t sg = 0;
+            std::memcpy(&sg, in + l.signs_off + b * 32 + 4 * sub, 4);
+            sg = iq3s_pairs_to_signs(sg);
+            std::memcpy(out[b].signs + 4 * sub, &sg, 4);
+        }
         std::memcpy(out[b].scales, in + l.scales_off + b * 4, 4);
     }
 }

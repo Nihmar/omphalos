@@ -321,10 +321,35 @@ __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t *
 
 // IQ3_S: 110-byte blocks. Per 32-weight sub-block: eight 9-bit grid indices
 // (8 bits from qs, the 9th from one qh bit per index), four sign-mask bytes and
-// a 4-bit scale shared by two sub-blocks. Grid (2 KiB) in LDS, signs are plain
-// masks so no table is needed.
+// a 4-bit scale shared by two sub-blocks. Grid (2 KiB, bytes) in LDS; each
+// byte pair becomes a half2 with one permute and one packed add, the signs
+// (pair-ordered by the repack, see repack.hh) are OR-ed in with one shift and
+// one and_or per pair, and v_dot2 accumulates: about half the instructions of
+// a float-per-weight loop (#63).
 constexpr long long kIq3sChunkSub = 256;  // 8192 weights staged per LDS refill
 constexpr long long kIq3sRows = 4;        // output rows computed per warp
+
+// Packed-f16 helpers for the codebook GEMVs: a u32 holds two halves; the sign
+// of each half is its bit 15, so a (positive) codebook value is negated by
+// OR-ing its sign in, and v_dot2_f32_f16 does two exact products (small
+// integers times f16) accumulated in f32 per instruction.
+typedef _Float16 half2_v __attribute__((ext_vector_type(2)));
+
+__device__ inline float dot2(const uint32_t w, const uint32_t x, const float acc) {
+    return __builtin_amdgcn_fdot2(__builtin_bit_cast(half2_v, w), __builtin_bit_cast(half2_v, x),
+                                  acc, false);
+}
+
+// Two unsigned byte codebook values (the bytes Sel picks from g) as a packed
+// half2: the f16 with exponent field 25 and mantissa b is 1024 + b, so one byte
+// permute builds 1024 + b and one packed add removes the 1024 (exact, b < 256).
+template <uint32_t Sel>
+__device__ inline uint32_t grid_pair_to_half2(const uint32_t g) {
+    const uint32_t biased = __builtin_amdgcn_perm(0x64646464u, g, Sel);
+    const half2_v v =
+        __builtin_bit_cast(half2_v, biased) - half2_v{(_Float16) 1024, (_Float16) 1024};
+    return __builtin_bit_cast(uint32_t, v);
+}
 
 __global__ void gemv_iq3s_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ qh,
                                  const uint8_t * __restrict__ signs,
@@ -334,7 +359,7 @@ __global__ void gemv_iq3s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
                                  const long long chunk_sub) {
     extern __shared__ uint8_t smem[];
     __half * xs = reinterpret_cast<__half *>(smem);
-    uint32_t * grid = reinterpret_cast<uint32_t *>(smem + chunk_sub * 64);
+    uint32_t * grid = reinterpret_cast<uint32_t *>(smem + chunk_sub * 64);  // 512 x 4 bytes
     for (int i = threadIdx.x; i < 512; i += blockDim.x) {
         grid[i] = omph::quant::kIq3sGrid[i];
     }
@@ -357,17 +382,17 @@ __global__ void gemv_iq3s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
             continue;
         }
         for (long long s = base + lane; s < base + len; s += 32) {
-            const __half * xv = xs + (s - base) * 32;
+            const uint4 * xv = reinterpret_cast<const uint4 *>(xs + (s - base) * 32);
             uint2 q[kIq3sRows];
-            uint8_t qhb[kIq3sRows];
-            const uint8_t * sgp[kIq3sRows];
+            uint32_t qhb[kIq3sRows];
+            uint32_t sg[kIq3sRows];
             float dbr[kIq3sRows];
 #pragma unroll
             for (int r = 0; r < kIq3sRows; ++r) {
                 const long long row = row0 + r <= rlast ? row0 + r : rlast;
                 q[r] = *reinterpret_cast<const uint2 *>(qs + row * blocks * 64 + s * 8);
                 qhb[r] = qh[row * blocks * 8 + s];
-                sgp[r] = signs + row * blocks * 32 + s * 4;
+                sg[r] = *reinterpret_cast<const uint32_t *>(signs + row * blocks * 32 + s * 4);
                 const uint8_t sc = scales[row * blocks * 4 + s / 2];
                 const float dv = __half2float(
                     *reinterpret_cast<const __half *>(d + row * blocks * 2 + (s / 8) * 2));
@@ -376,33 +401,29 @@ __global__ void gemv_iq3s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
             float part[kIq3sRows] = {};
 #pragma unroll
             for (int l = 0; l < 4; ++l) {
+                const uint4 xq = xv[l];  // the 8 activations of this group, packed
 #pragma unroll
                 for (int r = 0; r < kIq3sRows; ++r) {
-                    const uint8_t * bytes = reinterpret_cast<const uint8_t *>(&q[r]);
-                    const uint32_t hb = qhb[r];
-                    const uint32_t i1 =
-                        (uint32_t) bytes[2 * l] | (((hb >> (2 * l)) & 1u) << 8);
-                    const uint32_t i2 =
-                        (uint32_t) bytes[2 * l + 1] | (((hb >> (2 * l + 1)) & 1u) << 8);
-                    const uint32_t g1 = grid[i1];
-                    const uint32_t g2 = grid[i2];
-                    const uint8_t sm = sgp[r][l];
-                    float g1f[4];
-                    float g2f[4];
-                    grid4(g1, g1f);
-                    grid4(g2, g2f);
-                    uint32_t smk[8];
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        smk[j] = ((sm >> j) & 1u) ? 0x80000000u : 0u;
-                    }
-#pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        float v1 = __uint_as_float(__float_as_uint(g1f[j]) ^ smk[j]);
-                        float v2 = __uint_as_float(__float_as_uint(g2f[j]) ^ smk[4 + j]);
-                        part[r] = fmaf(v1, __half2float(xv[8 * l + j]), part[r]);
-                        part[r] = fmaf(v2, __half2float(xv[8 * l + 4 + j]), part[r]);
-                    }
+                    const uint32_t lo = (q[r].x >> (16 * (l & 1))) & 0xFFFFu;
+                    const uint32_t word = l < 2 ? lo : (q[r].y >> (16 * (l & 1))) & 0xFFFFu;
+                    const uint32_t i1 = (word & 0xFFu) | (((qhb[r] >> (2 * l)) & 1u) << 8);
+                    const uint32_t i2 = (word >> 8) | (((qhb[r] >> (2 * l + 1)) & 1u) << 8);
+                    const uint32_t b1 = grid[i1];
+                    const uint32_t b2 = grid[i2];
+                    const uint2 g1 = make_uint2(grid_pair_to_half2<0x04010400u>(b1),
+                                                grid_pair_to_half2<0x04030402u>(b1));
+                    const uint2 g2 = make_uint2(grid_pair_to_half2<0x04010400u>(b2),
+                                                grid_pair_to_half2<0x04030402u>(b2));
+                    // pair p = 4l + i: its two sign bits land on the half2 sign
+                    // bits with one shift (layout: repack.hh); the grid values
+                    // are positive, so OR-ing the sign in negates them.
+                    constexpr uint32_t kSign2 = 0x80008000u;
+                    float p = part[r];
+                    p = dot2(((sg[r] << (4 * l)) & kSign2) | g1.x, xq.x, p);
+                    p = dot2(((sg[r] << (4 * l + 1)) & kSign2) | g1.y, xq.y, p);
+                    p = dot2(((sg[r] << (4 * l + 2)) & kSign2) | g2.x, xq.z, p);
+                    p = dot2(((sg[r] << (4 * l + 3)) & kSign2) | g2.y, xq.w, p);
+                    part[r] = p;
                 }
             }
 #pragma unroll
@@ -1067,14 +1088,14 @@ __global__ void gemv_iq3s_b4_kernel(const uint8_t * __restrict__ qs,
             const __half * xv0 = x + s * 32;
             uint2 qw[kB4Rows];
             uint8_t qhb[kB4Rows];
-            const uint8_t * sgp[kB4Rows];
+            uint32_t sgw[kB4Rows];
             float dbr[kB4Rows];
 #pragma unroll
             for (int r = 0; r < kB4Rows; ++r) {
                 const long long row = row0 + r <= rlast ? row0 + r : rlast;
                 qw[r] = *reinterpret_cast<const uint2 *>(qs + row * blocks * 64 + s * 8);
                 qhb[r] = qh[row * blocks * 8 + s];
-                sgp[r] = signs + row * blocks * 32 + s * 4;
+                sgw[r] = *reinterpret_cast<const uint32_t *>(signs + row * blocks * 32 + s * 4);
                 const uint8_t sc = scales[row * blocks * 4 + s / 2];
                 const float dv = __half2float(
                     *reinterpret_cast<const __half *>(d + row * blocks * 2 + (s / 8) * 2));
@@ -1096,7 +1117,6 @@ __global__ void gemv_iq3s_b4_kernel(const uint8_t * __restrict__ qs,
                             (uint32_t) bytes[2 * l + 1] | (((hb >> (2 * l + 1)) & 1u) << 8);
                         const uint32_t g1 = grid[i1];
                         const uint32_t g2 = grid[i2];
-                        const uint8_t sm = sgp[r][l];
                         float g1f[4];
                         float g2f[4];
                         grid4(g1, g1f);
@@ -1104,7 +1124,11 @@ __global__ void gemv_iq3s_b4_kernel(const uint8_t * __restrict__ qs,
                         uint32_t smk[8];
 #pragma unroll
                         for (int j = 0; j < 8; ++j) {
-                            smk[j] = ((sm >> j) & 1u) ? 0x80000000u : 0u;
+                            // weight w = 8l + j: sign bit at 15 - w/2 (even w) or
+                            // 31 - w/2 (odd w), see the IQ3_S layout in repack.hh
+                            const int w = 8 * l + j;
+                            const int pos = (w & 1) ? 31 - w / 2 : 15 - w / 2;
+                            smk[j] = ((sgw[r] >> pos) & 1u) << 31;
                         }
 #pragma unroll
                         for (int j = 0; j < 4; ++j) {

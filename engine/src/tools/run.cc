@@ -905,6 +905,14 @@ private:
                 if (std::getenv("OMPH_SKIP_GEMV") != nullptr) {
                     return true;  // ablation only: wrong results, valid timing
                 }
+                // Ablation only: skip the GEMVs of one GGUF type. The step time
+                // difference is that type's real cost; rocprofv3's per-kernel
+                // times inflate some kernels by up to 40 % (#63).
+                if (const char * st = std::getenv("OMPH_SKIP_GEMV_TYPE")) {
+                    if ((uint32_t) std::atoi(st) == it->second.type) {
+                        return true;
+                    }
+                }
                 timer_gemv_.start();
                 const bool gemv_ok = gemv_one(it->second.type, w, x16, y, n_out, k);
                 timer_gemv_.stop(t_gemv_);
