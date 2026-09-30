@@ -1139,6 +1139,92 @@ __global__ void gemv_iq3s_b4_kernel(const uint8_t * __restrict__ qs,
     }
 }
 
+// IQ4_XS, four tokens at once: the gemv_q4k_b4 shape (no activation staging, the
+// activation read from L1/L2) with the single-token kernel's decoding — a uint4 of
+// codes per sub-block, the low nibbles mapping the first 16 weights and the high
+// nibbles the next 16, and one scale d * (sc - 32) per sub-block. Only the
+// 16-entry codebook stays in LDS (64 bytes).
+__global__ void gemv_iq4_b4_kernel(const uint8_t * __restrict__ qs,
+                                   const uint8_t * __restrict__ sc,
+                                   const uint8_t * __restrict__ d, const __half * __restrict__ x,
+                                   float * __restrict__ y, const long long rows,
+                                   const long long n_sub, const long long k) {
+    extern __shared__ float table[];
+    if (threadIdx.x < 16) {
+        table[threadIdx.x] = (float) kIq4Table[threadIdx.x];
+    }
+    __syncthreads();
+
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kB4Rows;
+    const long long blocks = n_sub / 8;
+    const long long rlast = rows - 1;
+
+    float acc[kB4Rows * kB4Nt] = {};
+    for (long long base = 0; base < n_sub; base += kB4ChunkSub) {
+        const long long len = n_sub - base < kB4ChunkSub ? n_sub - base : kB4ChunkSub;
+        if (row0 >= rows) {
+            continue;
+        }
+        for (long long s = base + lane; s < base + len; s += 32) {
+            const long long blk = s / 8;
+            const int sub = (int) (s % 8);
+            const __half * xv0 = x + s * 32;
+            uint4 qw[kB4Rows];
+            float dl[kB4Rows];
+#pragma unroll
+            for (int r = 0; r < kB4Rows; ++r) {
+                const long long row = row0 + r <= rlast ? row0 + r : rlast;
+                qw[r] = *reinterpret_cast<const uint4 *>(qs + row * blocks * 128 + s * 16);
+                dl[r] = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 +
+                                                                       2 * blk)) *
+                        (float) ((int) sc[row * blocks * 8 + blk * 8 + sub] - 32);
+            }
+            float part[kB4Rows * kB4Nt] = {};
+#pragma unroll
+            for (int t = 0; t < kB4Nt; ++t) {
+                const __half * xv = xv0 + t * k;
+#pragma unroll
+                for (int v = 0; v < 16; ++v) {
+                    const float xval = __half2float(xv[v]);
+#pragma unroll
+                    for (int r = 0; r < kB4Rows; ++r) {
+                        const uint8_t code = reinterpret_cast<const uint8_t *>(&qw[r])[v] & 0xF;
+                        part[r * kB4Nt + t] = fmaf(table[code], xval, part[r * kB4Nt + t]);
+                    }
+                }
+#pragma unroll
+                for (int v = 0; v < 16; ++v) {
+                    const float xval = __half2float(xv[v + 16]);
+#pragma unroll
+                    for (int r = 0; r < kB4Rows; ++r) {
+                        const uint8_t code = reinterpret_cast<const uint8_t *>(&qw[r])[v] >> 4;
+                        part[r * kB4Nt + t] = fmaf(table[code], xval, part[r * kB4Nt + t]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < kB4Rows * kB4Nt; ++i) {
+                acc[i] = fmaf(dl[i / kB4Nt], part[i], acc[i]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kB4Rows * kB4Nt; ++i) {
+        float v = acc[i];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down(v, off);
+        }
+        const int r = i / kB4Nt;
+        const int t = i % kB4Nt;
+        if (lane == 0 && row0 + r < rows) {
+            y[t * rows + row0 + r] = v;
+        }
+    }
+}
+
 } // namespace
 
 bool gemv_q4k_b4(const void * packed, const void * x_f16, float * y, const int64_t rows,
@@ -1382,6 +1468,23 @@ bool gemv_iq3s_b4(const void * packed, const void * x_f16, float * y, const int6
                                                   base + l.d_off,
                                                   static_cast<const __half *>(x_f16), y, rows,
                                                   n_sub, k);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool gemv_iq4_xs_b4(const void * packed, const void * x_f16, float * y, const int64_t rows,
+                    const int64_t k, hipStream_t stream) {
+    if (packed == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
+        k % 256 != 0) {
+        return false;
+    }
+    const int64_t n_blocks = rows * (k / 256);
+    const omph::format::Iq4Layout l = omph::format::iq4_layout(n_blocks);
+    const int64_t n_sub = k / 32;
+    const auto * base = static_cast<const uint8_t *>(packed);
+    const dim3 grid((unsigned) ((rows + 8 * kB4Rows - 1) / (8 * kB4Rows)));
+    gemv_iq4_b4_kernel<<<grid, 256, 16 * sizeof(float), stream>>>(
+        base + l.qs_off, base + l.sc_off, base + l.d_off, static_cast<const __half *>(x_f16), y,
+        rows, n_sub, k);
     return hipGetLastError() == hipSuccess;
 }
 
