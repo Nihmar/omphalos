@@ -633,3 +633,24 @@ IQ3_S/IQ3_XXS (worth ~3-4 ms if one exists, see M3.18), and attack on the
 per-kernel latency of the small-op chains — for which HIP stream capture is the
 tool, with the caveat above that the win is smaller than the 22 ms estimate that
 started this thread.
+
+# M3.20 — investigation 1: a cheaper sign application
+
+The sign costs ~46 % of IQ3_S (M3.18, upper bound by removal). Replacing the
+per-value `if (mask & bit) v = -v;` with **masks built once per 8-value group and
+a XOR on the float sign bit** helps where the register/instruction mix allows:
+
+| type | select (before) | XOR (after) |
+|---|---:|---:|
+| IQ3_XXS | 246.0 GB/s (77.3 %) | **273.3 GB/s (85.8 %)** |
+| IQ3_S | 220.7 GB/s (69.3 %) | **241.9 GB/s (76.0 %)** |
+| IQ2_XS | ~200 GB/s | ~194-215 GB/s (noisy, small tensor) |
+| IQ2_XXS | 227.2 GB/s (71.4 %) | 216.6 — **worse**, reverted |
+| IQ2_S | 232.7 GB/s (73.1 %) | 208.4 — **worse**, reverted |
+
+So the answer to "can the sign be made cheaper" is: **sometimes, and only by
+measuring**. The two that lost have the same structure — the extra 8-entry mask
+array pushed them over a register threshold. Kept: the three that measured faster.
+Accuracy unchanged everywhere (2.0-2.7e-4).
+
+Decode: 59 -> 58 ms/token (the win is concentrated in IQ3_XXS/IQ3_S, ~4.3 GiB).

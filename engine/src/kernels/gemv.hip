@@ -280,18 +280,19 @@ __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t *
                 for (int r = 0; r < kIq3Rows; ++r) {
                     const uint8_t * bytes = reinterpret_cast<const uint8_t *>(&q[r]);
                     const uint8_t sg = stab[(a[r] >> (7 * l)) & 127];
+                    uint32_t smk[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        smk[j] = ((sg >> j) & 1u) ? 0x80000000u : 0u;
+                    }
                     const uint32_t g1 = grid[bytes[2 * l]];
                     const uint32_t g2 = grid[bytes[2 * l + 1]];
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {
-                        float g1v = (float) ((g1 >> (8 * j)) & 0xFF);
-                        float g2v = (float) ((g2 >> (8 * j)) & 0xFF);
-                        if (sg & (1u << j)) {
-                            g1v = -g1v;
-                        }
-                        if (sg & (1u << (4 + j))) {
-                            g2v = -g2v;
-                        }
+                        float g1v = __uint_as_float(
+                            __float_as_uint((float) ((g1 >> (8 * j)) & 0xFF)) ^ smk[j]);
+                        float g2v = __uint_as_float(
+                            __float_as_uint((float) ((g2 >> (8 * j)) & 0xFF)) ^ smk[4 + j]);
                         part[r] = fmaf(g1v, __half2float(xv[8 * l + j]), part[r]);
                         part[r] = fmaf(g2v, __half2float(xv[8 * l + 4 + j]), part[r]);
                     }
@@ -390,16 +391,15 @@ __global__ void gemv_iq3s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
                     float g2f[4];
                     grid4(g1, g1f);
                     grid4(g2, g2f);
+                    uint32_t smk[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        smk[j] = ((sm >> j) & 1u) ? 0x80000000u : 0u;
+                    }
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {
-                        float v1 = g1f[j];
-                        float v2 = g2f[j];
-                        if (sm & (1u << j)) {
-                            v1 = -v1;
-                        }
-                        if (sm & (1u << (4 + j))) {
-                            v2 = -v2;
-                        }
+                        float v1 = __uint_as_float(__float_as_uint(g1f[j]) ^ smk[j]);
+                        float v2 = __uint_as_float(__float_as_uint(g2f[j]) ^ smk[4 + j]);
                         part[r] = fmaf(v1, __half2float(xv[8 * l + j]), part[r]);
                         part[r] = fmaf(v2, __half2float(xv[8 * l + 4 + j]), part[r]);
                     }
@@ -709,6 +709,11 @@ __global__ void gemv_iq2xs_kernel(const uint8_t * __restrict__ qs, const uint8_t
                 for (int r = 0; r < kIq2Rows; ++r) {
                     const uint32_t e = ent[r][l >> 1] >> (16 * (l & 1));
                     const uint8_t sg = stab[(e >> 9) & 127];
+                    uint32_t smk[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        smk[j] = ((sg >> j) & 1u) ? 0x80000000u : 0u;
+                    }
                     const uint64_t g = grid[e & 511];
                     const uint32_t glo = (uint32_t) g;
                     const uint32_t ghi = (uint32_t) (g >> 32);
@@ -717,10 +722,7 @@ __global__ void gemv_iq2xs_kernel(const uint8_t * __restrict__ qs, const uint8_t
                     grid4(ghi, gf + 4);
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
-                        float v = gf[j];
-                        if (sg & (1u << j)) {
-                            v = -v;
-                        }
+                        float v = __uint_as_float(__float_as_uint(gf[j]) ^ smk[j]);
                         sub[r][l >> 1] =
                             fmaf(v, __half2float(xv[8 * l + j]), sub[r][l >> 1]);
                     }
@@ -806,6 +808,11 @@ __global__ void gemv_iq2xxs_kernel(const uint8_t * __restrict__ qs,
                 for (int r = 0; r < kIq2Rows; ++r) {
                     const uint32_t idx_byte = (aux0[r] >> (8 * l)) & 0xFF;
                     const uint8_t sg = stab[(aux1[r] >> (7 * l)) & 127];
+                    uint32_t smk[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        smk[j] = ((sg >> j) & 1u) ? 0x80000000u : 0u;
+                    }
                     const uint64_t g = grid[idx_byte];
                     const uint32_t glo = (uint32_t) g;
                     const uint32_t ghi = (uint32_t) (g >> 32);
@@ -906,6 +913,11 @@ __global__ void gemv_iq2s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
                     const uint32_t lo = (qsw[r] >> (8 * l)) & 0xFF;
                     const uint32_t hi = ((qhb[r] >> (2 * l)) & 3) << 8;
                     const uint32_t sg = (sgw[r] >> (8 * l)) & 0xFF;
+                    uint32_t smk[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        smk[j] = ((sg >> j) & 1u) ? 0x80000000u : 0u;
+                    }
                     const uint64_t g = grid[lo | hi];
                     const uint32_t glo = (uint32_t) g;
                     const uint32_t ghi = (uint32_t) (g >> 32);
