@@ -9,10 +9,12 @@
 // layer are dequantized to f16 into a reusable scratch buffer, and every op is
 // a separate kernel launch. Naive by design — this is the M2 correctness path.
 #include "format/gguf.hh"
+#include "format/repack.hh"
 #include "kernels/attn.hh"
 #include "kernels/dequant.hh"
 #include "kernels/elementwise.hh"
 #include "kernels/gdn.hh"
+#include "kernels/gemv.hh"
 #include "runtime/matmul.hh"
 
 #include <hip/hip_runtime.h>
@@ -24,6 +26,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -111,8 +114,8 @@ void write_f32(const std::string & path, const std::vector<float> & data) {
 
 class Runner {
 public:
-    explicit Runner(const std::string & path, const int64_t max_tokens)
-        : file_(path), h_(read_hparams(file_)) {
+    explicit Runner(const std::string & path, const int64_t max_tokens, const bool use_gemv)
+        : file_(path), h_(read_hparams(file_)), use_gemv_(use_gemv) {
         const int64_t ne = h_.n_embd;
         const int64_t T = max_tokens;
         const int64_t ssm_q = h_.ssm_n_kh * h_.ssm_s;              // 2048
@@ -123,11 +126,62 @@ public:
         const int64_t attn_fused = h_.n_head * 2 * h_.head_dim;    // 12288 (q | gate)
         const int64_t fused = std::max(ssm_channels, attn_fused);
 
-        const size_t total = file_.size() - (size_t) file_.data_offset();
-        if (hipMalloc(&dev_weights_, total) != hipSuccess ||
-            hipMemcpy(dev_weights_, file_.base() + file_.data_offset(), total,
-                      hipMemcpyHostToDevice) != hipSuccess) {
-            throw std::runtime_error("cannot upload the weights to VRAM");
+        // Per-tensor upload: the types with a fused GEMV kernel are repacked on
+        // the host first (PLAN.md §8.3), everything else goes up verbatim. Only
+        // one copy of each tensor is kept in VRAM.
+        {
+            struct Place {
+                std::string name;
+                size_t off = 0;
+            };
+            std::vector<Place> places;
+            size_t total = 0;
+            for (const omph::gguf::TensorInfo & t : file_.tensors()) {
+                Place p;
+                p.name = t.name;
+                p.off = total;
+                const int64_t bb = omph::format::quant_block_bytes(t.type);
+                if (use_gemv_ && bb > 0 && t.nbytes % (uint64_t) bb == 0) {
+                    std::vector<uint8_t> packed;
+                    if (omph::format::repack_any(t.type, file_.tensor_data(t),
+                                                 (int64_t) (t.nbytes / (uint64_t) bb), packed)) {
+                        GemvEntry e;
+                        e.off = total;
+                        e.bytes = packed.size();
+                        e.rows = (int64_t) t.ne[1];
+                        e.k = (int64_t) t.ne[0];
+                        e.type = t.type;
+                        gems_[t.name] = e;
+                        total += (packed.size() + 255) & ~(size_t) 255;
+                        places.push_back(p);
+                        continue;
+                    }
+                }
+                total += ((size_t) t.nbytes + 255) & ~(size_t) 255;
+                places.push_back(p);
+            }
+            if (hipMalloc(&dev_weights_, total) != hipSuccess) {
+                throw std::runtime_error("cannot allocate the weight image");
+            }
+            auto * base = static_cast<uint8_t *>(dev_weights_);
+            for (const Place & p : places) {
+                const omph::gguf::TensorInfo * t = file_.tensor(p.name);
+                const int64_t bb = omph::format::quant_block_bytes(t->type);
+                const bool repacked = gems_.count(p.name) != 0 && bb > 0;
+                std::vector<uint8_t> packed;
+                const void * src = file_.tensor_data(*t);
+                size_t bytes = (size_t) t->nbytes;
+                if (repacked) {
+                    (void) omph::format::repack_any(t->type, src,
+                                                    (int64_t) (t->nbytes / (uint64_t) bb), packed);
+                    src = packed.data();
+                    bytes = packed.size();
+                }
+                if (hipMemcpy(base + p.off, src, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+                    throw std::runtime_error("cannot upload " + p.name);
+                }
+                off_[p.name] = p.off;
+            }
         }
 
         if (!scratch_.init((size_t) 1280 * 1024 * 1024)) {
@@ -162,6 +216,7 @@ public:
         alloc(&logits_, T * h_.n_vocab * 4);
         alloc(&tmp_logits_, T * std::min<int64_t>(h_.n_vocab, 32768) * 4);
         alloc(&head16_, (size_t) std::min<int64_t>(h_.n_vocab, 32768) * ne * 2);
+        alloc(&raw_stage_, (size_t) 768 * 1024 * 1024);  // raw bytes for the f16 fallback
         max_seq_ = T;
         int64_t n_kv = 0;
         for (int64_t il = 0; il < h_.n_layer; ++il) {
@@ -199,7 +254,7 @@ public:
         if (te == nullptr) return fail("token_embd.weight missing");
         const int64_t row_bytes = (int64_t) (te->nbytes / te->ne[1]);
         for (int64_t t = 0; t < T; ++t) {
-            const uint8_t * src = static_cast<const uint8_t *>(dev_weights_) + te->offset +
+            const uint8_t * src = static_cast<const uint8_t *>(dev_weights_) + off_.at(te->name) +
                                   (size_t) toks[t] * row_bytes;
             if (!omph::kernels::dequantize(te->type, src,
                                            static_cast<uint8_t *>(x_) + t * ne * 4, ne, false,
@@ -212,7 +267,7 @@ public:
             const omph::gguf::TensorInfo * t = file_.tensor(name);
             return t == nullptr ? nullptr : reinterpret_cast<const float *>(
                                                 static_cast<const uint8_t *>(dev_weights_) +
-                                                t->offset);
+                                                off_.at(t->name));
         };
 
         for (int64_t il = 0; il < h_.n_layer; ++il) {
@@ -245,19 +300,15 @@ public:
                                                 nullptr)) {
                 return fail("residual/norm failed");
             }
-            void * wg = stage_w(p + "ffn_gate.weight");
-            void * wu = stage_w(p + "ffn_up.weight");
-            void * wd = stage_w(p + "ffn_down.weight");
-            omph::runtime::Linear linear;
-            if (!linear.run(wg, h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T) ||
-                !linear.run(wu, h16_, static_cast<float *>(ffn2_), h_.n_ff, ne, T) ||
+            if (!matmul(p + "ffn_gate.weight", h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T) ||
+                !matmul(p + "ffn_up.weight", h16_, static_cast<float *>(ffn2_), h_.n_ff, ne, T) ||
                 !omph::kernels::silu_inplace(static_cast<float *>(ffn1_), T * h_.n_ff, nullptr) ||
                 !omph::kernels::mul_inplace(static_cast<float *>(ffn1_),
                                             static_cast<const float *>(ffn2_), T * h_.n_ff,
                                             nullptr) ||
                 !omph::kernels::cast_f32_to_f16(static_cast<const float *>(ffn1_), ffn16_,
                                                 T * h_.n_ff, nullptr) ||
-                !linear.run(wd, ffn16_, static_cast<float *>(cur_), ne, h_.n_ff, T) ||
+                !matmul(p + "ffn_down.weight", ffn16_, static_cast<float *>(cur_), ne, h_.n_ff, T) ||
                 !omph::kernels::add_out(static_cast<const float *>(cur_),
                                         static_cast<const float *>(resid_),
                                         static_cast<float *>(x_), T * ne, nullptr)) {
@@ -279,12 +330,29 @@ public:
                                             nullptr)) {
             return fail("output_norm failed");
         }
+        if (use_gemv_ && T == 1 && gems_.count("output.weight") != 0) {
+            if (!matmul("output.weight", h16_, static_cast<float *>(logits_), h_.n_vocab, ne, T) ||
+                hipDeviceSynchronize() != hipSuccess) {
+                return fail("lm_head (gemv) failed");
+            }
+            logits.resize((size_t) T * h_.n_vocab);
+            (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
+            return true;
+        }
         // lm head in vocab chunks: the whole f16 head (248k x 5120) would not fit
         const omph::gguf::TensorInfo * head = file_.tensor("output.weight");
         if (head == nullptr) {
             return fail("output.weight missing");
         }
         const int64_t head_row_bytes = (int64_t) (head->nbytes / head->ne[1]);
+        if (gems_.count(head->name) != 0) {
+            (void) hipMemcpy(raw_stage_, file_.tensor_data(*head), (size_t) head->nbytes,
+                             hipMemcpyHostToDevice);
+        }
+        const uint8_t * head_src = gems_.count(head->name) != 0
+                                       ? static_cast<const uint8_t *>(raw_stage_)
+                                       : static_cast<const uint8_t *>(dev_weights_) +
+                                             off_.at(head->name);
         const int64_t chunk = std::min<int64_t>(h_.n_vocab, 32768);
         omph::runtime::Linear linear;
         for (int64_t v0 = 0; v0 < h_.n_vocab; v0 += chunk) {
@@ -292,7 +360,7 @@ public:
             void * wh = head16_;
             if (!omph::kernels::dequantize(
                     head->type,
-                    static_cast<const uint8_t *>(dev_weights_) + head->offset + v0 * head_row_bytes,
+                    head_src + v0 * head_row_bytes,
                     wh, rows * ne, true, nullptr) ||
                 !linear.run(wh, h16_, static_cast<float *>(tmp_logits_), rows, ne, T) ||
                 hipMemcpy2D(static_cast<uint8_t *>(logits_) + v0 * 4, (size_t) h_.n_vocab * 4,
@@ -358,19 +426,14 @@ private:
         const int64_t kv_out = h_.n_head_kv * h_.head_dim;
         float * k_cache = static_cast<float *>(kv_k_) + kv_index_[il] * max_seq_ * kv_out;
         float * v_cache = static_cast<float *>(kv_v_) + kv_index_[il] * max_seq_ * kv_out;
-        void * wq = stage_w(p + "attn_q.weight");
-        void * wk = stage_w(p + "attn_k.weight");
-        void * wv = stage_w(p + "attn_v.weight");
-        void * wo = stage_w(p + "attn_output.weight");
         const float * q_norm = f32_ref(p + "attn_q_norm.weight");
         const float * k_norm = f32_ref(p + "attn_k_norm.weight");
         if (!omph::kernels::cast_f32_to_f16(static_cast<const float *>(cur_), h16_, T * ne, nullptr)) {
             return fail("cast failed");
         }
-        omph::runtime::Linear linear;
-        if (!linear.run(wq, h16_, static_cast<float *>(fused_), q_out, ne, T) ||
-            !linear.run(wk, h16_, static_cast<float *>(k_), kv_out, ne, T) ||
-            !linear.run(wv, h16_, static_cast<float *>(v_), kv_out, ne, T) ||
+        if (!matmul(p + "attn_q.weight", h16_, static_cast<float *>(fused_), q_out, ne, T) ||
+            !matmul(p + "attn_k.weight", h16_, static_cast<float *>(k_), kv_out, ne, T) ||
+            !matmul(p + "attn_v.weight", h16_, static_cast<float *>(v_), kv_out, ne, T) ||
             !omph::kernels::split_qg(static_cast<const float *>(fused_),
                                      static_cast<float *>(q_), static_cast<float *>(gate_), T,
                                      h_.n_head, h_.head_dim, nullptr) ||
@@ -395,7 +458,8 @@ private:
                                       1.0f / std::sqrt((float) h_.head_dim), nullptr) ||
             !omph::kernels::cast_f32_to_f16(static_cast<const float *>(attn_), ffn16_,
                                             T * h_.n_head * h_.head_dim, nullptr) ||
-            !linear.run(wo, ffn16_, static_cast<float *>(blk_), ne, h_.n_head * h_.head_dim, T)) {
+            !matmul(p + "attn_output.weight", ffn16_, static_cast<float *>(blk_), ne,
+                    h_.n_head * h_.head_dim, T)) {
             return fail("attention layer failed");
         }
         return true;
@@ -413,11 +477,6 @@ private:
         const int64_t channels = q_dims + k_dims + v_dims;
         const float l2_scale = 1.0f / std::sqrt((float) s);
 
-        void * wqkv = stage_w(p + "attn_qkv.weight");
-        void * wz = stage_w(p + "attn_gate.weight");
-        void * wbeta = stage_w(p + "ssm_beta.weight");
-        void * walpha = stage_w(p + "ssm_alpha.weight");
-        void * wout = stage_w(p + "ssm_out.weight");
         const float * dt_bias = f32_ref(p + "ssm_dt.bias");
         const float * ssm_a = f32_ref(p + "ssm_a");
         const float * ssm_norm = f32_ref(p + "ssm_norm.weight");
@@ -433,11 +492,10 @@ private:
         if (!omph::kernels::cast_f32_to_f16(static_cast<const float *>(cur_), h16_, T * ne, nullptr)) {
             return fail("cast failed");
         }
-        omph::runtime::Linear linear;
-        if (!linear.run(wqkv, h16_, static_cast<float *>(fused_), channels, ne, T) ||
-            !linear.run(wz, h16_, static_cast<float *>(z_), v_dims, ne, T) ||
-            !linear.run(wbeta, h16_, static_cast<float *>(beta_), n_vh, ne, T) ||
-            !linear.run(walpha, h16_, static_cast<float *>(alpha_), n_vh, ne, T)) {
+        if (!matmul(p + "attn_qkv.weight", h16_, static_cast<float *>(fused_), channels, ne, T) ||
+            !matmul(p + "attn_gate.weight", h16_, static_cast<float *>(z_), v_dims, ne, T) ||
+            !matmul(p + "ssm_beta.weight", h16_, static_cast<float *>(beta_), n_vh, ne, T) ||
+            !matmul(p + "ssm_alpha.weight", h16_, static_cast<float *>(alpha_), n_vh, ne, T)) {
             return fail("gdn projection failed");
         }
         if (!omph::kernels::sigmoid_inplace(static_cast<float *>(beta_), T * n_vh, nullptr) ||
@@ -487,11 +545,49 @@ private:
                                        T * n_vh, v_dim, (float) h_.eps, nullptr) ||
             !omph::kernels::cast_f32_to_f16(static_cast<const float *>(o_), ffn16_, T * v_dims,
                                             nullptr) ||
-            !linear.run(wout, ffn16_, static_cast<float *>(blk_), ne, v_dims, T)) {
+            !matmul(p + "ssm_out.weight", ffn16_, static_cast<float *>(blk_), ne, v_dims, T)) {
             return fail("gdn output failed");
         }
         conv_flip_[il] ^= 1;
         return true;
+    }
+
+    // One matmul: the fused GEMV for single-token steps when it is available for
+    // this tensor, otherwise the f16 dequant + hipBLASLt path.
+    bool matmul(const std::string & name, const void * x16, float * y, const int64_t n_out,
+                const int64_t k, const int64_t T) {
+        if (use_gemv_ && T == 1) {
+            const auto it = gems_.find(name);
+            if (it != gems_.end() && it->second.rows == n_out && it->second.k == k) {
+                const void * w = static_cast<const uint8_t *>(dev_weights_) + it->second.off;
+                switch (it->second.type) {
+                    case 10: return omph::kernels::gemv_q2k(w, x16, y, n_out, k, nullptr);
+                    case 12: return omph::kernels::gemv_q4k(w, x16, y, n_out, k, nullptr);
+                    case 18: return omph::kernels::gemv_iq3_xxs(w, x16, y, n_out, k, nullptr);
+                    case 21: return omph::kernels::gemv_iq3_s(w, x16, y, n_out, k, nullptr);
+                    case 23: return omph::kernels::gemv_iq4_xs(w, x16, y, n_out, k, nullptr);
+                    default: break;
+                }
+            }
+        }
+        void * w = stage_w(name);
+        omph::runtime::Linear linear;
+        return linear.run(w, x16, y, n_out, k, T);
+    }
+
+    // Device pointer to the original GGUF bytes: they live in the image unless
+    // the tensor was repacked, in which case they are staged from the file.
+    const void * raw_bytes(const std::string & name) {
+        const auto it = gems_.find(name);
+        if (it == gems_.end()) {
+            return static_cast<const uint8_t *>(dev_weights_) + off_.at(name);
+        }
+        const omph::gguf::TensorInfo * t = file_.tensor(name);
+        if (hipMemcpy(raw_stage_, file_.tensor_data(*t), (size_t) t->nbytes,
+                      hipMemcpyHostToDevice) != hipSuccess) {
+            throw std::runtime_error("cannot stage " + name);
+        }
+        return raw_stage_;
     }
 
     void * stage_w(const std::string & name) {
@@ -508,9 +604,7 @@ private:
             }
             std::fprintf(stderr, "] type=%u\n", t->type);
         }
-        if (!omph::kernels::dequantize(t->type,
-                                       static_cast<const uint8_t *>(dev_weights_) + t->offset, dst,
-                                       n, true, nullptr)) {
+        if (!omph::kernels::dequantize(t->type, raw_bytes(name), dst, n, true, nullptr)) {
             throw std::runtime_error("dequant failed for " + name);
         }
         return dst;
@@ -522,11 +616,22 @@ private:
             throw std::runtime_error("missing tensor " + name);
         }
         return reinterpret_cast<const float *>(static_cast<const uint8_t *>(dev_weights_) +
-                                               t->offset);
+                                               off_.at(name));
     }
+
+    struct GemvEntry {
+        size_t off = 0;
+        size_t bytes = 0;
+        int64_t rows = 0;
+        int64_t k = 0;
+        uint32_t type = 0;
+    };
 
     omph::gguf::File file_;
     HParams h_;
+    bool use_gemv_ = false;
+    std::unordered_map<std::string, size_t> off_;
+    std::unordered_map<std::string, GemvEntry> gems_;
     Scratch scratch_;
     std::vector<void *> states_;
     std::vector<int64_t> kv_index_;
@@ -559,6 +664,7 @@ private:
     void * logits_ = nullptr;
     void * tmp_logits_ = nullptr;
     void * head16_ = nullptr;
+    void * raw_stage_ = nullptr;
 };
 
 } // namespace
@@ -577,6 +683,7 @@ int main(int argc, char ** argv) {
     std::string gen_path;
     int64_t max_tokens = 0;
     int64_t generate = 0;
+    bool use_gemv = false;
     for (int i = 4; i < argc; ++i) {
         if (std::strcmp(argv[i], "--trace-dir") == 0 && i + 1 < argc) {
             trace_dir = argv[++i];
@@ -584,6 +691,8 @@ int main(int argc, char ** argv) {
             max_tokens = std::atoll(argv[++i]);
         } else if (std::strcmp(argv[i], "--generate") == 0 && i + 1 < argc) {
             generate = std::atoll(argv[++i]);
+        } else if (std::strcmp(argv[i], "--gemv") == 0) {
+            use_gemv = true;
         } else if (std::strcmp(argv[i], "--gen-out") == 0 && i + 1 < argc) {
             gen_path = argv[++i];
         }
@@ -608,7 +717,7 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "--generate also needs --gen-out\n");
             return 2;
         }
-        Runner runner(model, (int64_t) toks.size() + generate + 8);
+        Runner runner(model, (int64_t) toks.size() + generate + 8, use_gemv);
         const HParams & h = runner.hparams();
         std::vector<float> logits;
         if (!runner.forward(toks, logits, trace_dir, 0)) {
