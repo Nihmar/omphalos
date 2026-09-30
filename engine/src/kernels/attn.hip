@@ -408,7 +408,8 @@ bool kv_quant(const float * k_src, const float * v_src, uint8_t * k_q8, void * k
               hipStream_t stream) {
     if (k_src == nullptr || v_src == nullptr || k_q8 == nullptr || k_scales == nullptr ||
         v_q4 == nullptr || v_scales == nullptr || tokens <= 0 || nkv <= 0 || hd <= 0 ||
-        hd % kKvBlock != 0) {
+        hd % kKvBlock != 0 || (k16 == nullptr) != (v16 == nullptr) ||
+        (k16 != nullptr && window <= 0)) {
         return false;
     }
     const long long n_rows = tokens * nkv;
@@ -425,6 +426,16 @@ bool attention_flash_q8q4(const float * q, const uint8_t * k_q8, const void * k_
                           const int64_t seq, const int64_t nh, const int64_t nkv, const int64_t hd,
                           const float scale, const int64_t head_ratio, const int64_t window,
                           hipStream_t stream) {
+    // One thread per head dimension (<= 1024), 32-element quant blocks, and a
+    // butterfly un-rotation in the epilogue (power of two). The FP16 window
+    // needs both rings or neither.
+    if (q == nullptr || k_q8 == nullptr || k_scales == nullptr || v_q4 == nullptr ||
+        v_scales == nullptr || out == nullptr || tokens <= 0 || seq < tokens || nh <= 0 ||
+        nkv <= 0 || nh % nkv != 0 || head_ratio != nh / nkv || hd <= 0 || hd > 1024 ||
+        (hd & (hd - 1)) != 0 || hd % kKvBlock != 0 || (k16 == nullptr) != (v16 == nullptr) ||
+        (k16 != nullptr && window <= 0)) {
+        return false;
+    }
     const dim3 grid((unsigned) tokens, (unsigned) nh);
     attention_flash_q8q4_kernel<<<grid, (unsigned) hd, (size_t) hd * sizeof(float), stream>>>(
         q, k_q8, static_cast<const __half *>(k_scales), v_q4,
