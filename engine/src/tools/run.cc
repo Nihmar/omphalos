@@ -2,8 +2,9 @@
 //
 // usage: omph-run <model.gguf> <tokens.txt> <out-logits.f32> [--trace-dir DIR]
 //   tokens.txt: token ids separated by whitespace.
-//   Logits are written as tokens x n_vocab f32; with --trace-dir the per-layer
-//   outputs are dumped as l_out-<layer>.f32.
+//   Logits are written as tokens x n_vocab f32 for the whole prompt (one row
+//   with --last-logits); with --trace-dir the per-layer outputs are dumped as
+//   l_out-<layer>.f32 (single-chunk prompts only).
 //
 // The whole quantized tensor block lives in VRAM; the weights of the current
 // layer are dequantized to f16 into a reusable scratch buffer, and every op is
@@ -157,6 +158,7 @@ public:
         : file_(path), h_(read_hparams(file_)), use_gemv_(use_gemv) {
         const int64_t ne = h_.n_embd;
         const int64_t T = max_tokens;
+        max_tokens_ = max_tokens;
         const int64_t ssm_q = h_.ssm_n_kh * h_.ssm_s;              // 2048
         const int64_t ssm_v = h_.ssm_n_vh * (h_.ssm_inner / h_.ssm_n_vh);  // 6144
         const int64_t attn_q = h_.n_head * h_.head_dim;            // 6144
@@ -317,6 +319,11 @@ public:
     bool forward(const std::vector<int32_t> & toks, std::vector<float> & logits,
                  const std::string & trace_dir, const int64_t start_pos = 0) {
         const int64_t T = (int64_t) toks.size();
+        // The activations hold max_tokens_ rows and the KV cache max_seq_
+        // positions: anything past either is an out-of-bounds write.
+        if (T <= 0 || T > max_tokens_ || start_pos < 0 || start_pos + T > max_seq_) {
+            return fail("forward: tokens exceed the activation or KV capacity");
+        }
         hipEvent_t step_a{}, step_b{};
         const bool time_step = T == 1 && std::getenv("OMPH_TIMING") != nullptr;
         if (time_step) {
@@ -437,8 +444,7 @@ public:
                 if (!gemv_one(e.type, w, xlast, static_cast<float *>(logits_), h_.n_vocab, ne)) {
                     return fail("lm_head gemv failed");
                 }
-            } else if (!linear_.run(stage_w("output.weight"), xlast, static_cast<float *>(logits_),
-                                    h_.n_vocab, ne, 1)) {
+            } else if (!head_chunked(xlast, 1)) {
                 return fail("lm_head failed");
             }
             if (hipDeviceSynchronize() != hipSuccess) {
@@ -479,7 +485,26 @@ public:
             report_phases();
             return true;
         }
-        // lm head in vocab chunks: the whole f16 head (248k x 5120) would not fit
+        if (!head_chunked(h16_, T)) {
+            return false;
+        }
+        if (hipDeviceSynchronize() != hipSuccess) {
+            return fail("lm_head failed");
+        }
+        logits.resize((size_t) T * h_.n_vocab);
+        (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
+        report_phases();
+        if (time_step) {
+            step_event(step_a, step_b);
+        }
+        return true;
+    }
+
+    // lm head in vocab chunks, through the f16 dequant + hipBLASLt path: the
+    // whole f16 head (248k x 5120, 2.5 GB) would not fit. Writes (T, n_vocab)
+    // into logits_.
+    bool head_chunked(const void * x16, const int64_t T) {
+        const int64_t ne = h_.n_embd;
         const omph::gguf::TensorInfo * head = file_.tensor("output.weight");
         if (head == nullptr) {
             return fail("output.weight missing");
@@ -504,7 +529,7 @@ public:
             timer_stage_.stop(t_stage_);
             timer_gemm_.start();
             const bool head_gm =
-                linear_.run(wh, h16_, static_cast<float *>(tmp_logits_), rows, ne, T);
+                linear_.run(wh, x16, static_cast<float *>(tmp_logits_), rows, ne, T);
             timer_gemm_.stop(t_gemm_);
             if (!head_dq || !head_gm ||
                 hipMemcpy2D(static_cast<uint8_t *>(logits_) + v0 * 4, (size_t) h_.n_vocab * 4,
@@ -512,15 +537,6 @@ public:
                             hipMemcpyDeviceToDevice) != hipSuccess) {
                 return fail("lm_head failed");
             }
-        }
-        if (hipDeviceSynchronize() != hipSuccess) {
-            return fail("lm_head failed");
-        }
-        logits.resize((size_t) T * h_.n_vocab);
-        (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
-        report_phases();
-        if (time_step) {
-            step_event(step_a, step_b);
         }
         return true;
     }
@@ -1126,6 +1142,7 @@ private:
     std::vector<int64_t> kv_index_;
     std::vector<char> conv_flip_;
     int64_t max_seq_ = 0;
+    int64_t max_tokens_ = 0;
     void * kv_k_ = nullptr;
     void * kv_v_ = nullptr;
     void * kv_kq_ = nullptr;
@@ -1229,16 +1246,30 @@ int main(int argc, char ** argv) {
         if (max_tokens > 0 && max_tokens < act_chunk) {
             act_chunk = max_tokens;
         }
+        // The per-layer trace is one file per layer for one forward call: with
+        // several chunks it would hold the last chunk only.
+        if (!trace_dir.empty() && (int64_t) toks.size() > act_chunk) {
+            std::fprintf(stderr, "--trace-dir needs the prompt in one chunk (<= %lld tokens)\n",
+                         (long long) act_chunk);
+            return 2;
+        }
         Runner runner(model, act_chunk, use_gemv && generate > 0, last_logits, total_len);
         const HParams & h = runner.hparams();
+        // Every chunk's rows are kept, so the file is the whole prompt's logits;
+        // with --last-logits each forward returns one row and the last one wins.
         std::vector<float> logits;
+        std::vector<float> part_logits;
         for (int64_t off = 0; off < (int64_t) toks.size(); off += act_chunk) {
             const int64_t n = std::min<int64_t>(act_chunk, (int64_t) toks.size() - off);
             const std::vector<int32_t> part(toks.begin() + (size_t) off,
                                             toks.begin() + (size_t) (off + n));
-            const bool last = off + n == (int64_t) toks.size();
-            if (!runner.forward(part, logits, last ? trace_dir : std::string(), off)) {
+            if (!runner.forward(part, part_logits, trace_dir, off)) {
                 return 1;
+            }
+            if (last_logits) {
+                logits.swap(part_logits);
+            } else {
+                logits.insert(logits.end(), part_logits.begin(), part_logits.end());
             }
         }
         write_f32(logits_path, logits);
