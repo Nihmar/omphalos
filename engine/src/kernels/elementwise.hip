@@ -1,0 +1,69 @@
+// Elementwise / reduction kernels for the naive path.
+#include "kernels/elementwise.hh"
+
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+
+namespace omph::kernels {
+namespace {
+
+constexpr int kBlock = 256;
+
+__global__ void cast_f32_to_f16_kernel(const float * __restrict__ src, __half * __restrict__ dst,
+                                       const long long n) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = __float2half(src[i]);
+    }
+}
+
+// One block per row; blockDim.x must be a power of two.
+__global__ void rms_norm_kernel(const float * __restrict__ x, const float * __restrict__ w,
+                                float * __restrict__ y, const long long n, const float eps) {
+    extern __shared__ float sdata[];
+    const long long row = blockIdx.x;
+    const float * xr = x + row * n;
+    float * yr = y + row * n;
+
+    float acc = 0.0f;
+    for (long long i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = xr[i];
+        acc += v * v;
+    }
+    sdata[threadIdx.x] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if ((int) threadIdx.x < stride) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float scale = 1.0f / sqrtf(sdata[0] / (float) n + eps);
+    for (long long i = threadIdx.x; i < n; i += blockDim.x) {
+        yr[i] = xr[i] * scale * (w != nullptr ? w[i] : 1.0f);
+    }
+}
+
+} // namespace
+
+bool cast_f32_to_f16(const float * src, void * dst, const int64_t n, hipStream_t stream) {
+    if (src == nullptr || dst == nullptr || n <= 0) {
+        return false;
+    }
+    const long long grid = (n + kBlock - 1) / kBlock;
+    cast_f32_to_f16_kernel<<<(unsigned) grid, kBlock, 0, stream>>>(
+        src, reinterpret_cast<__half *>(dst), (long long) n);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool rms_norm(const float * x, const float * w, float * y, const int64_t rows, const int64_t n,
+              const float eps, hipStream_t stream) {
+    if (x == nullptr || y == nullptr || rows <= 0 || n <= 0 || n % kBlock != 0) {
+        return false;
+    }
+    rms_norm_kernel<<<(unsigned) rows, kBlock, kBlock * sizeof(float), stream>>>(x, w, y,
+                                                                                 (long long) n, eps);
+    return hipGetLastError() == hipSuccess;
+}
+
+} // namespace omph::kernels
