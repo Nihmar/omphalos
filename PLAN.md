@@ -150,10 +150,25 @@ Other per-token traffic (small but not zero):
 ### 4.2 Prefill is compute-bound
 
 **Where milestone 2/3 actually stand (measured, 2026-09-30).** The current prefill
-is the *correctness* path, not a prefill design: 2.1 s for a 10-token prompt =
-**4.7 t/s** (f16 path), 8.7 s with `--gemv` (the fallback re-stages raw bytes;
-use `--gemv` for decode measurements only). Against llama.cpp's measured
-**622.7 t/s** (pp512, M0) and the ~700-800 t/s target, four things separate us:
+is the *correctness* path, not a prefill design. A 10-token pass costs 2.0 s wall
+clock, ~0.56 s of which is the one-time weight upload over PCIe; the pass itself
+is ~1.45 s = **~7 t/s**. `OMPH_TIMING=1` splits it:
+
+| phase | time | share |
+|---|---:|---:|
+| dequant each layer's weights to f16 (`stage_w`) | 830 ms | 57 % |
+| f16 GEMMs (hipBLASLt) | 339 ms | 23 % |
+| attention / gated delta net kernels | 43 ms | 3 % |
+| small ops, casts, launches | ~200 ms | 14 % |
+
+80 % of the pass is therefore exactly what the M8 design replaces, and the block
+kernels are 3 % *at T = 10* — they are what grows with T, since the delta net is
+sequential today, which is why §10.3's chunked form matters for long prompts.
+With `--gemv` the pass is 8.7 s instead (the f16 fallback re-stages raw bytes):
+use `--gemv` for decode measurements only.
+
+Against llama.cpp's measured **622.7 t/s** (pp512, M0) and the ~700-800 t/s
+target, four things separate us:
 
 1. **f16 materialization.** The M2 path dequantizes every weight to f16 in global
    memory per pass: 27.5 B params x 2 B = **54 GB of writes** plus 11.28 GB of
