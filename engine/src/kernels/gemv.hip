@@ -105,10 +105,10 @@ constexpr long long kIq4Rows = 4;        // output rows computed per warp
 __global__ void gemv_iq4_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ sc,
                                 const uint8_t * __restrict__ d, const __half * __restrict__ x,
                                 float * __restrict__ y, const long long rows,
-                                const long long n_sub) {
+                                const long long n_sub, const long long chunk_sub) {
     extern __shared__ uint8_t smem[];
     __half * xs = reinterpret_cast<__half *>(smem);  // activation chunk
-    float * table = reinterpret_cast<float *>(smem + kIq4ChunkSub * 64);
+    float * table = reinterpret_cast<float *>(smem + chunk_sub * 64);
     if (threadIdx.x < 16) {
         table[threadIdx.x] = (float) kIq4Table[threadIdx.x];
     }
@@ -199,10 +199,10 @@ constexpr long long kIq3Rows = 4;        // output rows computed per warp       
 __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ aux,
                                 const uint8_t * __restrict__ d, const __half * __restrict__ x,
                                 float * __restrict__ y, const long long rows,
-                                const long long n_sub) {
+                                const long long n_sub, const long long chunk_sub) {
     extern __shared__ uint8_t smem[];
     __half * xs = reinterpret_cast<__half *>(smem);  // activation chunk
-    uint32_t * grid = reinterpret_cast<uint32_t *>(smem + kIq3ChunkSub * 64);
+    uint32_t * grid = reinterpret_cast<uint32_t *>(smem + chunk_sub * 64);
     uint8_t * stab = reinterpret_cast<uint8_t *>(grid + 256);
     for (int i = threadIdx.x; i < 256; i += blockDim.x) {
         grid[i] = omph::quant::kIq3xxsGrid[i];
@@ -298,10 +298,11 @@ __global__ void gemv_iq3s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
                                  const uint8_t * __restrict__ signs,
                                  const uint8_t * __restrict__ scales, const uint8_t * __restrict__ d,
                                  const __half * __restrict__ x, float * __restrict__ y,
-                                 const long long rows, const long long n_sub) {
+                                 const long long rows, const long long n_sub,
+                                 const long long chunk_sub) {
     extern __shared__ uint8_t smem[];
     __half * xs = reinterpret_cast<__half *>(smem);
-    uint32_t * grid = reinterpret_cast<uint32_t *>(smem + kIq3sChunkSub * 64);
+    uint32_t * grid = reinterpret_cast<uint32_t *>(smem + chunk_sub * 64);
     for (int i = threadIdx.x; i < 512; i += blockDim.x) {
         grid[i] = omph::quant::kIq3sGrid[i];
     }
@@ -419,14 +420,15 @@ bool gemv_iq3_s(const void * packed, const void * x_f16, float * y, const int64_
     const int64_t n_blocks = rows * (k / 256);
     const omph::format::Iq3sLayout l = omph::format::iq3s_layout(n_blocks);
     const int64_t n_sub = k / 32;
-    const size_t smem = (size_t) kIq3sChunkSub * 64 + 512 * 4;
+    const int64_t chunk = n_sub < kIq3sChunkSub ? n_sub : kIq3sChunkSub;
+    const size_t smem = (size_t) chunk * 64 + 512 * 4;
     const auto * base = static_cast<const uint8_t *>(packed);
     const dim3 grid((unsigned) ((rows + 8 * kIq3sRows - 1) / (8 * kIq3sRows)));
     gemv_iq3s_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.qh_off,
                                                   base + l.signs_off, base + l.scales_off,
                                                   base + l.d_off,
                                                   static_cast<const __half *>(x_f16), y, rows,
-                                                  n_sub);
+                                                  n_sub, chunk);
     return hipGetLastError() == hipSuccess;
 }
 
@@ -439,13 +441,14 @@ bool gemv_iq3_xxs(const void * packed, const void * x_f16, float * y, const int6
     const int64_t n_blocks = rows * (k / 256);
     const omph::format::Iq3XxsLayout l = omph::format::iq3_xxs_layout(n_blocks);
     const int64_t n_sub = k / 32;
-    const size_t smem = (size_t) kIq3ChunkSub * 64 + 256 * 4 + 128;
+    const int64_t chunk = n_sub < kIq3ChunkSub ? n_sub : kIq3ChunkSub;
+    const size_t smem = (size_t) chunk * 64 + 256 * 4 + 128;
     const auto * base = static_cast<const uint8_t *>(packed);
     const dim3 grid((unsigned) ((rows + 8 * kIq3Rows - 1) / (8 * kIq3Rows)));
     gemv_iq3_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.aux_off,
                                                  base + l.d_off,
                                                  static_cast<const __half *>(x_f16), y, rows,
-                                                 n_sub);
+                                                 n_sub, chunk);
     return hipGetLastError() == hipSuccess;
 }
 
@@ -458,7 +461,8 @@ bool gemv_iq4_xs(const void * packed, const void * x_f16, float * y, const int64
     const int64_t n_blocks = rows * (k / 256);
     const omph::format::Iq4Layout l = omph::format::iq4_layout(n_blocks);
     const int64_t n_sub = k / 32;
-    const size_t smem = (size_t) kIq4ChunkSub * 64 + 16 * sizeof(float);
+    const int64_t chunk = n_sub < kIq4ChunkSub ? n_sub : kIq4ChunkSub;
+    const size_t smem = (size_t) chunk * 64 + 16 * sizeof(float);
     if (smem > 64 * 1024) {
         return false;
     }
@@ -466,8 +470,32 @@ bool gemv_iq4_xs(const void * packed, const void * x_f16, float * y, const int64
     const dim3 grid((unsigned) ((rows + 8 * kIq4Rows - 1) / (8 * kIq4Rows)));
     gemv_iq4_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.sc_off, base + l.d_off,
                                                  static_cast<const __half *>(x_f16), y, rows,
-                                                 n_sub);
+                                                 n_sub, chunk);
     return hipGetLastError() == hipSuccess;
+}
+
+GemvOccupancy gemv_occupancy() {
+    GemvOccupancy o;
+    const void * kernels[4] = {(const void *) gemv_q4k_kernel, (const void *) gemv_iq4_kernel,
+                               (const void *) gemv_iq3_kernel, (const void *) gemv_iq3s_kernel};
+    o.smem_q4k = 0;
+    o.smem_iq4 = (size_t) kIq4ChunkSub * 64 + 16 * sizeof(float);
+    o.smem_iq3 = (size_t) kIq3ChunkSub * 64 + 256 * 4 + 128;
+    o.smem_iq3s = (size_t) kIq3sChunkSub * 64 + 512 * 4;
+    int n = 0;
+    const size_t smems[4] = {o.smem_q4k, o.smem_iq4, o.smem_iq3, o.smem_iq3s};
+    int results[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 4; ++i) {
+        (void) hipOccupancyMaxActiveBlocksPerMultiprocessor(&results[i], kernels[i], 256,
+                                                            smems[i]);
+    }
+    o.q4k = results[0];
+    o.iq4 = results[1];
+    o.iq3 = results[2];
+    o.iq3s = results[3];
+    o.block = 256;
+    (void) n;
+    return o;
 }
 
 } // namespace omph::kernels

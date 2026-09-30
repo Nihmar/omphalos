@@ -257,6 +257,14 @@ int main(int argc, char ** argv) {
         (void) hipMemcpy(dev_act32, act.data(), (size_t) kmax * 4, hipMemcpyHostToDevice);
         (void) omph::kernels::cast_f32_to_f16((const float *) dev_act32, dev_x, kmax, nullptr);
 
+        if (const char * occ = std::getenv("OMPH_OCCUPANCY")) {
+            (void) occ;
+            const omph::kernels::GemvOccupancy o = omph::kernels::gemv_occupancy();
+            std::printf("occupancy  : q4k %d  iq4 %d  iq3xxs %d  iq3s %d workgroups/CU "
+                        "(block %d, smem %zu/%zu/%zu/%zu)\n",
+                        o.q4k, o.iq4, o.iq3, o.iq3s, o.block, o.smem_q4k, o.smem_iq4, o.smem_iq3,
+                        o.smem_iq3s);
+        }
         const double ms = time_ms(cases, dev_x, (float *) dev_y, iters, nullptr);
         const double gbs = total_bytes / ms / 1e6;
         std::printf("fused      : %.3f ms  (%.1f MiB read)  -> %.1f GB/s  (%.1f%% of %.1f)\n", ms,
