@@ -523,3 +523,302 @@ is glue (attention kernels, per-layer norms, residuals, casts, launches).
 Same class of waste still applies to the prefill with `--gemv` (the f16 fallback
 stages every repacked tensor, ~1.6 GB per pass); the fix there is the small-batch
 GEMV, not more staging.
+
+# M3.16 — flash attention: decode 70 -> 59 ms/token
+
+The attention attribution (skip-the-attention ablation: 16 ms/step, ~1 ms per
+layer at T = 1) pointed at the naive kernel, which recomputed each Q·K dot
+**three times** (max, sum, weighted) and, worse, **per output dimension** — ~768x
+redundant work at the tested shapes.
+
+Replaced with a flash-style kernel (PLAN §10.4): one workgroup per (query token,
+head), one thread per head dimension, each cache row's score computed once and
+staged in LDS, the cache walked in blocks of hd rows with online softmax
+rescaling. The old kernel is gone.
+
+| path | before | after |
+|---|---:|---:|
+| fused GEMV decode | 70 ms/token | **59 ms/token** |
+| f16 decode | 630 ms/token | 621 ms/token |
+
+Tokens identical, logits within max |d| 0.0106 of the f16 path (summation order).
+
+Also this round:
+- the delta net's front end (conv + state shift + silu + split) is now one launch
+  instead of four — logits bit-identical, no measurable time change, which is
+  itself a finding: in that path it is not the launch count that costs.
+- a prefill-only run with `--gemv` no longer repacks anything: 8100 -> 2100 ms.
+
+**Decode is now 59 ms/token = 14.1x the milestone-2 f16 path.** Of that, ~48 ms
+are the fused GEMVs at the bandwidth ceiling and ~11 ms is the remaining glue —
+the attention's own GEMMs plus per-layer norms, casts and launches.
+
+# M3.17 — the optimized path reproduces the reference greedy output
+
+`check_gpu_decode.py --gemv --generate 3` (fused GEMV decode, flash attention,
+fused delta rule, 7 quant types):
+
+- engine generated `[198, 760, 3841]`, NumPy reference `[198, 760, 3841]` —
+  **greedy sequences identical**, prefill logits rel **4.9e-04**.
+- verdict: PASS.
+
+So the milestone-2 exit criterion still holds on the optimized path, not just on
+the f16 correctness path.
+
+## Where the 59 ms/token sits
+
+The fused GEMVs cost 48 ms, which matches the weighted average of the per-type
+efficiencies (Q4_K 92 %, IQ4_XS 82 %, IQ3_XXS 77 %, IQ3_S 69 %, IQ2_S 73 %,
+IQ2_XS 63 %, Q2_K 66 % -> ~77 %) against the 318 GB/s ceiling. So the GEMV path
+is at its *own* weighted ceiling: further decode gains have to come from the slow
+types or from the ~11 ms of glue, not from the fast ones.
+
+## Method note worth keeping
+
+Two attribution mistakes cost real time in this milestone and both are recorded
+here: event-based per-phase sums are meaningless when the same event objects are
+re-recorded (every pair points at the last recording), and a Python simulation of
+a kernel written *from the kernel* instead of from the spec will happily agree
+with a bug. Ablation switches and spec-derived simulations are what worked.
+
+# M3.18 — IQ3_S: the sign select is 46 % of the kernel
+
+Diagnostic (sign select removed — wrong results, valid timing): **220.6 -> 321.6
+GB/s**, i.e. +46 %, and that is the ceiling itself. So for IQ3_S the per-value
+sign handling, not the grid lookup or the index assembly, is what keeps it at
+69 %.
+
+The compiler turns `if (mask & bit) v = -v;` into a compare plus a select per
+value; the mask extraction adds another op or two. Every formulation that keeps
+the sign per value costs about the same (a +/-1 table, `copysign`, a XOR against a
+mask word all need the mask *and* a select), and the two that would remove it —
+pre-negated grids (256x the LDS) or folding it into the scale (the mask varies
+within a group while the scale does not) — do not work. IQ3_XXS (77 %) has the
+same structure and the same ceiling.
+
+Recorded as an open item with its measured upper bound: IQ3_S alone is 3.39 GiB
+(30 % of the weights), so closing it would be worth ~3-4 ms of the decode's
+59 ms/token if a cheap sign application can be found.
+
+# M3.19 — the decode is GPU-bound; three fusion attempts were neutral
+
+Measured with a fresh event pair around a single decode step (OMPH_TIMING=1):
+**~65 ms of GPU time per step** against ~60 ms of wall clock — the events
+themselves add a synchronise, so the honest reading is "GPU busy, not host
+submission bound". HIP graphs therefore address less than assumed.
+
+Three fusions were tried and all came out **neutral** (within noise):
+
+| change | launches removed | decode |
+|---|---:|---:|
+| conv + state shift + silu + split in one kernel | 3 per delta layer (144/step) | 70 -> 71 ms |
+| RMSNorm writing f16 (two per layer), SwiGLU + cast in one | ~3 per layer (192/step) | 59 -> 60 ms |
+
+Both are kept: fewer launches, fewer passes over the activations, identical
+results (logits bit-identical for the conv fusion, tokens identical throughout).
+But they say the quiet part out loud: **the remaining glue is per-kernel latency
+on dependency chains with tiny grids, not launch count** — which is why merging
+three of ~1600 launches, or 192 of them, moves nothing.
+
+## Where the 60 ms/token stands
+
+- ~46 ms is the GEMVs, computing from their own measured per-type rates (Q4_K
+  92 %, IQ4_XS 82 %, IQ3_XXS 77 %, IQ3_S 69 %, IQ2 63-73 %, Q2_K 66 %) against
+  the 318.3 GB/s ceiling. That is the floor for this set of kernels.
+- ~14 ms is everything else: the attention's own GEMMs, per-layer norms, casts,
+  the delta rule, and the latency between dependent tiny kernels.
+
+So the remaining decode levers are, in order: a cheaper sign application in
+IQ3_S/IQ3_XXS (worth ~3-4 ms if one exists, see M3.18), and attack on the
+per-kernel latency of the small-op chains — for which HIP stream capture is the
+tool, with the caveat above that the win is smaller than the 22 ms estimate that
+started this thread.
+
+# M3.20 — investigation 1: a cheaper sign application
+
+The sign costs ~46 % of IQ3_S (M3.18, upper bound by removal). Replacing the
+per-value `if (mask & bit) v = -v;` with **masks built once per 8-value group and
+a XOR on the float sign bit** helps where the register/instruction mix allows:
+
+| type | select (before) | XOR (after) |
+|---|---:|---:|
+| IQ3_XXS | 246.0 GB/s (77.3 %) | **273.3 GB/s (85.8 %)** |
+| IQ3_S | 220.7 GB/s (69.3 %) | **241.9 GB/s (76.0 %)** |
+| IQ2_XS | ~200 GB/s | ~194-215 GB/s (noisy, small tensor) |
+| IQ2_XXS | 227.2 GB/s (71.4 %) | 216.6 — **worse**, reverted |
+| IQ2_S | 232.7 GB/s (73.1 %) | 208.4 — **worse**, reverted |
+
+So the answer to "can the sign be made cheaper" is: **sometimes, and only by
+measuring**. The two that lost have the same structure — the extra 8-entry mask
+array pushed them over a register threshold. Kept: the three that measured faster.
+Accuracy unchanged everywhere (2.0-2.7e-4).
+
+Decode: 59 -> 58 ms/token (the win is concentrated in IQ3_XXS/IQ3_S, ~4.3 GiB).
+
+# M3.21 — investigations 2 and 3
+
+## 2. Per-kernel dispatch latency, measured with the dispatch trace
+
+`rocprofv3 --kernel-trace` (counters do not work on this box; the trace does)
+over prefill + 2 decode steps: 5585 dispatches, **1861 of them in a single decode
+step**, which runs 78.7 ms of span with **91 % GPU busy**. So:
+
+- the host is *not* the bottleneck (it was already indicated, now confirmed);
+- a decode step is ~1861 kernels, and the non-GEMV ones (~1480) take ~17 us each
+  on the GPU for trivial work — that is dispatch latency on a dependency chain,
+  ~25 ms of the step;
+- the GEMV dispatches (~380/step) account for ~46 ms.
+
+The earlier fusion experiments removed 144 and 192 dispatches — under 20 % of the
+small ones, which is why they measured as noise. **The lever that matches this
+number is HIP stream capture**, not fusing a few percent more kernels: a graph
+replaces ~1861 dispatches with one, and the GPU's own scheduler removes most of
+that 17 us. This corrects the estimate in M3.19: the decode is GPU-busy, but a
+large part of that "busy" *is* per-kernel dispatch overhead, which graphs do
+address.
+
+## 3. The small-batch GEMV is worth ~3.6x the prefill
+
+Quantified, not yet implemented: with NT = 5 tokens per weight read, a 10-token
+prefill reads the 12.02 GB of weights twice instead of the f16 path's
+(materialize 54 GB + read it + read the quantized 12 GB). The prefill's measured
+830 ms of staging + 339 ms of GEMM collapse to ~96 ms of GEMV, i.e. the pass goes
+from ~1.45 s to ~0.4 s — **~3.6x the prefill** — and the same kernel is the
+prerequisite for MTP verification (M6). It is the strongest remaining lever in
+the project after the decode graphs.
+
+# M3.22 — small-batch Q4_K: four tokens per weight read, 3.2x per token
+
+The levers from M3.21, first one implemented. `gemv_q4k_b4` reads the weight bytes
+once and uses them for four tokens (N = 1..5 from PLAN §10.1; four here), with the
+four result vectors written token-major — i.e. straight into the (T, out) layout
+the runtime already uses.
+
+| version | ms per 4 tokens | ms/token | vs single-token |
+|---|---:|---:|---:|
+| single-token Q4_K | 2.344 | 2.344 | 1.0x |
+| b4 with the activation staged in LDS (R=2) | 7.94 | 1.99 | 1.18x |
+| b4 with LDS staging, R=4 | 5.60 | 1.40 | 1.67x |
+| **b4 reading the activation from L1/L2 instead** | **2.903** | **0.73** | **3.2x** |
+
+Accuracy: max |d| **0.000e+00** against four single-token GEMVs, at every step.
+
+The intermediate results are the interesting part: staging the four activation
+vectors in LDS cost *more* than the weight traffic it was meant to help — 40 KB
+per workgroup against 82 KB of weights at R=4 — and dropping it turned a losing
+kernel into a 3.2x one. The activation vector is 10 KB per token and read by every
+row group, so L1/L2 already had it; the LDS copy was pure overhead.
+
+Wired into the lm head for T > 1 (four tokens per read, the tail on the
+single-token kernel): prefill 2104 -> 1967 ms, logits within 0.0092 of the chunked
+f16 head (the same f16-weight rounding as everywhere else).
+
+## The remaining port
+
+Only Q4_K has the b4 form so far, so the prefill's other layers still dequantize
+to f16. The measured per-tensor gain (3.2x) applied to the whole 11.2 GiB projects
+the prefill's GEMV cost from ~1170 ms to ~144 ms, i.e. the pass from ~1.45 s to
+~0.4 s (~3.5x, ~25 t/s). That is mechanical work: the same kernel shape for the
+other six types.
+
+# M3.23 — the small-batch path wired into the prefill
+
+`matmul` now takes the b4 route for T > 1 on the types that have it (Q4_K, IQ3_S,
+IQ4_XS — 68 % of the 11.2 GiB), four tokens per weight read with the tail on the
+single-token kernel; the other types still stage f16.
+
+Summed phase timers for a prefill + one token, the same binary:
+
+| | stage_w | blocks | total |
+|---|---:|---:|---:|
+| f16 path | 843 ms | 0 ms | 843 ms |
+| b4 path | 3 ms | 220 ms | **223 ms** |
+
+620 ms off the prefill — 43 % of it — with two thirds of the weights ported. The
+staging timer collapsing from 843 ms to 3 ms is the whole point: those weights are
+no longer materialised in f16 and read back.
+
+Correctness end to end: greedy tokens identical (`198 760 3841`), prefill logits
+within 0.0087 (4.7e-04 relative) of the f16 path — the quantised-weight rounding
+seen everywhere else — and the decode unchanged at 57 ms/token.
+
+The remaining ~32 % of the weights (IQ3_XXS 1.93 GiB, then Q6_K, Q2_K and the
+IQ2 family) are the same recipe: read the single-token kernel's inner loop, keep
+its index arithmetic verbatim, and verify against four single-token GEMVs.
+
+# M3.24 — IQ3_XXS ported, and what the b4 path is worth (measured by ablation)
+
+IQ3_XXS joins the small-batch family (bit-identical to four single-token GEMVs,
+0.026 ms/token vs 0.131 ms/token single — 5.0x). Wiring it in makes the coverage
+5.0 GiB of ~11.2 GiB on this model (Q4_K, IQ3_S, IQ4_XS, IQ3_XXS).
+
+With `OMPH_NO_B4` disabling the small-batch route, the same binary on the same
+run gives a clean comparison (prefill + one token, summed phase timers):
+
+| configuration | stage_w | blocks | total |
+|---|---:|---:|---:|
+| f16 (no repack) | 843 ms | 0 | 843 ms |
+| `--gemv`, no b4 | 1575 ms | 0 | 1575 ms |
+| `--gemv` with b4 | 2 ms | 297 ms | **298 ms** |
+
+**5.3x faster than the gemv fallback, 2.8x faster than the plain f16 prefill**,
+with the greedy tokens unchanged (`198 760 3841`).
+
+The earlier per-section phase numbers were not comparable between runs (timer
+attribution shifts), which is why this is measured by ablation on one binary.
+
+# M3.25 — where a decode step actually goes, and two results it produced
+
+Traced one decode step with the full kernel names (the earlier analysis collapsed
+them all into one bucket because the demangled names contain commas):
+
+| ms | us/kernel | count | kernel |
+|---:|---:|---:|---|
+| 25.58 | 145 | 176 | gemv_iq3s |
+| 17.33 | 126 | 137 | gemv_iq4 (IQ4_XS) |
+| 11.32 | 138 | 82 | gemv_iq3 (IQ3_XXS) |
+| 10.21 | 173 | 59 | gemv_q4k |
+| **4.88** | **41** | **119** | **Cijk (hipBLASLt, MT16x16x32)** |
+| 3.23 | 27 | 120 | (gated norm chain) |
+| 2.65 | 166 | 16 | gemv_iq2s |
+| 2.62 | 44 | 60 | delta_step |
+| 2.41 | 15 | 159 | rms_norm_f16 |
+| 1.87 / 1.77 / 0.94 | | 14 / 9 / 6 | gemv_q2k / iq2xs / iq2xxs |
+
+The GEMVs are 72 ms of the 87 ms busy — 82 % of the step — and they run at
+~168 GB/s against the 250 GB/s the same kernels reach on a large tensor in the
+bench. (The bench overstates the small tensors: a 27 MiB tensor fits in L2, so
+those numbers are cache bandwidth.)
+
+## Result 1: HIP graphs are worth ~1 ms, not 25 (negative, and that closes a line)
+
+`omph-graph-probe` launches a chain of the same length as a decode step (1861
+tiny dependent kernels) and replays the identical chain from a graph:
+
+| | ms | us per kernel |
+|---|---:|---:|
+| launched one by one | 6.755 | 3.63 |
+| replayed as a graph | 5.773 | 3.10 |
+| saved | **0.982** | 0.54 |
+
+A graph recovers 15 % of the per-kernel cost, i.e. **~1 ms of a 57 ms step**. The
+schedule state I had inferred from the trace (91 % busy, 9 % gaps) does not imply
+what I thought it did. This is the cheap experiment that pays for itself: the
+device-side token/position refactor capture needs is not worth a 2 % win.
+
+## Result 2: 96 BF16 GEMVs replace 119 tiny hipBLASLt GEMMs (-3.2 ms/step, -5.3 %)
+
+`ssm_alpha`/`ssm_beta` are BF16 (type 30) and went through the f16 path: convert
+to f16, then an M = 1 GEMM with 16x16 tiles — ~41 us per call for a 480 KB matrix.
+`gemv_bf16` does the dot product directly (bf16 -> f32 is a shift).
+
+The first version was *slower* than what it replaced: a warp-per-row grid gave
+2 workgroups for 48 rows. One workgroup per row, k split across eight warps with
+an LDS reduction, is the shape that works:
+
+| | total for 40 decode steps |
+|---|---:|
+| OMPH_NO_BF16_GEMV=1 | 9578 ms |
+| with gemv_bf16 | **9451 ms** |
+
+3.2 ms per step, tokens identical (`198 760 3841`), 40 steps measured twice each.

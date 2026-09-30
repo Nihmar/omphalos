@@ -30,6 +30,7 @@ def main() -> None:
     ap.add_argument("--tool", default="../engine/build/omph-run")
     ap.add_argument("--generate", type=int, default=8)
     ap.add_argument("--tol", type=float, default=0.15)
+    ap.add_argument("--gemv", action="store_true", help="use the fused GEMV decode path")
     args = ap.parse_args()
 
     tokens = [int(v) for v in (Path(args.dump) / "tokens.txt").read_text().split()]
@@ -60,10 +61,11 @@ def main() -> None:
         tok_path.write_text(" ".join(str(t) for t in tokens))
         gen_path = Path(tmp) / "gen.txt"
         t0 = time.time()
-        out = subprocess.run(
-            [args.tool, args.model, str(tok_path), str(Path(tmp) / "logits.f32"),
-             "--generate", str(args.generate), "--gen-out", str(gen_path)],
-            check=True, capture_output=True, text=True)
+        cmd = [args.tool, args.model, str(tok_path), str(Path(tmp) / "logits.f32"),
+               "--generate", str(args.generate), "--gen-out", str(gen_path)]
+        if args.gemv:
+            cmd.append("--gemv")
+        out = subprocess.run(cmd, check=True, capture_output=True, text=True)
         print(f"engine: {time.time() - t0:.1f}s", flush=True)
         print(out.stdout.strip(), flush=True)
         gen_gpu = [int(v) for v in gen_path.read_text().split()]

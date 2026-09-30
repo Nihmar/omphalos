@@ -280,18 +280,19 @@ __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t *
                 for (int r = 0; r < kIq3Rows; ++r) {
                     const uint8_t * bytes = reinterpret_cast<const uint8_t *>(&q[r]);
                     const uint8_t sg = stab[(a[r] >> (7 * l)) & 127];
+                    uint32_t smk[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        smk[j] = ((sg >> j) & 1u) ? 0x80000000u : 0u;
+                    }
                     const uint32_t g1 = grid[bytes[2 * l]];
                     const uint32_t g2 = grid[bytes[2 * l + 1]];
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {
-                        float g1v = (float) ((g1 >> (8 * j)) & 0xFF);
-                        float g2v = (float) ((g2 >> (8 * j)) & 0xFF);
-                        if (sg & (1u << j)) {
-                            g1v = -g1v;
-                        }
-                        if (sg & (1u << (4 + j))) {
-                            g2v = -g2v;
-                        }
+                        float g1v = __uint_as_float(
+                            __float_as_uint((float) ((g1 >> (8 * j)) & 0xFF)) ^ smk[j]);
+                        float g2v = __uint_as_float(
+                            __float_as_uint((float) ((g2 >> (8 * j)) & 0xFF)) ^ smk[4 + j]);
                         part[r] = fmaf(g1v, __half2float(xv[8 * l + j]), part[r]);
                         part[r] = fmaf(g2v, __half2float(xv[8 * l + 4 + j]), part[r]);
                     }
@@ -390,16 +391,15 @@ __global__ void gemv_iq3s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
                     float g2f[4];
                     grid4(g1, g1f);
                     grid4(g2, g2f);
+                    uint32_t smk[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        smk[j] = ((sm >> j) & 1u) ? 0x80000000u : 0u;
+                    }
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {
-                        float v1 = g1f[j];
-                        float v2 = g2f[j];
-                        if (sm & (1u << j)) {
-                            v1 = -v1;
-                        }
-                        if (sm & (1u << (4 + j))) {
-                            v2 = -v2;
-                        }
+                        float v1 = __uint_as_float(__float_as_uint(g1f[j]) ^ smk[j]);
+                        float v2 = __uint_as_float(__float_as_uint(g2f[j]) ^ smk[4 + j]);
                         part[r] = fmaf(v1, __half2float(xv[8 * l + j]), part[r]);
                         part[r] = fmaf(v2, __half2float(xv[8 * l + 4 + j]), part[r]);
                     }
@@ -709,6 +709,11 @@ __global__ void gemv_iq2xs_kernel(const uint8_t * __restrict__ qs, const uint8_t
                 for (int r = 0; r < kIq2Rows; ++r) {
                     const uint32_t e = ent[r][l >> 1] >> (16 * (l & 1));
                     const uint8_t sg = stab[(e >> 9) & 127];
+                    uint32_t smk[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        smk[j] = ((sg >> j) & 1u) ? 0x80000000u : 0u;
+                    }
                     const uint64_t g = grid[e & 511];
                     const uint32_t glo = (uint32_t) g;
                     const uint32_t ghi = (uint32_t) (g >> 32);
@@ -717,10 +722,7 @@ __global__ void gemv_iq2xs_kernel(const uint8_t * __restrict__ qs, const uint8_t
                     grid4(ghi, gf + 4);
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
-                        float v = gf[j];
-                        if (sg & (1u << j)) {
-                            v = -v;
-                        }
+                        float v = __uint_as_float(__float_as_uint(gf[j]) ^ smk[j]);
                         sub[r][l >> 1] =
                             fmaf(v, __half2float(xv[8 * l + j]), sub[r][l >> 1]);
                     }
@@ -806,6 +808,11 @@ __global__ void gemv_iq2xxs_kernel(const uint8_t * __restrict__ qs,
                 for (int r = 0; r < kIq2Rows; ++r) {
                     const uint32_t idx_byte = (aux0[r] >> (8 * l)) & 0xFF;
                     const uint8_t sg = stab[(aux1[r] >> (7 * l)) & 127];
+                    uint32_t smk[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        smk[j] = ((sg >> j) & 1u) ? 0x80000000u : 0u;
+                    }
                     const uint64_t g = grid[idx_byte];
                     const uint32_t glo = (uint32_t) g;
                     const uint32_t ghi = (uint32_t) (g >> 32);
@@ -906,6 +913,11 @@ __global__ void gemv_iq2s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
                     const uint32_t lo = (qsw[r] >> (8 * l)) & 0xFF;
                     const uint32_t hi = ((qhb[r] >> (2 * l)) & 3) << 8;
                     const uint32_t sg = (sgw[r] >> (8 * l)) & 0xFF;
+                    uint32_t smk[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        smk[j] = ((sg >> j) & 1u) ? 0x80000000u : 0u;
+                    }
                     const uint64_t g = grid[lo | hi];
                     const uint32_t glo = (uint32_t) g;
                     const uint32_t ghi = (uint32_t) (g >> 32);
@@ -943,7 +955,438 @@ __global__ void gemv_iq2s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
     }
 }
 
+// Q4_K, four tokens at once: the weight bytes and scales are read once and used
+// for four dot products. Two output rows per warp keeps the accumulators (8) and
+// the weight registers in budget; the activation chunk holds the four token
+// vectors side by side in LDS.
+constexpr long long kB4Rows = 4;
+constexpr long long kB4Nt = 4;
+constexpr long long kB4ChunkSub = 128;  // 4096 weights per token staged
+
+__global__ void gemv_q4k_b4_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ sc,
+                                   const uint8_t * __restrict__ mn, const uint8_t * __restrict__ d,
+                                   const uint8_t * __restrict__ dmin,
+                                   const __half * __restrict__ x, float * __restrict__ y,
+                                   const long long rows, const long long n_sub,
+                                   const long long chunk_sub, const long long k) {
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kB4Rows;
+    const long long blocks = n_sub / 8;
+    const long long rlast = rows - 1;
+
+    float acc[kB4Rows * kB4Nt] = {};
+    for (long long base = 0; base < n_sub; base += chunk_sub) {
+        const long long len = n_sub - base < chunk_sub ? n_sub - base : chunk_sub;
+        if (row0 >= rows) {
+            continue;
+        }
+        for (long long s = base + lane; s < base + len; s += 32) {
+            const long long blk = s / 8;
+            const int sub = (int) (s % 8);
+            (void) 0;  // activations are read straight from global (L1/L2 resident)
+            uint4 q[kB4Rows];
+            float ds[kB4Rows];
+            float ms[kB4Rows];
+#pragma unroll
+            for (int r = 0; r < kB4Rows; ++r) {
+                const long long row = row0 + r <= rlast ? row0 + r : rlast;
+                q[r] = *reinterpret_cast<const uint4 *>(qs + row * blocks * 128 + s * 16);
+                ds[r] = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 +
+                                                                       2 * blk)) *
+                        (float) sc[row * blocks * 8 + blk * 8 + sub];
+                ms[r] = __half2float(
+                            *reinterpret_cast<const __half *>(dmin + row * blocks * 2 + 2 * blk)) *
+                        (float) mn[row * blocks * 8 + blk * 8 + sub];
+            }
+            float part[kB4Rows * kB4Nt] = {};
+#pragma unroll
+            for (int t = 0; t < kB4Nt; ++t) {
+                const __half * xv = x + t * k + s * 32;
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    const float x0 = __half2float(xv[2 * j]);
+                    const float x1 = __half2float(xv[2 * j + 1]);
+#pragma unroll
+                    for (int r = 0; r < kB4Rows; ++r) {
+                        const uint8_t b = reinterpret_cast<const uint8_t *>(&q[r])[j];
+                        part[r * kB4Nt + t] =
+                            fmaf(fmaf(ds[r], (float) (b & 0xF), -ms[r]), x0, part[r * kB4Nt + t]);
+                        part[r * kB4Nt + t] =
+                            fmaf(fmaf(ds[r], (float) (b >> 4), -ms[r]), x1, part[r * kB4Nt + t]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < kB4Rows * kB4Nt; ++i) {
+                acc[i] += part[i];
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kB4Rows * kB4Nt; ++i) {
+        float v = acc[i];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down(v, off);
+        }
+        const int r = i / kB4Nt;
+        const int t = i % kB4Nt;
+        if (lane == 0 && row0 + r < rows && row0 + r < row0 + kB4Rows) {
+            y[t * rows + row0 + r] = v;
+        }
+    }
+}
+
+// IQ3_S, four tokens at once: the shape of gemv_q4k_b4 (no LDS staging, the
+// activation read from L1/L2, token-major results) with the index arithmetic of
+// the single-token kernel — 8 bytes of qs and one byte of qh per 32-weight
+// sub-block, four sign bytes, and a 4-bit scale whose contribution is
+// d * (1 + 2*nibble).
+__global__ void gemv_iq3s_b4_kernel(const uint8_t * __restrict__ qs,
+                                    const uint8_t * __restrict__ qh,
+                                    const uint8_t * __restrict__ signs,
+                                    const uint8_t * __restrict__ scales,
+                                    const uint8_t * __restrict__ d, const __half * __restrict__ x,
+                                    float * __restrict__ y, const long long rows,
+                                    const long long n_sub, const long long k) {
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kB4Rows;
+    const long long blocks = n_sub / 8;
+    const long long rlast = rows - 1;
+    const uint32_t * grid = omph::quant::kIq3sGrid;
+
+    float acc[kB4Rows * kB4Nt] = {};
+    for (long long base = 0; base < n_sub; base += kB4ChunkSub) {
+        const long long len = n_sub - base < kB4ChunkSub ? n_sub - base : kB4ChunkSub;
+        if (row0 >= rows) {
+            continue;
+        }
+        for (long long s = base + lane; s < base + len; s += 32) {
+            const __half * xv0 = x + s * 32;
+            uint2 qw[kB4Rows];
+            uint8_t qhb[kB4Rows];
+            const uint8_t * sgp[kB4Rows];
+            float dbr[kB4Rows];
+#pragma unroll
+            for (int r = 0; r < kB4Rows; ++r) {
+                const long long row = row0 + r <= rlast ? row0 + r : rlast;
+                qw[r] = *reinterpret_cast<const uint2 *>(qs + row * blocks * 64 + s * 8);
+                qhb[r] = qh[row * blocks * 8 + s];
+                sgp[r] = signs + row * blocks * 32 + s * 4;
+                const uint8_t sc = scales[row * blocks * 4 + s / 2];
+                const float dv = __half2float(
+                    *reinterpret_cast<const __half *>(d + row * blocks * 2 + (s / 8) * 2));
+                dbr[r] = dv * (1.0f + 2.0f * (float) ((s & 1) ? (sc >> 4) : (sc & 0xF)));
+            }
+            float part[kB4Rows * kB4Nt] = {};
+#pragma unroll
+            for (int t = 0; t < kB4Nt; ++t) {
+                const __half * xv = xv0 + t * k;
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+#pragma unroll
+                    for (int r = 0; r < kB4Rows; ++r) {
+                        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(&qw[r]);
+                        const uint32_t hb = qhb[r];
+                        const uint32_t i1 =
+                            (uint32_t) bytes[2 * l] | (((hb >> (2 * l)) & 1u) << 8);
+                        const uint32_t i2 =
+                            (uint32_t) bytes[2 * l + 1] | (((hb >> (2 * l + 1)) & 1u) << 8);
+                        const uint32_t g1 = grid[i1];
+                        const uint32_t g2 = grid[i2];
+                        const uint8_t sm = sgp[r][l];
+                        float g1f[4];
+                        float g2f[4];
+                        grid4(g1, g1f);
+                        grid4(g2, g2f);
+                        uint32_t smk[8];
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            smk[j] = ((sm >> j) & 1u) ? 0x80000000u : 0u;
+                        }
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const float v1 = __uint_as_float(__float_as_uint(g1f[j]) ^ smk[j]);
+                            const float v2 = __uint_as_float(__float_as_uint(g2f[j]) ^ smk[4 + j]);
+                            part[r * kB4Nt + t] =
+                                fmaf(v1, __half2float(xv[8 * l + j]), part[r * kB4Nt + t]);
+                            part[r * kB4Nt + t] = fmaf(v2, __half2float(xv[8 * l + 4 + j]),
+                                                       part[r * kB4Nt + t]);
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < kB4Rows * kB4Nt; ++i) {
+                acc[i] = fmaf(dbr[i / kB4Nt], part[i], acc[i]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kB4Rows * kB4Nt; ++i) {
+        float v = acc[i];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down(v, off);
+        }
+        const int r = i / kB4Nt;
+        const int t = i % kB4Nt;
+        if (lane == 0 && row0 + r < rows) {
+            y[t * rows + row0 + r] = v;
+        }
+    }
+}
+
+// IQ4_XS, four tokens at once: the gemv_q4k_b4 shape (no activation staging, the
+// activation read from L1/L2) with the single-token kernel's decoding — a uint4 of
+// codes per sub-block, the low nibbles mapping the first 16 weights and the high
+// nibbles the next 16, and one scale d * (sc - 32) per sub-block. Only the
+// 16-entry codebook stays in LDS (64 bytes).
+__global__ void gemv_iq4_b4_kernel(const uint8_t * __restrict__ qs,
+                                   const uint8_t * __restrict__ sc,
+                                   const uint8_t * __restrict__ d, const __half * __restrict__ x,
+                                   float * __restrict__ y, const long long rows,
+                                   const long long n_sub, const long long k) {
+    extern __shared__ float table[];
+    if (threadIdx.x < 16) {
+        table[threadIdx.x] = (float) kIq4Table[threadIdx.x];
+    }
+    __syncthreads();
+
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kB4Rows;
+    const long long blocks = n_sub / 8;
+    const long long rlast = rows - 1;
+
+    float acc[kB4Rows * kB4Nt] = {};
+    for (long long base = 0; base < n_sub; base += kB4ChunkSub) {
+        const long long len = n_sub - base < kB4ChunkSub ? n_sub - base : kB4ChunkSub;
+        if (row0 >= rows) {
+            continue;
+        }
+        for (long long s = base + lane; s < base + len; s += 32) {
+            const long long blk = s / 8;
+            const int sub = (int) (s % 8);
+            const __half * xv0 = x + s * 32;
+            uint4 qw[kB4Rows];
+            float dl[kB4Rows];
+#pragma unroll
+            for (int r = 0; r < kB4Rows; ++r) {
+                const long long row = row0 + r <= rlast ? row0 + r : rlast;
+                qw[r] = *reinterpret_cast<const uint4 *>(qs + row * blocks * 128 + s * 16);
+                dl[r] = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 +
+                                                                       2 * blk)) *
+                        (float) ((int) sc[row * blocks * 8 + blk * 8 + sub] - 32);
+            }
+            float part[kB4Rows * kB4Nt] = {};
+#pragma unroll
+            for (int t = 0; t < kB4Nt; ++t) {
+                const __half * xv = xv0 + t * k;
+#pragma unroll
+                for (int v = 0; v < 16; ++v) {
+                    const float xval = __half2float(xv[v]);
+#pragma unroll
+                    for (int r = 0; r < kB4Rows; ++r) {
+                        const uint8_t code = reinterpret_cast<const uint8_t *>(&qw[r])[v] & 0xF;
+                        part[r * kB4Nt + t] = fmaf(table[code], xval, part[r * kB4Nt + t]);
+                    }
+                }
+#pragma unroll
+                for (int v = 0; v < 16; ++v) {
+                    const float xval = __half2float(xv[v + 16]);
+#pragma unroll
+                    for (int r = 0; r < kB4Rows; ++r) {
+                        const uint8_t code = reinterpret_cast<const uint8_t *>(&qw[r])[v] >> 4;
+                        part[r * kB4Nt + t] = fmaf(table[code], xval, part[r * kB4Nt + t]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < kB4Rows * kB4Nt; ++i) {
+                acc[i] = fmaf(dl[i / kB4Nt], part[i], acc[i]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kB4Rows * kB4Nt; ++i) {
+        float v = acc[i];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down(v, off);
+        }
+        const int r = i / kB4Nt;
+        const int t = i % kB4Nt;
+        if (lane == 0 && row0 + r < rows) {
+            y[t * rows + row0 + r] = v;
+        }
+    }
+}
+
+// IQ3_XXS, four tokens at once. Same shape as the other b4 kernels (no staging,
+// the activation from L1/L2) with the single-token decoding verbatim: 8 bytes of
+// qs and 4 bytes of aux per 32-weight sub-block, 8-bit grid indices, the sign
+// index from the aux word, and one scale d * (0.5 + (aux >> 28)) * 0.5.
+__global__ void gemv_iq3_b4_kernel(const uint8_t * __restrict__ qs,
+                                   const uint8_t * __restrict__ aux,
+                                   const uint8_t * __restrict__ d, const __half * __restrict__ x,
+                                   float * __restrict__ y, const long long rows,
+                                   const long long n_sub, const long long k) {
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kB4Rows;
+    const long long blocks = n_sub / 8;
+    const long long rlast = rows - 1;
+    const uint32_t * grid = omph::quant::kIq3xxsGrid;
+    const uint8_t * stab = omph::quant::kKsignsIq2xs;
+
+    float acc[kB4Rows * kB4Nt] = {};
+    if (row0 < rows) {
+        for (long long s = lane; s < n_sub; s += 32) {
+            const __half * xv0 = x + s * 32;
+            uint2 qw[kB4Rows];
+            uint32_t aw[kB4Rows];
+            float db[kB4Rows];
+#pragma unroll
+            for (int r = 0; r < kB4Rows; ++r) {
+                const long long row = row0 + r <= rlast ? row0 + r : rlast;
+                qw[r] = *reinterpret_cast<const uint2 *>(qs + row * blocks * 64 + s * 8);
+                aw[r] = *reinterpret_cast<const uint32_t *>(aux + row * blocks * 32 + s * 4);
+                db[r] = __half2float(*reinterpret_cast<const __half *>(
+                            d + row * blocks * 2 + (s / 8) * 2)) *
+                        (0.5f + (float) (aw[r] >> 28)) * 0.5f;
+            }
+            float part[kB4Rows * kB4Nt] = {};
+#pragma unroll
+            for (int t = 0; t < kB4Nt; ++t) {
+                const __half * xv = xv0 + t * k;
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+#pragma unroll
+                    for (int r = 0; r < kB4Rows; ++r) {
+                        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(&qw[r]);
+                        const uint8_t sg = stab[(aw[r] >> (7 * l)) & 127];
+                        uint32_t smk[8];
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            smk[j] = ((sg >> j) & 1u) ? 0x80000000u : 0u;
+                        }
+                        const uint32_t g1 = grid[bytes[2 * l]];
+                        const uint32_t g2 = grid[bytes[2 * l + 1]];
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const float g1v = __uint_as_float(
+                                __float_as_uint((float) ((g1 >> (8 * j)) & 0xFF)) ^ smk[j]);
+                            const float g2v = __uint_as_float(
+                                __float_as_uint((float) ((g2 >> (8 * j)) & 0xFF)) ^ smk[4 + j]);
+                            part[r * kB4Nt + t] =
+                                fmaf(g1v, __half2float(xv[8 * l + j]), part[r * kB4Nt + t]);
+                            part[r * kB4Nt + t] = fmaf(g2v, __half2float(xv[8 * l + 4 + j]),
+                                                       part[r * kB4Nt + t]);
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < kB4Rows * kB4Nt; ++i) {
+                acc[i] = fmaf(db[i / kB4Nt], part[i], acc[i]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kB4Rows * kB4Nt; ++i) {
+        float v = acc[i];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down(v, off);
+        }
+        const int r = i / kB4Nt;
+        const int t = i % kB4Nt;
+        if (lane == 0 && row0 + r < rows) {
+            y[t * rows + row0 + r] = v;
+        }
+    }
+}
+
+// BF16 weights, single token: bf16 is the top half of an f32, so the conversion
+// is a shift and the kernel is a plain bandwidth-bound dot product. This exists
+// because the f16 path has to convert these small matrices and then runs a tiny
+// M = 1 GEMM, which costs ~40 us per call regardless of the size.
+__device__ inline float bf16_to_f32(const uint16_t b) {
+    return __uint_as_float((uint32_t) b << 16);
+}
+
+constexpr long long kBf16Threads = 256;  // eight warps per row
+
+// One workgroup per output row, the k dimension split across the warps with an
+// LDS reduction: with 48 rows there is no other way to fill the GPU, and the row
+// at 10 KB is far too small for a warp-per-row scheme.
+__global__ void gemv_bf16_kernel(const uint16_t * __restrict__ w, const __half * __restrict__ x,
+                                 float * __restrict__ y, const long long rows, const long long k) {
+    __shared__ float red[kBf16Threads / 32];
+    const long long row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const int nwarp = (int) (blockDim.x / 32);
+    const uint16_t * wrow = w + row * k;
+
+    const long long per_warp = (k + nwarp - 1) / nwarp;
+    const long long begin = (long long) warp * per_warp;
+    const long long end = begin + per_warp < k ? begin + per_warp : k;
+
+    float acc = 0.0f;
+    for (long long i = begin + lane * 8; i < end; i += 32 * 8) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (i + j < end) {
+                acc = fmaf(bf16_to_f32(wrow[i + j]), __half2float(x[i + j]), acc);
+            }
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off);
+    }
+    if (lane == 0) {
+        red[warp] = acc;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < nwarp; ++i) {
+            total += red[i];
+        }
+        y[row] = total;
+    }
+}
+
 } // namespace
+
+bool gemv_q4k_b4(const void * packed, const void * x_f16, float * y, const int64_t rows,
+                 const int64_t k, hipStream_t stream) {
+    if (packed == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
+        k % 256 != 0) {
+        return false;
+    }
+    const int64_t n_blocks = rows * (k / 256);
+    const omph::format::Q4kLayout l = omph::format::q4k_layout(n_blocks);
+    const int64_t n_sub = k / 32;
+    const int64_t chunk = n_sub < kB4ChunkSub ? n_sub : kB4ChunkSub;
+    const size_t smem = 0;
+    const auto * base = static_cast<const uint8_t *>(packed);
+    const dim3 grid((unsigned) ((rows + 8 * kB4Rows - 1) / (8 * kB4Rows)));
+    gemv_q4k_b4_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.sc_off,
+                                                    base + l.mn_off, base + l.d_off,
+                                                    base + l.dmin_off,
+                                                    static_cast<const __half *>(x_f16), y, rows,
+                                                    n_sub, chunk, k);
+    return hipGetLastError() == hipSuccess;
+}
 
 bool gemv_q4k(const void * packed, const void * x_f16, float * y, const int64_t rows,
               const int64_t k, hipStream_t stream) {
@@ -1147,6 +1590,70 @@ GemvOccupancy gemv_occupancy() {
     o.block = 256;
     (void) n;
     return o;
+}
+
+bool gemv_iq3s_b4(const void * packed, const void * x_f16, float * y, const int64_t rows,
+                  const int64_t k, hipStream_t stream) {
+    if (packed == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
+        k % 256 != 0) {
+        return false;
+    }
+    const int64_t n_blocks = rows * (k / 256);
+    const omph::format::Iq3sLayout l = omph::format::iq3s_layout(n_blocks);
+    const int64_t n_sub = k / 32;
+    const auto * base = static_cast<const uint8_t *>(packed);
+    const dim3 grid((unsigned) ((rows + 8 * kB4Rows - 1) / (8 * kB4Rows)));
+    gemv_iq3s_b4_kernel<<<grid, 256, 0, stream>>>(base + l.qs_off, base + l.qh_off,
+                                                  base + l.signs_off, base + l.scales_off,
+                                                  base + l.d_off,
+                                                  static_cast<const __half *>(x_f16), y, rows,
+                                                  n_sub, k);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool gemv_iq4_xs_b4(const void * packed, const void * x_f16, float * y, const int64_t rows,
+                    const int64_t k, hipStream_t stream) {
+    if (packed == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
+        k % 256 != 0) {
+        return false;
+    }
+    const int64_t n_blocks = rows * (k / 256);
+    const omph::format::Iq4Layout l = omph::format::iq4_layout(n_blocks);
+    const int64_t n_sub = k / 32;
+    const auto * base = static_cast<const uint8_t *>(packed);
+    const dim3 grid((unsigned) ((rows + 8 * kB4Rows - 1) / (8 * kB4Rows)));
+    gemv_iq4_b4_kernel<<<grid, 256, 16 * sizeof(float), stream>>>(
+        base + l.qs_off, base + l.sc_off, base + l.d_off, static_cast<const __half *>(x_f16), y,
+        rows, n_sub, k);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool gemv_iq3_xxs_b4(const void * packed, const void * x_f16, float * y, const int64_t rows,
+                     const int64_t k, hipStream_t stream) {
+    if (packed == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
+        k % 256 != 0) {
+        return false;
+    }
+    const int64_t n_blocks = rows * (k / 256);
+    const omph::format::Iq3XxsLayout l = omph::format::iq3_xxs_layout(n_blocks);
+    const int64_t n_sub = k / 32;
+    const auto * base = static_cast<const uint8_t *>(packed);
+    const dim3 grid((unsigned) ((rows + 8 * kB4Rows - 1) / (8 * kB4Rows)));
+    gemv_iq3_b4_kernel<<<grid, 256, 0, stream>>>(base + l.qs_off, base + l.aux_off,
+                                                 base + l.d_off,
+                                                 static_cast<const __half *>(x_f16), y, rows,
+                                                 n_sub, k);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool gemv_bf16(const void * w, const void * x_f16, float * y, const int64_t rows, const int64_t k,
+               hipStream_t stream) {
+    if (w == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 || k % 256 != 0) {
+        return false;
+    }
+    gemv_bf16_kernel<<<(unsigned) rows, kBf16Threads, 0, stream>>>(
+        static_cast<const uint16_t *>(w), static_cast<const __half *>(x_f16), y, rows, k);
+    return hipGetLastError() == hipSuccess;
 }
 
 } // namespace omph::kernels

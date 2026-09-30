@@ -65,4 +65,23 @@ bool gemv_iq2_xxs(const void * packed, const void * x_f16, float * y, int64_t ro
 bool gemv_iq2_s(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
                 hipStream_t stream);
 
+// Small-batch Q4_K: four tokens per weight read. `x_f16` holds four activation
+// vectors back to back (stride k), `y` four result vectors (stride rows). This is
+// what turns the prefill from "materialize f16" into "read the weights once per
+// group of tokens", and it is the shape MTP verification needs.
+bool gemv_q4k_b4(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
+                 hipStream_t stream);
+
+// Same contract as gemv_q4k_b4 for IQ3_S and IQ4_XS.
+bool gemv_iq3s_b4(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
+                  hipStream_t stream);
+bool gemv_iq4_xs_b4(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
+                    hipStream_t stream);
+bool gemv_iq3_xxs_b4(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
+                     hipStream_t stream);
+
+// BF16 weights (type 30), single token: a plain dot product, no codebook.
+bool gemv_bf16(const void * w, const void * x_f16, float * y, int64_t rows, int64_t k,
+               hipStream_t stream);
+
 } // namespace omph::kernels

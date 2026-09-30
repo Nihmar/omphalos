@@ -55,6 +55,10 @@ add_executable(omph-gdn src/tools/gdn.cc)
 target_include_directories(omph-gdn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(omph-gdn PRIVATE omphalos hip::host roc::hipblaslt)
 
+add_executable(omph-graph-probe src/tools/graph_probe.cc)
+target_include_directories(omph-graph-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(omph-graph-probe PRIVATE omphalos hip::host)
+
 add_executable(omph-run src/tools/run.cc)
 target_include_directories(omph-run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(omph-run PRIVATE omphalos hip::host roc::hipblaslt)

@@ -192,6 +192,8 @@ public:
                         e.rows = (int64_t) t.ne[1];
                         e.k = (int64_t) t.ne[0];
                         e.type = t.type;
+                        e.has_b4 = std::getenv("OMPH_NO_B4") == nullptr &&
+                                   (t.type == 12 || t.type == 18 || t.type == 21 || t.type == 23);
                         gems_[t.name] = e;
                         total += (packed.size() + 255) & ~(size_t) 255;
                         places.push_back(p);
@@ -288,6 +290,13 @@ public:
     bool forward(const std::vector<int32_t> & toks, std::vector<float> & logits,
                  const std::string & trace_dir, const int64_t start_pos = 0) {
         const int64_t T = (int64_t) toks.size();
+        hipEvent_t step_a{}, step_b{};
+        const bool time_step = T == 1 && std::getenv("OMPH_TIMING") != nullptr;
+        if (time_step) {
+            (void) hipEventCreate(&step_a);
+            (void) hipEventCreate(&step_b);
+            (void) hipEventRecord(step_a, nullptr);
+        }
         const int64_t ne = h_.n_embd;
 
         // token embeddings, one row at a time (the table is quantized)
@@ -314,14 +323,15 @@ public:
         for (int64_t il = 0; il < h_.n_layer; ++il) {
             const std::string p = "blk." + std::to_string(il) + ".";
             const bool recurrent = file_.tensor(p + "ssm_a") != nullptr;
+            const bool skip_attn = !recurrent && std::getenv("OMPH_SKIP_ATTN") != nullptr;
+            const bool skip_ffn = std::getenv("OMPH_SKIP_FFN") != nullptr;
             const float * attn_norm = vec(p + "attn_norm.weight");
             const float * post_norm = vec(p + "post_attention_norm.weight");
             if (attn_norm == nullptr || post_norm == nullptr) {
                 return fail("missing layer norms");
             }
-            if (!omph::kernels::rms_norm(static_cast<const float *>(x_), attn_norm,
-                                         static_cast<float *>(cur_), T, ne, (float) h_.eps, 1.0f,
-                                         nullptr)) {
+            if (!omph::kernels::rms_norm_f16(static_cast<const float *>(x_), attn_norm, h16_, T,
+                                             ne, (float) h_.eps, 1.0f, nullptr)) {
                 return fail("attn_norm failed");
             }
             scratch_.reset();
@@ -331,29 +341,26 @@ public:
             timer_block_.start();
             if (recurrent) {
                 if (!gdn_layer(il, p, T)) return false;
-            } else {
+            } else if (!skip_attn) {
                 if (!attn_layer(il, p, T, start_pos)) return false;
             }
             timer_block_.stop(t_block_);
+            if (skip_ffn) {
+                continue;
+            }
             // x = ffn(rms_norm(block + x)) + (block + x)
             if (!omph::kernels::add_out(static_cast<const float *>(blk_),
                                         static_cast<const float *>(x_),
                                         static_cast<float *>(resid_), T * ne, nullptr) ||
-                !omph::kernels::rms_norm(static_cast<const float *>(resid_), post_norm,
-                                         static_cast<float *>(cur_), T, ne, (float) h_.eps, 1.0f,
-                                         nullptr) ||
-                !omph::kernels::cast_f32_to_f16(static_cast<const float *>(cur_), h16_, T * ne,
-                                                nullptr)) {
+                !omph::kernels::rms_norm_f16(static_cast<const float *>(resid_), post_norm,
+                                             h16_, T, ne, (float) h_.eps, 1.0f, nullptr)) {
                 return fail("residual/norm failed");
             }
             if (!matmul(p + "ffn_gate.weight", h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T) ||
                 !matmul(p + "ffn_up.weight", h16_, static_cast<float *>(ffn2_), h_.n_ff, ne, T) ||
-                !omph::kernels::silu_inplace(static_cast<float *>(ffn1_), T * h_.n_ff, nullptr) ||
-                !omph::kernels::mul_inplace(static_cast<float *>(ffn1_),
-                                            static_cast<const float *>(ffn2_), T * h_.n_ff,
-                                            nullptr) ||
-                !omph::kernels::cast_f32_to_f16(static_cast<const float *>(ffn1_), ffn16_,
-                                                T * h_.n_ff, nullptr) ||
+                !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
+                                           static_cast<const float *>(ffn2_), ffn16_, T * h_.n_ff,
+                                           nullptr) ||
                 !matmul(p + "ffn_down.weight", ffn16_, static_cast<float *>(cur_), ne, h_.n_ff, T) ||
                 !omph::kernels::add_out(static_cast<const float *>(cur_),
                                         static_cast<const float *>(resid_),
@@ -380,6 +387,39 @@ public:
             if (!matmul("output.weight", h16_, static_cast<float *>(logits_), h_.n_vocab, ne, T) ||
                 hipDeviceSynchronize() != hipSuccess) {
                 return fail("lm_head (gemv) failed");
+            }
+            logits.resize((size_t) T * h_.n_vocab);
+            (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
+            report_phases();
+            if (time_step) {
+                step_event(step_a, step_b);
+            }
+            return true;
+        }
+        // Small-batch head: for a Q4_K head with 2+ tokens, run four tokens per
+        // weight read instead of materializing f16 (PLAN.md §10.1's N = 1..5).
+        if (use_gemv_ && T > 1 && gems_.count("output.weight") != 0 &&
+            gems_.at("output.weight").type == 12) {
+            const auto & e = gems_.at("output.weight");
+            const void * w = static_cast<const uint8_t *>(dev_weights_) + e.off;
+            int64_t t0 = 0;
+            for (; t0 + 4 <= T; t0 += 4) {
+                if (!omph::kernels::gemv_q4k_b4(w, static_cast<const uint8_t *>(h16_) + t0 * ne * 2,
+                                                static_cast<float *>(logits_) + t0 * h_.n_vocab,
+                                                h_.n_vocab, ne, nullptr)) {
+                    return fail("lm_head batch4 failed");
+                }
+            }
+            for (; t0 < T; ++t0) {
+                if (!omph::kernels::gemv_q4k(
+                        w, static_cast<const uint8_t *>(h16_) + t0 * ne * 2,
+                        static_cast<float *>(logits_) + t0 * h_.n_vocab, h_.n_vocab, ne,
+                        nullptr)) {
+                    return fail("lm_head tail failed");
+                }
+            }
+            if (hipDeviceSynchronize() != hipSuccess) {
+                return fail("lm_head failed");
             }
             logits.resize((size_t) T * h_.n_vocab);
             (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
@@ -426,6 +466,9 @@ public:
         logits.resize((size_t) T * h_.n_vocab);
         (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
         report_phases();
+        if (time_step) {
+            step_event(step_a, step_b);
+        }
         return true;
     }
 
@@ -444,6 +487,16 @@ public:
         t_gemm_.clear();
         t_gemv_.clear();
         t_block_.clear();
+    }
+
+    void step_event(hipEvent_t a, hipEvent_t b) {
+        (void) hipEventRecord(b, nullptr);
+        (void) hipEventSynchronize(b);
+        float ms = 0.0f;
+        (void) hipEventElapsedTime(&ms, a, b);
+        std::fprintf(stderr, "step gpu %.2f ms\n", ms);
+        (void) hipEventDestroy(a);
+        (void) hipEventDestroy(b);
     }
 
     const HParams & hparams() const { return h_; }
@@ -497,9 +550,7 @@ private:
         float * v_cache = static_cast<float *>(kv_v_) + kv_index_[il] * max_seq_ * kv_out;
         const float * q_norm = f32_ref(p + "attn_q_norm.weight");
         const float * k_norm = f32_ref(p + "attn_k_norm.weight");
-        if (!omph::kernels::cast_f32_to_f16(static_cast<const float *>(cur_), h16_, T * ne, nullptr)) {
-            return fail("cast failed");
-        }
+
         if (!matmul(p + "attn_q.weight", h16_, static_cast<float *>(fused_), q_out, ne, T) ||
             !matmul(p + "attn_k.weight", h16_, static_cast<float *>(k_), kv_out, ne, T) ||
             !matmul(p + "attn_v.weight", h16_, static_cast<float *>(v_), kv_out, ne, T) ||
@@ -558,9 +609,7 @@ private:
         float * conv_new = conv_flip_[il] ? conv_a : conv_b;
         float * seq_state = reinterpret_cast<float *>(st + 2 * n_conv_f * 4);
 
-        if (!omph::kernels::cast_f32_to_f16(static_cast<const float *>(cur_), h16_, T * ne, nullptr)) {
-            return fail("cast failed");
-        }
+
         if (!matmul(p + "attn_qkv.weight", h16_, static_cast<float *>(fused_), channels, ne, T) ||
             !matmul(p + "attn_gate.weight", h16_, static_cast<float *>(z_), v_dims, ne, T) ||
             !matmul(p + "ssm_beta.weight", h16_, static_cast<float *>(beta_), n_vh, ne, T) ||
@@ -572,16 +621,10 @@ private:
                                                   nullptr) ||
             !omph::kernels::mul_row_inplace(static_cast<float *>(alpha_), ssm_a, T, n_vh,
                                             nullptr) ||
-            !omph::kernels::conv1d_state(static_cast<const float *>(fused_), conv_w, conv_cur,
-                                         static_cast<float *>(conv_out_), T, channels,
-                                         h_.ssm_conv_k, nullptr) ||
-            !omph::kernels::conv_state_update(static_cast<const float *>(fused_), conv_cur,
-                                              conv_new, T, channels, h_.ssm_conv_k, nullptr) ||
-            !omph::kernels::silu_inplace(static_cast<float *>(conv_out_), T * channels, nullptr) ||
-            !omph::kernels::split_qkv(static_cast<const float *>(conv_out_),
-                                      static_cast<float *>(q_), static_cast<float *>(k_),
-                                      static_cast<float *>(v_), T, q_dims, k_dims, v_dims,
-                                      nullptr) ||
+            !omph::kernels::conv_silu_split_fused(
+                static_cast<const float *>(fused_), conv_w, conv_cur, conv_new,
+                static_cast<float *>(q_), static_cast<float *>(k_), static_cast<float *>(v_), T,
+                channels, h_.ssm_conv_k, q_dims, k_dims, v_dims, nullptr) ||
             !omph::kernels::rms_norm(static_cast<const float *>(q_), nullptr,
                                      static_cast<float *>(q_), T * n_kh, s,
                                      (float) (h_.eps / (double) s), l2_scale, nullptr) ||
@@ -613,10 +656,56 @@ private:
         return true;
     }
 
+    // One fused GEMV launch for a single token, dispatched on the GGUF type.
+    static bool gemv_one(const int type, const void * w, const void * x, float * y,
+                         const int64_t n_out, const int64_t k) {
+        switch (type) {
+            case 10: return omph::kernels::gemv_q2k(w, x, y, n_out, k, nullptr);
+            case 12: return omph::kernels::gemv_q4k(w, x, y, n_out, k, nullptr);
+            case 14: return omph::kernels::gemv_q6k(w, x, y, n_out, k, nullptr);
+            case 16: return omph::kernels::gemv_iq2_xxs(w, x, y, n_out, k, nullptr);
+            case 17: return omph::kernels::gemv_iq2_xs(w, x, y, n_out, k, nullptr);
+            case 18: return omph::kernels::gemv_iq3_xxs(w, x, y, n_out, k, nullptr);
+            case 21: return omph::kernels::gemv_iq3_s(w, x, y, n_out, k, nullptr);
+            case 22: return omph::kernels::gemv_iq2_s(w, x, y, n_out, k, nullptr);
+            case 23: return omph::kernels::gemv_iq4_xs(w, x, y, n_out, k, nullptr);
+            default: return false;
+        }
+    }
+
+    // Small-batch GEMV: one weight read per four tokens. Only the types that have
+    // this form answer true; the others stay on the f16 path.
+    static bool gemv_batch4(const int type, const void * w, const void * x, float * y,
+                            const int64_t n_out, const int64_t k) {
+        switch (type) {
+            case 12: return omph::kernels::gemv_q4k_b4(w, x, y, n_out, k, nullptr);
+            case 21: return omph::kernels::gemv_iq3s_b4(w, x, y, n_out, k, nullptr);
+            case 23: return omph::kernels::gemv_iq4_xs_b4(w, x, y, n_out, k, nullptr);
+            case 18: return omph::kernels::gemv_iq3_xxs_b4(w, x, y, n_out, k, nullptr);
+            default: return false;
+        }
+    }
+
     // One matmul: the fused GEMV for single-token steps when it is available for
-    // this tensor, otherwise the f16 dequant + hipBLASLt path.
+    // this tensor, the small-batch GEMV for a few tokens, otherwise the f16
+    // dequant + hipBLASLt path.
     bool matmul(const std::string & name, const void * x16, float * y, const int64_t n_out,
                 const int64_t k, const int64_t T) {
+        if (T == 1) {
+            // BF16 weights: bf16 is the top half of an f32, so a direct dot
+            // product beats converting to f16 and running a tiny M = 1 GEMM.
+            const omph::gguf::TensorInfo * ti = file_.tensor(name);
+            if (ti != nullptr && ti->type == 30 && ti->ne[1] == n_out && ti->ne[0] == k &&
+                std::getenv("OMPH_NO_BF16_GEMV") == nullptr) {
+                const void * w = static_cast<const uint8_t *>(dev_weights_) + off_.at(name);
+                timer_gemv_.start();
+                const bool ok = omph::kernels::gemv_bf16(w, x16, y, n_out, k, nullptr);
+                timer_gemv_.stop(t_gemv_);
+                if (ok) {
+                    return true;
+                }
+            }
+        }
         if (use_gemv_ && T == 1) {
             const auto it = gems_.find(name);
             if (it != gems_.end() && it->second.rows == n_out && it->second.k == k) {
@@ -625,21 +714,45 @@ private:
                     return true;  // ablation only: wrong results, valid timing
                 }
                 timer_gemv_.start();
-                bool gemv_ok = false;
-                switch (it->second.type) {
-                    case 10: gemv_ok = omph::kernels::gemv_q2k(w, x16, y, n_out, k, nullptr); break;
-                    case 12: gemv_ok = omph::kernels::gemv_q4k(w, x16, y, n_out, k, nullptr); break;
-                    case 14: gemv_ok = omph::kernels::gemv_q6k(w, x16, y, n_out, k, nullptr); break;
-                    case 16: gemv_ok = omph::kernels::gemv_iq2_xxs(w, x16, y, n_out, k, nullptr); break;
-                    case 17: gemv_ok = omph::kernels::gemv_iq2_xs(w, x16, y, n_out, k, nullptr); break;
-                    case 18: gemv_ok = omph::kernels::gemv_iq3_xxs(w, x16, y, n_out, k, nullptr); break;
-                    case 22: gemv_ok = omph::kernels::gemv_iq2_s(w, x16, y, n_out, k, nullptr); break;
-                    case 21: gemv_ok = omph::kernels::gemv_iq3_s(w, x16, y, n_out, k, nullptr); break;
-                    case 23: gemv_ok = omph::kernels::gemv_iq4_xs(w, x16, y, n_out, k, nullptr); break;
-                    default: break;
-                }
+                const bool gemv_ok = gemv_one(it->second.type, w, x16, y, n_out, k);
                 timer_gemv_.stop(t_gemv_);
                 if (gemv_ok) {
+                    return true;
+                }
+                if (std::getenv("OMPH_TRACE_F16") != nullptr) {
+                    const omph::gguf::TensorInfo * ti = file_.tensor(name);
+                    std::fprintf(stderr,
+                                 "f16 path: %s (entry %s, type %u, ne %lld x %lld, %lld B)\n",
+                                 name.c_str(), it != gems_.end() ? "yes" : "no",
+                                 ti != nullptr ? (unsigned) ti->type : 0u,
+                                 ti != nullptr ? (long long) ti->ne[0] : 0,
+                                 ti != nullptr ? (long long) ti->ne[1] : 0,
+                                 ti != nullptr ? (long long) ti->nbytes : 0);
+                }
+            } else if (std::getenv("OMPH_TRACE_F16") != nullptr) {
+                const omph::gguf::TensorInfo * ti = file_.tensor(name);
+                std::fprintf(stderr, "f16 path: %s (not a gemv tensor, type %u, %lld B)\n",
+                             name.c_str(), ti != nullptr ? (unsigned) ti->type : 0u,
+                             ti != nullptr ? (long long) ti->nbytes : 0);
+            }
+        }
+        if (use_gemv_ && T > 1) {
+            const auto it = gems_.find(name);
+            if (it != gems_.end() && it->second.rows == n_out && it->second.k == k &&
+                it->second.has_b4) {
+                const uint8_t * w = static_cast<const uint8_t *>(dev_weights_) + it->second.off;
+                const auto * xb = static_cast<const uint8_t *>(x16);
+                timer_gemv_.start();
+                bool ok = true;
+                int64_t t0 = 0;
+                for (; t0 + 4 <= T && ok; t0 += 4) {
+                    ok = gemv_batch4(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k);
+                }
+                for (; t0 < T && ok; ++t0) {
+                    ok = gemv_one(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k);
+                }
+                timer_gemv_.stop(t_gemv_);
+                if (ok) {
                     return true;
                 }
             }
@@ -706,6 +819,7 @@ private:
         int64_t rows = 0;
         int64_t k = 0;
         uint32_t type = 0;
+        bool has_b4 = false;  // a small-batch kernel exists for this type
     };
 
     omph::gguf::File file_;
@@ -807,7 +921,9 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "--generate also needs --gen-out\n");
             return 2;
         }
-        Runner runner(model, (int64_t) toks.size() + generate + 8, use_gemv);
+        // Repacking only pays off when the decode runs: a prefill-only run is
+        // better off with the raw bytes in place (no staging fallback).
+        Runner runner(model, (int64_t) toks.size() + generate + 8, use_gemv && generate > 0);
         const HParams & h = runner.hparams();
         std::vector<float> logits;
         if (!runner.forward(toks, logits, trace_dir, 0)) {
