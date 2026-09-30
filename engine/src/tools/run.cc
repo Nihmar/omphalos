@@ -178,7 +178,11 @@ public:
                 p.name = t.name;
                 p.off = total;
                 const int64_t bb = omph::format::quant_block_bytes(t.type);
-                if (use_gemv_ && bb > 0 && t.nbytes % (uint64_t) bb == 0) {
+                // The token embedding is a row gather, not a matmul: keep its raw
+                // bytes in the image so the per-token lookup never stages 388 MiB
+                // over PCIe.
+                const bool embed = t.name == "token_embd.weight";
+                if (use_gemv_ && !embed && bb > 0 && t.nbytes % (uint64_t) bb == 0) {
                     std::vector<uint8_t> packed;
                     if (omph::format::repack_any(t.type, file_.tensor_data(t),
                                                  (int64_t) (t.nbytes / (uint64_t) bb), packed)) {

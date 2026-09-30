@@ -504,3 +504,22 @@ predicts the next step: of the 84 ms, ~48 is the fused GEMVs (already at the
 bandwidth ceiling) and ~36 is the remaining glue — attention kernels, per-layer
 norms, residuals, casts and the ~500 launches per step that HIP graphs (M4)
 would collapse.
+
+# M3.15 — stop staging the embedding per token: decode 84 -> 70 ms/token
+
+The embedding is a row gather, not a matmul, but it was in the repacked set, so
+`raw_bytes()` copied the whole 388 MiB table host->device on *every* token
+(~19 ms at PCIe speed). Keeping its raw bytes in the image removes that.
+
+| path | before | after |
+|---|---:|---:|
+| fused GEMV decode | 84 ms/token | **70 ms/token** |
+| f16 decode | 630 ms/token | 630 ms/token (never staged) |
+
+Greedy sequence unchanged. That is **11.9x the milestone-2 decode** (831 -> 70
+ms/token), of which ~48 ms is the fused GEMVs at the bandwidth ceiling and ~22 ms
+is glue (attention kernels, per-layer norms, residuals, casts, launches).
+
+Same class of waste still applies to the prefill with `--gemv` (the f16 fallback
+stages every repacked tensor, ~1.6 GB per pass); the fix there is the small-batch
+GEMV, not more staging.
