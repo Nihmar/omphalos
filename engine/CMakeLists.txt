@@ -52,3 +52,7 @@ target_link_libraries(omph-attn PRIVATE omphalos hip::host roc::hipblaslt)
 add_executable(omph-gdn src/tools/gdn.cc)
 target_include_directories(omph-gdn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(omph-gdn PRIVATE omphalos hip::host roc::hipblaslt)
+
+add_executable(omph-run src/tools/run.cc)
+target_include_directories(omph-run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(omph-run PRIVATE omphalos hip::host roc::hipblaslt)
