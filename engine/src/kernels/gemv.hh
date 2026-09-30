@@ -23,4 +23,9 @@ bool gemv_iq4_xs(const void * packed, const void * x_f16, float * y, int64_t row
 bool gemv_iq3_xxs(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
                   hipStream_t stream);
 
+// Same contract for a tensor in the repacked IQ3_S layout (9-bit grid indices,
+/// four sign-mask bytes per 32-weight sub-block, packed 4-bit scales).
+bool gemv_iq3_s(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
+                hipStream_t stream);
+
 } // namespace omph::kernels

@@ -251,4 +251,60 @@ void unrepack_iq3_xxs(const void * src, const int64_t n_blocks, void * dst) {
     }
 }
 
+// ------------------------------------------------------------------ IQ3_S
+
+namespace {
+
+#pragma pack(push, 1)
+struct BlockIq3S {
+    uint16_t d;
+    uint8_t qs[64];
+    uint8_t qh[8];
+    uint8_t signs[32];
+    uint8_t scales[4];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(BlockIq3S) == 110, "IQ3_S block must be 110 bytes");
+
+} // namespace
+
+Iq3sLayout iq3s_layout(const int64_t n_blocks) {
+    Iq3sLayout l;
+    l.n_blocks = n_blocks;
+    l.qs_off = 0;
+    l.qh_off = align128(n_blocks * 64);
+    l.signs_off = align128(l.qh_off + n_blocks * 8);
+    l.scales_off = align128(l.signs_off + n_blocks * 32);
+    l.d_off = align128(l.scales_off + n_blocks * 4);
+    l.total = align128(l.d_off + n_blocks * 2);
+    return l;
+}
+
+void repack_iq3_s(const void * src, const int64_t n_blocks, void * dst) {
+    const Iq3sLayout l = iq3s_layout(n_blocks);
+    const auto * in = static_cast<const BlockIq3S *>(src);
+    uint8_t * out = static_cast<uint8_t *>(dst);
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        std::memcpy(out + l.d_off + 2 * b, &in[b].d, 2);
+        std::memcpy(out + l.qs_off + b * 64, in[b].qs, 64);
+        std::memcpy(out + l.qh_off + b * 8, in[b].qh, 8);
+        std::memcpy(out + l.signs_off + b * 32, in[b].signs, 32);
+        std::memcpy(out + l.scales_off + b * 4, in[b].scales, 4);
+    }
+}
+
+void unrepack_iq3_s(const void * src, const int64_t n_blocks, void * dst) {
+    const Iq3sLayout l = iq3s_layout(n_blocks);
+    const uint8_t * in = static_cast<const uint8_t *>(src);
+    auto * out = static_cast<BlockIq3S *>(dst);
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        std::memcpy(&out[b].d, in + l.d_off + 2 * b, 2);
+        std::memcpy(out[b].qs, in + l.qs_off + b * 64, 64);
+        std::memcpy(out[b].qh, in + l.qh_off + b * 8, 8);
+        std::memcpy(out[b].signs, in + l.signs_off + b * 32, 32);
+        std::memcpy(out[b].scales, in + l.scales_off + b * 4, 4);
+    }
+}
+
 } // namespace omph::format

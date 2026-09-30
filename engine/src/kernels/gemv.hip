@@ -286,6 +286,109 @@ __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t *
     }
 }
 
+
+// IQ3_S: 110-byte blocks. Per 32-weight sub-block: eight 9-bit grid indices
+// (8 bits from qs, the 9th from one qh bit per index), four sign-mask bytes and
+// a 4-bit scale shared by two sub-blocks. Grid (2 KiB) in LDS, signs are plain
+// masks so no table is needed.
+constexpr long long kIq3sChunkSub = 256;  // 8192 weights staged per LDS refill
+constexpr long long kIq3sRows = 4;        // output rows computed per warp
+
+__global__ void gemv_iq3s_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ qh,
+                                 const uint8_t * __restrict__ signs,
+                                 const uint8_t * __restrict__ scales, const uint8_t * __restrict__ d,
+                                 const __half * __restrict__ x, float * __restrict__ y,
+                                 const long long rows, const long long n_sub) {
+    extern __shared__ uint8_t smem[];
+    __half * xs = reinterpret_cast<__half *>(smem);
+    uint32_t * grid = reinterpret_cast<uint32_t *>(smem + kIq3sChunkSub * 64);
+    for (int i = threadIdx.x; i < 512; i += blockDim.x) {
+        grid[i] = omph::quant::kIq3sGrid[i];
+    }
+
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kIq3sRows;
+    const long long blocks = n_sub / 8;
+    const long long rlast = rows - 1;
+
+    float acc[kIq3sRows] = {};
+    for (long long base = 0; base < n_sub; base += kIq3sChunkSub) {
+        const long long len = n_sub - base < kIq3sChunkSub ? n_sub - base : kIq3sChunkSub;
+        for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
+            xs[i] = x[base * 32 + i];
+        }
+        __syncthreads();
+        if (row0 >= rows) {
+            __syncthreads();  // keep the barrier count identical across warps
+            continue;
+        }
+        for (long long s = base + lane; s < base + len; s += 32) {
+            const __half * xv = xs + (s - base) * 32;
+            uint2 q[kIq3sRows];
+            uint8_t qhb[kIq3sRows];
+            const uint8_t * sgp[kIq3sRows];
+            float dbr[kIq3sRows];
+#pragma unroll
+            for (int r = 0; r < kIq3sRows; ++r) {
+                const long long row = row0 + r <= rlast ? row0 + r : rlast;
+                q[r] = *reinterpret_cast<const uint2 *>(qs + row * blocks * 64 + s * 8);
+                qhb[r] = qh[row * blocks * 8 + s];
+                sgp[r] = signs + row * blocks * 32 + s * 4;
+                const uint8_t sc = scales[row * blocks * 4 + s / 2];
+                const float dv = __half2float(
+                    *reinterpret_cast<const __half *>(d + row * blocks * 2 + (s / 8) * 2));
+                dbr[r] = dv * (1.0f + 2.0f * (float) ((s & 1) ? (sc >> 4) : (sc & 0xF)));
+            }
+            float part[kIq3sRows] = {};
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+#pragma unroll
+                for (int r = 0; r < kIq3sRows; ++r) {
+                    const uint8_t * bytes = reinterpret_cast<const uint8_t *>(&q[r]);
+                    const uint32_t hb = qhb[r];
+                    const uint32_t i1 =
+                        (uint32_t) bytes[2 * l] | (((hb >> (2 * l)) & 1u) << 8);
+                    const uint32_t i2 =
+                        (uint32_t) bytes[2 * l + 1] | (((hb >> (2 * l + 1)) & 1u) << 8);
+                    const uint32_t g1 = grid[i1];
+                    const uint32_t g2 = grid[i2];
+                    const uint8_t sm = sgp[r][l];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        float v1 = (float) ((g1 >> (8 * j)) & 0xFF);
+                        float v2 = (float) ((g2 >> (8 * j)) & 0xFF);
+                        if (sm & (1u << j)) {
+                            v1 = -v1;
+                        }
+                        if (sm & (1u << (4 + j))) {
+                            v2 = -v2;
+                        }
+                        part[r] = fmaf(v1, __half2float(xv[8 * l + j]), part[r]);
+                        part[r] = fmaf(v2, __half2float(xv[8 * l + 4 + j]), part[r]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kIq3sRows; ++r) {
+                acc[r] = fmaf(dbr[r], part[r], acc[r]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < kIq3sRows; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down(v, off);
+        }
+        if (lane == 0 && row0 + r < rows) {
+            y[row0 + r] = v;
+        }
+    }
+}
+
 } // namespace
 
 bool gemv_q4k(const void * packed, const void * x_f16, float * y, const int64_t rows,
@@ -303,6 +406,26 @@ bool gemv_q4k(const void * packed, const void * x_f16, float * y, const int64_t 
     gemv_q4k_kernel<<<grid, 256, smem, stream>>>(
         base + l.qs_off, base + l.sc_off, base + l.mn_off, base + l.d_off, base + l.dmin_off,
         static_cast<const __half *>(x_f16), y, rows, n_sub);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool gemv_iq3_s(const void * packed, const void * x_f16, float * y, const int64_t rows,
+                const int64_t k, hipStream_t stream) {
+    if (packed == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
+        k % 256 != 0) {
+        return false;
+    }
+    const int64_t n_blocks = rows * (k / 256);
+    const omph::format::Iq3sLayout l = omph::format::iq3s_layout(n_blocks);
+    const int64_t n_sub = k / 32;
+    const size_t smem = (size_t) kIq3sChunkSub * 64 + 512 * 4;
+    const auto * base = static_cast<const uint8_t *>(packed);
+    const dim3 grid((unsigned) ((rows + 8 * kIq3sRows - 1) / (8 * kIq3sRows)));
+    gemv_iq3s_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.qh_off,
+                                                  base + l.signs_off, base + l.scales_off,
+                                                  base + l.d_off,
+                                                  static_cast<const __half *>(x_f16), y, rows,
+                                                  n_sub);
     return hipGetLastError() == hipSuccess;
 }
 

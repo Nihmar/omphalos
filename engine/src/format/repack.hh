@@ -90,4 +90,30 @@ Iq3XxsLayout iq3_xxs_layout(int64_t n_blocks);
 void repack_iq3_xxs(const void * src, int64_t n_blocks, void * dst);
 void unrepack_iq3_xxs(const void * src, int64_t n_blocks, void * dst);
 
+// ------------------------------------------------------------------ IQ3_S
+//
+// GGUF IQ3_S: 110-byte blocks — f16 `d`, 64 bytes of low grid-index bits,
+// 8 bytes holding the 9th index bit for each 32-weight sub-block, 32 bytes of
+// sign masks, 4 bytes of packed 4-bit scales. Same size after repacking; the
+// kernel decodes the scale nibbles itself.
+//
+//   [ qs     ] 64 B/block
+//   [ qh     ]  8 B/block
+//   [ signs  ] 32 B/block
+//   [ scales ]  4 B/block
+//   [ d      ]  2 B/block
+struct Iq3sLayout {
+    int64_t n_blocks = 0;
+    int64_t qs_off = 0;
+    int64_t qh_off = 0;
+    int64_t signs_off = 0;
+    int64_t scales_off = 0;
+    int64_t d_off = 0;
+    int64_t total = 0;
+};
+
+Iq3sLayout iq3s_layout(int64_t n_blocks);
+void repack_iq3_s(const void * src, int64_t n_blocks, void * dst);
+void unrepack_iq3_s(const void * src, int64_t n_blocks, void * dst);
+
 } // namespace omph::format
