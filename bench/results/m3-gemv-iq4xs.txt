@@ -434,3 +434,28 @@ Also fixed while measuring: `Linear` was constructed per matmul call (one
 hipBLASLt handle created and destroyed ~500 times per pass). Hoisting it to a
 Runner member is worth ~7 % of the pass — worth doing, but it was not the missing
 time.
+
+# M3.13 — where the decode's 127 ms/token actually go (ablation)
+
+The per-phase event sums were unreliable (events are single objects, so every
+recorded pair ended up pointing at the same two events). Ablation is robust:
+`OMPH_SKIP_GEMV=1` and `OMPH_SKIP_STAGE=1` skip a phase (wrong results, valid
+timing) and the delta is its cost.
+
+| run (prefill + 20 decode steps, --gemv) | wall clock |
+|---|---:|
+| full | 10036 ms |
+| without the fused GEMVs | 9063 ms |
+| without stage+GEMM | 8984 ms |
+
+So the fused GEMVs cost **973 ms / 20 steps = 48 ms per token**. The covered
+weights are ~11.2 GiB, i.e. **~250 GB/s — essentially the measured ceiling**, and
+that includes the lm head's 682 MiB.
+
+**Conclusion: the GEMV path is already at the achievable decode bandwidth.** The
+decode step is 127 ms/token, so ~79 ms is *glue*: the per-layer small kernels
+(RMSNorm, residuals, casts, SwiGLU), the 5-launch-per-token delta rule, the
+attention, and ~900 launches per step. The next decode work is not faster GEMVs
+— it is PLAN §10.6 (fold norms and residuals into GEMV prologues/epilogues),
+§10.2 (one fused delta-net decode kernel instead of five tiny launches) and then
+HIP graphs (M4).

@@ -321,13 +321,13 @@ public:
                 return fail("attn_norm failed");
             }
             scratch_.reset();
-            timer_gemm_.start();
+            timer_block_.start();
             if (recurrent) {
                 if (!gdn_layer(il, p, T)) return false;
             } else {
                 if (!attn_layer(il, p, T, start_pos)) return false;
             }
-            timer_gemm_.stop(t_block_);
+            timer_block_.stop(t_block_);
             // x = ffn(rms_norm(block + x)) + (block + x)
             if (!omph::kernels::add_out(static_cast<const float *>(blk_),
                                         static_cast<const float *>(x_),
@@ -376,6 +376,7 @@ public:
             }
             logits.resize((size_t) T * h_.n_vocab);
             (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
+            report_phases();
             return true;
         }
         // lm head in vocab chunks: the whole f16 head (248k x 5120) would not fit
@@ -417,19 +418,25 @@ public:
         }
         logits.resize((size_t) T * h_.n_vocab);
         (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
-        if (std::getenv("OMPH_TIMING") != nullptr) {
-            (void) hipDeviceSynchronize();
-            std::fprintf(stderr,
-                         "phases: stage_w %.1f ms  gemm(f16) %.1f ms  blocks %.1f ms  "
-                         "calls: %zu/%zu/%zu\n",
-                         PhaseTimer::total_ms(t_stage_), PhaseTimer::total_ms(t_gemm_),
-                         PhaseTimer::total_ms(t_block_), t_stage_.size(), t_gemm_.size(),
-                         t_block_.size());
-            t_stage_.clear();
-            t_gemm_.clear();
-            t_block_.clear();
-        }
+        report_phases();
         return true;
+    }
+
+    void report_phases() {
+        if (std::getenv("OMPH_TIMING") == nullptr) {
+            return;
+        }
+        (void) hipDeviceSynchronize();
+        std::fprintf(stderr,
+                     "phases: stage_w %.1f ms  gemm(f16) %.1f ms  gemv %.1f ms  blocks %.1f ms "
+                     "| calls %zu/%zu/%zu/%zu\n",
+                     PhaseTimer::total_ms(t_stage_), PhaseTimer::total_ms(t_gemm_),
+                     PhaseTimer::total_ms(t_gemv_), PhaseTimer::total_ms(t_block_),
+                     t_stage_.size(), t_gemm_.size(), t_gemv_.size(), t_block_.size());
+        t_stage_.clear();
+        t_gemm_.clear();
+        t_gemv_.clear();
+        t_block_.clear();
     }
 
     const HParams & hparams() const { return h_; }
@@ -615,19 +622,31 @@ private:
             const auto it = gems_.find(name);
             if (it != gems_.end() && it->second.rows == n_out && it->second.k == k) {
                 const void * w = static_cast<const uint8_t *>(dev_weights_) + it->second.off;
+                if (std::getenv("OMPH_SKIP_GEMV") != nullptr) {
+                    return true;  // ablation only: wrong results, valid timing
+                }
+                timer_gemv_.start();
+                bool gemv_ok = false;
                 switch (it->second.type) {
-                    case 10: return omph::kernels::gemv_q2k(w, x16, y, n_out, k, nullptr);
-                    case 12: return omph::kernels::gemv_q4k(w, x16, y, n_out, k, nullptr);
-                    case 14: return omph::kernels::gemv_q6k(w, x16, y, n_out, k, nullptr);
-                    case 16: return omph::kernels::gemv_iq2_xxs(w, x16, y, n_out, k, nullptr);
-                    case 17: return omph::kernels::gemv_iq2_xs(w, x16, y, n_out, k, nullptr);
-                    case 18: return omph::kernels::gemv_iq3_xxs(w, x16, y, n_out, k, nullptr);
-                    case 22: return omph::kernels::gemv_iq2_s(w, x16, y, n_out, k, nullptr);
-                    case 21: return omph::kernels::gemv_iq3_s(w, x16, y, n_out, k, nullptr);
-                    case 23: return omph::kernels::gemv_iq4_xs(w, x16, y, n_out, k, nullptr);
+                    case 10: gemv_ok = omph::kernels::gemv_q2k(w, x16, y, n_out, k, nullptr); break;
+                    case 12: gemv_ok = omph::kernels::gemv_q4k(w, x16, y, n_out, k, nullptr); break;
+                    case 14: gemv_ok = omph::kernels::gemv_q6k(w, x16, y, n_out, k, nullptr); break;
+                    case 16: gemv_ok = omph::kernels::gemv_iq2_xxs(w, x16, y, n_out, k, nullptr); break;
+                    case 17: gemv_ok = omph::kernels::gemv_iq2_xs(w, x16, y, n_out, k, nullptr); break;
+                    case 18: gemv_ok = omph::kernels::gemv_iq3_xxs(w, x16, y, n_out, k, nullptr); break;
+                    case 22: gemv_ok = omph::kernels::gemv_iq2_s(w, x16, y, n_out, k, nullptr); break;
+                    case 21: gemv_ok = omph::kernels::gemv_iq3_s(w, x16, y, n_out, k, nullptr); break;
+                    case 23: gemv_ok = omph::kernels::gemv_iq4_xs(w, x16, y, n_out, k, nullptr); break;
                     default: break;
                 }
+                timer_gemv_.stop(t_gemv_);
+                if (gemv_ok) {
+                    return true;
+                }
             }
+        }
+        if (std::getenv("OMPH_SKIP_STAGE") != nullptr) {
+            return true;  // ablation only
         }
         void * w = stage_w(name);
         timer_gemm_.start();
@@ -696,6 +715,9 @@ private:
     omph::runtime::Linear linear_;  // one hipBLASLt handle for the whole run
     PhaseTimer timer_stage_;
     PhaseTimer timer_gemm_;
+    PhaseTimer timer_gemv_;
+    PhaseTimer timer_block_;
+    std::vector<std::pair<hipEvent_t, hipEvent_t>> t_gemv_;
     std::vector<std::pair<hipEvent_t, hipEvent_t>> t_stage_;
     std::vector<std::pair<hipEvent_t, hipEvent_t>> t_gemm_;
     std::vector<std::pair<hipEvent_t, hipEvent_t>> t_block_;
