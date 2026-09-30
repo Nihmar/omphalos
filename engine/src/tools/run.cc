@@ -654,8 +654,38 @@ private:
         return true;
     }
 
+    // One fused GEMV launch for a single token, dispatched on the GGUF type.
+    static bool gemv_one(const int type, const void * w, const void * x, float * y,
+                         const int64_t n_out, const int64_t k) {
+        switch (type) {
+            case 10: return omph::kernels::gemv_q2k(w, x, y, n_out, k, nullptr);
+            case 12: return omph::kernels::gemv_q4k(w, x, y, n_out, k, nullptr);
+            case 14: return omph::kernels::gemv_q6k(w, x, y, n_out, k, nullptr);
+            case 16: return omph::kernels::gemv_iq2_xxs(w, x, y, n_out, k, nullptr);
+            case 17: return omph::kernels::gemv_iq2_xs(w, x, y, n_out, k, nullptr);
+            case 18: return omph::kernels::gemv_iq3_xxs(w, x, y, n_out, k, nullptr);
+            case 21: return omph::kernels::gemv_iq3_s(w, x, y, n_out, k, nullptr);
+            case 22: return omph::kernels::gemv_iq2_s(w, x, y, n_out, k, nullptr);
+            case 23: return omph::kernels::gemv_iq4_xs(w, x, y, n_out, k, nullptr);
+            default: return false;
+        }
+    }
+
+    // Small-batch GEMV: one weight read per four tokens. Only the types that have
+    // this form answer true; the others stay on the f16 path.
+    static bool gemv_batch4(const int type, const void * w, const void * x, float * y,
+                            const int64_t n_out, const int64_t k) {
+        switch (type) {
+            case 12: return omph::kernels::gemv_q4k_b4(w, x, y, n_out, k, nullptr);
+            case 21: return omph::kernels::gemv_iq3s_b4(w, x, y, n_out, k, nullptr);
+            case 23: return omph::kernels::gemv_iq4_xs_b4(w, x, y, n_out, k, nullptr);
+            default: return false;
+        }
+    }
+
     // One matmul: the fused GEMV for single-token steps when it is available for
-    // this tensor, otherwise the f16 dequant + hipBLASLt path.
+    // this tensor, the small-batch GEMV for a few tokens, otherwise the f16
+    // dequant + hipBLASLt path.
     bool matmul(const std::string & name, const void * x16, float * y, const int64_t n_out,
                 const int64_t k, const int64_t T) {
         if (use_gemv_ && T == 1) {
@@ -666,21 +696,30 @@ private:
                     return true;  // ablation only: wrong results, valid timing
                 }
                 timer_gemv_.start();
-                bool gemv_ok = false;
-                switch (it->second.type) {
-                    case 10: gemv_ok = omph::kernels::gemv_q2k(w, x16, y, n_out, k, nullptr); break;
-                    case 12: gemv_ok = omph::kernels::gemv_q4k(w, x16, y, n_out, k, nullptr); break;
-                    case 14: gemv_ok = omph::kernels::gemv_q6k(w, x16, y, n_out, k, nullptr); break;
-                    case 16: gemv_ok = omph::kernels::gemv_iq2_xxs(w, x16, y, n_out, k, nullptr); break;
-                    case 17: gemv_ok = omph::kernels::gemv_iq2_xs(w, x16, y, n_out, k, nullptr); break;
-                    case 18: gemv_ok = omph::kernels::gemv_iq3_xxs(w, x16, y, n_out, k, nullptr); break;
-                    case 22: gemv_ok = omph::kernels::gemv_iq2_s(w, x16, y, n_out, k, nullptr); break;
-                    case 21: gemv_ok = omph::kernels::gemv_iq3_s(w, x16, y, n_out, k, nullptr); break;
-                    case 23: gemv_ok = omph::kernels::gemv_iq4_xs(w, x16, y, n_out, k, nullptr); break;
-                    default: break;
-                }
+                const bool gemv_ok = gemv_one(it->second.type, w, x16, y, n_out, k);
                 timer_gemv_.stop(t_gemv_);
                 if (gemv_ok) {
+                    return true;
+                }
+            }
+        }
+        if (use_gemv_ && T > 1) {
+            const auto it = gems_.find(name);
+            if (it != gems_.end() && it->second.rows == n_out && it->second.k == k &&
+                (it->second.type == 12 || it->second.type == 21 || it->second.type == 23)) {
+                const uint8_t * w = static_cast<const uint8_t *>(dev_weights_) + it->second.off;
+                const auto * xb = static_cast<const uint8_t *>(x16);
+                timer_gemv_.start();
+                bool ok = true;
+                int64_t t0 = 0;
+                for (; t0 + 4 <= T && ok; t0 += 4) {
+                    ok = gemv_batch4(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k);
+                }
+                for (; t0 < T && ok; ++t0) {
+                    ok = gemv_one(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k);
+                }
+                timer_gemv_.stop(t_gemv_);
+                if (ok) {
                     return true;
                 }
             }

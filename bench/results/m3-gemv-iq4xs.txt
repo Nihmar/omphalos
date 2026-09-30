@@ -720,3 +720,28 @@ to f16. The measured per-tensor gain (3.2x) applied to the whole 11.2 GiB projec
 the prefill's GEMV cost from ~1170 ms to ~144 ms, i.e. the pass from ~1.45 s to
 ~0.4 s (~3.5x, ~25 t/s). That is mechanical work: the same kernel shape for the
 other six types.
+
+# M3.23 — the small-batch path wired into the prefill
+
+`matmul` now takes the b4 route for T > 1 on the types that have it (Q4_K, IQ3_S,
+IQ4_XS — 68 % of the 11.2 GiB), four tokens per weight read with the tail on the
+single-token kernel; the other types still stage f16.
+
+Summed phase timers for a prefill + one token, the same binary:
+
+| | stage_w | blocks | total |
+|---|---:|---:|---:|
+| f16 path | 843 ms | 0 ms | 843 ms |
+| b4 path | 3 ms | 220 ms | **223 ms** |
+
+620 ms off the prefill — 43 % of it — with two thirds of the weights ported. The
+staging timer collapsing from 843 ms to 3 ms is the whole point: those weights are
+no longer materialised in f16 and read back.
+
+Correctness end to end: greedy tokens identical (`198 760 3841`), prefill logits
+within 0.0087 (4.7e-04 relative) of the f16 path — the quantised-weight rounding
+seen everywhere else — and the decode unchanged at 57 ms/token.
+
+The remaining ~32 % of the weights (IQ3_XXS 1.93 GiB, then Q6_K, Q2_K and the
+IQ2 family) are the same recipe: read the single-token kernel's inner loop, keep
+its index arithmetic verbatim, and verify against four single-token GEMVs.
