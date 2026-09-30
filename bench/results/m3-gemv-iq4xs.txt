@@ -580,3 +580,22 @@ here: event-based per-phase sums are meaningless when the same event objects are
 re-recorded (every pair points at the last recording), and a Python simulation of
 a kernel written *from the kernel* instead of from the spec will happily agree
 with a bug. Ablation switches and spec-derived simulations are what worked.
+
+# M3.18 — IQ3_S: the sign select is 46 % of the kernel
+
+Diagnostic (sign select removed — wrong results, valid timing): **220.6 -> 321.6
+GB/s**, i.e. +46 %, and that is the ceiling itself. So for IQ3_S the per-value
+sign handling, not the grid lookup or the index assembly, is what keeps it at
+69 %.
+
+The compiler turns `if (mask & bit) v = -v;` into a compare plus a select per
+value; the mask extraction adds another op or two. Every formulation that keeps
+the sign per value costs about the same (a +/-1 table, `copysign`, a XOR against a
+mask word all need the mask *and* a select), and the two that would remove it —
+pre-negated grids (256x the LDS) or folding it into the scale (the mask varies
+within a group while the scale does not) — do not work. IQ3_XXS (77 %) has the
+same structure and the same ceiling.
+
+Recorded as an open item with its measured upper bound: IQ3_S alone is 3.39 GiB
+(30 % of the weights), so closing it would be worth ~3-4 ms of the decode's
+59 ms/token if a cheap sign application can be found.
