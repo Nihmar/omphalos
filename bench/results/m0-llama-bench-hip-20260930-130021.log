@@ -1,0 +1,16 @@
+# omphalos M0 llama.cpp baselines
+# label: hip
+# build: /home/alessandro/Projects/llama.cpp-RX9060XT-16GB/build-hip
+# model: models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+# date:  2026-09-30T13:00:21+02:00
+# note:  desktop session active during run
++ llama-bench -p 512 -n 128 -d 0,4096,16384
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 16304 MiB):
+  Device 0: AMD Radeon RX 9060 XT, gfx1200 (0x1200), VMM: no, Wave Size: 32, VRAM: 16304 MiB
++ llama-bench -p 512 -n 128 -ctk q8_0 -ctv q8_0 -d 16384,32768
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 16304 MiB):
+  Device 0: AMD Radeon RX 9060 XT, gfx1200 (0x1200), VMM: no, Wave Size: 32, VRAM: 16304 MiB
++ llama-bench -p 512 -n 128 -ctk q8_0 -ctv q4_0 -d 16384,32768
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 16304 MiB):
+  Device 0: AMD Radeon RX 9060 XT, gfx1200 (0x1200), VMM: no, Wave Size: 32, VRAM: 16304 MiB
+results: /home/alessandro/Projects/omphalos/bench/results/m0-llama-bench-hip-20260930-130021.csv
