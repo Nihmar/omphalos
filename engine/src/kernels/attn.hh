@@ -25,4 +25,34 @@ bool attention(const float * q, const float * k_cache, const float * v_cache, co
                float * out, int64_t tokens, int64_t seq, int64_t nh, int64_t nkv, int64_t hd,
                float scale, hipStream_t stream);
 
+// --- quantized KV (PLAN.md §13) -------------------------------------------
+//
+// K is stored as Q8 and V as Q4, in 32-element blocks along head_dim with the
+// scales in a separate stream. head_dim is 256, so there are 8 blocks per head
+// per token: K is 272 B per head (256 + 16 of scales) and V is 144 B, against
+// 1024 B each in f32.
+
+// Fast Walsh-Hadamard along n (a power of two), applied to q and k after RoPE.
+// H is orthogonal, so (Hq)·(Hk) = q·k and the scores are unchanged while the
+// outliers get spread across the channels, which is what makes Q4 viable.
+bool hadamard_f32(float * x, const int64_t rows, const int64_t n, hipStream_t stream);
+
+// Quantizes the T token rows of k/v (f32, T * nkv * hd each) into the cache at
+// `pos`, computing one scale per 32-element block.
+// `k16`/`v16` (may be null) hold an exact f16 copy of the most recent `window`
+// tokens in a ring: the FP16 window of PLAN §13.4, in the same rotated basis.
+bool kv_quant(const float * k_src, const float * v_src, uint8_t * k_q8, void * k_scales,
+              uint8_t * v_q4, void * v_scales, void * k16, void * v16, const int64_t pos,
+              const int64_t tokens, const int64_t nkv, const int64_t hd, const int64_t window,
+              hipStream_t stream);
+
+// Flash attention over the quantized cache: same contract as `attention`, with K
+// and V dequantized as they are read.
+bool attention_flash_q8q4(const float * q, const uint8_t * k_q8, const void * k_scales,
+                          const uint8_t * v_q4, const void * v_scales, const void * k16,
+                          const void * v16, const float * gate, float * out, const int64_t tokens,
+                          const int64_t seq, const int64_t nh, const int64_t nkv, const int64_t hd,
+                          const float scale, const int64_t head_ratio, const int64_t window,
+                          hipStream_t stream);
+
 } // namespace omph::kernels

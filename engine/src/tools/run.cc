@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -151,7 +152,8 @@ private:
 
 class Runner {
 public:
-    explicit Runner(const std::string & path, const int64_t max_tokens, const bool use_gemv)
+    explicit Runner(const std::string & path, const int64_t max_tokens, const bool use_gemv,
+                    const bool last_logits_only = false, const int64_t kv_capacity = 0)
         : file_(path), h_(read_hparams(file_)), use_gemv_(use_gemv) {
         const int64_t ne = h_.n_embd;
         const int64_t T = max_tokens;
@@ -256,18 +258,42 @@ public:
         alloc(&ffn1_, T * h_.n_ff * 4);
         alloc(&ffn2_, T * h_.n_ff * 4);
         alloc(&ffn16_, T * h_.n_ff * 2);
-        alloc(&logits_, T * h_.n_vocab * 4);
+        last_logits_only_ = last_logits_only;
+        alloc(&logits_, (last_logits_only ? 1 : T) * h_.n_vocab * 4);
         alloc(&tmp_logits_, T * std::min<int64_t>(h_.n_vocab, 32768) * 4);
         alloc(&head16_, (size_t) std::min<int64_t>(h_.n_vocab, 32768) * ne * 2);
         alloc(&raw_stage_, (size_t) 768 * 1024 * 1024);  // raw bytes for the f16 fallback
-        max_seq_ = T;
+        const int64_t kvcap = kv_capacity > 0 ? kv_capacity : T;
+        max_seq_ = kvcap;
         int64_t n_kv = 0;
         for (int64_t il = 0; il < h_.n_layer; ++il) {
             const bool recurrent = file_.tensor("blk." + std::to_string(il) + ".ssm_a") != nullptr;
             kv_index_.push_back(recurrent ? -1 : n_kv++);
         }
-        alloc(&kv_k_, (size_t) n_kv * T * attn_kv * 4);
-        alloc(&kv_v_, (size_t) n_kv * T * attn_kv * 4);
+        // The KV cache is sized by the whole sequence, the activations by the
+        // chunk: that is what lets a long prompt run in pieces.
+        kv_q8q4_ = std::getenv("OMPH_KV_Q8Q4") != nullptr;
+        // Kept even in the quantized mode: skipping it saves 4.3 GB at 32k but the
+        // unreferenced-f32-cache path needs the attention plumbing reworked, and
+        // that attempt regressed the working 8k case. Documented in the results.
+        alloc(&kv_k_, (size_t) n_kv * kvcap * attn_kv * 4);
+        alloc(&kv_v_, (size_t) n_kv * kvcap * attn_kv * 4);
+        if (kv_q8q4_) {
+            // K Q8 + V Q4 with 32-element blocks: 272 B and 144 B per head per
+            // token, against 1024 B each in f32 (PLAN.md §13).
+            const int64_t nblk = h_.head_dim / 32;
+            alloc(&kv_kq_, (size_t) n_kv * kvcap * attn_kv);
+            alloc(&kv_ks_, (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2);
+            alloc(&kv_vq_, (size_t) n_kv * kvcap * attn_kv / 2);
+            alloc(&kv_vs_, (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2);
+            // FP16 window: the last `kv_window_` tokens exactly, in the same
+            // rotated basis, in a ring (PLAN §13.4).
+            if (const char * w = std::getenv("OMPH_KV_WINDOW")) {
+                kv_window_ = std::atoll(w);
+            }
+            alloc(&kv_k16_, (size_t) n_kv * kv_window_ * attn_kv * 2);
+            alloc(&kv_v16_, (size_t) n_kv * kv_window_ * attn_kv * 2);
+        }
         conv_flip_.assign((size_t) h_.n_layer, 0);
         for (int64_t il = 0; il < h_.n_layer; ++il) {
             void * st = nullptr;
@@ -397,6 +423,32 @@ public:
             if (time_step) {
                 step_event(step_a, step_b);
             }
+            return true;
+        }
+        // Only the last token's logits: at 32k the full (T, 248320) f32 buffer is
+        // 33 GB, and the long-context KV validation only needs the final row.
+        if (last_logits_only_) {
+            const uint8_t * xlast = static_cast<const uint8_t *>(h16_) + (T - 1) * ne * 2;
+            const omph::gguf::TensorInfo * ht = file_.tensor("output.weight");
+            if (ht == nullptr) {
+                return fail("output.weight missing");
+            }
+            if (use_gemv_ && gems_.count("output.weight") != 0) {
+                const auto & e = gems_.at("output.weight");
+                const void * w = static_cast<const uint8_t *>(dev_weights_) + e.off;
+                if (!gemv_one(e.type, w, xlast, static_cast<float *>(logits_), h_.n_vocab, ne)) {
+                    return fail("lm_head gemv failed");
+                }
+            } else if (!linear_.run(stage_w("output.weight"), xlast, static_cast<float *>(logits_),
+                                    h_.n_vocab, ne, 1)) {
+                return fail("lm_head failed");
+            }
+            if (hipDeviceSynchronize() != hipSuccess) {
+                return fail("lm_head failed");
+            }
+            logits.resize((size_t) h_.n_vocab);
+            (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
+            report_phases();
             return true;
         }
         // Small-batch head: for a Q4_K head with 2+ tokens, run four tokens per
@@ -549,14 +601,26 @@ private:
         const int64_t ne = h_.n_embd;
         const int64_t q_out = h_.n_head * 2 * h_.head_dim;
         const int64_t kv_out = h_.n_head_kv * h_.head_dim;
-        float * k_cache = static_cast<float *>(kv_k_) + kv_index_[il] * max_seq_ * kv_out;
-        float * v_cache = static_cast<float *>(kv_v_) + kv_index_[il] * max_seq_ * kv_out;
+        // Null in the quantized-KV mode, where the f32 cache is never allocated.
+        float * k_cache = kv_k_ == nullptr
+                              ? nullptr
+                              : static_cast<float *>(kv_k_) + kv_index_[il] * max_seq_ * kv_out;
+        float * v_cache = kv_v_ == nullptr
+                              ? nullptr
+                              : static_cast<float *>(kv_v_) + kv_index_[il] * max_seq_ * kv_out;
         const float * q_norm = f32_ref(p + "attn_q_norm.weight");
         const float * k_norm = f32_ref(p + "attn_k_norm.weight");
 
         if (!matmul(p + "attn_q.weight", h16_, static_cast<float *>(fused_), q_out, ne, T) ||
             !matmul(p + "attn_k.weight", h16_, static_cast<float *>(k_), kv_out, ne, T) ||
             !matmul(p + "attn_v.weight", h16_, static_cast<float *>(v_), kv_out, ne, T) ||
+            (kv_q8q4_ &&
+             (!omph::kernels::hadamard_f32(static_cast<float *>(q_), T * h_.n_head,
+                                           h_.head_dim, nullptr) ||
+              !omph::kernels::hadamard_f32(static_cast<float *>(k_), T * h_.n_head_kv,
+                                           h_.head_dim, nullptr) ||
+              !omph::kernels::hadamard_f32(static_cast<float *>(v_), T * h_.n_head_kv,
+                                           h_.head_dim, nullptr))) ||
             !omph::kernels::split_qg(static_cast<const float *>(fused_),
                                      static_cast<float *>(q_), static_cast<float *>(gate_), T,
                                      h_.n_head, h_.head_dim, nullptr) ||
@@ -574,11 +638,7 @@ private:
                       hipMemcpyDeviceToDevice) != hipSuccess ||
             hipMemcpy(v_cache + pos0 * kv_out, v_, (size_t) T * kv_out * 4,
                       hipMemcpyDeviceToDevice) != hipSuccess ||
-            !omph::kernels::attention(static_cast<const float *>(q_), k_cache, v_cache,
-                                      static_cast<const float *>(gate_),
-                                      static_cast<float *>(attn_), T, pos0 + T, h_.n_head,
-                                      h_.n_head_kv, h_.head_dim,
-                                      1.0f / std::sqrt((float) h_.head_dim), nullptr) ||
+            !attn_impl(il, k_cache, v_cache, pos0, T) ||
             !omph::kernels::cast_f32_to_f16(static_cast<const float *>(attn_), ffn16_,
                                             T * h_.n_head * h_.head_dim, nullptr) ||
             !matmul(p + "attn_output.weight", ffn16_, static_cast<float *>(blk_), ne,
@@ -657,6 +717,159 @@ private:
         }
         conv_flip_[il] ^= 1;
         return true;
+    }
+
+    // KV write + attention, on either the f32 cache (memcpy + flash attention) or
+    // the Q8/Q4 one (quantize, then flash attention that dequantizes on the fly).
+    bool attn_impl(const int64_t il, float * k_cache, float * v_cache, const int64_t pos0,
+                   const int64_t T) {
+        const int64_t kv_out = h_.n_head_kv * h_.head_dim;
+        const int64_t nblk = h_.head_dim / 32;
+        const float scale = 1.0f / std::sqrt((float) h_.head_dim);
+        if (kv_q8q4_) {
+            // The KV caches are indexed by attention layer (kv_index_), not by model
+            // layer: 16 of the 64 layers have one.
+            const int64_t kvl = kv_index_[il];
+            uint8_t * kq = static_cast<uint8_t *>(kv_kq_) + kvl * max_seq_ * kv_out;
+            uint8_t * vq = static_cast<uint8_t *>(kv_vq_) + kvl * max_seq_ * kv_out / 2;
+            auto * ksc = static_cast<uint8_t *>(kv_ks_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2;
+            auto * vsc = static_cast<uint8_t *>(kv_vs_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2;
+            auto * k16 = static_cast<uint8_t *>(kv_k16_) + kvl * kv_window_ * kv_out * 2;
+            auto * v16 = static_cast<uint8_t *>(kv_v16_) + kvl * kv_window_ * kv_out * 2;
+            if (!omph::kernels::kv_quant(static_cast<const float *>(k_),
+                                         static_cast<const float *>(v_), kq, ksc, vq, vsc, k16,
+                                         v16, pos0, T, h_.n_head_kv, h_.head_dim, kv_window_,
+                                         nullptr)) {
+                return false;
+            }
+            if (std::getenv("OMPH_TRACE_KV") != nullptr) {
+                std::fprintf(stderr,
+                             "kv ptrs il=%lld: kq %p ks %p vq %p vs %p | bases %p %p %p %p | "
+                             "kout %lld nblk %lld\n",
+                             (long long) il, (void *) kq, (void *) ksc, (void *) vq, (void *) vsc,
+                             kv_kq_, kv_ks_, kv_vq_, kv_vs_, (long long) kv_out, (long long) nblk);
+            }
+            if (std::getenv("OMPH_TRACE_KV") != nullptr) {
+                if (hipDeviceSynchronize() != hipSuccess) {
+                    std::fprintf(stderr, "kv: QUANTIZE faulted il=%lld\n", (long long) il);
+                    return false;
+                }
+                std::fprintf(stderr, "kv: quantize ok il=%lld\n", (long long) il);
+            }
+            if (std::getenv("OMPH_DUMP_KV") != nullptr && il == 3) {
+                // Verify the writer on the host before blaming the reader.
+                const int64_t row = 0;  // token 0, kv head 0
+                std::vector<uint8_t> kq_host((size_t) h_.head_dim);
+                std::vector<uint16_t> ks_host((size_t) nblk);
+                std::vector<uint8_t> vq_host((size_t) h_.head_dim / 2);
+                std::vector<uint16_t> vs_host((size_t) nblk);
+                std::vector<float> ksrc((size_t) h_.head_dim);
+                std::vector<float> vsrc((size_t) h_.head_dim);
+                (void) hipMemcpy(kq_host.data(), kq + (size_t) row * h_.head_dim,
+                                 kq_host.size(), hipMemcpyDeviceToHost);
+                (void) hipMemcpy(ks_host.data(), ksc + (size_t) row * nblk * 2, ks_host.size() * 2,
+                                 hipMemcpyDeviceToHost);
+                (void) hipMemcpy(vq_host.data(), vq + (size_t) row * h_.head_dim / 2,
+                                 vq_host.size(), hipMemcpyDeviceToHost);
+                (void) hipMemcpy(vs_host.data(), vsc + (size_t) row * nblk * 2, vs_host.size() * 2,
+                                 hipMemcpyDeviceToHost);
+                (void) hipMemcpy(ksrc.data(), static_cast<const float *>(k_) + row * h_.head_dim,
+                                 ksrc.size() * 4, hipMemcpyDeviceToHost);
+                (void) hipMemcpy(vsrc.data(), static_cast<const float *>(v_) + row * h_.head_dim,
+                                 vsrc.size() * 4, hipMemcpyDeviceToHost);
+                auto h2f = [](const uint16_t b) {
+                    const uint32_t e = (uint32_t) (b & 0x8000) << 16;
+                    const uint32_t m = (uint32_t) (b & 0x3FF) << 13;
+                    uint32_t ex = (b >> 10) & 0x1F;
+                    ex = (ex == 0) ? 0u : (ex == 31 ? 255u : ex + 112u);
+                    return __builtin_bit_cast(float, e | (ex << 23) | m);
+                };
+                double kerr = 0.0;
+                double verr = 0.0;
+                for (int i = 0; i < h_.head_dim; ++i) {
+                    const double kq_val = (double) (int8_t) kq_host[(size_t) i] *
+                                          (double) h2f(ks_host[(size_t) (i / 32)]);
+                    kerr = std::max(kerr, std::fabs(kq_val - (double) ksrc[(size_t) i]));
+                    const uint8_t byte = vq_host[(size_t) ((i / 32) * 16 + (i & 15))];
+                    const int nib = (i & 16) ? (byte >> 4) : (byte & 0xF);
+                    const double vq_val =
+                        (double) (nib - 8) * (double) h2f(vs_host[(size_t) (i / 32)]);
+                    verr = std::max(verr, std::fabs(vq_val - (double) vsrc[(size_t) i]));
+                }
+                std::fprintf(stderr, "kv dump: k err %.5f (src |max| %.3f), v err %.5f\n", kerr,
+                             (double) *std::max_element(ksrc.begin(), ksrc.end()), verr);
+                double worst = 0.0;
+                int wi = -1;
+                for (int i = 0; i < h_.head_dim; ++i) {
+                    const uint8_t byte = vq_host[(size_t) ((i / 32) * 16 + (i & 15))];
+                    const int nib = (i & 16) ? (byte >> 4) : (byte & 0xF);
+                    const double vq_val = (double) (nib - 8) * (double) h2f(vs_host[(size_t) (i / 32)]);
+                    const double e = std::fabs(vq_val - (double) vsrc[(size_t) i]);
+                    if (e > worst) {
+                        worst = e;
+                        wi = i;
+                    }
+                }
+                if (std::getenv("OMPH_DUMP_KV") != nullptr) {
+                    std::fprintf(stderr, "  v block 4 bytes:");
+                    for (int k = 0; k < 16; ++k) {
+                        std::fprintf(stderr, " %02x", vq_host[(size_t) (64 + k)]);
+                    }
+                    std::fprintf(stderr, "\n  v src[128..135]:");
+                    for (int k = 128; k < 136; ++k) {
+                        std::fprintf(stderr, " %.3f", (double) vsrc[(size_t) k]);
+                    }
+                    std::fprintf(stderr, "   src[136..143]:");
+                    for (int k = 136; k < 144; ++k) {
+                        std::fprintf(stderr, " %.3f", (double) vsrc[(size_t) k]);
+                    }
+                    std::fprintf(stderr, "\n  v scales:");
+                    for (int k = 0; k < 8; ++k) {
+                        std::fprintf(stderr, " %.4f", (double) h2f(vs_host[(size_t) k]));
+                    }
+                    std::fprintf(stderr, "\n  k scales:");
+                    for (int k = 0; k < 8; ++k) {
+                        std::fprintf(stderr, " %.4f", (double) h2f(ks_host[(size_t) k]));
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+                if (wi >= 0) {
+                    const uint8_t byte = vq_host[(size_t) ((wi / 32) * 16 + (wi & 15))];
+                    std::fprintf(stderr,
+                                 "  worst v[%d] src %.4f deq %.4f nib %d scale %.5f (block %d)\n",
+                                 wi, (double) vsrc[(size_t) wi],
+                                 (double) ((wi & 16) ? (byte >> 4) : (byte & 0xF)) - 8,
+                                 (int) ((wi & 16) ? (byte >> 4) : (byte & 0xF)),
+                                 (double) h2f(vs_host[(size_t) (wi / 32)]), wi / 32);
+                }
+            }
+            if (std::getenv("OMPH_TRACE_KV") != nullptr) {
+                std::fprintf(stderr, "kv: quant ok il=%lld pos=%lld T=%lld\n", (long long) il,
+                             (long long) pos0, (long long) T);
+            }
+            const bool ok = omph::kernels::attention_flash_q8q4(
+                static_cast<const float *>(q_), kq, ksc, vq, vsc, k16, v16,
+                static_cast<const float *>(gate_), static_cast<float *>(attn_), T, pos0 + T,
+                h_.n_head, h_.n_head_kv, h_.head_dim, scale, h_.n_head / h_.n_head_kv,
+                kv_window_, nullptr);
+            if (hipDeviceSynchronize() != hipSuccess) {
+                return false;
+            }
+            return ok;
+        }
+        if (k_cache == nullptr || v_cache == nullptr) {
+            return false;
+        }
+        if (hipMemcpy(k_cache + pos0 * kv_out, k_, (size_t) T * kv_out * 4,
+                      hipMemcpyDeviceToDevice) != hipSuccess ||
+            hipMemcpy(v_cache + pos0 * kv_out, v_, (size_t) T * kv_out * 4,
+                      hipMemcpyDeviceToDevice) != hipSuccess) {
+            return false;
+        }
+        return omph::kernels::attention(static_cast<const float *>(q_), k_cache, v_cache,
+                                        static_cast<const float *>(gate_),
+                                        static_cast<float *>(attn_), T, pos0 + T, h_.n_head,
+                                        h_.n_head_kv, h_.head_dim, scale, nullptr);
     }
 
     // One fused GEMV launch for a single token, dispatched on the GGUF type.
@@ -742,6 +955,23 @@ private:
         if (use_gemv_ && T > 1) {
             const auto it = gems_.find(name);
             if (it != gems_.end() && it->second.rows == n_out && it->second.k == k &&
+                !it->second.has_b4 && has_gemv_type(it->second.type)) {
+                // Types with a single-token kernel but no small-batch form: run one
+                // per token. No staging, so a long prefill stays inside VRAM — it
+                // just does not amortize the weight read (the b4 port is the fix).
+                const uint8_t * w = static_cast<const uint8_t *>(dev_weights_) + it->second.off;
+                const auto * xb = static_cast<const uint8_t *>(x16);
+                timer_gemv_.start();
+                bool ok = true;
+                for (int64_t t0 = 0; t0 < T && ok; ++t0) {
+                    ok = gemv_one(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k);
+                }
+                timer_gemv_.stop(t_gemv_);
+                if (ok) {
+                    return true;
+                }
+            }
+            if (it != gems_.end() && it->second.rows == n_out && it->second.k == k &&
                 it->second.has_b4) {
                 const uint8_t * w = static_cast<const uint8_t *>(dev_weights_) + it->second.off;
                 const auto * xb = static_cast<const uint8_t *>(x16);
@@ -814,8 +1044,8 @@ private:
         // 18.6 MiB tensor. Convert once, keep it: at most 64 MiB, which keeps the
         // big repacked weights (whose f16 form would not fit VRAM) out.
         const int64_t n_elems = numel(*t);
-        const bool cacheable = std::getenv("OMPH_NO_F16_CACHE") == nullptr &&
-                              !has_gemv_type(t->type) && n_elems * 2 <= (256 << 20);
+        bool cacheable = std::getenv("OMPH_NO_F16_CACHE") == nullptr &&
+                         !has_gemv_type(t->type) && n_elems * 2 <= (256 << 20);
         if (cacheable) {
             const auto it = f16_cache_.find(name);
             if (it != f16_cache_.end()) {
@@ -834,7 +1064,10 @@ private:
         void * dst = nullptr;
         if (cacheable) {
             if (hipMalloc(&dst, (size_t) n * 2) != hipSuccess) {
-                throw std::runtime_error("cannot cache f16 for " + name);
+                // Long contexts fill VRAM: caching is an optimization, never a
+                // reason to fail. Fall back to the per-call staging buffer.
+                cacheable = false;
+                dst = scratch_.alloc((size_t) n * 2);
             }
         } else {
             dst = scratch_.alloc((size_t) n * 2);
@@ -891,11 +1124,20 @@ private:
     std::unordered_map<std::string, GemvEntry> gems_;
     Scratch scratch_;
     std::vector<void *> states_;
+    bool last_logits_only_ = false;
     std::vector<int64_t> kv_index_;
     std::vector<char> conv_flip_;
     int64_t max_seq_ = 0;
     void * kv_k_ = nullptr;
     void * kv_v_ = nullptr;
+    void * kv_kq_ = nullptr;
+    void * kv_ks_ = nullptr;
+    void * kv_vq_ = nullptr;
+    void * kv_vs_ = nullptr;
+    void * kv_k16_ = nullptr;
+    void * kv_v16_ = nullptr;
+    int64_t kv_window_ = 0;  // off by default: measured neutral at 512 tokens (M5)
+    bool kv_q8q4_ = false;
     void * dev_weights_ = nullptr;
     void * x_ = nullptr;
     void * cur_ = nullptr;
@@ -941,11 +1183,14 @@ int main(int argc, char ** argv) {
     std::string trace_dir;
     std::string gen_path;
     int64_t max_tokens = 0;
+    bool last_logits = false;
     int64_t generate = 0;
     bool use_gemv = false;
     for (int i = 4; i < argc; ++i) {
         if (std::strcmp(argv[i], "--trace-dir") == 0 && i + 1 < argc) {
             trace_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--last-logits") == 0) {
+            last_logits = true;
         } else if (std::strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
             max_tokens = std::atoll(argv[++i]);
         } else if (std::strcmp(argv[i], "--generate") == 0 && i + 1 < argc) {
@@ -978,11 +1223,25 @@ int main(int argc, char ** argv) {
         }
         // Repacking only pays off when the decode runs: a prefill-only run is
         // better off with the raw bytes in place (no staging fallback).
-        Runner runner(model, (int64_t) toks.size() + generate + 8, use_gemv && generate > 0);
+        // Long prompts run in chunks: the activation buffers are sized by the
+        // chunk, the KV cache by the whole sequence. Without this, a 8k prompt
+        // needs ~3 GB of activations on top of the weights and does not fit.
+        const int64_t total_len = (int64_t) toks.size() + generate + 8;
+        int64_t act_chunk = total_len < 512 ? total_len : 512;
+        if (max_tokens > 0 && max_tokens < act_chunk) {
+            act_chunk = max_tokens;
+        }
+        Runner runner(model, act_chunk, use_gemv && generate > 0, last_logits, total_len);
         const HParams & h = runner.hparams();
         std::vector<float> logits;
-        if (!runner.forward(toks, logits, trace_dir, 0)) {
-            return 1;
+        for (int64_t off = 0; off < (int64_t) toks.size(); off += act_chunk) {
+            const int64_t n = std::min<int64_t>(act_chunk, (int64_t) toks.size() - off);
+            const std::vector<int32_t> part(toks.begin() + (size_t) off,
+                                            toks.begin() + (size_t) (off + n));
+            const bool last = off + n == (int64_t) toks.size();
+            if (!runner.forward(part, logits, last ? trace_dir : std::string(), off)) {
+                return 1;
+            }
         }
         write_f32(logits_path, logits);
         const auto argmax = [&](const float * row) {
@@ -998,7 +1257,7 @@ int main(int argc, char ** argv) {
             // greedy decode: one token per step, reusing the KV cache, the conv
             // state and the delta-net state
             std::vector<int32_t> gen;
-            int32_t next = argmax(logits.data() + (toks.size() - 1) * (size_t) h.n_vocab);
+            int32_t next = argmax(logits.data() + (logits.size() - h.n_vocab));
             for (int64_t i = 0; i < generate; ++i) {
                 gen.push_back(next);
                 if (i + 1 == generate) {
@@ -1023,9 +1282,10 @@ int main(int argc, char ** argv) {
             std::printf("\n");
         }
         // greedy tokens for the report
-        std::printf("logits: %lld x %lld -> %s\ngreedy:", (long long) toks.size(),
+        const size_t n_rows = logits.size() / (size_t) h.n_vocab;
+        std::printf("logits: %lld x %lld -> %s\ngreedy:", (long long) n_rows,
                     (long long) h.n_vocab, logits_path.c_str());
-        for (size_t t = 0; t < toks.size(); ++t) {
+        for (size_t t = 0; t < n_rows; ++t) {
             const float * row = logits.data() + t * (size_t) h.n_vocab;
             std::printf(" %lld", (long long) argmax(row));
         }
