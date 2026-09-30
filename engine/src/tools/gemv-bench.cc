@@ -28,43 +28,12 @@ int fail(const char * msg) {
 
 bool repack_tensor(const uint32_t type, const void * src, const int64_t n_blocks,
                     std::vector<uint8_t> & dst) {
-    if (type == 12) {
-        dst.resize((size_t) omph::format::q4k_layout(n_blocks).total);
-        omph::format::repack_q4k(src, n_blocks, dst.data());
-    } else if (type == 23) {
-        dst.resize((size_t) omph::format::iq4_layout(n_blocks).total);
-        omph::format::repack_iq4_xs(src, n_blocks, dst.data());
-    } else if (type == 18) {
-        dst.resize((size_t) omph::format::iq3_xxs_layout(n_blocks).total);
-        omph::format::repack_iq3_xxs(src, n_blocks, dst.data());
-    } else if (type == 21) {
-        dst.resize((size_t) omph::format::iq3s_layout(n_blocks).total);
-        omph::format::repack_iq3_s(src, n_blocks, dst.data());
-    } else if (type == 10) {
-        dst.resize((size_t) omph::format::q2k_layout(n_blocks).total);
-        omph::format::repack_q2k(src, n_blocks, dst.data());
-    } else {
-        return false;
-    }
-    return true;
+    return omph::format::repack_any(type, src, n_blocks, dst);
 }
 
 bool unrepack_tensor(const uint32_t type, const void * src, const int64_t n_blocks,
                      std::vector<uint8_t> & dst) {
-    if (type == 12) {
-        omph::format::unrepack_q4k(src, n_blocks, dst.data());
-    } else if (type == 23) {
-        omph::format::unrepack_iq4_xs(src, n_blocks, dst.data());
-    } else if (type == 18) {
-        omph::format::unrepack_iq3_xxs(src, n_blocks, dst.data());
-    } else if (type == 21) {
-        omph::format::unrepack_iq3_s(src, n_blocks, dst.data());
-    } else if (type == 10) {
-        omph::format::unrepack_q2k(src, n_blocks, dst.data());
-    } else {
-        return false;
-    }
-    return true;
+    return omph::format::unrepack_any(type, src, n_blocks, dst);
 }
 
 struct Case {
@@ -87,6 +56,9 @@ bool launch(const Case & c, const void * x, float * y, hipStream_t stream) {
     }
     if (c.t->type == 21) {
         return omph::kernels::gemv_iq3_s(c.dev, x, y, c.rows, c.k, stream);
+    }
+    if (c.t->type == 10) {
+        return omph::kernels::gemv_q2k(c.dev, x, y, c.rows, c.k, stream);
     }
     return false;
 }

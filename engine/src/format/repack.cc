@@ -359,4 +359,49 @@ void unrepack_q2k(const void * src, const int64_t n_blocks, void * dst) {
     }
 }
 
+int64_t quant_block_bytes(const uint32_t type) {
+    switch (type) {
+        case 10: return 84;    // Q2_K   (layout only, no kernel yet)
+        case 12: return 144;   // Q4_K
+        case 18: return 98;    // IQ3_XXS
+        case 21: return 110;   // IQ3_S
+        case 23: return 136;   // IQ4_XS
+        default: return 0;
+    }
+}
+
+bool repack_any(const uint32_t type, const void * src, const int64_t n_blocks,
+                std::vector<uint8_t> & dst) {
+    if (type == 12) {
+        dst.resize((size_t) q4k_layout(n_blocks).total);
+        repack_q4k(src, n_blocks, dst.data());
+    } else if (type == 23) {
+        dst.resize((size_t) iq4_layout(n_blocks).total);
+        repack_iq4_xs(src, n_blocks, dst.data());
+    } else if (type == 18) {
+        dst.resize((size_t) iq3_xxs_layout(n_blocks).total);
+        repack_iq3_xxs(src, n_blocks, dst.data());
+    } else if (type == 21) {
+        dst.resize((size_t) iq3s_layout(n_blocks).total);
+        repack_iq3_s(src, n_blocks, dst.data());
+    } else if (type == 10) {
+        dst.resize((size_t) q2k_layout(n_blocks).total);
+        repack_q2k(src, n_blocks, dst.data());
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool unrepack_any(const uint32_t type, const void * src, const int64_t n_blocks,
+                  std::vector<uint8_t> & dst) {
+    if (type == 12) unrepack_q4k(src, n_blocks, dst.data());
+    else if (type == 23) unrepack_iq4_xs(src, n_blocks, dst.data());
+    else if (type == 18) unrepack_iq3_xxs(src, n_blocks, dst.data());
+    else if (type == 21) unrepack_iq3_s(src, n_blocks, dst.data());
+    else if (type == 10) unrepack_q2k(src, n_blocks, dst.data());
+    else return false;
+    return true;
+}
+
 } // namespace omph::format

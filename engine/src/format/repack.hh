@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 
 namespace omph::format {
 
@@ -139,5 +140,12 @@ struct Q2kLayout {
 Q2kLayout q2k_layout(int64_t n_blocks);
 void repack_q2k(const void * src, int64_t n_blocks, void * dst);
 void unrepack_q2k(const void * src, int64_t n_blocks, void * dst);
+
+// Byte size of one quantized block of `type` (0 when unsupported).
+int64_t quant_block_bytes(uint32_t type);
+
+// Dispatch helpers over the types with a repacked layout + GEMV kernel.
+bool repack_any(uint32_t type, const void * src, int64_t n_blocks, std::vector<uint8_t> & dst);
+bool unrepack_any(uint32_t type, const void * src, int64_t n_blocks, std::vector<uint8_t> & dst);
 
 } // namespace omph::format
