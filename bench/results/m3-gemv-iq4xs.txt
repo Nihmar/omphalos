@@ -949,3 +949,40 @@ a nearly flat distribution (top-10 mass 0.007), so the KL is measuring noise on
 the tails rather than a change in what the model believes. The real-prompt number
 to quote is the 10-token one, and the honest statement is that the long-context
 validation is still open.
+
+# M5 — chunked prefill: 8192 tokens now runs at all
+
+The activation buffers were sized by the whole prompt, so at 8192 they cost ~3 GB
+(tmp_logits_ 1.07 GB, ffn1_/ffn2_ 570 MB each) on top of 12.4 GiB of weights and
+the run died. `--last-logits` did not help: those buffers are allocated in the
+constructor regardless.
+
+The prefill now runs in chunks of 512 (activations by chunk, KV by the whole
+sequence):
+
+| context | before | after |
+|---|---|---|
+| 512 | runs | runs |
+| 2048 | `error: ffn failed` | runs |
+| 8192 | out of VRAM | **runs** |
+| 32768 | out of VRAM | out of VRAM |
+
+Two things 32768 is still short of, both identified rather than guessed:
+
+1. **The f32 KV is still allocated alongside the quantized one** — 4.3 GB wasted
+   in that mode. Skipping it looked like a two-line change and regressed the
+   working 8192 case (the attention plumbing holds pointers into a cache that no
+   longer exists), so it was reverted and is recorded here rather than half-done.
+2. **The quantized attention dequantizes per (query, position) pair** — every one
+   of the 256 query threads converts the same key from bytes, a 256x redundancy.
+   That is why the quantized KV is *slower* at long context instead of faster:
+
+   | 8192 tokens | step |
+   |---|---:|
+   | f32 KV | 79.5 ms |
+   | K Q8 + V Q4 | 104.6 ms |
+
+   At that length the KV reads are ~4 % of the step, so the bandwidth saved is
+   ~3 ms against ~25 ms of extra conversions. The fix is the LDS-tiled form of
+   PLAN §8.3 (dequantize each key block once per workgroup, reuse across the query
+   positions) or the int8 dot of §13.8 — not more window tuning.

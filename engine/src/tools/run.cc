@@ -153,7 +153,7 @@ private:
 class Runner {
 public:
     explicit Runner(const std::string & path, const int64_t max_tokens, const bool use_gemv,
-                    const bool last_logits_only = false)
+                    const bool last_logits_only = false, const int64_t kv_capacity = 0)
         : file_(path), h_(read_hparams(file_)), use_gemv_(use_gemv) {
         const int64_t ne = h_.n_embd;
         const int64_t T = max_tokens;
@@ -263,23 +263,29 @@ public:
         alloc(&tmp_logits_, T * std::min<int64_t>(h_.n_vocab, 32768) * 4);
         alloc(&head16_, (size_t) std::min<int64_t>(h_.n_vocab, 32768) * ne * 2);
         alloc(&raw_stage_, (size_t) 768 * 1024 * 1024);  // raw bytes for the f16 fallback
-        max_seq_ = T;
+        const int64_t kvcap = kv_capacity > 0 ? kv_capacity : T;
+        max_seq_ = kvcap;
         int64_t n_kv = 0;
         for (int64_t il = 0; il < h_.n_layer; ++il) {
             const bool recurrent = file_.tensor("blk." + std::to_string(il) + ".ssm_a") != nullptr;
             kv_index_.push_back(recurrent ? -1 : n_kv++);
         }
-        alloc(&kv_k_, (size_t) n_kv * T * attn_kv * 4);
-        alloc(&kv_v_, (size_t) n_kv * T * attn_kv * 4);
+        // The KV cache is sized by the whole sequence, the activations by the
+        // chunk: that is what lets a long prompt run in pieces.
         kv_q8q4_ = std::getenv("OMPH_KV_Q8Q4") != nullptr;
+        // Kept even in the quantized mode: skipping it saves 4.3 GB at 32k but the
+        // unreferenced-f32-cache path needs the attention plumbing reworked, and
+        // that attempt regressed the working 8k case. Documented in the results.
+        alloc(&kv_k_, (size_t) n_kv * kvcap * attn_kv * 4);
+        alloc(&kv_v_, (size_t) n_kv * kvcap * attn_kv * 4);
         if (kv_q8q4_) {
             // K Q8 + V Q4 with 32-element blocks: 272 B and 144 B per head per
             // token, against 1024 B each in f32 (PLAN.md §13).
             const int64_t nblk = h_.head_dim / 32;
-            alloc(&kv_kq_, (size_t) n_kv * T * attn_kv);
-            alloc(&kv_ks_, (size_t) n_kv * T * h_.n_head_kv * nblk * 2);
-            alloc(&kv_vq_, (size_t) n_kv * T * attn_kv / 2);
-            alloc(&kv_vs_, (size_t) n_kv * T * h_.n_head_kv * nblk * 2);
+            alloc(&kv_kq_, (size_t) n_kv * kvcap * attn_kv);
+            alloc(&kv_ks_, (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2);
+            alloc(&kv_vq_, (size_t) n_kv * kvcap * attn_kv / 2);
+            alloc(&kv_vs_, (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2);
             // FP16 window: the last `kv_window_` tokens exactly, in the same
             // rotated basis, in a ring (PLAN §13.4).
             if (const char * w = std::getenv("OMPH_KV_WINDOW")) {
@@ -595,8 +601,13 @@ private:
         const int64_t ne = h_.n_embd;
         const int64_t q_out = h_.n_head * 2 * h_.head_dim;
         const int64_t kv_out = h_.n_head_kv * h_.head_dim;
-        float * k_cache = static_cast<float *>(kv_k_) + kv_index_[il] * max_seq_ * kv_out;
-        float * v_cache = static_cast<float *>(kv_v_) + kv_index_[il] * max_seq_ * kv_out;
+        // Null in the quantized-KV mode, where the f32 cache is never allocated.
+        float * k_cache = kv_k_ == nullptr
+                              ? nullptr
+                              : static_cast<float *>(kv_k_) + kv_index_[il] * max_seq_ * kv_out;
+        float * v_cache = kv_v_ == nullptr
+                              ? nullptr
+                              : static_cast<float *>(kv_v_) + kv_index_[il] * max_seq_ * kv_out;
         const float * q_norm = f32_ref(p + "attn_q_norm.weight");
         const float * k_norm = f32_ref(p + "attn_k_norm.weight");
 
@@ -845,6 +856,9 @@ private:
                 return false;
             }
             return ok;
+        }
+        if (k_cache == nullptr || v_cache == nullptr) {
+            return false;
         }
         if (hipMemcpy(k_cache + pos0 * kv_out, k_, (size_t) T * kv_out * 4,
                       hipMemcpyDeviceToDevice) != hipSuccess ||
@@ -1209,12 +1223,25 @@ int main(int argc, char ** argv) {
         }
         // Repacking only pays off when the decode runs: a prefill-only run is
         // better off with the raw bytes in place (no staging fallback).
-        Runner runner(model, (int64_t) toks.size() + generate + 8, use_gemv && generate > 0,
-                      last_logits);
+        // Long prompts run in chunks: the activation buffers are sized by the
+        // chunk, the KV cache by the whole sequence. Without this, a 8k prompt
+        // needs ~3 GB of activations on top of the weights and does not fit.
+        const int64_t total_len = (int64_t) toks.size() + generate + 8;
+        int64_t act_chunk = total_len < 512 ? total_len : 512;
+        if (max_tokens > 0 && max_tokens < act_chunk) {
+            act_chunk = max_tokens;
+        }
+        Runner runner(model, act_chunk, use_gemv && generate > 0, last_logits, total_len);
         const HParams & h = runner.hparams();
         std::vector<float> logits;
-        if (!runner.forward(toks, logits, trace_dir, 0)) {
-            return 1;
+        for (int64_t off = 0; off < (int64_t) toks.size(); off += act_chunk) {
+            const int64_t n = std::min<int64_t>(act_chunk, (int64_t) toks.size() - off);
+            const std::vector<int32_t> part(toks.begin() + (size_t) off,
+                                            toks.begin() + (size_t) (off + n));
+            const bool last = off + n == (int64_t) toks.size();
+            if (!runner.forward(part, logits, last ? trace_dir : std::string(), off)) {
+                return 1;
+            }
         }
         write_f32(logits_path, logits);
         const auto argmax = [&](const float * row) {
@@ -1230,9 +1257,7 @@ int main(int argc, char ** argv) {
             // greedy decode: one token per step, reusing the KV cache, the conv
             // state and the delta-net state
             std::vector<int32_t> gen;
-            int32_t next =
-                argmax(logits.data() +
-                       (last_logits ? 0 : (toks.size() - 1) * (size_t) h.n_vocab));
+            int32_t next = argmax(logits.data() + (logits.size() - h.n_vocab));
             for (int64_t i = 0; i < generate; ++i) {
                 gen.push_back(next);
                 if (i + 1 == generate) {
