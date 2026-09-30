@@ -691,6 +691,21 @@ private:
     // dequant + hipBLASLt path.
     bool matmul(const std::string & name, const void * x16, float * y, const int64_t n_out,
                 const int64_t k, const int64_t T) {
+        if (T == 1) {
+            // BF16 weights: bf16 is the top half of an f32, so a direct dot
+            // product beats converting to f16 and running a tiny M = 1 GEMM.
+            const omph::gguf::TensorInfo * ti = file_.tensor(name);
+            if (ti != nullptr && ti->type == 30 && ti->ne[1] == n_out && ti->ne[0] == k &&
+                std::getenv("OMPH_NO_BF16_GEMV") == nullptr) {
+                const void * w = static_cast<const uint8_t *>(dev_weights_) + off_.at(name);
+                timer_gemv_.start();
+                const bool ok = omph::kernels::gemv_bf16(w, x16, y, n_out, k, nullptr);
+                timer_gemv_.stop(t_gemv_);
+                if (ok) {
+                    return true;
+                }
+            }
+        }
         if (use_gemv_ && T == 1) {
             const auto it = gems_.find(name);
             if (it != gems_.end() && it->second.rows == n_out && it->second.k == k) {
@@ -704,6 +719,21 @@ private:
                 if (gemv_ok) {
                     return true;
                 }
+                if (std::getenv("OMPH_TRACE_F16") != nullptr) {
+                    const omph::gguf::TensorInfo * ti = file_.tensor(name);
+                    std::fprintf(stderr,
+                                 "f16 path: %s (entry %s, type %u, ne %lld x %lld, %lld B)\n",
+                                 name.c_str(), it != gems_.end() ? "yes" : "no",
+                                 ti != nullptr ? (unsigned) ti->type : 0u,
+                                 ti != nullptr ? (long long) ti->ne[0] : 0,
+                                 ti != nullptr ? (long long) ti->ne[1] : 0,
+                                 ti != nullptr ? (long long) ti->nbytes : 0);
+                }
+            } else if (std::getenv("OMPH_TRACE_F16") != nullptr) {
+                const omph::gguf::TensorInfo * ti = file_.tensor(name);
+                std::fprintf(stderr, "f16 path: %s (not a gemv tensor, type %u, %lld B)\n",
+                             name.c_str(), ti != nullptr ? (unsigned) ti->type : 0u,
+                             ti != nullptr ? (long long) ti->nbytes : 0);
             }
         }
         if (use_gemv_ && T > 1) {

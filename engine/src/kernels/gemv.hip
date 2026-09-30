@@ -1310,6 +1310,61 @@ __global__ void gemv_iq3_b4_kernel(const uint8_t * __restrict__ qs,
     }
 }
 
+// BF16 weights, single token: bf16 is the top half of an f32, so the conversion
+// is a shift and the kernel is a plain bandwidth-bound dot product. This exists
+// because the f16 path has to convert these small matrices and then runs a tiny
+// M = 1 GEMM, which costs ~40 us per call regardless of the size.
+__device__ inline float bf16_to_f32(const uint16_t b) {
+    return __uint_as_float((uint32_t) b << 16);
+}
+
+constexpr long long kBf16Threads = 256;  // eight warps per row
+
+// One workgroup per output row, the k dimension split across the warps with an
+// LDS reduction: with 48 rows there is no other way to fill the GPU, and the row
+// at 10 KB is far too small for a warp-per-row scheme.
+__global__ void gemv_bf16_kernel(const uint16_t * __restrict__ w, const __half * __restrict__ x,
+                                 float * __restrict__ y, const long long rows, const long long k) {
+    __shared__ float red[kBf16Threads / 32];
+    const long long row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const int nwarp = (int) (blockDim.x / 32);
+    const uint16_t * wrow = w + row * k;
+
+    const long long per_warp = (k + nwarp - 1) / nwarp;
+    const long long begin = (long long) warp * per_warp;
+    const long long end = begin + per_warp < k ? begin + per_warp : k;
+
+    float acc = 0.0f;
+    for (long long i = begin + lane * 8; i < end; i += 32 * 8) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (i + j < end) {
+                acc = fmaf(bf16_to_f32(wrow[i + j]), __half2float(x[i + j]), acc);
+            }
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off);
+    }
+    if (lane == 0) {
+        red[warp] = acc;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < nwarp; ++i) {
+            total += red[i];
+        }
+        y[row] = total;
+    }
+}
+
 } // namespace
 
 bool gemv_q4k_b4(const void * packed, const void * x_f16, float * y, const int64_t rows,
@@ -1588,6 +1643,16 @@ bool gemv_iq3_xxs_b4(const void * packed, const void * x_f16, float * y, const i
                                                  base + l.d_off,
                                                  static_cast<const __half *>(x_f16), y, rows,
                                                  n_sub, k);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool gemv_bf16(const void * w, const void * x_f16, float * y, const int64_t rows, const int64_t k,
+               hipStream_t stream) {
+    if (w == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 || k % 256 != 0) {
+        return false;
+    }
+    gemv_bf16_kernel<<<(unsigned) rows, kBf16Threads, 0, stream>>>(
+        static_cast<const uint16_t *>(w), static_cast<const __half *>(x_f16), y, rows, k);
     return hipGetLastError() == hipSuccess;
 }
 

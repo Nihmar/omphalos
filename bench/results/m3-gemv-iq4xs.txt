@@ -766,3 +766,59 @@ with the greedy tokens unchanged (`198 760 3841`).
 
 The earlier per-section phase numbers were not comparable between runs (timer
 attribution shifts), which is why this is measured by ablation on one binary.
+
+# M3.25 — where a decode step actually goes, and two results it produced
+
+Traced one decode step with the full kernel names (the earlier analysis collapsed
+them all into one bucket because the demangled names contain commas):
+
+| ms | us/kernel | count | kernel |
+|---:|---:|---:|---|
+| 25.58 | 145 | 176 | gemv_iq3s |
+| 17.33 | 126 | 137 | gemv_iq4 (IQ4_XS) |
+| 11.32 | 138 | 82 | gemv_iq3 (IQ3_XXS) |
+| 10.21 | 173 | 59 | gemv_q4k |
+| **4.88** | **41** | **119** | **Cijk (hipBLASLt, MT16x16x32)** |
+| 3.23 | 27 | 120 | (gated norm chain) |
+| 2.65 | 166 | 16 | gemv_iq2s |
+| 2.62 | 44 | 60 | delta_step |
+| 2.41 | 15 | 159 | rms_norm_f16 |
+| 1.87 / 1.77 / 0.94 | | 14 / 9 / 6 | gemv_q2k / iq2xs / iq2xxs |
+
+The GEMVs are 72 ms of the 87 ms busy — 82 % of the step — and they run at
+~168 GB/s against the 250 GB/s the same kernels reach on a large tensor in the
+bench. (The bench overstates the small tensors: a 27 MiB tensor fits in L2, so
+those numbers are cache bandwidth.)
+
+## Result 1: HIP graphs are worth ~1 ms, not 25 (negative, and that closes a line)
+
+`omph-graph-probe` launches a chain of the same length as a decode step (1861
+tiny dependent kernels) and replays the identical chain from a graph:
+
+| | ms | us per kernel |
+|---|---:|---:|
+| launched one by one | 6.755 | 3.63 |
+| replayed as a graph | 5.773 | 3.10 |
+| saved | **0.982** | 0.54 |
+
+A graph recovers 15 % of the per-kernel cost, i.e. **~1 ms of a 57 ms step**. The
+schedule state I had inferred from the trace (91 % busy, 9 % gaps) does not imply
+what I thought it did. This is the cheap experiment that pays for itself: the
+device-side token/position refactor capture needs is not worth a 2 % win.
+
+## Result 2: 96 BF16 GEMVs replace 119 tiny hipBLASLt GEMMs (-3.2 ms/step, -5.3 %)
+
+`ssm_alpha`/`ssm_beta` are BF16 (type 30) and went through the f16 path: convert
+to f16, then an M = 1 GEMM with 16x16 tiles — ~41 us per call for a 480 KB matrix.
+`gemv_bf16` does the dot product directly (bf16 -> f32 is a shift).
+
+The first version was *slower* than what it replaced: a warp-per-row grid gave
+2 workgroups for 48 rows. One workgroup per row, k split across eight warps with
+an LDS reduction, is the shape that works:
+
+| | total for 40 decode steps |
+|---|---:|
+| OMPH_NO_BF16_GEMV=1 | 9578 ms |
+| with gemv_bf16 | **9451 ms** |
+
+3.2 ms per step, tokens identical (`198 760 3841`), 40 steps measured twice each.

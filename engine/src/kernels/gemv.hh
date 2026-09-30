@@ -80,4 +80,8 @@ bool gemv_iq4_xs_b4(const void * packed, const void * x_f16, float * y, int64_t 
 bool gemv_iq3_xxs_b4(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
                      hipStream_t stream);
 
+// BF16 weights (type 30), single token: a plain dot product, no codebook.
+bool gemv_bf16(const void * w, const void * x_f16, float * y, int64_t rows, int64_t k,
+               hipStream_t stream);
+
 } // namespace omph::kernels
