@@ -49,22 +49,43 @@ static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) {
         return true;  // activations only
     }
-    const size_t nbytes = ggml_nbytes(t);
-    if (nbytes == 0) {
+    if (t->buffer == nullptr) {
+        return true;
+    }
+    // Pack the logical content (ne0 fastest, rows contiguous): views can have
+    // arbitrary strides between rows, so a flat memcpy would mix rows up.
+    const size_t row_bytes = ggml_row_size(t->type, t->ne[0]);
+    const size_t logical = row_bytes * (size_t) t->ne[1] * (size_t) t->ne[2] * (size_t) t->ne[3];
+    if (row_bytes == 0 || logical == 0) {
         return true;
     }
 
-    std::vector<uint8_t> buf;
-    const void * data = nullptr;
-    if (t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) {
-        data = t->data;
-    } else if (t->buffer != nullptr) {
-        buf.resize(nbytes);
-        ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
-        data = buf.data();
-    }
-    if (data == nullptr) {
-        return true;
+    std::vector<uint8_t> packed(logical);
+    if (ggml_backend_buffer_is_host(t->buffer) && ggml_nbytes(t) == logical) {
+        std::memcpy(packed.data(), t->data, logical);
+    } else if (ggml_backend_buffer_is_host(t->buffer)) {
+        const char * base = (const char *) t->data;
+        size_t off = 0;
+        for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+                for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                    std::memcpy(packed.data() + off,
+                                base + i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3], row_bytes);
+                    off += row_bytes;
+                }
+            }
+        }
+    } else {
+        size_t off = 0;
+        for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+                for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                    const size_t byte_off = i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3];
+                    ggml_backend_tensor_get(t, packed.data() + off, byte_off, row_bytes);
+                    off += row_bytes;
+                }
+            }
+        }
     }
 
     const char * ext = t->type == GGML_TYPE_F32  ? "f32"
@@ -74,18 +95,18 @@ static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     std::snprintf(fname, sizeof(fname), "%s/%04d-%s.%s", st->outdir.c_str(), st->counter++,
                   sanitize(t->name).c_str(), ext);
     if (FILE * f = std::fopen(fname, "wb")) {
-        std::fwrite(data, 1, nbytes, f);
+        std::fwrite(packed.data(), 1, logical, f);
         std::fclose(f);
     }
     const char * base = std::strrchr(fname, '/');
     std::fprintf(st->index,
                  "{\"name\": \"%s\", \"op\": \"%s\", \"type\": \"%s\","
-                 " \"ne\": [%lld, %lld, %lld, %lld], \"file\": \"%s\"}\n",
+                 " \"ne\": [%lld, %lld, %lld, %lld], \"bytes\": %lld, \"file\": \"%s\"}\n",
                  t->name, ggml_op_name(t->op), ggml_type_name(t->type), (long long) t->ne[0],
                  (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
-                 base ? base + 1 : fname);
+                 (long long) logical, base ? base + 1 : fname);
     st->saved++;
-    st->bytes += (long long) nbytes;
+    st->bytes += (long long) logical;
     return true;
 }
 

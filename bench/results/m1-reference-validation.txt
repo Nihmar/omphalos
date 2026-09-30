@@ -1,0 +1,45 @@
+# M1 — reference forward pass validation (2026-09-30)
+
+Golden data: `tools/native/dump_tensors` (CPU backend, f32 activations) for the
+10-token prompt `"The quick brown fox jumps over the lazy dog."` →
+`models/golden/cpu` (3461 tensors, local only). Regenerate with
+`tools/native/build.sh <llama.cpp-dir>` + one `dump_tensors` run.
+
+Reference: `tools/src/omphalos_tools/reference.py` (NumPy; one pass over the 10
+tokens with the gated delta net recurrence in ggml layout and a KV cache for the
+16 full-attention layers), validated by `tools/validate_reference.py`.
+
+## Layer-by-layer (relative max error vs golden)
+
+| layer | attn_norm | attn_residual | ffn_out | l_out |
+|---|---:|---:|---:|---:|
+| 0 | 4.6e-08 | 6.2e-03 | 1.0e-02 | 3.8e-03 |
+| 29 | 3.7e-03 | 6.4e-03 | 6.6e-02 | 6.4e-03 |
+| 49 | 1.0e-02 | 2.0e-02 | 5.3e-02 | 2.0e-02 |
+| 62 | 1.9e-02 | 1.1e-02 | 7.0e-02 | 1.3e-02 |
+
+The error floor is set by llama.cpp's CPU path itself: for quantized weights it
+quantizes the activations to q8_K in every matmul, so each GEMM carries ~0.5–1%
+relative error; over 64 layers it accumulates to a few percent. Our reference is
+the more accurate side of the comparison (embeddings are bit-exact: rel = 0).
+
+## End-to-end (last prompt position)
+
+- top-1: reference 198 vs llama.cpp 198 → **match**
+- **KL(llama.cpp || reference) = 1.6e-03**, logits max|d| 0.43 (|logits| up to ~20)
+
+## Known differences
+
+- `new_state-N` (the fused `ggml_gated_delta_net` output buffer) uses a
+  different internal layout in llama.cpp: the per-token outputs match, the
+  dumped state tensor does not. To settle in M2 against the engine kernels.
+- `q_conv_predelta-N` in the dump has 16 k-heads (the fused kernel does the
+  v-head expansion internally); the reference tiles k-heads as `h % n_kh`
+  (ggml_repeat semantics — verified empirically).
+
+## Reproduce
+
+```
+cd tools
+uv run python validate_reference.py --tol 3e-2 --quiet     # ~3.5 min for 64 layers
+```
