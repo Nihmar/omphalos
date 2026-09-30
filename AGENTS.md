@@ -70,8 +70,9 @@ engine/build/omph-run <model.gguf> models/golden/cpu/tokens.txt <out-logits.f32>
 
 # per-block checks against the golden dump (models/golden/cpu, local)
 cd tools
-uv run python check_gpu_dequant.py                 # dequant kernels vs ggml
-uv run python check_gpu_linear.py                 # matmul path
+../engine/build/omph-dequant <model> <tensor> /tmp/dq.raw
+uv run python validate_gpu_dequant.py <model> <tensor> /tmp/dq.raw  # dequant kernel, bit-exact
+uv run python check_gpu_linear.py <model> <tensor>  # matmul path
 uv run python check_gpu_attn.py <model> <layer>   # attention layers 3 / 7 / 63
 uv run python check_gpu_gdn.py  <model> <layer>   # delta-net layers 0 / 1 / 20
 uv run python check_gpu_run.py  <model> --layers  # 64-layer stack vs the dump
