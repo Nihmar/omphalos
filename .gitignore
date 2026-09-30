@@ -26,3 +26,6 @@ bench/results/*.srv.log
 
 # Raw profiler traces (summaries are kept in bench/results/)
 bench/traces/
+
+# Native tool binaries (built by tools/native/build.sh)
+tools/native/dump_tensors
