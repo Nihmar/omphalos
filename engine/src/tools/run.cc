@@ -615,7 +615,10 @@ public:
 private:
     // Returns false: every caller is a bool function that reports failure.
     static bool fail(const char * msg) {
-        std::fprintf(stderr, "%s\n", msg);
+        // The pending HIP error (if any) is usually the actual cause.
+        const hipError_t err = hipGetLastError();
+        std::fprintf(stderr, "%s%s%s\n", msg, err != hipSuccess ? ": " : "",
+                     err != hipSuccess ? hipGetErrorString(err) : "");
         return false;
     }
 
@@ -1034,7 +1037,10 @@ private:
         if (cacheable) {
             if (hipMalloc(&dst, (size_t) n * 2) != hipSuccess) {
                 // Long contexts fill VRAM: caching is an optimization, never a
-                // reason to fail. Fall back to the per-call staging buffer.
+                // reason to fail. Fall back to the per-call staging buffer, and
+                // clear the out-of-memory error, which the next kernel wrapper's
+                // hipGetLastError() would otherwise report as its own failure.
+                (void) hipGetLastError();
                 cacheable = false;
                 dst = scratch_.alloc((size_t) n * 2);
             }
