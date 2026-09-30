@@ -149,6 +149,34 @@ Other per-token traffic (small but not zero):
 
 ### 4.2 Prefill is compute-bound
 
+**Where milestone 2/3 actually stand (measured, 2026-09-30).** The current prefill
+is the *correctness* path, not a prefill design: 2.1 s for a 10-token prompt =
+**4.7 t/s** (f16 path), 8.7 s with `--gemv` (the fallback re-stages raw bytes;
+use `--gemv` for decode measurements only). Against llama.cpp's measured
+**622.7 t/s** (pp512, M0) and the ~700-800 t/s target, four things separate us:
+
+1. **f16 materialization.** The M2 path dequantizes every weight to f16 in global
+   memory per pass: 27.5 B params x 2 B = **54 GB of writes** plus 11.28 GB of
+   reads. Dequantizing into LDS inside the GEMM removes almost all of it.
+2. **Small/skinny GEMMs.** hipBLASLt at M = 10 is nowhere near the measured
+   **46 TFLOPS fp16 at M = 512** — and fp16 WMMA is the only matrix path this GPU
+   has (the int8 tile does not exist on gfx1200, see §10.5 and
+   `bench/results/m3-isa-probe.txt`).
+3. **Sequential DeltaNet.** The decode-shaped gated delta net runs one token per
+   step: O(T) dependent launches (~120k for a 512-token prompt). The chunked
+   WY/UT form (§10.3) is what removes that, and it is the hardest piece in the
+   project.
+4. **Naive attention and no fusions** (no flash-style tiles, no RMSNorm/epilogue
+   fusion).
+
+**The target is reachable, and the arithmetic says why:** 512 tokens x 27.5 B
+params x 2 = ~28 TFLOP; at the *measured* 46 TFLOPS that is ~0.6 s, i.e.
+**~850 t/s**. So the ~700-900 t/s goal is exactly this GPU's fp16 WMMA compute
+limit — there is no headroom to buy with cleverness, only with dequant-into-LDS,
+large M, the chunked DeltaNet and tiled attention. That is milestone 8, which is
+why prefill is priority 3.
+
+
 During prefill, weights are read once per micro-batch (e.g. 512 tokens) and reused for every token in it. At 622.7 t/s with ~11.28 GiB of weights and ubatch 512, the card reads only ~14 GB/s (~4% of bandwidth).
 
 - Dense FLOPs ≈ 2 × params per token ≈ 2 × 27 B = **~54 GFLOP/token**.
