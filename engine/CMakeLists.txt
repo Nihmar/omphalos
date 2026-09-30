@@ -20,6 +20,7 @@ add_library(omphalos SHARED
     src/kernels/probe.hip
     src/kernels/dequant.hip
     src/kernels/elementwise.hip
+    src/kernels/attn.hip
 )
 target_include_directories(omphalos
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -42,3 +43,7 @@ target_link_libraries(omph-dequant PRIVATE omphalos hip::host)
 add_executable(omph-linear src/tools/linear.cc)
 target_include_directories(omph-linear PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(omph-linear PRIVATE omphalos hip::host roc::hipblaslt)
+
+add_executable(omph-attn src/tools/attn.cc)
+target_include_directories(omph-attn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(omph-attn PRIVATE omphalos hip::host roc::hipblaslt)
