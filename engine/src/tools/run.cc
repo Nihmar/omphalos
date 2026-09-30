@@ -280,6 +280,13 @@ public:
             alloc(&kv_ks_, (size_t) n_kv * T * h_.n_head_kv * nblk * 2);
             alloc(&kv_vq_, (size_t) n_kv * T * attn_kv / 2);
             alloc(&kv_vs_, (size_t) n_kv * T * h_.n_head_kv * nblk * 2);
+            // FP16 window: the last `kv_window_` tokens exactly, in the same
+            // rotated basis, in a ring (PLAN §13.4).
+            if (const char * w = std::getenv("OMPH_KV_WINDOW")) {
+                kv_window_ = std::atoll(w);
+            }
+            alloc(&kv_k16_, (size_t) n_kv * kv_window_ * attn_kv * 2);
+            alloc(&kv_v16_, (size_t) n_kv * kv_window_ * attn_kv * 2);
         }
         conv_flip_.assign((size_t) h_.n_layer, 0);
         for (int64_t il = 0; il < h_.n_layer; ++il) {
@@ -716,9 +723,12 @@ private:
             uint8_t * vq = static_cast<uint8_t *>(kv_vq_) + kvl * max_seq_ * kv_out / 2;
             auto * ksc = static_cast<uint8_t *>(kv_ks_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2;
             auto * vsc = static_cast<uint8_t *>(kv_vs_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2;
+            auto * k16 = static_cast<uint8_t *>(kv_k16_) + kvl * kv_window_ * kv_out * 2;
+            auto * v16 = static_cast<uint8_t *>(kv_v16_) + kvl * kv_window_ * kv_out * 2;
             if (!omph::kernels::kv_quant(static_cast<const float *>(k_),
-                                         static_cast<const float *>(v_), kq, ksc, vq, vsc, pos0,
-                                         T, h_.n_head_kv, h_.head_dim, nullptr)) {
+                                         static_cast<const float *>(v_), kq, ksc, vq, vsc, k16,
+                                         v16, pos0, T, h_.n_head_kv, h_.head_dim, kv_window_,
+                                         nullptr)) {
                 return false;
             }
             if (std::getenv("OMPH_TRACE_KV") != nullptr) {
@@ -827,9 +837,10 @@ private:
                              (long long) pos0, (long long) T);
             }
             const bool ok = omph::kernels::attention_flash_q8q4(
-                static_cast<const float *>(q_), kq, ksc, vq, vsc,
+                static_cast<const float *>(q_), kq, ksc, vq, vsc, k16, v16,
                 static_cast<const float *>(gate_), static_cast<float *>(attn_), T, pos0 + T,
-                h_.n_head, h_.n_head_kv, h_.head_dim, scale, h_.n_head / h_.n_head_kv, nullptr);
+                h_.n_head, h_.n_head_kv, h_.head_dim, scale, h_.n_head / h_.n_head_kv,
+                kv_window_, nullptr);
             if (hipDeviceSynchronize() != hipSuccess) {
                 return false;
             }
@@ -1092,6 +1103,9 @@ private:
     void * kv_ks_ = nullptr;
     void * kv_vq_ = nullptr;
     void * kv_vs_ = nullptr;
+    void * kv_k16_ = nullptr;
+    void * kv_v16_ = nullptr;
+    int64_t kv_window_ = 0;  // off by default: measured neutral at 512 tokens (M5)
     bool kv_q8q4_ = false;
     void * dev_weights_ = nullptr;
     void * x_ = nullptr;

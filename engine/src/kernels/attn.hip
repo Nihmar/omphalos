@@ -253,8 +253,10 @@ __global__ void hadamard_kernel(float * __restrict__ x, const long long rows, co
 __global__ void kv_quant_kernel(const float * __restrict__ k_src, const float * __restrict__ v_src,
                                 uint8_t * __restrict__ k_q8, __half * __restrict__ k_scales,
                                 uint8_t * __restrict__ v_q4, __half * __restrict__ v_scales,
+                                __half * __restrict__ k16, __half * __restrict__ v16,
                                 const long long pos, const long long n_rows,
-                                const long long nkv, const long long hd) {
+                                const long long nkv, const long long hd,
+                                const long long window) {
     __shared__ float amax_sh[8];
     const long long row = blockIdx.x;  // token * nkv + kv head
     if (row >= n_rows) {
@@ -267,6 +269,16 @@ __global__ void kv_quant_kernel(const float * __restrict__ k_src, const float * 
     const long long nb = hd / kKvBlock;
     const int lane = (int) threadIdx.x;
 
+    // FP16 window (PLAN §13.4): the most recent `window` tokens keep an exact K
+    // and V in the rotated basis, in a ring, so the attention can read them
+    // instead of the quantized form.
+    if (k16 != nullptr) {
+        const long long slot = (token % window) * nkv + head;
+        for (long long i = lane; i < hd; i += 32) {
+            k16[slot * hd + i] = __float2half(k_src[row * hd + i]);
+            v16[slot * hd + i] = __float2half(v_src[row * hd + i]);
+        }
+    }
     for (long long b = 0; b < nb; ++b) {
         const long long off = row * hd + b * kKvBlock;
         float amax = 0.0f;
@@ -322,9 +334,11 @@ __global__ void kv_quant_kernel(const float * __restrict__ k_src, const float * 
 __global__ void attention_flash_q8q4_kernel(
     const float * __restrict__ q, const uint8_t * __restrict__ k_q8,
     const __half * __restrict__ k_scales, const uint8_t * __restrict__ v_q4,
-    const __half * __restrict__ v_scales, const float * __restrict__ gate,
+    const __half * __restrict__ v_scales, const __half * __restrict__ k16,
+    const __half * __restrict__ v16, const float * __restrict__ gate,
     float * __restrict__ out, const long long tokens, const long long seq, const long long nh,
-    const long long nkv, const long long hd, const float scale, const long long head_ratio) {
+    const long long nkv, const long long hd, const float scale, const long long head_ratio,
+    const long long window) {
     extern __shared__ float sh[];
     float * sc = sh;
     const long long h = blockIdx.y;
@@ -341,15 +355,23 @@ __global__ void attention_flash_q8q4_kernel(
     for (long long s0 = 0; s0 <= q_row; s0 += hd) {
         const long long bs = q_row - s0 + 1 < hd ? q_row - s0 + 1 : hd;
         if (d < bs) {
-            const long long kv = (s0 + d) * nkv + kvh;
-            const uint8_t * kq = k_q8 + kv * hd;
-            const __half * ksc = k_scales + kv * nb;
+            const long long p = s0 + d;
             float dot = 0.0f;
-            for (long long b = 0; b < nb; ++b) {
-                const float ks = __half2float(ksc[b]);
-                for (int i = 0; i < kKvBlock; ++i) {
-                    const float k = (float) (int8_t) kq[b * kKvBlock + i];
-                    dot = fmaf(qr[b * kKvBlock + i], k * ks, dot);
+            if (k16 != nullptr && p + window > q_row + 1) {
+                const __half * kw = k16 + ((p % window) * nkv + kvh) * hd;
+                for (long long i = 0; i < hd; ++i) {
+                    dot = fmaf(qr[i], __half2float(kw[i]), dot);
+                }
+            } else {
+                const long long kv = p * nkv + kvh;
+                const uint8_t * kq = k_q8 + kv * hd;
+                const __half * ksc = k_scales + kv * nb;
+                for (long long b = 0; b < nb; ++b) {
+                    const float ks = __half2float(ksc[b]);
+                    for (int i = 0; i < kKvBlock; ++i) {
+                        const float k = (float) (int8_t) kq[b * kKvBlock + i];
+                        dot = fmaf(qr[b * kKvBlock + i], k * ks, dot);
+                    }
                 }
             }
             sc[d] = dot * scale;
@@ -369,15 +391,20 @@ __global__ void attention_flash_q8q4_kernel(
         float a = 0.0f;
         for (long long j = 0; j < bs; ++j) {
             const float wj = sc[j];
-            const long long kv = (s0 + j) * nkv + kvh;
-            const uint8_t * vq = v_q4 + kv * hd / 2;
-            const float vs = __half2float(v_scales[kv * nb + d / kKvBlock]);
-            // element d of the head: block d/32 holds 16 bytes, and within the block
-            // the low nibbles are elements 0..15 and the high nibbles 16..31
-            const uint8_t byte = vq[(d / kKvBlock) * (kKvBlock / 2) + (d & 15)];
-            const int nib = (d & 16) ? (byte >> 4) : (byte & 0xF);
+            const long long p = s0 + j;
+            float vval;
+            if (v16 != nullptr && p + window > q_row + 1) {
+                vval = __half2float(v16[((p % window) * nkv + kvh) * hd + d]);
+            } else {
+                const long long kv = p * nkv + kvh;
+                const uint8_t * vq = v_q4 + kv * hd / 2;
+                const float vs = __half2float(v_scales[kv * nb + d / kKvBlock]);
+                const uint8_t byte = vq[(d / kKvBlock) * (kKvBlock / 2) + (d & 15)];
+                const int nib = (d & 16) ? (byte >> 4) : (byte & 0xF);
+                vval = (float) (nib - 8) * vs;
+            }
             lsum += wj;
-            a = fmaf(wj, (float) (nib - 8) * vs, a);
+            a = fmaf(wj, vval, a);
         }
         l = l * corr + lsum;
         acc = acc * corr + a;
@@ -421,8 +448,9 @@ bool hadamard_f32(float * x, const int64_t rows, const int64_t n, hipStream_t st
 }
 
 bool kv_quant(const float * k_src, const float * v_src, uint8_t * k_q8, void * k_scales,
-              uint8_t * v_q4, void * v_scales, const int64_t pos, const int64_t tokens,
-              const int64_t nkv, const int64_t hd, hipStream_t stream) {
+              uint8_t * v_q4, void * v_scales, void * k16, void * v16, const int64_t pos,
+              const int64_t tokens, const int64_t nkv, const int64_t hd, const int64_t window,
+              hipStream_t stream) {
     if (k_src == nullptr || v_src == nullptr || k_q8 == nullptr || k_scales == nullptr ||
         v_q4 == nullptr || v_scales == nullptr || tokens <= 0 || nkv <= 0 || hd <= 0 ||
         hd % kKvBlock != 0) {
@@ -431,20 +459,23 @@ bool kv_quant(const float * k_src, const float * v_src, uint8_t * k_q8, void * k
     const long long n_rows = tokens * nkv;
     kv_quant_kernel<<<(unsigned) n_rows, 32, 0, stream>>>(
         k_src, v_src, k_q8, static_cast<__half *>(k_scales), v_q4,
-        static_cast<__half *>(v_scales), pos, n_rows, nkv, hd);
+        static_cast<__half *>(v_scales), static_cast<__half *>(k16), static_cast<__half *>(v16),
+        pos, n_rows, nkv, hd, window > 0 ? window : 1);
     return hipGetLastError() == hipSuccess;
 }
 
 bool attention_flash_q8q4(const float * q, const uint8_t * k_q8, const void * k_scales,
-                          const uint8_t * v_q4, const void * v_scales, const float * gate,
-                          float * out, const int64_t tokens, const int64_t seq,
-                          const int64_t nh, const int64_t nkv, const int64_t hd,
-                          const float scale, const int64_t head_ratio, hipStream_t stream) {
+                          const uint8_t * v_q4, const void * v_scales, const void * k16,
+                          const void * v16, const float * gate, float * out, const int64_t tokens,
+                          const int64_t seq, const int64_t nh, const int64_t nkv, const int64_t hd,
+                          const float scale, const int64_t head_ratio, const int64_t window,
+                          hipStream_t stream) {
     const dim3 grid((unsigned) tokens, (unsigned) nh);
     attention_flash_q8q4_kernel<<<grid, (unsigned) hd, (size_t) hd * sizeof(float), stream>>>(
         q, k_q8, static_cast<const __half *>(k_scales), v_q4,
-        static_cast<const __half *>(v_scales), gate, out, tokens, seq, nh, nkv, hd, scale,
-        head_ratio);
+        static_cast<const __half *>(v_scales), static_cast<const __half *>(k16),
+        static_cast<const __half *>(v16), gate, out, tokens, seq, nh, nkv, hd, scale, head_ratio,
+        window > 0 ? window : 1);
     return hipGetLastError() == hipSuccess;
 }
 
