@@ -72,4 +72,8 @@ bool gemv_iq2_s(const void * packed, const void * x_f16, float * y, int64_t rows
 bool gemv_q4k_b4(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
                  hipStream_t stream);
 
+// Same contract as gemv_q4k_b4 for IQ3_S.
+bool gemv_iq3s_b4(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
+                  hipStream_t stream);
+
 } // namespace omph::kernels

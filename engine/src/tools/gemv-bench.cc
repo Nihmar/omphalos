@@ -257,8 +257,8 @@ int main(int argc, char ** argv) {
             // Small-batch path: four tokens per weight read, verified against four
             // single-token GEMVs and reported per token.
             const Case & c = cases.front();
-            if (c.t->type != 12) {
-                return fail("--batch4 needs a Q4_K tensor");
+            if (c.t->type != 12 && c.t->type != 21) {
+                return fail("--batch4 needs a Q4_K or IQ3_S tensor");
             }
             void * x4 = nullptr;
             void * y1 = nullptr;
@@ -272,15 +272,21 @@ int main(int argc, char ** argv) {
                 (void) hipMemcpy(static_cast<uint8_t *>(x4) + (size_t) t * kmax * 2, dev_x,
                                  (size_t) kmax * 2, hipMemcpyDeviceToDevice);
             }
+            const auto launch_b4 = [&](void * xa, float * ya) {
+                if (c.t->type == 12) {
+                    return omph::kernels::gemv_q4k_b4(c.dev, xa, ya, c.rows, c.k, nullptr);
+                }
+                return omph::kernels::gemv_iq3s_b4(c.dev, xa, ya, c.rows, c.k, nullptr);
+            };
             for (int i = 0; i < 5; ++i) {
-                (void) omph::kernels::gemv_q4k_b4(c.dev, x4, (float *) y4, c.rows, c.k, nullptr);
+                (void) launch_b4(x4, (float *) y4);
             }
             hipEvent_t e0, e1;
             (void) hipEventCreate(&e0);
             (void) hipEventCreate(&e1);
             (void) hipEventRecord(e0, nullptr);
             for (int i = 0; i < iters; ++i) {
-                (void) omph::kernels::gemv_q4k_b4(c.dev, x4, (float *) y4, c.rows, c.k, nullptr);
+                (void) launch_b4(x4, (float *) y4);
             }
             (void) hipEventRecord(e1, nullptr);
             (void) hipDeviceSynchronize();
@@ -288,14 +294,14 @@ int main(int argc, char ** argv) {
             (void) hipEventElapsedTime(&ms4, e0, e1);
             const double per_batch = ms4 / iters;
             const double bytes = (double) c.bytes;
-            std::printf("batch4     : %.3f ms per 4 tokens -> %.1f GB/s, %.1f GB/s per token "
-                        "(%.1f%% of %.1f per token)\n",
-                        per_batch, bytes / per_batch / 1e6, 1e3 * bytes / per_batch / 1e6,
-                        100.0 * (1e3 * bytes / per_batch / 1e6) / kMeasuredBandwidthGBs,
-                        kMeasuredBandwidthGBs);
+            const double per_token = per_batch / 4.0;
+            std::printf("batch4     : %.3f ms per 4 tokens (%.3f ms/token) -> %.1f GB/s, "
+                        "%.1f GB/s effective per token\n",
+                        per_batch, per_token, bytes / (per_batch * 1e6),
+                        bytes / (per_token * 1e6));
             double maxd = 0.0;
             for (int t = 0; t < 4; ++t) {
-                (void) omph::kernels::gemv_q4k(c.dev, dev_x, (float *) y1, c.rows, c.k, nullptr);
+                (void) launch(c, dev_x, (float *) y1, nullptr);
                 (void) hipDeviceSynchronize();
                 std::vector<float> a((size_t) c.rows);
                 std::vector<float> b((size_t) c.rows);

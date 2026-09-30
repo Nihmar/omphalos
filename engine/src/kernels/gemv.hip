@@ -1038,6 +1038,107 @@ __global__ void gemv_q4k_b4_kernel(const uint8_t * __restrict__ qs, const uint8_
     }
 }
 
+// IQ3_S, four tokens at once: the shape of gemv_q4k_b4 (no LDS staging, the
+// activation read from L1/L2, token-major results) with the index arithmetic of
+// the single-token kernel — 8 bytes of qs and one byte of qh per 32-weight
+// sub-block, four sign bytes, and a 4-bit scale whose contribution is
+// d * (1 + 2*nibble).
+__global__ void gemv_iq3s_b4_kernel(const uint8_t * __restrict__ qs,
+                                    const uint8_t * __restrict__ qh,
+                                    const uint8_t * __restrict__ signs,
+                                    const uint8_t * __restrict__ scales,
+                                    const uint8_t * __restrict__ d, const __half * __restrict__ x,
+                                    float * __restrict__ y, const long long rows,
+                                    const long long n_sub, const long long k) {
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kB4Rows;
+    const long long blocks = n_sub / 8;
+    const long long rlast = rows - 1;
+    const uint32_t * grid = omph::quant::kIq3sGrid;
+
+    float acc[kB4Rows * kB4Nt] = {};
+    for (long long base = 0; base < n_sub; base += kB4ChunkSub) {
+        const long long len = n_sub - base < kB4ChunkSub ? n_sub - base : kB4ChunkSub;
+        if (row0 >= rows) {
+            continue;
+        }
+        for (long long s = base + lane; s < base + len; s += 32) {
+            const __half * xv0 = x + s * 32;
+            uint2 qw[kB4Rows];
+            uint8_t qhb[kB4Rows];
+            const uint8_t * sgp[kB4Rows];
+            float dbr[kB4Rows];
+#pragma unroll
+            for (int r = 0; r < kB4Rows; ++r) {
+                const long long row = row0 + r <= rlast ? row0 + r : rlast;
+                qw[r] = *reinterpret_cast<const uint2 *>(qs + row * blocks * 64 + s * 8);
+                qhb[r] = qh[row * blocks * 8 + s];
+                sgp[r] = signs + row * blocks * 32 + s * 4;
+                const uint8_t sc = scales[row * blocks * 4 + s / 2];
+                const float dv = __half2float(
+                    *reinterpret_cast<const __half *>(d + row * blocks * 2 + (s / 8) * 2));
+                dbr[r] = dv * (1.0f + 2.0f * (float) ((s & 1) ? (sc >> 4) : (sc & 0xF)));
+            }
+            float part[kB4Rows * kB4Nt] = {};
+#pragma unroll
+            for (int t = 0; t < kB4Nt; ++t) {
+                const __half * xv = xv0 + t * k;
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+#pragma unroll
+                    for (int r = 0; r < kB4Rows; ++r) {
+                        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(&qw[r]);
+                        const uint32_t hb = qhb[r];
+                        const uint32_t i1 =
+                            (uint32_t) bytes[2 * l] | (((hb >> (2 * l)) & 1u) << 8);
+                        const uint32_t i2 =
+                            (uint32_t) bytes[2 * l + 1] | (((hb >> (2 * l + 1)) & 1u) << 8);
+                        const uint32_t g1 = grid[i1];
+                        const uint32_t g2 = grid[i2];
+                        const uint8_t sm = sgp[r][l];
+                        float g1f[4];
+                        float g2f[4];
+                        grid4(g1, g1f);
+                        grid4(g2, g2f);
+                        uint32_t smk[8];
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            smk[j] = ((sm >> j) & 1u) ? 0x80000000u : 0u;
+                        }
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const float v1 = __uint_as_float(__float_as_uint(g1f[j]) ^ smk[j]);
+                            const float v2 = __uint_as_float(__float_as_uint(g2f[j]) ^ smk[4 + j]);
+                            part[r * kB4Nt + t] =
+                                fmaf(v1, __half2float(xv[8 * l + j]), part[r * kB4Nt + t]);
+                            part[r * kB4Nt + t] = fmaf(v2, __half2float(xv[8 * l + 4 + j]),
+                                                       part[r * kB4Nt + t]);
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < kB4Rows * kB4Nt; ++i) {
+                acc[i] = fmaf(dbr[i / kB4Nt], part[i], acc[i]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kB4Rows * kB4Nt; ++i) {
+        float v = acc[i];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down(v, off);
+        }
+        const int r = i / kB4Nt;
+        const int t = i % kB4Nt;
+        if (lane == 0 && row0 + r < rows) {
+            y[t * rows + row0 + r] = v;
+        }
+    }
+}
+
 } // namespace
 
 bool gemv_q4k_b4(const void * packed, const void * x_f16, float * y, const int64_t rows,
@@ -1263,6 +1364,25 @@ GemvOccupancy gemv_occupancy() {
     o.block = 256;
     (void) n;
     return o;
+}
+
+bool gemv_iq3s_b4(const void * packed, const void * x_f16, float * y, const int64_t rows,
+                  const int64_t k, hipStream_t stream) {
+    if (packed == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
+        k % 256 != 0) {
+        return false;
+    }
+    const int64_t n_blocks = rows * (k / 256);
+    const omph::format::Iq3sLayout l = omph::format::iq3s_layout(n_blocks);
+    const int64_t n_sub = k / 32;
+    const auto * base = static_cast<const uint8_t *>(packed);
+    const dim3 grid((unsigned) ((rows + 8 * kB4Rows - 1) / (8 * kB4Rows)));
+    gemv_iq3s_b4_kernel<<<grid, 256, 0, stream>>>(base + l.qs_off, base + l.qh_off,
+                                                  base + l.signs_off, base + l.scales_off,
+                                                  base + l.d_off,
+                                                  static_cast<const __half *>(x_f16), y, rows,
+                                                  n_sub, k);
+    return hipGetLastError() == hipSuccess;
 }
 
 } // namespace omph::kernels
