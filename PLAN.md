@@ -742,7 +742,7 @@ Errors in K change the pre-softmax scores (i.e. *where* the model looks); errors
 
 ### 13.4 FP16 windows
 
-- **Recent window:** last N tokens (e.g. 64–128) kept in FP16, quantized in blocks as the window fills. Better quality where it matters most, and allows **per-channel K quantization over groups of tokens** (KIVI-style), more accurate than per-token for K.
+- **Recent window:** last N tokens (e.g. 64–128) kept in FP16, quantized in blocks as the window fills. **Measured (M5, #61):** 128 tokens take the KL from 0.00174 to 0.00090 nats at 16k (and remove a 0.27-nat outlier) for 8.4 MB; on by default in the Q8/Q4 mode. Better quality where it matters most, and allows **per-channel K quantization over groups of tokens** (KIVI-style), more accurate than per-token for K.
 - **Initial tokens:** first few positions in FP16 (they often receive a lot of attention; gated attention should reduce this "sink" effect, but keeping a few in FP16 is almost free).
 
 ### 13.5 Mixed precision per layer
@@ -925,17 +925,15 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 | 9 | Offline converter + final format | Layouts frozen, bit-exact verification in the converter |
 | 10 | Polish | C ABI, OpenAI-compatible server, prompt-prefix cache in host RAM, breadcrumbs |
 
-Status: **M0-M4 are complete**; M5 (quantized KV) has its core landed (issue #43):
-K Q8 + V Q4 with the Hadamard rotation, 4.92x less KV VRAM (4.29 GB -> 0.87 GB at
-32k). After the post-M5 review fixes (#45-#55): the rotation now runs after RoPE as
-§13.3 specifies (#46 — the first 0.0837-nat figure was measuring its misplacement),
-the flash softmax race is fixed and the engine is bit-deterministic (#55), and
-KL(f32 || q8q4) is **0.0014 nats** over all 512 positions of a wikitext prompt, top-1
-96.5 % (`tools/compare_logits.py`, `bench/results/m5-kv-kl.txt`). The f32 cache is no
-longer allocated beside the quantized one (#47), so a 32k prefill now runs. Left in M5:
-tuning the FP16 windows of §13.4 (implemented, off by default, fixed in #48), the
-per-layer selection of §13.5, and the 32k validation — which needs a reference other
-than f32 KV, since that does not fit next to the weights at 32k.
+Status: **M0-M5 are complete.** M5 (quantized KV, issues #43, #58-#61): K Q8 + V Q4
+with the Hadamard rotation and a 128-token FP16 window, 4.92x less KV VRAM (4.29 GB ->
+0.87 GB at 32k). Validated against the exact f32 KV (kept in host RAM for the purpose,
+`OMPH_KV_HOST=1`) up to 32k: KL 0.00084 / 0.00090 / 0.00071 nats at 8k / 16k / 32k,
+top-1 >= 98.6 %, under llama.cpp's own q8_0/q4_0 KV (0.00162 / 0.00149 / 0.00135) at
+every length — the budget chosen in #58 (`bench/results/m5-kv-kl-long.txt`). The
+GQA-grouped flash attention (#59) makes the decode nearly flat in context: 58.4 ms at
+512, 61.7 ms at 8k, 65.0 ms at 16k with the quantized KV (was 99.0 ms at 8k). Left to
+decide: whether Q8/Q4 becomes the engine's default KV (today opt-in, `OMPH_KV_Q8Q4=1`).
 Before that, M4's status: the decode was at
 73.3 % of the ceiling (57 ms/token) when M3 closed, and the two defects above put it at
 ~75.6 % (55.2 ms/token) — at the milestone's criterion. What is left of the criterion is

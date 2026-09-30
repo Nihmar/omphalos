@@ -5,7 +5,8 @@
 //   Logits are written as tokens x n_vocab f32 for the whole prompt (one row
 //   with --last-logits, the last N with --logits-tail N); with --trace-dir the
 //   per-layer outputs are dumped as l_out-<layer>.f32 (single-chunk prompts only).
-//   OMPH_KV_Q8Q4=1 quantizes the KV (OMPH_KV_WINDOW=N: FP16 ring of N tokens);
+//   OMPH_KV_Q8Q4=1 quantizes the KV (FP16 ring of the last 128 tokens;
+//   OMPH_KV_WINDOW=N changes it, 0 disables it);
 //   OMPH_KV_HOST=1 keeps the exact f32 KV in host RAM (long-context reference).
 //
 // The whole quantized tensor block lives in VRAM; the weights of the current
@@ -305,7 +306,10 @@ public:
             alloc(&kv_vq_, (size_t) n_kv * kvcap * attn_kv / 2);
             alloc(&kv_vs_, (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2);
             // FP16 window: the last `kv_window_` tokens exactly, in the same
-            // rotated basis, in a ring (PLAN §13.4).
+            // rotated basis, in a ring (PLAN §13.4). 128 by default: it keeps the
+            // KL under llama.cpp's q8_0/q4_0 up to 32k for 8.4 MB (#61);
+            // OMPH_KV_WINDOW=0 turns it off.
+            kv_window_ = 128;
             if (const char * w = std::getenv("OMPH_KV_WINDOW")) {
                 kv_window_ = std::atoll(w);
             }
@@ -1112,7 +1116,7 @@ private:
     void * kv_vs_ = nullptr;
     void * kv_k16_ = nullptr;
     void * kv_v16_ = nullptr;
-    int64_t kv_window_ = 0;  // off by default: measured neutral at 512 tokens (M5)
+    int64_t kv_window_ = 0;  // Q8/Q4 mode: 128 unless OMPH_KV_WINDOW says otherwise
     bool kv_q8q4_ = false;
     bool kv_host_ = false;  // f32 KV in pinned host RAM (validation reference)
     void * kv_stage_k_ = nullptr;
