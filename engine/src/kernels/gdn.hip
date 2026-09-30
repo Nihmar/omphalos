@@ -444,8 +444,8 @@ bool delta_step_fused(float * state, const float * q, const float * k, const flo
                       const int64_t n_kh, const int64_t s, const float scale,
                       hipStream_t stream) {
     if (state == nullptr || q == nullptr || k == nullptr || v == nullptr || beta == nullptr ||
-        gate == nullptr || o == nullptr || heads <= 0 || s <= 0 || (s & (s - 1)) != 0) {
-        return false;
+        gate == nullptr || o == nullptr || heads <= 0 || n_kh <= 0 || s != 128) {
+        return false;  // the kernel's thread mapping is written for s == 128
     }
     const size_t smem = (size_t) 3 * s * sizeof(float);
     delta_step_kernel<<<(unsigned) heads, 256, smem, stream>>>(state, q, k, v, beta, gate, o,

@@ -2,8 +2,9 @@
 //
 // usage: omph-run <model.gguf> <tokens.txt> <out-logits.f32> [--trace-dir DIR]
 //   tokens.txt: token ids separated by whitespace.
-//   Logits are written as tokens x n_vocab f32; with --trace-dir the per-layer
-//   outputs are dumped as l_out-<layer>.f32.
+//   Logits are written as tokens x n_vocab f32 for the whole prompt (one row
+//   with --last-logits); with --trace-dir the per-layer outputs are dumped as
+//   l_out-<layer>.f32 (single-chunk prompts only).
 //
 // The whole quantized tensor block lives in VRAM; the weights of the current
 // layer are dequantized to f16 into a reusable scratch buffer, and every op is
@@ -157,6 +158,7 @@ public:
         : file_(path), h_(read_hparams(file_)), use_gemv_(use_gemv) {
         const int64_t ne = h_.n_embd;
         const int64_t T = max_tokens;
+        max_tokens_ = max_tokens;
         const int64_t ssm_q = h_.ssm_n_kh * h_.ssm_s;              // 2048
         const int64_t ssm_v = h_.ssm_n_vh * (h_.ssm_inner / h_.ssm_n_vh);  // 6144
         const int64_t attn_q = h_.n_head * h_.head_dim;            // 6144
@@ -184,23 +186,24 @@ public:
                 // bytes in the image so the per-token lookup never stages 388 MiB
                 // over PCIe.
                 const bool embed = t.name == "token_embd.weight";
-                if (use_gemv_ && !embed && bb > 0 && t.nbytes % (uint64_t) bb == 0) {
-                    std::vector<uint8_t> packed;
-                    if (omph::format::repack_any(t.type, file_.tensor_data(t),
-                                                 (int64_t) (t.nbytes / (uint64_t) bb), packed)) {
-                        GemvEntry e;
-                        e.off = total;
-                        e.bytes = packed.size();
-                        e.rows = (int64_t) t.ne[1];
-                        e.k = (int64_t) t.ne[0];
-                        e.type = t.type;
-                        e.has_b4 = std::getenv("OMPH_NO_B4") == nullptr &&
-                                   (t.type == 12 || t.type == 18 || t.type == 21 || t.type == 23);
-                        gems_[t.name] = e;
-                        total += (packed.size() + 255) & ~(size_t) 255;
-                        places.push_back(p);
-                        continue;
-                    }
+                // Sized from the layout: the repack itself runs once, at upload.
+                const int64_t packed_bytes =
+                    use_gemv_ && !embed && bb > 0 && t.nbytes % (uint64_t) bb == 0
+                        ? omph::format::repacked_bytes(t.type, (int64_t) (t.nbytes / (uint64_t) bb))
+                        : 0;
+                if (packed_bytes > 0) {
+                    GemvEntry e;
+                    e.off = total;
+                    e.bytes = (size_t) packed_bytes;
+                    e.rows = (int64_t) t.ne[1];
+                    e.k = (int64_t) t.ne[0];
+                    e.type = t.type;
+                    e.has_b4 = std::getenv("OMPH_NO_B4") == nullptr &&
+                               (t.type == 12 || t.type == 18 || t.type == 21 || t.type == 23);
+                    gems_[t.name] = e;
+                    total += ((size_t) packed_bytes + 255) & ~(size_t) 255;
+                    places.push_back(p);
+                    continue;
                 }
                 total += ((size_t) t.nbytes + 255) & ~(size_t) 255;
                 places.push_back(p);
@@ -217,8 +220,11 @@ public:
                 const void * src = file_.tensor_data(*t);
                 size_t bytes = (size_t) t->nbytes;
                 if (repacked) {
-                    (void) omph::format::repack_any(t->type, src,
-                                                    (int64_t) (t->nbytes / (uint64_t) bb), packed);
+                    if (!omph::format::repack_any(t->type, src,
+                                                  (int64_t) (t->nbytes / (uint64_t) bb), packed) ||
+                        packed.size() != gems_.at(p.name).bytes) {
+                        throw std::runtime_error("repack failed for " + p.name);
+                    }
                     src = packed.data();
                     bytes = packed.size();
                 }
@@ -273,12 +279,10 @@ public:
         // The KV cache is sized by the whole sequence, the activations by the
         // chunk: that is what lets a long prompt run in pieces.
         kv_q8q4_ = std::getenv("OMPH_KV_Q8Q4") != nullptr;
-        // Kept even in the quantized mode: skipping it saves 4.3 GB at 32k but the
-        // unreferenced-f32-cache path needs the attention plumbing reworked, and
-        // that attempt regressed the working 8k case. Documented in the results.
-        alloc(&kv_k_, (size_t) n_kv * kvcap * attn_kv * 4);
-        alloc(&kv_v_, (size_t) n_kv * kvcap * attn_kv * 4);
-        if (kv_q8q4_) {
+        if (!kv_q8q4_) {
+            alloc(&kv_k_, (size_t) n_kv * kvcap * attn_kv * 4);
+            alloc(&kv_v_, (size_t) n_kv * kvcap * attn_kv * 4);
+        } else {
             // K Q8 + V Q4 with 32-element blocks: 272 B and 144 B per head per
             // token, against 1024 B each in f32 (PLAN.md §13).
             const int64_t nblk = h_.head_dim / 32;
@@ -319,6 +323,11 @@ public:
     bool forward(const std::vector<int32_t> & toks, std::vector<float> & logits,
                  const std::string & trace_dir, const int64_t start_pos = 0) {
         const int64_t T = (int64_t) toks.size();
+        // The activations hold max_tokens_ rows and the KV cache max_seq_
+        // positions: anything past either is an out-of-bounds write.
+        if (T <= 0 || T > max_tokens_ || start_pos < 0 || start_pos + T > max_seq_) {
+            return fail("forward: tokens exceed the activation or KV capacity");
+        }
         hipEvent_t step_a{}, step_b{};
         const bool time_step = T == 1 && std::getenv("OMPH_TIMING") != nullptr;
         if (time_step) {
@@ -439,8 +448,7 @@ public:
                 if (!gemv_one(e.type, w, xlast, static_cast<float *>(logits_), h_.n_vocab, ne)) {
                     return fail("lm_head gemv failed");
                 }
-            } else if (!linear_.run(stage_w("output.weight"), xlast, static_cast<float *>(logits_),
-                                    h_.n_vocab, ne, 1)) {
+            } else if (!head_chunked(xlast, 1)) {
                 return fail("lm_head failed");
             }
             if (hipDeviceSynchronize() != hipSuccess) {
@@ -449,6 +457,9 @@ public:
             logits.resize((size_t) h_.n_vocab);
             (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
             report_phases();
+            if (time_step) {
+                step_event(step_a, step_b);
+            }
             return true;
         }
         // Small-batch head: for a Q4_K head with 2+ tokens, run four tokens per
@@ -481,7 +492,26 @@ public:
             report_phases();
             return true;
         }
-        // lm head in vocab chunks: the whole f16 head (248k x 5120) would not fit
+        if (!head_chunked(h16_, T)) {
+            return false;
+        }
+        if (hipDeviceSynchronize() != hipSuccess) {
+            return fail("lm_head failed");
+        }
+        logits.resize((size_t) T * h_.n_vocab);
+        (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
+        report_phases();
+        if (time_step) {
+            step_event(step_a, step_b);
+        }
+        return true;
+    }
+
+    // lm head in vocab chunks, through the f16 dequant + hipBLASLt path: the
+    // whole f16 head (248k x 5120, 2.5 GB) would not fit. Writes (T, n_vocab)
+    // into logits_.
+    bool head_chunked(const void * x16, const int64_t T) {
+        const int64_t ne = h_.n_embd;
         const omph::gguf::TensorInfo * head = file_.tensor("output.weight");
         if (head == nullptr) {
             return fail("output.weight missing");
@@ -506,7 +536,7 @@ public:
             timer_stage_.stop(t_stage_);
             timer_gemm_.start();
             const bool head_gm =
-                linear_.run(wh, h16_, static_cast<float *>(tmp_logits_), rows, ne, T);
+                linear_.run(wh, x16, static_cast<float *>(tmp_logits_), rows, ne, T);
             timer_gemm_.stop(t_gemm_);
             if (!head_dq || !head_gm ||
                 hipMemcpy2D(static_cast<uint8_t *>(logits_) + v0 * 4, (size_t) h_.n_vocab * 4,
@@ -514,15 +544,6 @@ public:
                             hipMemcpyDeviceToDevice) != hipSuccess) {
                 return fail("lm_head failed");
             }
-        }
-        if (hipDeviceSynchronize() != hipSuccess) {
-            return fail("lm_head failed");
-        }
-        logits.resize((size_t) T * h_.n_vocab);
-        (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
-        report_phases();
-        if (time_step) {
-            step_event(step_a, step_b);
         }
         return true;
     }
@@ -557,9 +578,10 @@ public:
     const HParams & hparams() const { return h_; }
 
 private:
-    static int fail(const char * msg) {
+    // Returns false: every caller is a bool function that reports failure.
+    static bool fail(const char * msg) {
         std::fprintf(stderr, "%s\n", msg);
-        return 1;
+        return false;
     }
 
     static HParams read_hparams(const omph::gguf::File & f) {
@@ -614,13 +636,6 @@ private:
         if (!matmul(p + "attn_q.weight", h16_, static_cast<float *>(fused_), q_out, ne, T) ||
             !matmul(p + "attn_k.weight", h16_, static_cast<float *>(k_), kv_out, ne, T) ||
             !matmul(p + "attn_v.weight", h16_, static_cast<float *>(v_), kv_out, ne, T) ||
-            (kv_q8q4_ &&
-             (!omph::kernels::hadamard_f32(static_cast<float *>(q_), T * h_.n_head,
-                                           h_.head_dim, nullptr) ||
-              !omph::kernels::hadamard_f32(static_cast<float *>(k_), T * h_.n_head_kv,
-                                           h_.head_dim, nullptr) ||
-              !omph::kernels::hadamard_f32(static_cast<float *>(v_), T * h_.n_head_kv,
-                                           h_.head_dim, nullptr))) ||
             !omph::kernels::split_qg(static_cast<const float *>(fused_),
                                      static_cast<float *>(q_), static_cast<float *>(gate_), T,
                                      h_.n_head, h_.head_dim, nullptr) ||
@@ -634,10 +649,16 @@ private:
                                       (float) h_.freq_base, pos0, nullptr) ||
             !omph::kernels::rope_neox(static_cast<float *>(k_), T, h_.n_head_kv, h_.head_dim,
                                       h_.n_rot, (float) h_.freq_base, pos0, nullptr) ||
-            hipMemcpy(k_cache + pos0 * kv_out, k_, (size_t) T * kv_out * 4,
-                      hipMemcpyDeviceToDevice) != hipSuccess ||
-            hipMemcpy(v_cache + pos0 * kv_out, v_, (size_t) T * kv_out * 4,
-                      hipMemcpyDeviceToDevice) != hipSuccess ||
+            // Quantized KV: rotate Q and K after QK-norm and RoPE, neither of which
+            // commutes with H, so that (HQ)·(HK) = Q·K (PLAN.md §13.3). V has no
+            // norm or RoPE; the attention epilogue un-rotates it.
+            (kv_q8q4_ &&
+             (!omph::kernels::hadamard_f32(static_cast<float *>(q_), T * h_.n_head,
+                                           h_.head_dim, nullptr) ||
+              !omph::kernels::hadamard_f32(static_cast<float *>(k_), T * h_.n_head_kv,
+                                           h_.head_dim, nullptr) ||
+              !omph::kernels::hadamard_f32(static_cast<float *>(v_), T * h_.n_head_kv,
+                                           h_.head_dim, nullptr))) ||
             !attn_impl(il, k_cache, v_cache, pos0, T) ||
             !omph::kernels::cast_f32_to_f16(static_cast<const float *>(attn_), ffn16_,
                                             T * h_.n_head * h_.head_dim, nullptr) ||
@@ -742,120 +763,11 @@ private:
                                          nullptr)) {
                 return false;
             }
-            if (std::getenv("OMPH_TRACE_KV") != nullptr) {
-                std::fprintf(stderr,
-                             "kv ptrs il=%lld: kq %p ks %p vq %p vs %p | bases %p %p %p %p | "
-                             "kout %lld nblk %lld\n",
-                             (long long) il, (void *) kq, (void *) ksc, (void *) vq, (void *) vsc,
-                             kv_kq_, kv_ks_, kv_vq_, kv_vs_, (long long) kv_out, (long long) nblk);
-            }
-            if (std::getenv("OMPH_TRACE_KV") != nullptr) {
-                if (hipDeviceSynchronize() != hipSuccess) {
-                    std::fprintf(stderr, "kv: QUANTIZE faulted il=%lld\n", (long long) il);
-                    return false;
-                }
-                std::fprintf(stderr, "kv: quantize ok il=%lld\n", (long long) il);
-            }
-            if (std::getenv("OMPH_DUMP_KV") != nullptr && il == 3) {
-                // Verify the writer on the host before blaming the reader.
-                const int64_t row = 0;  // token 0, kv head 0
-                std::vector<uint8_t> kq_host((size_t) h_.head_dim);
-                std::vector<uint16_t> ks_host((size_t) nblk);
-                std::vector<uint8_t> vq_host((size_t) h_.head_dim / 2);
-                std::vector<uint16_t> vs_host((size_t) nblk);
-                std::vector<float> ksrc((size_t) h_.head_dim);
-                std::vector<float> vsrc((size_t) h_.head_dim);
-                (void) hipMemcpy(kq_host.data(), kq + (size_t) row * h_.head_dim,
-                                 kq_host.size(), hipMemcpyDeviceToHost);
-                (void) hipMemcpy(ks_host.data(), ksc + (size_t) row * nblk * 2, ks_host.size() * 2,
-                                 hipMemcpyDeviceToHost);
-                (void) hipMemcpy(vq_host.data(), vq + (size_t) row * h_.head_dim / 2,
-                                 vq_host.size(), hipMemcpyDeviceToHost);
-                (void) hipMemcpy(vs_host.data(), vsc + (size_t) row * nblk * 2, vs_host.size() * 2,
-                                 hipMemcpyDeviceToHost);
-                (void) hipMemcpy(ksrc.data(), static_cast<const float *>(k_) + row * h_.head_dim,
-                                 ksrc.size() * 4, hipMemcpyDeviceToHost);
-                (void) hipMemcpy(vsrc.data(), static_cast<const float *>(v_) + row * h_.head_dim,
-                                 vsrc.size() * 4, hipMemcpyDeviceToHost);
-                auto h2f = [](const uint16_t b) {
-                    const uint32_t e = (uint32_t) (b & 0x8000) << 16;
-                    const uint32_t m = (uint32_t) (b & 0x3FF) << 13;
-                    uint32_t ex = (b >> 10) & 0x1F;
-                    ex = (ex == 0) ? 0u : (ex == 31 ? 255u : ex + 112u);
-                    return __builtin_bit_cast(float, e | (ex << 23) | m);
-                };
-                double kerr = 0.0;
-                double verr = 0.0;
-                for (int i = 0; i < h_.head_dim; ++i) {
-                    const double kq_val = (double) (int8_t) kq_host[(size_t) i] *
-                                          (double) h2f(ks_host[(size_t) (i / 32)]);
-                    kerr = std::max(kerr, std::fabs(kq_val - (double) ksrc[(size_t) i]));
-                    const uint8_t byte = vq_host[(size_t) ((i / 32) * 16 + (i & 15))];
-                    const int nib = (i & 16) ? (byte >> 4) : (byte & 0xF);
-                    const double vq_val =
-                        (double) (nib - 8) * (double) h2f(vs_host[(size_t) (i / 32)]);
-                    verr = std::max(verr, std::fabs(vq_val - (double) vsrc[(size_t) i]));
-                }
-                std::fprintf(stderr, "kv dump: k err %.5f (src |max| %.3f), v err %.5f\n", kerr,
-                             (double) *std::max_element(ksrc.begin(), ksrc.end()), verr);
-                double worst = 0.0;
-                int wi = -1;
-                for (int i = 0; i < h_.head_dim; ++i) {
-                    const uint8_t byte = vq_host[(size_t) ((i / 32) * 16 + (i & 15))];
-                    const int nib = (i & 16) ? (byte >> 4) : (byte & 0xF);
-                    const double vq_val = (double) (nib - 8) * (double) h2f(vs_host[(size_t) (i / 32)]);
-                    const double e = std::fabs(vq_val - (double) vsrc[(size_t) i]);
-                    if (e > worst) {
-                        worst = e;
-                        wi = i;
-                    }
-                }
-                if (std::getenv("OMPH_DUMP_KV") != nullptr) {
-                    std::fprintf(stderr, "  v block 4 bytes:");
-                    for (int k = 0; k < 16; ++k) {
-                        std::fprintf(stderr, " %02x", vq_host[(size_t) (64 + k)]);
-                    }
-                    std::fprintf(stderr, "\n  v src[128..135]:");
-                    for (int k = 128; k < 136; ++k) {
-                        std::fprintf(stderr, " %.3f", (double) vsrc[(size_t) k]);
-                    }
-                    std::fprintf(stderr, "   src[136..143]:");
-                    for (int k = 136; k < 144; ++k) {
-                        std::fprintf(stderr, " %.3f", (double) vsrc[(size_t) k]);
-                    }
-                    std::fprintf(stderr, "\n  v scales:");
-                    for (int k = 0; k < 8; ++k) {
-                        std::fprintf(stderr, " %.4f", (double) h2f(vs_host[(size_t) k]));
-                    }
-                    std::fprintf(stderr, "\n  k scales:");
-                    for (int k = 0; k < 8; ++k) {
-                        std::fprintf(stderr, " %.4f", (double) h2f(ks_host[(size_t) k]));
-                    }
-                    std::fprintf(stderr, "\n");
-                }
-                if (wi >= 0) {
-                    const uint8_t byte = vq_host[(size_t) ((wi / 32) * 16 + (wi & 15))];
-                    std::fprintf(stderr,
-                                 "  worst v[%d] src %.4f deq %.4f nib %d scale %.5f (block %d)\n",
-                                 wi, (double) vsrc[(size_t) wi],
-                                 (double) ((wi & 16) ? (byte >> 4) : (byte & 0xF)) - 8,
-                                 (int) ((wi & 16) ? (byte >> 4) : (byte & 0xF)),
-                                 (double) h2f(vs_host[(size_t) (wi / 32)]), wi / 32);
-                }
-            }
-            if (std::getenv("OMPH_TRACE_KV") != nullptr) {
-                std::fprintf(stderr, "kv: quant ok il=%lld pos=%lld T=%lld\n", (long long) il,
-                             (long long) pos0, (long long) T);
-            }
-            const bool ok = omph::kernels::attention_flash_q8q4(
+            return omph::kernels::attention_flash_q8q4(
                 static_cast<const float *>(q_), kq, ksc, vq, vsc, k16, v16,
                 static_cast<const float *>(gate_), static_cast<float *>(attn_), T, pos0 + T,
                 h_.n_head, h_.n_head_kv, h_.head_dim, scale, h_.n_head / h_.n_head_kv,
                 kv_window_, nullptr);
-            if (hipDeviceSynchronize() != hipSuccess) {
-                return false;
-            }
-            return ok;
         }
         if (k_cache == nullptr || v_cache == nullptr) {
             return false;
@@ -1128,6 +1040,7 @@ private:
     std::vector<int64_t> kv_index_;
     std::vector<char> conv_flip_;
     int64_t max_seq_ = 0;
+    int64_t max_tokens_ = 0;
     void * kv_k_ = nullptr;
     void * kv_v_ = nullptr;
     void * kv_kq_ = nullptr;
@@ -1231,16 +1144,30 @@ int main(int argc, char ** argv) {
         if (max_tokens > 0 && max_tokens < act_chunk) {
             act_chunk = max_tokens;
         }
+        // The per-layer trace is one file per layer for one forward call: with
+        // several chunks it would hold the last chunk only.
+        if (!trace_dir.empty() && (int64_t) toks.size() > act_chunk) {
+            std::fprintf(stderr, "--trace-dir needs the prompt in one chunk (<= %lld tokens)\n",
+                         (long long) act_chunk);
+            return 2;
+        }
         Runner runner(model, act_chunk, use_gemv && generate > 0, last_logits, total_len);
         const HParams & h = runner.hparams();
+        // Every chunk's rows are kept, so the file is the whole prompt's logits;
+        // with --last-logits each forward returns one row and the last one wins.
         std::vector<float> logits;
+        std::vector<float> part_logits;
         for (int64_t off = 0; off < (int64_t) toks.size(); off += act_chunk) {
             const int64_t n = std::min<int64_t>(act_chunk, (int64_t) toks.size() - off);
             const std::vector<int32_t> part(toks.begin() + (size_t) off,
                                             toks.begin() + (size_t) (off + n));
-            const bool last = off + n == (int64_t) toks.size();
-            if (!runner.forward(part, logits, last ? trace_dir : std::string(), off)) {
+            if (!runner.forward(part, part_logits, trace_dir, off)) {
                 return 1;
+            }
+            if (last_logits) {
+                logits.swap(part_logits);
+            } else {
+                logits.insert(logits.end(), part_logits.begin(), part_logits.end());
             }
         }
         write_f32(logits_path, logits);
