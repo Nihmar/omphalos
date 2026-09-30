@@ -797,6 +797,102 @@ __global__ void gemv_iq2xxs_kernel(const uint8_t * __restrict__ qs,
     }
 }
 
+
+// IQ2_S: 82-byte blocks. Per 32-weight sub-block: four low index bytes, four
+// sign-mask bytes, one byte carrying the 2-bit index extension per entry and one
+// byte with two 4-bit scales. Grid is 1024 x 8 B -> 8 KiB of LDS.
+constexpr long long kIq2sChunkSub = 256;
+constexpr long long kIq2sRows = 4;
+
+__global__ void gemv_iq2s_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ sg,
+                                 const uint8_t * __restrict__ qh, const uint8_t * __restrict__ sc,
+                                 const uint8_t * __restrict__ d, const __half * __restrict__ x,
+                                 float * __restrict__ y, const long long rows,
+                                 const long long n_sub, const long long chunk_sub) {
+    extern __shared__ uint8_t smem[];
+    __half * xs = reinterpret_cast<__half *>(smem);
+    uint64_t * grid = reinterpret_cast<uint64_t *>(smem + chunk_sub * 64);
+    for (int i = threadIdx.x; i < 1024; i += blockDim.x) {
+        grid[i] = omph::quant::kIq2sGrid[i];
+    }
+
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kIq2sRows;
+    const long long blocks = n_sub / 8;
+    const long long rlast = rows - 1;
+
+    float acc[kIq2sRows] = {};
+    for (long long base = 0; base < n_sub; base += chunk_sub) {
+        const long long len = n_sub - base < chunk_sub ? n_sub - base : chunk_sub;
+        for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
+            xs[i] = x[base * 32 + i];
+        }
+        __syncthreads();
+        if (row0 >= rows) {
+            __syncthreads();  // keep the barrier count identical across warps
+            continue;
+        }
+        for (long long s = base + lane; s < base + len; s += 32) {
+            const __half * xv = xs + (s - base) * 32;
+            const long long blk = s / 8;
+            const int ib = (int) (s % 8);
+            uint32_t qsw[kIq2sRows];
+            uint32_t sgw[kIq2sRows];
+            uint32_t qhb[kIq2sRows];
+            float dbl[kIq2sRows][2];
+#pragma unroll
+            for (int r = 0; r < kIq2sRows; ++r) {
+                const long long row = row0 + r <= rlast ? row0 + r : rlast;
+                qsw[r] = *reinterpret_cast<const uint32_t *>(qs + row * blocks * 32 + s * 4);
+                sgw[r] = *reinterpret_cast<const uint32_t *>(sg + row * blocks * 32 + s * 4);
+                qhb[r] = qh[row * blocks * 8 + s];
+                const uint8_t scb = sc[row * blocks * 8 + blk * 8 + ib];
+                const float dv =
+                    __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 + blk * 2));
+                dbl[r][0] = dv * (0.5f + (float) (scb & 0xF)) * 0.25f;
+                dbl[r][1] = dv * (0.5f + (float) (scb >> 4)) * 0.25f;
+            }
+            float sub[kIq2sRows][2] = {};
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+#pragma unroll
+                for (int r = 0; r < kIq2sRows; ++r) {
+                    const uint32_t lo = (qsw[r] >> (8 * l)) & 0xFF;
+                    const uint32_t hi = ((qhb[r] >> (2 * l)) & 3) << 8;
+                    const uint32_t sg = (sgw[r] >> (8 * l)) & 0xFF;
+                    const uint64_t g = grid[lo | hi];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        float v = (float) ((g >> (8 * j)) & 0xFF);
+                        if (sg & (1u << j)) {
+                            v = -v;
+                        }
+                        sub[r][l >> 1] = fmaf(v, __half2float(xv[8 * l + j]), sub[r][l >> 1]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kIq2sRows; ++r) {
+                acc[r] = fmaf(dbl[r][0], sub[r][0], acc[r]);
+                acc[r] = fmaf(dbl[r][1], sub[r][1], acc[r]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < kIq2sRows; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down(v, off);
+        }
+        if (lane == 0 && row0 + r < rows) {
+            y[row0 + r] = v;
+        }
+    }
+}
+
 } // namespace
 
 bool gemv_q4k(const void * packed, const void * x_f16, float * y, const int64_t rows,
@@ -814,6 +910,26 @@ bool gemv_q4k(const void * packed, const void * x_f16, float * y, const int64_t 
     gemv_q4k_kernel<<<grid, 256, smem, stream>>>(
         base + l.qs_off, base + l.sc_off, base + l.mn_off, base + l.d_off, base + l.dmin_off,
         static_cast<const __half *>(x_f16), y, rows, n_sub);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool gemv_iq2_s(const void * packed, const void * x_f16, float * y, const int64_t rows,
+                const int64_t k, hipStream_t stream) {
+    if (packed == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
+        k % 256 != 0) {
+        return false;
+    }
+    const int64_t n_blocks = rows * (k / 256);
+    const omph::format::Iq2sLayout l = omph::format::iq2s_layout(n_blocks);
+    const int64_t n_sub = k / 32;
+    const int64_t chunk = n_sub < kIq2sChunkSub ? n_sub : kIq2sChunkSub;
+    const size_t smem = (size_t) chunk * 64 + 1024 * 8;
+    const auto * base = static_cast<const uint8_t *>(packed);
+    const dim3 grid((unsigned) ((rows + 8 * kIq2sRows - 1) / (8 * kIq2sRows)));
+    gemv_iq2s_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.signs_off,
+                                                  base + l.qh_off, base + l.sc_off, base + l.d_off,
+                                                  static_cast<const __half *>(x_f16), y, rows,
+                                                  n_sub, chunk);
     return hipGetLastError() == hipSuccess;
 }
 

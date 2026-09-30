@@ -366,6 +366,7 @@ int64_t quant_block_bytes(const uint32_t type) {
         case 14: return 210;   // Q6_K
         case 16: return 66;    // IQ2_XXS
         case 17: return 74;    // IQ2_XS
+        case 22: return 82;    // IQ2_S
         case 18: return 98;    // IQ3_XXS
         case 21: return 110;   // IQ3_S
         case 23: return 136;   // IQ4_XS
@@ -393,6 +394,9 @@ bool repack_any(const uint32_t type, const void * src, const int64_t n_blocks,
     } else if (type == 17) {
         dst.resize((size_t) iq2_xs_layout(n_blocks).total);
         repack_iq2_xs(src, n_blocks, dst.data());
+    } else if (type == 22) {
+        dst.resize((size_t) iq2s_layout(n_blocks).total);
+        repack_iq2_s(src, n_blocks, dst.data());
     } else if (type == 16) {
         dst.resize((size_t) iq2_xxs_layout(n_blocks).total);
         repack_iq2_xxs(src, n_blocks, dst.data());
@@ -413,6 +417,7 @@ bool unrepack_any(const uint32_t type, const void * src, const int64_t n_blocks,
     else if (type == 21) unrepack_iq3_s(src, n_blocks, dst.data());
     else if (type == 14) unrepack_q6k(src, n_blocks, dst.data());
     else if (type == 17) unrepack_iq2_xs(src, n_blocks, dst.data());
+    else if (type == 22) unrepack_iq2_s(src, n_blocks, dst.data());
     else if (type == 16) unrepack_iq2_xxs(src, n_blocks, dst.data());
     else if (type == 10) unrepack_q2k(src, n_blocks, dst.data());
     else return false;
@@ -547,6 +552,58 @@ void unrepack_iq2_xxs(const void * src, const int64_t n_blocks, void * dst) {
     auto * out = static_cast<BlockIq2Xxs *>(dst);
     for (int64_t b = 0; b < n_blocks; ++b) {
         std::memcpy(out[b].qs, in + l.qs_off + b * 64, 64);
+        std::memcpy(&out[b].d, in + l.d_off + 2 * b, 2);
+    }
+}
+
+// ------------------------------------------------------------------ IQ2_S
+
+namespace {
+#pragma pack(push, 1)
+struct BlockIq2S {
+    uint16_t d;
+    uint8_t qs[64];  // 32 index bytes, then 32 sign bytes
+    uint8_t qh[8];
+    uint8_t scales[8];
+};
+#pragma pack(pop)
+static_assert(sizeof(BlockIq2S) == 82, "IQ2_S block must be 82 bytes");
+} // namespace
+
+Iq2sLayout iq2s_layout(const int64_t n_blocks) {
+    Iq2sLayout l;
+    l.n_blocks = n_blocks;
+    l.qs_off = 0;
+    l.signs_off = align128(n_blocks * 32);
+    l.qh_off = align128(l.signs_off + n_blocks * 32);
+    l.sc_off = align128(l.qh_off + n_blocks * 8);
+    l.d_off = align128(l.sc_off + n_blocks * 8);
+    l.total = align128(l.d_off + n_blocks * 2);
+    return l;
+}
+
+void repack_iq2_s(const void * src, const int64_t n_blocks, void * dst) {
+    const Iq2sLayout l = iq2s_layout(n_blocks);
+    const auto * in = static_cast<const BlockIq2S *>(src);
+    uint8_t * out = static_cast<uint8_t *>(dst);
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        std::memcpy(out + l.qs_off + b * 32, in[b].qs, 32);
+        std::memcpy(out + l.signs_off + b * 32, in[b].qs + 32, 32);
+        std::memcpy(out + l.qh_off + b * 8, in[b].qh, 8);
+        std::memcpy(out + l.sc_off + b * 8, in[b].scales, 8);
+        std::memcpy(out + l.d_off + 2 * b, &in[b].d, 2);
+    }
+}
+
+void unrepack_iq2_s(const void * src, const int64_t n_blocks, void * dst) {
+    const Iq2sLayout l = iq2s_layout(n_blocks);
+    const uint8_t * in = static_cast<const uint8_t *>(src);
+    auto * out = static_cast<BlockIq2S *>(dst);
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        std::memcpy(out[b].qs, in + l.qs_off + b * 32, 32);
+        std::memcpy(out[b].qs + 32, in + l.signs_off + b * 32, 32);
+        std::memcpy(out[b].qh, in + l.qh_off + b * 8, 8);
+        std::memcpy(out[b].scales, in + l.sc_off + b * 8, 8);
         std::memcpy(&out[b].d, in + l.d_off + 2 * b, 2);
     }
 }

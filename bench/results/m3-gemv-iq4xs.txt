@@ -316,3 +316,52 @@ table in LDS.
 IQ2_S outside the token embedding (~0.37 GiB), IQ1_M (0.02) and the BF16/F32
 vectors (norms and biases, not GEMV-shaped) — about 0.4 GiB, so IQ2_S is the last
 type worth a kernel for the decode path.
+
+# M3.10 — IQ2_S GEMV: the decode weight path is now essentially all fused
+
+| measurement | result |
+|---|---:|
+| all 17 IQ2_S tensors (763.1 MiB) | **140.5 GB/s = 44.1 %** (slowest) |
+| accuracy vs the f16 dequant path | max \|d\| 3.8e-3 (**2.0e-4 relative**) |
+| repack round-trip | byte-identical, source size (763.1 MiB) |
+
+IQ2_S is the heaviest kernel: a 1024-entry grid (8 KiB of LDS), 10-bit index
+assembly from a low byte plus a 2-bit extension, and a sign mask per 8 values —
+about 3 ops per value. It is still far ahead of the f16 fallback it replaces,
+which read 2 bytes per weight instead of 0.56.
+
+Fixed while wiring it in: the token embedding dequantizes its rows straight from
+the image, so once IQ2_S got a repacked layout the embedding lookup read
+repacked bytes. It now stages the original bytes like every other fallback use.
+The greedy sequence caught it (all-zero tokens) — the correctness net doing its
+job.
+
+## Decode progression
+
+| configuration | decode |
+|---|---:|
+| f16 (milestone 2) | 831 ms/token |
+| 4 fused types (M3.7) | 174 ms/token |
+| 6 fused types (M3.9) | 144 ms/token |
+| **7 fused types (now)** | **127 ms/token** |
+
+**6.5x the milestone-2 decode, tokens byte-identical.**
+
+## Coverage of the quantized weights
+
+| type | GiB | measured |
+|---|---:|---:|
+| IQ3_S | 3.39 | 68.9 % |
+| IQ4_XS | 2.81 | 82.2 % |
+| IQ3_XXS | 1.93 | 77.3 % |
+| Q4_K | 1.47 | 91.8 % |
+| IQ2_S | 0.75 | 44.1 % |
+| Q6_K (MTP) | 0.32 | 49.4 % |
+| Q2_K | 0.22 | 65.8 % |
+| IQ2_XS | 0.21 | 52.2 % |
+| IQ2_XXS | 0.09 | 53.7 % |
+| **total** | **~11.2** | **99.3 % of 11.28 GiB** |
+
+Only IQ1_M (0.02 GiB) and the BF16/F32 norm vectors are left outside, and neither
+is GEMV-shaped. The remaining decode levers are therefore kernel quality (IQ2_S
+and IQ6_K are the two slow ones) rather than coverage.

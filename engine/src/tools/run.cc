@@ -254,8 +254,8 @@ public:
         if (te == nullptr) return fail("token_embd.weight missing");
         const int64_t row_bytes = (int64_t) (te->nbytes / te->ne[1]);
         for (int64_t t = 0; t < T; ++t) {
-            const uint8_t * src = static_cast<const uint8_t *>(dev_weights_) + off_.at(te->name) +
-                                  (size_t) toks[t] * row_bytes;
+            const uint8_t * src =
+                static_cast<const uint8_t *>(raw_bytes(te->name)) + (size_t) toks[t] * row_bytes;
             if (!omph::kernels::dequantize(te->type, src,
                                            static_cast<uint8_t *>(x_) + t * ne * 4, ne, false,
                                            nullptr)) {
@@ -567,6 +567,7 @@ private:
                     case 16: return omph::kernels::gemv_iq2_xxs(w, x16, y, n_out, k, nullptr);
                     case 17: return omph::kernels::gemv_iq2_xs(w, x16, y, n_out, k, nullptr);
                     case 18: return omph::kernels::gemv_iq3_xxs(w, x16, y, n_out, k, nullptr);
+                    case 22: return omph::kernels::gemv_iq2_s(w, x16, y, n_out, k, nullptr);
                     case 21: return omph::kernels::gemv_iq3_s(w, x16, y, n_out, k, nullptr);
                     case 23: return omph::kernels::gemv_iq4_xs(w, x16, y, n_out, k, nullptr);
                     default: break;

@@ -191,4 +191,25 @@ Iq2Layout iq2_xxs_layout(int64_t n_blocks);
 void repack_iq2_xxs(const void * src, int64_t n_blocks, void * dst);
 void unrepack_iq2_xxs(const void * src, int64_t n_blocks, void * dst);
 
+// ------------------------------------------------------------------ IQ2_S
+//
+// GGUF IQ2_S: 82-byte blocks — f16 `d`, 64 bytes holding 4 low index bits per
+// 32-weight sub-block followed by 4 sign bytes per sub-block, 8 bytes of 2-bit
+// index extensions (the grid has 1024 entries) and 8 bytes of 4-bit scales.
+// The two halves of the index/sign area are split into their own streams; size
+// unchanged, and the signs are already masks so no table is needed.
+//   [ qs 32 ] [ signs 32 ] [ qh 8 ] [ sc 8 ] [ d 2 ]
+struct Iq2sLayout {
+    int64_t n_blocks = 0;
+    int64_t qs_off = 0;
+    int64_t signs_off = 0;
+    int64_t qh_off = 0;
+    int64_t sc_off = 0;
+    int64_t d_off = 0;
+    int64_t total = 0;
+};
+Iq2sLayout iq2s_layout(int64_t n_blocks);
+void repack_iq2_s(const void * src, int64_t n_blocks, void * dst);
+void unrepack_iq2_s(const void * src, int64_t n_blocks, void * dst);
+
 } // namespace omph::format
