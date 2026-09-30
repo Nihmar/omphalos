@@ -42,4 +42,9 @@ struct GemvOccupancy {
 };
 GemvOccupancy gemv_occupancy();
 
+// Same contract for a tensor in the repacked Q2_K layout (2-bit quants, a 4-bit
+// scale and a 4-bit min per 16-weight sub-block).
+bool gemv_q2k(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
+              hipStream_t stream);
+
 } // namespace omph::kernels
