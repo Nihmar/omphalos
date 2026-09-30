@@ -398,8 +398,9 @@ public:
             if (attn_norm == nullptr || post_norm == nullptr) {
                 return fail("missing layer norms");
             }
-            if (!omph::kernels::rms_norm_f16(static_cast<const float *>(x_), attn_norm, h16_, T,
-                                             ne, (float) h_.eps, 1.0f, nullptr)) {
+            if (!omph::kernels::add_rms_norm_f16(static_cast<const float *>(x_), nullptr, nullptr,
+                                                 attn_norm, h16_, T, ne, (float) h_.eps,
+                                                 nullptr)) {
                 return fail("attn_norm failed");
             }
             scratch_.reset();
@@ -417,11 +418,10 @@ public:
                 continue;
             }
             // x = ffn(rms_norm(block + x)) + (block + x)
-            if (!omph::kernels::add_out(static_cast<const float *>(blk_),
-                                        static_cast<const float *>(x_),
-                                        static_cast<float *>(resid_), T * ne, nullptr) ||
-                !omph::kernels::rms_norm_f16(static_cast<const float *>(resid_), post_norm,
-                                             h16_, T, ne, (float) h_.eps, 1.0f, nullptr)) {
+            if (!omph::kernels::add_rms_norm_f16(static_cast<const float *>(blk_),
+                                                 static_cast<const float *>(x_),
+                                                 static_cast<float *>(resid_), post_norm, h16_,
+                                                 T, ne, (float) h_.eps, nullptr)) {
                 return fail("residual/norm failed");
             }
             if (!matmul(p + "ffn_gate.weight", h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T) ||

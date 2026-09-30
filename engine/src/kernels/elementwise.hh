@@ -19,10 +19,10 @@ bool mul_inplace(float * x, const float * y, int64_t n, hipStream_t stream);
 bool add_inplace(float * x, const float * y, int64_t n, hipStream_t stream);
 bool add_out(const float * x, const float * y, float * out, int64_t n, hipStream_t stream);
 
-// y[row, :] = rms_norm(x[row, :], w, eps) * scale, written as f16 — the fused
-// prologue for a GEMV that wants an f16 activation.
-bool rms_norm_f16(const float * x, const float * w, void * y_f16, int64_t rows, int64_t n,
-                  float eps, float scale, hipStream_t stream);
+// y (f16) = rms_norm(a + b) * w per row of n; b and sum_out may be null, else
+// sum_out (f32) receives a + b, the residual stream. n % 4 == 0, n <= 8192.
+bool add_rms_norm_f16(const float * a, const float * b, float * sum_out, const float * w,
+                      void * y_f16, int64_t rows, int64_t n, float eps, hipStream_t stream);
 
 // out[i] = silu(x[i]) * y[i], written as f16 — the SwiGLU epilogue feeding the
 // down projection.
