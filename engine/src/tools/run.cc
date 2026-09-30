@@ -273,12 +273,10 @@ public:
         // The KV cache is sized by the whole sequence, the activations by the
         // chunk: that is what lets a long prompt run in pieces.
         kv_q8q4_ = std::getenv("OMPH_KV_Q8Q4") != nullptr;
-        // Kept even in the quantized mode: skipping it saves 4.3 GB at 32k but the
-        // unreferenced-f32-cache path needs the attention plumbing reworked, and
-        // that attempt regressed the working 8k case. Documented in the results.
-        alloc(&kv_k_, (size_t) n_kv * kvcap * attn_kv * 4);
-        alloc(&kv_v_, (size_t) n_kv * kvcap * attn_kv * 4);
-        if (kv_q8q4_) {
+        if (!kv_q8q4_) {
+            alloc(&kv_k_, (size_t) n_kv * kvcap * attn_kv * 4);
+            alloc(&kv_v_, (size_t) n_kv * kvcap * attn_kv * 4);
+        } else {
             // K Q8 + V Q4 with 32-element blocks: 272 B and 144 B per head per
             // token, against 1024 B each in f32 (PLAN.md §13).
             const int64_t nblk = h_.head_dim / 32;
@@ -638,10 +636,6 @@ private:
                                            h_.head_dim, nullptr) ||
               !omph::kernels::hadamard_f32(static_cast<float *>(v_), T * h_.n_head_kv,
                                            h_.head_dim, nullptr))) ||
-            hipMemcpy(k_cache + pos0 * kv_out, k_, (size_t) T * kv_out * 4,
-                      hipMemcpyDeviceToDevice) != hipSuccess ||
-            hipMemcpy(v_cache + pos0 * kv_out, v_, (size_t) T * kv_out * 4,
-                      hipMemcpyDeviceToDevice) != hipSuccess ||
             !attn_impl(il, k_cache, v_cache, pos0, T) ||
             !omph::kernels::cast_f32_to_f16(static_cast<const float *>(attn_), ffn16_,
                                             T * h_.n_head * h_.head_dim, nullptr) ||
