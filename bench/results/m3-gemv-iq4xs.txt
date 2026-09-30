@@ -229,3 +229,35 @@ and the remaining levers are:
    needs).
 3. **Wire the GEMVs into the runtime** — end-to-end decode numbers instead of
    per-tensor ones.
+
+# M3.7 — fused GEMVs wired into the runtime (decode)
+
+`--gemv` makes the runtime repack every tensor with a fused kernel at load and
+use the GEMV for single-token steps; the rest falls back to the f16 dequant +
+hipBLASLt path. Weights are read once and kept in one image (~11.4 GiB); the f16
+fallback for repacked tensors re-stages the original bytes from the mmap.
+
+## Decode (10-token prompt, 20 greedy steps timed)
+
+| path | prefill | decode |
+|---|---:|---:|
+| f16 (milestone 2) | 2161 ms | **831 ms/token** (1.2 t/s) |
+| **fused GEMV** | 8129 ms | **174 ms/token** (5.7 t/s) |
+
+**4.8x faster decode, and the generated tokens are byte-identical to the f16
+path** (198 760 3841 13477 37550 33075 888 279 15217 5388 13 198), which is also
+the milestone-2 reference sequence.
+
+Prefill got *slower* with `--gemv` (2161 -> 8129 ms): the f16 fallback for
+repacked tensors stages the original quantized bytes from the mmap through the
+host on every layer, ~1.6 GB per pass. Prefill speed is priority 3 and the M8
+WMMA path replaces it; recorded rather than papered over.
+
+## Where the remaining decode time goes
+
+The covered 9.82 GiB should take ~39 ms at ~250 GB/s, so most of the 174 ms per
+token is the **f16 fallback for the 1.46 GiB of uncovered types** (IQ2_S, Q6_K,
+IQ2_XS/XXS, BF16/F32/IQ1_M = 14 % of the weights), which is read at 2 bytes per
+weight instead of ~0.5 plus its dequant and staging. The next lever is therefore
+not a faster kernel, it is **removing the fallback**: a GEMV for Q6_K and IQ2_S
+covers most of it.
