@@ -1,0 +1,58 @@
+# M3.1 — fused Q4_K GEMV + load-time repacking (2026-09-30)
+
+Tensor: `output.weight` (248320 x 5120, Q4_K, 682.0 MiB) — the largest single
+tensor of the model, so the most bandwidth-hungry GEMV of the decode path.
+Conditions: `omph-gemv-bench --iters 50` (warm-up 5), median of 5 runs,
+ROCm 7.2.4, gfx1200, desktop idle (PLAN.md §17).
+Ceiling: 318.3 GB/s measured (`bench/results/m0-bandwidth.csv`).
+
+## Summary (median of 5 runs)
+
+| path | time | weight bytes read | effective bandwidth | vs ceiling |
+|---|---:|---:|---:|---:|
+| fused Q4_K GEMV (repacked) | **2.90 ms** | 701.0 MiB | **253.2 GB/s** | **79.6 %** |
+| f16 path (dequant + hipBLASLt) | 82.97 ms | 2425.0 MiB | 30.6 GB/s | 9.6 % |
+
+The fused kernel is **28.6x faster** than the milestone-2 path for this GEMV and
+already clears the milestone-3 target (>= 60 % of measured bandwidth).
+
+Repacking: 715,161,600 -> 735,027,200 bytes (+2.8 %, the 6-bit scales and mins are
+decoded to bytes), verified by rebuilding the source block stream and comparing
+**byte for byte** (`byte-identical rebuild: yes`).
+
+Accuracy against the f16 path (same activations, f16 rounding only): max |d| 6e-4
+(1.9e-4 relative), mean |d| 1e-4, |ref| up to 3.0.
+
+## Raw runs
+
+```
+Ceiling: 318.3 GB/s (measured, `bench/results/m0-bandwidth.csv`).
+
+```
+tensor output.weight: 248320 x 5120, Q4_K, 682.0 MiB, 4966400 blocks
+repack: 715161600 -> 735027200 bytes, byte-identical rebuild: yes
+f16 path   : 82.644 ms  (weights 2425.0 MiB)  -> 30.8 GB/s
+fused q4k  : 2.895 ms  (weights 701.0 MiB)  -> 253.9 GB/s  (79.8% of 318.3)
+accuracy   : max|d| 0.0006 (1.91e-04 rel), mean|d| 0.0001, |ref| up to 3.0
+tensor output.weight: 248320 x 5120, Q4_K, 682.0 MiB, 4966400 blocks
+repack: 715161600 -> 735027200 bytes, byte-identical rebuild: yes
+f16 path   : 83.324 ms  (weights 2425.0 MiB)  -> 30.5 GB/s
+fused q4k  : 2.903 ms  (weights 701.0 MiB)  -> 253.2 GB/s  (79.6% of 318.3)
+accuracy   : max|d| 0.0006 (1.91e-04 rel), mean|d| 0.0001, |ref| up to 3.0
+tensor output.weight: 248320 x 5120, Q4_K, 682.0 MiB, 4966400 blocks
+repack: 715161600 -> 735027200 bytes, byte-identical rebuild: yes
+f16 path   : 82.770 ms  (weights 2425.0 MiB)  -> 30.7 GB/s
+fused q4k  : 2.908 ms  (weights 701.0 MiB)  -> 252.8 GB/s  (79.4% of 318.3)
+accuracy   : max|d| 0.0006 (1.91e-04 rel), mean|d| 0.0001, |ref| up to 3.0
+tensor output.weight: 248320 x 5120, Q4_K, 682.0 MiB, 4966400 blocks
+repack: 715161600 -> 735027200 bytes, byte-identical rebuild: yes
+f16 path   : 82.966 ms  (weights 2425.0 MiB)  -> 30.6 GB/s
+fused q4k  : 2.894 ms  (weights 701.0 MiB)  -> 254.0 GB/s  (79.8% of 318.3)
+accuracy   : max|d| 0.0006 (1.91e-04 rel), mean|d| 0.0001, |ref| up to 3.0
+tensor output.weight: 248320 x 5120, Q4_K, 682.0 MiB, 4966400 blocks
+repack: 715161600 -> 735027200 bytes, byte-identical rebuild: yes
+f16 path   : 83.063 ms  (weights 2425.0 MiB)  -> 30.6 GB/s
+fused q4k  : 2.901 ms  (weights 701.0 MiB)  -> 253.4 GB/s  (79.6% of 318.3)
+accuracy   : max|d| 0.0006 (1.91e-04 rel), mean|d| 0.0001, |ref| up to 3.0
+```
+```
