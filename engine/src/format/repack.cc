@@ -196,4 +196,59 @@ void unrepack_iq4_xs(const void * src, const int64_t n_blocks, void * dst) {
     }
 }
 
+// ------------------------------------------------------------------ IQ3_XXS
+
+namespace {
+
+#pragma pack(push, 1)
+struct BlockIq3Xxs {
+    uint16_t d;
+    uint8_t qs[96];  // 64 bytes of grid indices, then 32 bytes of scale/sign words
+};
+#pragma pack(pop)
+
+static_assert(sizeof(BlockIq3Xxs) == 98, "IQ3_XXS block must be 98 bytes");
+
+} // namespace
+
+Iq3XxsLayout iq3_xxs_layout(const int64_t n_blocks) {
+    Iq3XxsLayout l;
+    l.n_blocks = n_blocks;
+    l.qs_off = 0;
+    l.aux_off = align128(n_blocks * 64);
+    l.d_off = align128(l.aux_off + n_blocks * 32);
+    l.total = align128(l.d_off + n_blocks * 2);
+    return l;
+}
+
+void repack_iq3_xxs(const void * src, const int64_t n_blocks, void * dst) {
+    const Iq3XxsLayout l = iq3_xxs_layout(n_blocks);
+    const auto * in = static_cast<const BlockIq3Xxs *>(src);
+    uint8_t * out = static_cast<uint8_t *>(dst);
+    uint8_t * qs = out + l.qs_off;
+    uint8_t * aux = out + l.aux_off;
+    uint8_t * d = out + l.d_off;
+
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        std::memcpy(d + 2 * b, &in[b].d, 2);
+        std::memcpy(qs + b * 64, in[b].qs, 64);
+        std::memcpy(aux + b * 32, in[b].qs + 64, 32);
+    }
+}
+
+void unrepack_iq3_xxs(const void * src, const int64_t n_blocks, void * dst) {
+    const Iq3XxsLayout l = iq3_xxs_layout(n_blocks);
+    const uint8_t * in = static_cast<const uint8_t *>(src);
+    const uint8_t * qs = in + l.qs_off;
+    const uint8_t * aux = in + l.aux_off;
+    const uint8_t * d = in + l.d_off;
+    auto * out = static_cast<BlockIq3Xxs *>(dst);
+
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        std::memcpy(&out[b].d, d + 2 * b, 2);
+        std::memcpy(out[b].qs, qs + b * 64, 64);
+        std::memcpy(out[b].qs + 64, aux + b * 32, 32);
+    }
+}
+
 } // namespace omph::format

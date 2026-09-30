@@ -26,6 +26,37 @@ int fail(const char * msg) {
     return 1;
 }
 
+bool repack_tensor(const uint32_t type, const void * src, const int64_t n_blocks,
+                    std::vector<uint8_t> & dst) {
+    if (type == 12) {
+        dst.resize((size_t) omph::format::q4k_layout(n_blocks).total);
+        omph::format::repack_q4k(src, n_blocks, dst.data());
+    } else if (type == 23) {
+        dst.resize((size_t) omph::format::iq4_layout(n_blocks).total);
+        omph::format::repack_iq4_xs(src, n_blocks, dst.data());
+    } else if (type == 18) {
+        dst.resize((size_t) omph::format::iq3_xxs_layout(n_blocks).total);
+        omph::format::repack_iq3_xxs(src, n_blocks, dst.data());
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool unrepack_tensor(const uint32_t type, const void * src, const int64_t n_blocks,
+                     std::vector<uint8_t> & dst) {
+    if (type == 12) {
+        omph::format::unrepack_q4k(src, n_blocks, dst.data());
+    } else if (type == 23) {
+        omph::format::unrepack_iq4_xs(src, n_blocks, dst.data());
+    } else if (type == 18) {
+        omph::format::unrepack_iq3_xxs(src, n_blocks, dst.data());
+    } else {
+        return false;
+    }
+    return true;
+}
+
 struct Case {
     const omph::gguf::TensorInfo * t = nullptr;
     void * dev = nullptr;  // repacked tensor on the device
@@ -117,6 +148,7 @@ int main(int argc, char ** argv) {
     int iters = 50;
     bool iq4_all = false;
     int all_type = -1;
+    int repack_only = -1;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
             iters = std::atoi(argv[++i]);
@@ -125,12 +157,45 @@ int main(int argc, char ** argv) {
             all_type = 23;
         } else if (std::strcmp(argv[i], "--all-of-type") == 0 && i + 1 < argc) {
             all_type = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--repack-only") == 0 && i + 1 < argc) {
+            repack_only = std::atoi(argv[++i]);
         } else if (argv[i][0] != '-') {
             name = argv[i];
         }
     }
     try {
         omph::gguf::File file(model);
+        if (repack_only >= 0) {
+            int64_t n_tensors = 0;
+            int64_t n_src = 0;
+            int64_t n_repacked = 0;
+            for (const omph::gguf::TensorInfo & t : file.tensors()) {
+                if ((int) t.type != repack_only) {
+                    continue;
+                }
+                const int64_t n_blocks = (int64_t) (t.nbytes / (t.type == 12 ? 144 : t.type == 23 ? 136 : 98));
+                std::vector<uint8_t> packed;
+                std::vector<uint8_t> rebuilt((size_t) t.nbytes);
+                if (!repack_tensor(t.type, file.tensor_data(t), n_blocks, packed) ||
+                    !unrepack_tensor(t.type, packed.data(), n_blocks, rebuilt)) {
+                    std::fprintf(stderr, "unsupported type for %s\n", t.name.c_str());
+                    return 1;
+                }
+                if (std::memcmp(rebuilt.data(), file.tensor_data(t), (size_t) t.nbytes) != 0) {
+                    std::printf("NOT lossless: %s\n", t.name.c_str());
+                    return 1;
+                }
+                ++n_tensors;
+                n_src += (int64_t) t.nbytes;
+                n_repacked += (int64_t) packed.size();
+            }
+            std::printf("repack-only type %d: %lld tensors, source %.1f MiB -> repacked %.1f MiB "
+                        "(%.1f%%), all byte-identical rebuilds\n",
+                        repack_only, (long long) n_tensors, (double) n_src / (1024 * 1024),
+                        (double) n_repacked / (1024 * 1024),
+                        100.0 * (double) n_repacked / (double) n_src);
+            return 0;
+        }
         std::vector<Case> cases;
         double total_bytes = 0.0;
 
