@@ -30,3 +30,6 @@ bench/traces/
 # Native tool binaries (built by tools/native/build.sh)
 tools/native/dump_tensors
 tools/native/isa_probe
+
+# rocprofv3 output
+.rocprofv3/

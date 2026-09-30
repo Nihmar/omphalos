@@ -28,4 +28,18 @@ bool gemv_iq3_xxs(const void * packed, const void * x_f16, float * y, int64_t ro
 bool gemv_iq3_s(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
                 hipStream_t stream);
 
+// Max resident workgroups per CU for each kernel (occupancy probe).
+struct GemvOccupancy {
+    int q4k = 0;
+    int iq4 = 0;
+    int iq3 = 0;
+    int iq3s = 0;
+    int block = 0;
+    size_t smem_q4k = 0;
+    size_t smem_iq4 = 0;
+    size_t smem_iq3 = 0;
+    size_t smem_iq3s = 0;
+};
+GemvOccupancy gemv_occupancy();
+
 } // namespace omph::kernels

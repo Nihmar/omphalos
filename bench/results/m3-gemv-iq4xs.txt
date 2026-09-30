@@ -183,3 +183,49 @@ verified byte-identical on all 144 tensors (3474.0 -> 3474.0 MiB, 100.0 %).
 | *remaining* (IQ2_S, Q6_K, Q2_K, IQ2_XS/XXS, BF16, F32, IQ1_M) | 1.68 | — | — |
 
 **9.60 of 11.28 GiB (85 %) now run on fused repacked GEMVs.**
+
+# M3.6 — profiling attempt: occupancy, and why the HW counters are empty
+
+## Hardware performance counters: not available
+
+`rocprofv3 --pmc ...` runs and produces a counter CSV, but every value is 0
+(the dispatch rows are there, the values are not) — the counters need the AMD
+perf permissions this box does not grant, so no counter-based analysis is
+possible without a sysctl change. What the CSV *does* give for free is the
+static per-kernel resource usage:
+
+| kernel | VGPRs | LDS (dynamic) |
+|---|---:|---:|
+| `gemv_q4k` (Q4_K) | 128 | k x 2 B |
+| `gemv_iq4` (IQ4_XS) | 120 | 16.4 KiB |
+| `gemv_iq3` (IQ3_XXS) | 120 | 17.5 KiB |
+| `gemv_iq3s` (IQ3_S) | 152 | 18.4 KiB |
+
+## Occupancy (hipOccupancyMaxActiveBlocksPerMultiprocessor, 256 threads)
+
+`OMPH_OCCUPANCY=1 omph-gemv-bench ...` reports workgroups per CU: q4k 6,
+iq4 3, iq3xxs 3, iq3s 3 with the *maximum* chunk reserved. 
+
+That exposed a real waste: the wrappers asked for the largest chunk even when
+k is small enough to fit in one (k = 5120 needs 10 KiB, not 16.4). The dynamic
+LDS size is now `min(n_sub, chunk) * 64 + tables`, which raises the occupancy
+for the common shapes. Measured effect on the aggregates so far: neutral
+(261.2 vs 261.6 GB/s for IQ4_XS) — the big-k tensors were already chunked,
+and the small-k ones were not occupancy-limited.
+
+## Where this leaves the optimisation work
+
+The counter data is unavailable, but the A/B experiments already measured the
+answer for IQ4_XS: removing bank conflicts (padded LDS) made things *worse*,
+while removing instructions per weight (outer product over 4 rows) made them
+40 % better. So the kernels are instruction/latency bound, not memory bound,
+and the remaining levers are:
+
+1. **Submission overhead** — the type aggregates lose 10-15 points on the
+   small tensors (attn_k/attn_v are 2.7 MiB and run at 148 GB/s). HIP graphs
+   are the fix, and they belong to M4.
+2. **Small batch N = 1...5** — same weights, more tokens; the only lever that
+   increases arithmetic intensity in decode (and it is what MTP verification
+   needs).
+3. **Wire the GEMVs into the runtime** — end-to-end decode numbers instead of
+   per-tensor ones.
