@@ -599,3 +599,37 @@ same structure and the same ceiling.
 Recorded as an open item with its measured upper bound: IQ3_S alone is 3.39 GiB
 (30 % of the weights), so closing it would be worth ~3-4 ms of the decode's
 59 ms/token if a cheap sign application can be found.
+
+# M3.19 — the decode is GPU-bound; three fusion attempts were neutral
+
+Measured with a fresh event pair around a single decode step (OMPH_TIMING=1):
+**~65 ms of GPU time per step** against ~60 ms of wall clock — the events
+themselves add a synchronise, so the honest reading is "GPU busy, not host
+submission bound". HIP graphs therefore address less than assumed.
+
+Three fusions were tried and all came out **neutral** (within noise):
+
+| change | launches removed | decode |
+|---|---:|---:|
+| conv + state shift + silu + split in one kernel | 3 per delta layer (144/step) | 70 -> 71 ms |
+| RMSNorm writing f16 (two per layer), SwiGLU + cast in one | ~3 per layer (192/step) | 59 -> 60 ms |
+
+Both are kept: fewer launches, fewer passes over the activations, identical
+results (logits bit-identical for the conv fusion, tokens identical throughout).
+But they say the quiet part out loud: **the remaining glue is per-kernel latency
+on dependency chains with tiny grids, not launch count** — which is why merging
+three of ~1600 launches, or 192 of them, moves nothing.
+
+## Where the 60 ms/token stands
+
+- ~46 ms is the GEMVs, computing from their own measured per-type rates (Q4_K
+  92 %, IQ4_XS 82 %, IQ3_XXS 77 %, IQ3_S 69 %, IQ2 63-73 %, Q2_K 66 %) against
+  the 318.3 GB/s ceiling. That is the floor for this set of kernels.
+- ~14 ms is everything else: the attention's own GEMMs, per-layer norms, casts,
+  the delta rule, and the latency between dependent tiny kernels.
+
+So the remaining decode levers are, in order: a cheaper sign application in
+IQ3_S/IQ3_XXS (worth ~3-4 ms if one exists, see M3.18), and attack on the
+per-kernel latency of the small-op chains — for which HIP stream capture is the
+tool, with the caveat above that the win is smaller than the 22 ms estimate that
+started this thread.

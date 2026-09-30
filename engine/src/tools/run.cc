@@ -288,6 +288,13 @@ public:
     bool forward(const std::vector<int32_t> & toks, std::vector<float> & logits,
                  const std::string & trace_dir, const int64_t start_pos = 0) {
         const int64_t T = (int64_t) toks.size();
+        hipEvent_t step_a{}, step_b{};
+        const bool time_step = T == 1 && std::getenv("OMPH_TIMING") != nullptr;
+        if (time_step) {
+            (void) hipEventCreate(&step_a);
+            (void) hipEventCreate(&step_b);
+            (void) hipEventRecord(step_a, nullptr);
+        }
         const int64_t ne = h_.n_embd;
 
         // token embeddings, one row at a time (the table is quantized)
@@ -321,9 +328,8 @@ public:
             if (attn_norm == nullptr || post_norm == nullptr) {
                 return fail("missing layer norms");
             }
-            if (!omph::kernels::rms_norm(static_cast<const float *>(x_), attn_norm,
-                                         static_cast<float *>(cur_), T, ne, (float) h_.eps, 1.0f,
-                                         nullptr)) {
+            if (!omph::kernels::rms_norm_f16(static_cast<const float *>(x_), attn_norm, h16_, T,
+                                             ne, (float) h_.eps, 1.0f, nullptr)) {
                 return fail("attn_norm failed");
             }
             scratch_.reset();
@@ -344,21 +350,15 @@ public:
             if (!omph::kernels::add_out(static_cast<const float *>(blk_),
                                         static_cast<const float *>(x_),
                                         static_cast<float *>(resid_), T * ne, nullptr) ||
-                !omph::kernels::rms_norm(static_cast<const float *>(resid_), post_norm,
-                                         static_cast<float *>(cur_), T, ne, (float) h_.eps, 1.0f,
-                                         nullptr) ||
-                !omph::kernels::cast_f32_to_f16(static_cast<const float *>(cur_), h16_, T * ne,
-                                                nullptr)) {
+                !omph::kernels::rms_norm_f16(static_cast<const float *>(resid_), post_norm,
+                                             h16_, T, ne, (float) h_.eps, 1.0f, nullptr)) {
                 return fail("residual/norm failed");
             }
             if (!matmul(p + "ffn_gate.weight", h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T) ||
                 !matmul(p + "ffn_up.weight", h16_, static_cast<float *>(ffn2_), h_.n_ff, ne, T) ||
-                !omph::kernels::silu_inplace(static_cast<float *>(ffn1_), T * h_.n_ff, nullptr) ||
-                !omph::kernels::mul_inplace(static_cast<float *>(ffn1_),
-                                            static_cast<const float *>(ffn2_), T * h_.n_ff,
-                                            nullptr) ||
-                !omph::kernels::cast_f32_to_f16(static_cast<const float *>(ffn1_), ffn16_,
-                                                T * h_.n_ff, nullptr) ||
+                !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
+                                           static_cast<const float *>(ffn2_), ffn16_, T * h_.n_ff,
+                                           nullptr) ||
                 !matmul(p + "ffn_down.weight", ffn16_, static_cast<float *>(cur_), ne, h_.n_ff, T) ||
                 !omph::kernels::add_out(static_cast<const float *>(cur_),
                                         static_cast<const float *>(resid_),
@@ -389,6 +389,9 @@ public:
             logits.resize((size_t) T * h_.n_vocab);
             (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
             report_phases();
+            if (time_step) {
+                step_event(step_a, step_b);
+            }
             return true;
         }
         // lm head in vocab chunks: the whole f16 head (248k x 5120) would not fit
@@ -431,6 +434,9 @@ public:
         logits.resize((size_t) T * h_.n_vocab);
         (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
         report_phases();
+        if (time_step) {
+            step_event(step_a, step_b);
+        }
         return true;
     }
 
@@ -449,6 +455,16 @@ public:
         t_gemm_.clear();
         t_gemv_.clear();
         t_block_.clear();
+    }
+
+    void step_event(hipEvent_t a, hipEvent_t b) {
+        (void) hipEventRecord(b, nullptr);
+        (void) hipEventSynchronize(b);
+        float ms = 0.0f;
+        (void) hipEventElapsedTime(&ms, a, b);
+        std::fprintf(stderr, "step gpu %.2f ms\n", ms);
+        (void) hipEventDestroy(a);
+        (void) hipEventDestroy(b);
     }
 
     const HParams & hparams() const { return h_; }
@@ -502,9 +518,7 @@ private:
         float * v_cache = static_cast<float *>(kv_v_) + kv_index_[il] * max_seq_ * kv_out;
         const float * q_norm = f32_ref(p + "attn_q_norm.weight");
         const float * k_norm = f32_ref(p + "attn_k_norm.weight");
-        if (!omph::kernels::cast_f32_to_f16(static_cast<const float *>(cur_), h16_, T * ne, nullptr)) {
-            return fail("cast failed");
-        }
+
         if (!matmul(p + "attn_q.weight", h16_, static_cast<float *>(fused_), q_out, ne, T) ||
             !matmul(p + "attn_k.weight", h16_, static_cast<float *>(k_), kv_out, ne, T) ||
             !matmul(p + "attn_v.weight", h16_, static_cast<float *>(v_), kv_out, ne, T) ||
@@ -563,9 +577,7 @@ private:
         float * conv_new = conv_flip_[il] ? conv_a : conv_b;
         float * seq_state = reinterpret_cast<float *>(st + 2 * n_conv_f * 4);
 
-        if (!omph::kernels::cast_f32_to_f16(static_cast<const float *>(cur_), h16_, T * ne, nullptr)) {
-            return fail("cast failed");
-        }
+
         if (!matmul(p + "attn_qkv.weight", h16_, static_cast<float *>(fused_), channels, ne, T) ||
             !matmul(p + "attn_gate.weight", h16_, static_cast<float *>(z_), v_dims, ne, T) ||
             !matmul(p + "ssm_beta.weight", h16_, static_cast<float *>(beta_), n_vh, ne, T) ||
