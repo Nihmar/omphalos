@@ -927,9 +927,15 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 
 Status: **M0-M4 are complete**; M5 (quantized KV) has its core landed (issue #43):
 K Q8 + V Q4 with the Hadamard rotation, 4.92x less KV VRAM (4.29 GB -> 0.87 GB at
-32k), KL(f32 || q8q4) 0.0837 nats at 512 tokens with the greedy tokens identical at
-short context. Left in M5: the FP16 windows of §13.4, the per-layer selection of
-§13.5 and the validation at 32k, which needs a prefill that runs there at all.
+32k). After the post-M5 review fixes (#45-#55): the rotation now runs after RoPE as
+§13.3 specifies (#46 — the first 0.0837-nat figure was measuring its misplacement),
+the flash softmax race is fixed and the engine is bit-deterministic (#55), and
+KL(f32 || q8q4) is **0.0014 nats** over all 512 positions of a wikitext prompt, top-1
+96.5 % (`tools/compare_logits.py`, `bench/results/m5-kv-kl.txt`). The f32 cache is no
+longer allocated beside the quantized one (#47), so a 32k prefill now runs. Left in M5:
+tuning the FP16 windows of §13.4 (implemented, off by default, fixed in #48), the
+per-layer selection of §13.5, and the 32k validation — which needs a reference other
+than f32 KV, since that does not fit next to the weights at 32k.
 Before that, M4's status: the decode was at
 73.3 % of the ceiling (57 ms/token) when M3 closed, and the two defects above put it at
 ~75.6 % (55.2 ms/token) — at the milestone's criterion. What is left of the criterion is
