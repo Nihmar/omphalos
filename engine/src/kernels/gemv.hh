@@ -52,4 +52,12 @@ bool gemv_q2k(const void * packed, const void * x_f16, float * y, int64_t rows, 
 bool gemv_q6k(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
               hipStream_t stream);
 
+// Same contract for IQ2_XS and IQ2_XXS in their repacked layouts (8-byte grid
+// entries, a 4-bit scale per 32-weight sub-block, sign indices resolved with the
+// 128-byte table).
+bool gemv_iq2_xs(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
+                 hipStream_t stream);
+bool gemv_iq2_xxs(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
+                  hipStream_t stream);
+
 } // namespace omph::kernels

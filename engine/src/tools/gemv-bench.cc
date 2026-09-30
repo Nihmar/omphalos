@@ -63,6 +63,12 @@ bool launch(const Case & c, const void * x, float * y, hipStream_t stream) {
     if (c.t->type == 14) {
         return omph::kernels::gemv_q6k(c.dev, x, y, c.rows, c.k, stream);
     }
+    if (c.t->type == 17) {
+        return omph::kernels::gemv_iq2_xs(c.dev, x, y, c.rows, c.k, stream);
+    }
+    if (c.t->type == 16) {
+        return omph::kernels::gemv_iq2_xxs(c.dev, x, y, c.rows, c.k, stream);
+    }
     return false;
 }
 

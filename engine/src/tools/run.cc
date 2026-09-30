@@ -563,6 +563,9 @@ private:
                 switch (it->second.type) {
                     case 10: return omph::kernels::gemv_q2k(w, x16, y, n_out, k, nullptr);
                     case 12: return omph::kernels::gemv_q4k(w, x16, y, n_out, k, nullptr);
+                    case 14: return omph::kernels::gemv_q6k(w, x16, y, n_out, k, nullptr);
+                    case 16: return omph::kernels::gemv_iq2_xxs(w, x16, y, n_out, k, nullptr);
+                    case 17: return omph::kernels::gemv_iq2_xs(w, x16, y, n_out, k, nullptr);
                     case 18: return omph::kernels::gemv_iq3_xxs(w, x16, y, n_out, k, nullptr);
                     case 21: return omph::kernels::gemv_iq3_s(w, x16, y, n_out, k, nullptr);
                     case 23: return omph::kernels::gemv_iq4_xs(w, x16, y, n_out, k, nullptr);

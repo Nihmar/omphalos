@@ -166,4 +166,29 @@ Q6kLayout q6k_layout(int64_t n_blocks);
 void repack_q6k(const void * src, int64_t n_blocks, void * dst);
 void unrepack_q6k(const void * src, int64_t n_blocks, void * dst);
 
+// ------------------------------------------------------------------ IQ2_XS / IQ2_XXS
+//
+// GGUF IQ2_XS: 74-byte blocks — f16 `d`, 32 uint16 entries (9-bit grid index +
+// 7-bit sign index) and 8 bytes of 4-bit scales. IQ2_XXS: 66-byte blocks — f16
+// `d` and 32 uint16 words each holding a grid index, a 7-bit sign index and a
+// 4-bit scale. Both only need their fields split into aligned streams; sizes are
+// unchanged and the kernels resolve signs with the 128-byte table.
+//   IQ2_XS : [ qs 64 ][ sc 8 ][ d 2 ]
+//   IQ2_XXS: [ qs 64 ][ d 2 ]
+struct Iq2Layout {
+    int64_t n_blocks = 0;
+    int64_t qs_off = 0;
+    int64_t sc_off = 0;
+    int64_t d_off = 0;
+    int64_t total = 0;
+};
+
+Iq2Layout iq2_xs_layout(int64_t n_blocks);
+void repack_iq2_xs(const void * src, int64_t n_blocks, void * dst);
+void unrepack_iq2_xs(const void * src, int64_t n_blocks, void * dst);
+
+Iq2Layout iq2_xxs_layout(int64_t n_blocks);
+void repack_iq2_xxs(const void * src, int64_t n_blocks, void * dst);
+void unrepack_iq2_xxs(const void * src, int64_t n_blocks, void * dst);
+
 } // namespace omph::format

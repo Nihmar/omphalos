@@ -285,3 +285,34 @@ That also corrects the previous estimate of the fallback: of the 1.46 GiB of
 uncovered types, ~0.75 GiB is the token embedding (a row gather, not a GEMV) and
 0.32 GiB is MTP. The fallback actually on the decode path is roughly 0.7 GiB
 (6 % of the weights): IQ2_S outside the embedding, IQ2_XS/XXS and IQ1_M.
+
+# M3.9 — IQ2_XS and IQ2_XXS GEMVs, and the decode after removing most of the fallback
+
+| type | size | bandwidth | accuracy |
+|---|---:|---:|---:|
+| IQ2_XS (17) | 211.0 MiB | **166.1 GB/s = 52.2 %** | 1.9e-4 relative |
+| IQ2_XXS (16) | 94.1 MiB | **171.0 GB/s = 53.7 %** | 2.0e-4 relative |
+
+Both repacks are byte-identical at the source size. Both were validated on the
+**aggregate** of all their tensors, not on one block — the Q2_K bug class (a
+missing per-block term) only shows up past the first block, so multi-block
+coverage is the rule now.
+
+IQ2_XS: four uint16 per 32-weight sub-block (9-bit grid index into a 512-entry
+grid, 7-bit sign index) plus one byte with two 4-bit scales. IQ2_XXS: one word of
+four grid byte-indices plus one word with four 7-bit sign indices and the 4-bit
+scale in its top nibble. Both keep the grid (4 KiB / 2 KiB) and the 128-byte sign
+table in LDS.
+
+## Decode after wiring them in
+
+| path | decode |
+|---|---:|
+| f16 (milestone 2) | 832 ms/token |
+| fused GEMV, four types (M3.7) | 174 ms/token |
+| **fused GEMV, six types (now)** | **144 ms/token** |
+
+**5.8x the milestone-2 decode, tokens byte-identical.** The remaining fallback is
+IQ2_S outside the token embedding (~0.37 GiB), IQ1_M (0.02) and the BF16/F32
+vectors (norms and biases, not GEMV-shaped) — about 0.4 GiB, so IQ2_S is the last
+type worth a kernel for the decode path.
