@@ -394,6 +394,36 @@ public:
             }
             return true;
         }
+        // Small-batch head: for a Q4_K head with 2+ tokens, run four tokens per
+        // weight read instead of materializing f16 (PLAN.md §10.1's N = 1..5).
+        if (use_gemv_ && T > 1 && gems_.count("output.weight") != 0 &&
+            gems_.at("output.weight").type == 12) {
+            const auto & e = gems_.at("output.weight");
+            const void * w = static_cast<const uint8_t *>(dev_weights_) + e.off;
+            int64_t t0 = 0;
+            for (; t0 + 4 <= T; t0 += 4) {
+                if (!omph::kernels::gemv_q4k_b4(w, static_cast<const uint8_t *>(h16_) + t0 * ne * 2,
+                                                static_cast<float *>(logits_) + t0 * h_.n_vocab,
+                                                h_.n_vocab, ne, nullptr)) {
+                    return fail("lm_head batch4 failed");
+                }
+            }
+            for (; t0 < T; ++t0) {
+                if (!omph::kernels::gemv_q4k(
+                        w, static_cast<const uint8_t *>(h16_) + t0 * ne * 2,
+                        static_cast<float *>(logits_) + t0 * h_.n_vocab, h_.n_vocab, ne,
+                        nullptr)) {
+                    return fail("lm_head tail failed");
+                }
+            }
+            if (hipDeviceSynchronize() != hipSuccess) {
+                return fail("lm_head failed");
+            }
+            logits.resize((size_t) T * h_.n_vocab);
+            (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
+            report_phases();
+            return true;
+        }
         // lm head in vocab chunks: the whole f16 head (248k x 5120) would not fit
         const omph::gguf::TensorInfo * head = file_.tensor("output.weight");
         if (head == nullptr) {

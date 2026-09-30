@@ -686,3 +686,37 @@ prefill reads the 12.02 GB of weights twice instead of the f16 path's
 from ~1.45 s to ~0.4 s — **~3.6x the prefill** — and the same kernel is the
 prerequisite for MTP verification (M6). It is the strongest remaining lever in
 the project after the decode graphs.
+
+# M3.22 — small-batch Q4_K: four tokens per weight read, 3.2x per token
+
+The levers from M3.21, first one implemented. `gemv_q4k_b4` reads the weight bytes
+once and uses them for four tokens (N = 1..5 from PLAN §10.1; four here), with the
+four result vectors written token-major — i.e. straight into the (T, out) layout
+the runtime already uses.
+
+| version | ms per 4 tokens | ms/token | vs single-token |
+|---|---:|---:|---:|
+| single-token Q4_K | 2.344 | 2.344 | 1.0x |
+| b4 with the activation staged in LDS (R=2) | 7.94 | 1.99 | 1.18x |
+| b4 with LDS staging, R=4 | 5.60 | 1.40 | 1.67x |
+| **b4 reading the activation from L1/L2 instead** | **2.903** | **0.73** | **3.2x** |
+
+Accuracy: max |d| **0.000e+00** against four single-token GEMVs, at every step.
+
+The intermediate results are the interesting part: staging the four activation
+vectors in LDS cost *more* than the weight traffic it was meant to help — 40 KB
+per workgroup against 82 KB of weights at R=4 — and dropping it turned a losing
+kernel into a 3.2x one. The activation vector is 10 KB per token and read by every
+row group, so L1/L2 already had it; the LDS copy was pure overhead.
+
+Wired into the lm head for T > 1 (four tokens per read, the tail on the
+single-token kernel): prefill 2104 -> 1967 ms, logits within 0.0092 of the chunked
+f16 head (the same f16-weight rounding as everywhere else).
+
+## The remaining port
+
+Only Q4_K has the b4 form so far, so the prefill's other layers still dequantize
+to f16. The measured per-tensor gain (3.2x) applied to the whole 11.2 GiB projects
+the prefill's GEMV cost from ~1170 ms to ~144 ms, i.e. the pass from ~1.45 s to
+~0.4 s (~3.5x, ~25 t/s). That is mechanical work: the same kernel shape for the
+other six types.
