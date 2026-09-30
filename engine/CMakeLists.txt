@@ -14,6 +14,7 @@ add_library(omphalos SHARED
     src/format/gguf.cc
     src/runtime/context.cc
     src/kernels/probe.hip
+    src/kernels/dequant.hip
 )
 target_include_directories(omphalos
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -27,3 +28,8 @@ target_link_libraries(omph-gguf-info PRIVATE omphalos)
 
 add_executable(omph-device-info src/tools/device_info.cc)
 target_link_libraries(omph-device-info PRIVATE omphalos)
+
+add_executable(omph-dequant src/tools/dequant.cc)
+target_include_directories(omph-dequant PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+find_package(hip REQUIRED)
+target_link_libraries(omph-dequant PRIVATE omphalos hip::host)
