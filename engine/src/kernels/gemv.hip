@@ -576,11 +576,22 @@ __global__ void gemv_q2k_kernel(const uint8_t * __restrict__ sc, const uint8_t *
 
 // Q6_K: 210-byte blocks. A lane iteration covers one 128-weight group: 64 bytes
 // of low nibbles, 32 bytes with the upper 2 bits and eight signed scales. The
-// four quarters of a group are contiguous weight runs (l, l+32, l+64, l+96), so
-// each activation is loaded once and the scale of each quarter folds into an
-// 8-entry per-group table (d * sc[i]).
+// four quarters of a group are contiguous weight runs (l, l+32, l+64, l+96): one
+// ql word and one qh word give four 6-bit codes of a quarter as bytes, which
+// become two half2 of (code - 32) (v_perm to 1024 + code, packed add of -1056,
+// exact) and go through v_dot2; one accumulator per 16-weight sub-block takes
+// its scale at the end (#95).
 constexpr long long kQ6kChunkSub = 256;
-constexpr long long kQ6kRows = 4;
+constexpr long long kQ6kRows = 2;
+constexpr long long kQ6kXPitch = 132;  // halves per staged 128-weight group (as Q2_K)
+
+template <uint32_t Sel>
+__device__ inline uint32_t q6_pair_to_half2(const uint32_t g) {
+    const uint32_t biased = __builtin_amdgcn_perm(0x64646464u, g, Sel);
+    const half2_v v =
+        __builtin_bit_cast(half2_v, biased) - half2_v{(_Float16) 1056, (_Float16) 1056};
+    return __builtin_bit_cast(uint32_t, v);
+}
 
 __global__ void gemv_q6k_kernel(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
                                 const uint8_t * __restrict__ sc, const uint8_t * __restrict__ d,
@@ -598,8 +609,10 @@ __global__ void gemv_q6k_kernel(const uint8_t * __restrict__ ql, const uint8_t *
     float acc[kQ6kRows] = {};
     for (long long base = 0; base < n_sub; base += chunk_sub) {
         const long long len = n_sub - base < chunk_sub ? n_sub - base : chunk_sub;
+        // Each lane reads its own 128-weight group: the 132-half pitch spreads
+        // the lanes over the LDS banks (a 128-half pitch puts them on one, #75).
         for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
-            xs[i] = x[base * 32 + i];
+            xs[(i / 128) * kQ6kXPitch + (i % 128)] = x[base * 32 + i];
         }
         __syncthreads();
         if (row0 >= rows) {
@@ -611,77 +624,53 @@ __global__ void gemv_q6k_kernel(const uint8_t * __restrict__ ql, const uint8_t *
         for (long long g = g_first + lane; g < g_last; g += 32) {
             const long long blk = g >> 1;
             const int half = (int) (g & 1);
-            const __half * xv = xs + (g * 4 - base) * 32;
+            const uint2 * xh =
+                reinterpret_cast<const uint2 *>(xs + (g - base / 4) * kQ6kXPitch);  // 4 halves
             float part[kQ6kRows] = {};
 #pragma unroll
             for (int r = 0; r < kQ6kRows; ++r) {
                 const long long row = row0 + r <= rlast ? row0 + r : rlast;
-                const uint8_t * pql = ql + row * blocks * 128 + blk * 128 + half * 64;
-                const uint8_t * pqh = qh + row * blocks * 64 + blk * 64 + half * 32;
-                const int8_t * psc =
-                    reinterpret_cast<const int8_t *>(sc + row * blocks * 16 + blk * 16 + half * 8);
+                const uint4 * pql =
+                    reinterpret_cast<const uint4 *>(ql + row * blocks * 128 + blk * 128 + half * 64);
+                const uint4 * pqh =
+                    reinterpret_cast<const uint4 *>(qh + row * blocks * 64 + blk * 64 + half * 32);
+                const uint2 scw =
+                    *reinterpret_cast<const uint2 *>(sc + row * blocks * 16 + blk * 16 + half * 8);
                 const float dv = __half2float(
                     *reinterpret_cast<const __half *>(d + row * blocks * 2 + blk * 2));
-                float dsc[8];
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    dsc[i] = dv * (float) psc[i];
-                }
-                const uint32_t qlw[16] = {
-                    reinterpret_cast<const uint32_t *>(pql)[0],
-                    reinterpret_cast<const uint32_t *>(pql)[1],
-                    reinterpret_cast<const uint32_t *>(pql)[2],
-                    reinterpret_cast<const uint32_t *>(pql)[3],
-                    reinterpret_cast<const uint32_t *>(pql)[4],
-                    reinterpret_cast<const uint32_t *>(pql)[5],
-                    reinterpret_cast<const uint32_t *>(pql)[6],
-                    reinterpret_cast<const uint32_t *>(pql)[7],
-                    reinterpret_cast<const uint32_t *>(pql)[8],
-                    reinterpret_cast<const uint32_t *>(pql)[9],
-                    reinterpret_cast<const uint32_t *>(pql)[10],
-                    reinterpret_cast<const uint32_t *>(pql)[11],
-                    reinterpret_cast<const uint32_t *>(pql)[12],
-                    reinterpret_cast<const uint32_t *>(pql)[13],
-                    reinterpret_cast<const uint32_t *>(pql)[14],
-                    reinterpret_cast<const uint32_t *>(pql)[15]};
-                const uint32_t qhw[8] = {
-                    reinterpret_cast<const uint32_t *>(pqh)[0],
-                    reinterpret_cast<const uint32_t *>(pqh)[1],
-                    reinterpret_cast<const uint32_t *>(pqh)[2],
-                    reinterpret_cast<const uint32_t *>(pqh)[3],
-                    reinterpret_cast<const uint32_t *>(pqh)[4],
-                    reinterpret_cast<const uint32_t *>(pqh)[5],
-                    reinterpret_cast<const uint32_t *>(pqh)[6],
-                    reinterpret_cast<const uint32_t *>(pqh)[7]};
+                const uint4 l0 = pql[0], l1 = pql[1], l2 = pql[2], l3 = pql[3];
+                const uint4 h0 = pqh[0], h1 = pqh[1];
+                const uint32_t qlw[16] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w,
+                                          l2.x, l2.y, l2.z, l2.w, l3.x, l3.y, l3.z, l3.w};
+                const uint32_t qhw[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
                 float sub[8] = {};
 #pragma unroll
-                for (int l = 0; l < 32; ++l) {
-                    const int wi = l >> 2;
-                    const int bi = 8 * (l & 3);
-                    const uint32_t ql_lo = (qlw[wi] >> bi) & 0xFF;
-                    const uint32_t ql_hi = (qlw[wi + 8] >> bi) & 0xFF;
-                    const uint32_t qh_b = (qhw[wi] >> bi) & 0xFF;
-                    const int is = l >> 4;
-                    const float x0 = __half2float(xv[l]);
-                    const float x1 = __half2float(xv[32 + l]);
-                    const float x2 = __half2float(xv[64 + l]);
-                    const float x3 = __half2float(xv[96 + l]);
-                    sub[0 + is] = fmaf(
-                        (float) (int) ((ql_lo & 0xF) | ((qh_b & 3) << 4)) - 32.0f, x0, sub[0 + is]);
-                    sub[2 + is] = fmaf(
-                        (float) (int) ((ql_hi & 0xF) | (((qh_b >> 2) & 3) << 4)) - 32.0f, x1,
-                        sub[2 + is]);
-                    sub[4 + is] = fmaf(
-                        (float) (int) ((ql_lo >> 4) | (((qh_b >> 4) & 3) << 4)) - 32.0f, x2,
-                        sub[4 + is]);
-                    sub[6 + is] = fmaf(
-                        (float) (int) ((ql_hi >> 4) | (((qh_b >> 6) & 3) << 4)) - 32.0f, x3,
-                        sub[6 + is]);
+                for (int wi = 0; wi < 8; ++wi) {
+                    const int is = wi >> 2;  // 16-weight sub-block within the quarter
+                    const uint32_t lo = qlw[wi];
+                    const uint32_t hi = qlw[wi + 8];
+                    const uint32_t hb = qhw[wi];
+                    // codes of weights 4wi..4wi+3 of each quarter, one per byte
+                    const uint32_t c[4] = {
+                        (lo & 0x0F0F0F0Fu) | ((hb & 0x03030303u) << 4),
+                        (hi & 0x0F0F0F0Fu) | ((hb & 0x0C0C0C0Cu) << 2),
+                        ((lo >> 4) & 0x0F0F0F0Fu) | (hb & 0x30303030u),
+                        ((hi >> 4) & 0x0F0F0F0Fu) | ((hb >> 2) & 0x30303030u)};
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const uint2 xv = xh[j * 8 + wi];
+                        float t = dot2(q6_pair_to_half2<0x04010400u>(c[j]), xv.x, sub[2 * j + is]);
+                        sub[2 * j + is] = dot2(q6_pair_to_half2<0x04030402u>(c[j]), xv.y, t);
+                    }
                 }
+                const uint32_t sw[2] = {scw.x, scw.y};
+                float pr = 0.0f;
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
-                    part[r] = fmaf(dsc[i], sub[i], part[r]);
+                    const float s8 = (float) (int8_t) (sw[i >> 2] >> (8 * (i & 3)));
+                    pr = fmaf(s8, sub[i], pr);
                 }
+                part[r] = dv * pr;
             }
 #pragma unroll
             for (int r = 0; r < kQ6kRows; ++r) {
@@ -1638,7 +1627,7 @@ bool gemv_q6k(const void * packed, const void * x_f16, float * y, const int64_t 
     const omph::format::Q6kLayout l = omph::format::q6k_layout(n_blocks);
     const int64_t n_sub = k / 32;
     const int64_t chunk = n_sub < kQ6kChunkSub ? n_sub : kQ6kChunkSub;
-    const size_t smem = (size_t) chunk * 64;
+    const size_t smem = (size_t) (chunk / 4) * kQ6kXPitch * 2;  // padded groups
     const auto * base = static_cast<const uint8_t *>(packed);
     const dim3 grid((unsigned) ((rows + 8 * kQ6kRows - 1) / (8 * kQ6kRows)));
     gemv_q6k_kernel<<<grid, 256, smem, stream>>>(base + l.ql_off, base + l.qh_off,
