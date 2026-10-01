@@ -225,7 +225,7 @@ int main(int argc, char ** argv) {
             return fail("input upload failed");
         }
 
-        // projections (hipBLASLt, all tokens: not what this tool checks)
+        // projections (the f16 GEMM, all tokens: not what this tool checks)
         omph::runtime::Linear linear;
         if (!linear.run(wqkv, ex16, (float *) qkv, channels, n_embd, tokens) ||
             !linear.run(wz, ex16, (float *) z, v_dims, n_embd, tokens)) {

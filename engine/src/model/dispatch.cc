@@ -1,4 +1,4 @@
-// Runner: matmul dispatch (fused GEMV, four-token GEMV, f16 + hipBLASLt).
+// Runner: matmul dispatch (fused GEMV, four-token GEMV, f16 + WMMA GEMM).
 #include "model/runner.hh"
 
 #include "format/repack.hh"
@@ -42,7 +42,7 @@ bool Runner::gemv_one(const int type, const void * w, const void * x, float * y,
 
 // One matmul: the fused GEMV for single-token steps when it is available for
 // this tensor, the small-batch GEMV for a few tokens, otherwise the f16
-// dequant + hipBLASLt path.
+// dequant + GEMM path.
 bool Runner::matmul(const Mat & m, const void * x16, float * y, const int64_t n_out,
             const int64_t k, const int64_t T) {
     if (m.t == nullptr) {

@@ -20,7 +20,6 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <tuple>
 #include <vector>
 
 namespace omph::model {
@@ -304,74 +303,10 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
             }
         }
     }
-    // hipBLASLt loads each kernel family on its first use (~0.1-0.35 s each,
-    // ~0.47 s in all for a prefill): pay it at load, not in the first prefill
-    // (M8), with one GEMM of every weight shape at the chunk size. Garbage in,
-    // garbage out: the scratch is overwritten before any real use. A --gemv
-    // runner warms up only if its chunks can reach the GEMM path, through a
-    // buffer it frees again (its scratch is allocated on first use).
     scratch_ready_ = !use_gemv_;
     gemm_min_ = env_.gemm_min;
-    if (!use_gemv_ || T >= gemm_min_) {
-        const int64_t wt = std::min<int64_t>(T, 512);
-        // (slice rows, k, output row stride): exactly the plans the prefill uses
-        std::vector<std::tuple<int64_t, int64_t, int64_t>> shapes;
-        const auto add = [&](const Mat & m) {
-            if (m.t != nullptr && m.t->ne.size() >= 2) {
-                const int64_t n_out = (int64_t) m.t->ne[1];
-                const int64_t k = (int64_t) m.t->ne[0];
-                const int64_t rows = stage_rows(n_out, k);
-                shapes.emplace_back(rows, k, n_out);
-                if (n_out % rows != 0) {
-                    shapes.emplace_back(n_out % rows, k, n_out);  // the last slice
-                }
-            }
-        };
-        for (const LayerWeights & L : layers_) {
-            for (const Mat * m : {&L.attn_q, &L.attn_k, &L.attn_v, &L.attn_output, &L.attn_qkv,
-                                  &L.attn_gate, &L.ssm_out, &L.ffn_up, &L.ffn_gate, &L.ffn_down}) {
-                add(*m);
-            }
-        }
-        if (!use_gemv_) {
-            const int64_t chunk = std::min<int64_t>(h_.n_vocab, 32768);
-            shapes.emplace_back(chunk, ne, chunk);  // the chunked head
-        }
-        std::sort(shapes.begin(), shapes.end());
-        shapes.erase(std::unique(shapes.begin(), shapes.end()), shapes.end());
-        // existing buffers: the scratch as W, ffn16_ as x, ffn1_ as y
-        void * w = nullptr;
-        if (use_gemv_) {
-            if (hipMalloc(&w, scratch_bytes) != hipSuccess) {
-                throw std::runtime_error("out of VRAM (hipBLASLt warmup)");
-            }
-        } else {
-            w = scratch_.alloc(scratch_bytes);
-        }
-        for (const auto & [rows, k, ldy] : shapes) {
-            if (k > h_.n_ff) {
-                continue;
-            }
-            // the head's chunk reads head16_ and writes tmp_logits_, which
-            // the f16 path allocates for its first head anyway
-            const bool head = ldy > h_.n_ff;
-            const void * wsrc = head ? lazy(&head16_, head16_bytes_) : w;
-            if (!head && (size_t) rows * k * 2 > scratch_bytes) {
-                continue;
-            }
-            float * yout = head ? static_cast<float *>(lazy(&tmp_logits_, tmp_logits_bytes_))
-                                : static_cast<float *>(ffn1_);
-            if (!linear_.run(wsrc, ffn16_, yout, rows, k, wt, ldy)) {
-                throw std::runtime_error("hipBLASLt warmup failed");
-            }
-        }
-        if (hipDeviceSynchronize() != hipSuccess) {
-            throw std::runtime_error("hipBLASLt warmup failed");
-        }
-        if (use_gemv_) {
-            (void) hipFree(w);
-        }
-        scratch_.reset();
+    if (overlap_) {
+        calibrate_overlap();
     }
     if (env_.timing) {
         size_t free_b = 0;
@@ -439,6 +374,87 @@ bool Runner::in_stack(const std::string & name) const {
     }
     // with MTP on, its block (blk.<n_layer>) is loaded too (#124)
     return std::atoll(name.c_str() + 4) < h_.n_layer + (mtp_ ? 1 : 0);
+}
+
+// The side stream overlaps sibling GEMVs (#71), ~0.9 ms of a 46 ms step. But
+// whether two of the process's hardware queues really run side by side is
+// decided when the queues are created, by the driver's queue scheduler, and
+// varies from run to run: on a bad pair every small kernel after a join waited
+// ~15 us and the step took 72 ms instead of 46.7 without overlap (#132; it
+// had been hidden by hipBLASLt taking a queue first). So the pattern of a
+// decode step's FFN is timed both ways at load; a losing side stream is
+// replaced by a new one (the next hardware queue), and after three tries the
+// overlap is turned off.
+void Runner::calibrate_overlap() {
+    const LayerWeights & L = layers_.front();
+    const int64_t ne = h_.n_embd;
+    const auto pattern = [&]() {
+        for (int i = 0; i < 16; ++i) {
+            if (!omph::kernels::add_rms_norm_f16(static_cast<const float *>(blk_),
+                                                 static_cast<const float *>(x_),
+                                                 static_cast<float *>(resid_), L.post_norm,
+                                                 h16_, 1, ne, (float) h_.eps, nullptr) ||
+                !fork_join(
+                    1,
+                    [&] {
+                        return matmul(L.ffn_up, h16_, static_cast<float *>(ffn2_), h_.n_ff, ne, 1);
+                    },
+                    [&] {
+                        return matmul(L.ffn_gate, h16_, static_cast<float *>(ffn1_), h_.n_ff, ne,
+                                      1);
+                    }) ||
+                !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
+                                           static_cast<const float *>(ffn2_), ffn16_, h_.n_ff,
+                                           nullptr)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    hipEvent_t e0 = nullptr;
+    hipEvent_t e1 = nullptr;
+    if (hipEventCreate(&e0) != hipSuccess || hipEventCreate(&e1) != hipSuccess) {
+        throw std::runtime_error("cannot create the calibration events");
+    }
+    // the median of five timings of the pattern, overlapped or not
+    const auto time = [&](const bool overlap) {
+        overlap_ = overlap;
+        std::vector<float> ms;
+        for (int rep = 0; rep < 6; ++rep) {
+            float t = 0.0f;
+            if (hipEventRecord(e0, nullptr) != hipSuccess || !pattern() ||
+                hipEventRecord(e1, nullptr) != hipSuccess || hipEventSynchronize(e1) != hipSuccess ||
+                hipEventElapsedTime(&t, e0, e1) != hipSuccess) {
+                throw std::runtime_error("overlap calibration failed");
+            }
+            if (rep > 0) {  // the first one warms up
+                ms.push_back(t);
+            }
+        }
+        std::sort(ms.begin(), ms.end());
+        return ms[ms.size() / 2];
+    };
+    const float serial = time(false);
+    bool keep = false;
+    for (int attempt = 0; attempt < 3 && !keep; ++attempt) {
+        if (attempt > 0) {
+            hipStream_t fresh = nullptr;
+            if (hipStreamCreateWithFlags(&fresh, hipStreamNonBlocking) != hipSuccess) {
+                break;
+            }
+            (void) hipStreamDestroy(side_);
+            side_ = fresh;
+        }
+        const float overlapped = time(true);
+        keep = overlapped < serial;
+        if (env_.timing) {
+            std::fprintf(stderr, "overlap calibration: serial %.3f ms, side stream %d %.3f ms%s\n",
+                         serial, attempt, overlapped, keep ? " (kept)" : "");
+        }
+    }
+    overlap_ = keep;
+    (void) hipEventDestroy(e0);
+    (void) hipEventDestroy(e1);
 }
 
 // Allocates *p on first use (the f16-path buffers, #86).

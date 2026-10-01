@@ -301,7 +301,7 @@ bool Runner::copy_logits(float * dst, const int64_t rows) {
     return true;
 }
 
-// lm head in vocab chunks, through the f16 dequant + hipBLASLt path: the
+// lm head in vocab chunks, through the f16 dequant + GEMM path: the
 // whole f16 head (248k x 5120, 2.5 GB) would not fit. Writes (T, n_vocab)
 // to `out` on the host, one vocab chunk at a time.
 bool Runner::head_chunked(const void * x16, const int64_t T, float * out) {

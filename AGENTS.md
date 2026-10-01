@@ -107,7 +107,7 @@ tools/native/build.sh <llama.cpp-dir> && tools/native/dump_tensors ...
 
 | option | effect |
 |---|---|
-| `--gemv` | decode with the fused GEMVs on repacked weights: the fast path. Only effective with `--generate`; a prefill-only run stays on the f16 + hipBLASLt path |
+| `--gemv` | decode with the fused GEMVs on repacked weights: the fast path. Only effective with `--generate`; a prefill-only run stays on the f16 + GEMM path |
 | `--generate N --gen-out FILE` | greedy-decode N tokens after the prompt, ids to FILE |
 | `--last-logits` / `--logits-tail N` | write only the last row / the last N rows of logits (long prompts) |
 | `--tokens N` | use only the first N prompt tokens |
@@ -128,16 +128,16 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_KV_HOST` | KV | exact f32 cache in pinned host RAM (long-context reference) |
 | `OMPH_KV_K4` | KV | K in V's Q4 format too (#81, experiment) |
 | `OMPH_KV_WINDOW=N` | KV | FP16 ring of the last N tokens (default 128, 0 = off) |
-| `OMPH_NO_OVERLAP` | A/B | no side stream for sibling GEMVs (#71) |
+| `OMPH_NO_OVERLAP` | A/B | no side stream for sibling GEMVs (#71). With it on, the runner times the overlap at load and drops a side stream that loses to running in order (#132; `OMPH_TIMING` prints the outcome) |
 | `OMPH_NO_B4` | A/B | no NT = 2..4-token GEMVs (verifications, short `--gemv` prefills): one launch per token |
-| `OMPH_GEMM_MIN=T` | A/B | `--gemv` runs of T+ tokens (prefill chunks) take the dequant + hipBLASLt path (default 32, the measured crossover; #129) |
-| `OMPH_STAGE_MIB=N` | A/B | f16 weights staged for hipBLASLt in row slices of ~N MiB (default 8, cache-resident; 0 = whole tensors; #129) |
+| `OMPH_GEMM_MIN=T` | A/B | `--gemv` runs of T+ tokens (prefill chunks) take the dequant + WMMA GEMM path (default 32, the measured crossover; #129, #132) |
+| `OMPH_STAGE_MIB=N` | A/B | f16 weights staged for the GEMM in row slices of ~N MiB (default 20, cache-resident; 0 = whole tensors; #129, #132) |
 | `OMPH_GDN_SERIAL` | A/B | a multi-token delta rule in one launch (one workgroup per head) instead of the token-parallel form (#96) |
 | `OMPH_NO_BF16_GEMV` | A/B | BF16 weights through the f16 path |
 | `OMPH_NO_F16_CACHE` | A/B | re-convert f16-path weights on every call |
 | `OMPH_HOST_ARGMAX` | A/B | greedy argmax on the host instead of the device (#102) |
 | `OMPH_SKIP_ATTN` / `OMPH_SKIP_FFN` / `OMPH_SKIP_BLOCKS` | ablation | no attention / no FFN / no blocks at all |
-| `OMPH_SKIP_GEMV` / `OMPH_SKIP_GEMV_TYPE=T` / `OMPH_SKIP_STAGE` | ablation | no fused GEMVs / none of GGUF type T / no f16 + hipBLASLt matmuls |
+| `OMPH_SKIP_GEMV` / `OMPH_SKIP_GEMV_TYPE=T` / `OMPH_SKIP_STAGE` | ablation | no fused GEMVs / none of GGUF type T / no f16 + GEMM matmuls |
 
 `omph-gemv-bench` reads two of its own: `OMPH_BENCH_STREAMS=N` (alternate launches over N streams) and `OMPH_OCCUPANCY` (print the occupancy probe).
 

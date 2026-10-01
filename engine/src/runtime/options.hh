@@ -18,7 +18,7 @@ struct EnvOptions {
 
     // --- decode paths (A/B switches)
     bool no_overlap = false;    // OMPH_NO_OVERLAP: no side stream for sibling GEMVs (#71)
-    int stage_mib = 8;          // OMPH_STAGE_MIB=N: f16 weight slices of ~N MiB (0: whole)
+    int stage_mib = 20;         // OMPH_STAGE_MIB=N: f16 weight slices of ~N MiB (0: whole)
     int gemm_min = 32;
     bool gdn_serial = false;    // OMPH_GDN_SERIAL: a chunk's delta rule in one launch (#96)
     bool no_b4 = false;         // OMPH_NO_B4: no NT-token GEMVs (verification, --gemv prefill)
@@ -33,7 +33,7 @@ struct EnvOptions {
     bool skip_blocks = false;   // OMPH_SKIP_BLOCKS: no attention / delta-net / FFN at all
     bool skip_gemv = false;     // OMPH_SKIP_GEMV: no fused GEMVs
     int skip_gemv_type = -1;    // OMPH_SKIP_GEMV_TYPE=T: no GEMVs of GGUF type T (#63)
-    bool skip_stage = false;    // OMPH_SKIP_STAGE: no f16 staging + hipBLASLt matmuls
+    bool skip_stage = false;    // OMPH_SKIP_STAGE: no f16 staging + GEMMs
 
     // --- diagnostics
     bool timing = false;        // OMPH_TIMING: VRAM after load, per-step GPU and wall times

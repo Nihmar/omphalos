@@ -1,5 +1,5 @@
 // omph-linear — y = x @ W^T through the naive GPU path:
-// dequantize W to f16, cast x to f16, hipBLASLt GEMM with f32 accumulate.
+// dequantize W to f16, cast x to f16, WMMA GEMM with f32 accumulate.
 //
 // usage: omph-linear <model.gguf> <weight-tensor> <in.f32> <out.f32> <tokens>
 //   in.f32:  tokens x in_features, row-major float32

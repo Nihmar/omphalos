@@ -10,7 +10,7 @@
 //   --gen-out FILE      ... and write them here (one id per line); required with --generate
 //   --gemv              decode with the fused GEMVs on repacked weights (the fast
 //                       path; only effective with --generate, a prefill-only run
-//                       stays on the f16 + hipBLASLt path)
+//                       stays on the f16 + GEMM path)
 //   --trace-dir DIR     dump each layer's output as l_out-<layer>.f32 (one-chunk
 //                       prompts only)
 // Without --last-logits / --logits-tail the file holds tokens x n_vocab f32.

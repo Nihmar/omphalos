@@ -1,5 +1,5 @@
 // Bump allocator over one device buffer: the f16 staging of one layer's weights
-// on the dequant + hipBLASLt path, reset per layer.
+// on the dequant + GEMM path, reset per layer.
 #pragma once
 
 #include <cstddef>
