@@ -107,8 +107,8 @@ bool Runner::gdn_layer(const int64_t il, const LayerWeights & L, const int64_t T
     float * conv_b = conv_a + n_conv_f;
     float * conv_cur = conv_flip_[il] ? conv_b : conv_a;
     float * conv_new = conv_flip_[il] ? conv_a : conv_b;
-    float * seq_state = reinterpret_cast<float *>(st + 2 * n_conv_f * 4);
-
+    float * seq_state = state_cur_[(size_t) il];
+    (void) st;
 
     const bool proj_ok = fork_join(
         T,
@@ -145,8 +145,24 @@ bool Runner::gdn_layer(const int64_t il, const LayerWeights & L, const int64_t T
     step.eps_l2 = (float) (h_.eps / (double) s);
     step.l2_scale = l2_scale;
     step.eps_norm = (float) h_.eps;
+    // A speculative verification (#122) reads the state from the current buffer
+    // and leaves it intact: the first token writes the alternate one, the rest
+    // update that; every token records its rank-1 factors, and the first the
+    // conv input history, so commit() can roll back to any prefix.
+    float * alt = verifying_ ? state_alt_[(size_t) il] : nullptr;
+    if (verifying_) {
+        step.replay = static_cast<float *>(replay_pool_) +
+                      rec_index_[(size_t) il] * spec_max_ *
+                          omph::kernels::gdn_replay_floats(n_vh, n_kh);
+        step.conv_hist = static_cast<float *>(conv_hist_pool_) +
+                         rec_index_[(size_t) il] * (h_.ssm_conv_k - 1 + spec_max_) * channels;
+    }
     for (int64_t t = 0; t < T; ++t) {
         step.t = t;
+        if (alt != nullptr) {
+            step.state = t == 0 ? seq_state : alt;
+            step.state_out = alt;
+        }
         step.x16 = reinterpret_cast<const __half *>(static_cast<const uint8_t *>(h16_) +
                                                     t * ne * 2);
         step.z = static_cast<const float *>(z_) + t * v_dims;

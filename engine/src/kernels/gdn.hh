@@ -44,7 +44,30 @@ struct GdnStep {
     float eps_l2 = 0.0f;               // the L2 norm's eps / s
     float l2_scale = 0.0f;             // 1 / sqrt(s), also the output scale
     float eps_norm = 0.0f;
+    // Speculative verification (#122), all optional:
+    float * state_out = nullptr;       // the updated state goes here instead of `state`
+    float * replay = nullptr;          // per token t: gdn_replay_floats(heads, n_kh) floats at
+                                       // t * that, the token's rank-1 factors (decay, k, d)
+    float * conv_hist = nullptr;       // at t = 0: [conv_cur; qkv] rows, (conv_k - 1 + tokens)
+                                       // x channels, to rebuild the tail of a shorter prefix
 };
 bool gdn_step(const GdnStep & a, int64_t heads, hipStream_t stream);
+
+// Floats of one token's replay record: decay (heads), k (n_kh x 128), d (heads x 128).
+inline int64_t gdn_replay_floats(const int64_t heads, const int64_t n_kh) {
+    return heads + n_kh * 128 + heads * 128;
+}
+
+// Applies the first `tokens` records of `replay` to `state` in place:
+// S <- decay S; S <- S + k d^T per token, the float operations of gdn_step in
+// its order, so the result equals the state gdn_step reached after them,
+// bit for bit (#104).
+bool gdn_replay(float * state, const float * replay, int64_t tokens, int64_t heads,
+                int64_t n_kh, hipStream_t stream);
+
+// conv_dst rows r < conv_k - 1 = conv_hist rows accepted + r: the conv tail after
+// the first `accepted` tokens of a recorded step.
+bool gdn_conv_select(const float * conv_hist, float * conv_dst, int64_t accepted,
+                     int64_t conv_k, int64_t channels, hipStream_t stream);
 
 } // namespace omph::kernels

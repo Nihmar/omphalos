@@ -111,6 +111,7 @@ tools/native/build.sh <llama.cpp-dir> && tools/native/dump_tensors ...
 | `--last-logits` / `--logits-tail N` | write only the last row / the last N rows of logits (long prompts) |
 | `--tokens N` | use only the first N prompt tokens |
 | `--trace-dir DIR` | dump every layer's output (one-chunk prompts only) |
+| `--draft-oracle FILE [--draft-k K] [--draft-corrupt N]` | speculative greedy decode with drafts from a token file (a plain greedy run's `--gen-out`), every N-th draft corrupted: validates the verification + rollback (#122); the output must equal the plain greedy run |
 
 The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (the authoritative list). Defaults are what the engine runs; ablations give wrong results with valid timings.
 
@@ -118,6 +119,7 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 |---|---|---|
 | `OMPH_TIMING` | diagnostics | VRAM after load, per-step `step gpu` / `step wall` |
 | `OMPH_PHASES` | diagnostics | per-phase GPU totals; its ~460 events per step add ~2.6 ms, so never measure the step with it (#100) |
+| `OMPH_SPEC_CHECK` | diagnostics | check every speculative rollback: the replay bit-exact against `gdn_step`, the FP16 ring restored (slow) |
 | `OMPH_TRACE_ALLOC` / `OMPH_TRACE_F16` / `OMPH_TRACE_STAGE` | diagnostics | f16-scratch allocations / matmuls falling back to the f16 path / f16 staging and cache hits |
 | `OMPH_KV_F32` | KV | exact f32 cache in VRAM (reference) |
 | `OMPH_KV_HOST` | KV | exact f32 cache in pinned host RAM (long-context reference) |
