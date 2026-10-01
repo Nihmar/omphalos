@@ -139,6 +139,50 @@ __global__ void swiglu_f16_kernel(const float * __restrict__ x, const float * __
     }
 }
 
+// Each thread keeps the best key of a strided slice, the waves and then the
+// workgroup reduce it, and one atomicMax per workgroup merges them.
+constexpr int kArgmaxThreads = 1024;
+constexpr int kArgmaxBlocks = 64;
+
+__device__ inline unsigned long long argmax_key(const float v, const unsigned i) {
+    uint32_t u = __float_as_uint(v);
+    u = u == 0x80000000u ? 0u : u;  // -0.0 ties with +0.0
+    const uint32_t ord = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return ((unsigned long long) ord << 32) | (0xffffffffu - i);
+}
+
+__global__ __launch_bounds__(kArgmaxThreads) void argmax_kernel(const float * __restrict__ x,
+                                                               const long long n,
+                                                               unsigned long long * key) {
+    __shared__ unsigned long long wbest[kArgmaxThreads / 32];
+    unsigned long long best = 0;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (long long) gridDim.x * blockDim.x) {
+        const unsigned long long k = argmax_key(x[i], (unsigned) i);
+        best = k > best ? k : best;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const unsigned long long o = __shfl_xor(best, off);
+        best = o > best ? o : best;
+    }
+    if ((threadIdx.x & 31) == 0) {
+        wbest[threadIdx.x >> 5] = best;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        best = wbest[threadIdx.x];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const unsigned long long o = __shfl_xor(best, off);
+            best = o > best ? o : best;
+        }
+        if (threadIdx.x == 0) {
+            atomicMax(key, best);
+        }
+    }
+}
+
 __global__ void wave_size_kernel(int * out) {
     if (threadIdx.x == 0) {
         *out = __builtin_amdgcn_wavefrontsize();
@@ -146,6 +190,18 @@ __global__ void wave_size_kernel(int * out) {
 }
 
 } // namespace
+
+bool argmax_f32(const float * x, const int64_t n, unsigned long long * key,
+                hipStream_t stream) {
+    if (x == nullptr || key == nullptr || n <= 0 || n >= (int64_t) 0xffffffffLL) {
+        return false;
+    }
+    if (hipMemsetAsync(key, 0, sizeof(*key), stream) != hipSuccess) {
+        return false;
+    }
+    argmax_kernel<<<kArgmaxBlocks, kArgmaxThreads, 0, stream>>>(x, (long long) n, key);
+    return hipGetLastError() == hipSuccess;
+}
 
 int kernel_wave_size() {
     int * dev = nullptr;

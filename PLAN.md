@@ -632,7 +632,7 @@ Measured on the decode step (M4, issue #41):
   worth its complexity. Revisit only if a future step becomes launch-bound — the probe
   (`omph-graph-probe`) is the instrument that decides it.
 - **Two streams**: main compute stream + auxiliary stream for deferred MTP KV fill (§12.3) and uploads (image embeddings, prompt-cache restores).
-- Host thread pinned to a P-core; the only per-token host work is reading back the token id and detokenizing/streaming (can be on another thread).
+- Host thread pinned to a P-core; the only per-token host work is reading back the token id and detokenizing/streaming (can be on another thread). **Done for the greedy decode (#102)**: the argmax runs on the device and 8 bytes come back instead of 1 MB of logits (wall 47.99 → 47.84 ms/token). Re-measured in #102 on the 789-kernel step: wall − GPU time is now 0.02 ms, and a graph would save ~0.47 µs × 789 ≈ 0.37 ms. Graphs stay dropped: they would need device-side positions and a fixed attention grid (its split count follows `seq`).
 - Advanced (later): **persistent "megakernel"** for decode — one long-running kernel that walks the layers, removing inter-kernel bubbles and tail effects. High complexity; only after everything else.
 
 ---
