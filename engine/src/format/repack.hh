@@ -64,9 +64,6 @@ Iq4Layout iq4_layout(int64_t n_blocks);
 void repack_iq4_xs(const void * src, int64_t n_blocks, void * dst);
 void unrepack_iq4_xs(const void * src, int64_t n_blocks, void * dst);
 
-// The 16 int8 codebook values of IQ4_NL / IQ4_XS (ggml-common.h).
-extern const int8_t kIq4Codebook[16];
-
 // ------------------------------------------------------------------ IQ3_XXS
 //
 // GGUF IQ3_XXS: 98-byte blocks — f16 `d`, 64 bytes of 4-byte grid indices

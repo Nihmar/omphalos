@@ -92,9 +92,6 @@ void unrepack_q4k(const void * src, const int64_t n_blocks, void * dst) {
 
 // ------------------------------------------------------------------ IQ4_XS
 
-const int8_t kIq4Codebook[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
-                                 1,    13,   25,  38,  53,  69,  89,  113};
-
 Iq4Layout iq4_layout(const int64_t n_blocks) {
     Iq4Layout l;
     l.n_blocks = n_blocks;
