@@ -45,14 +45,6 @@ __global__ void rms_norm_kernel(const float * __restrict__ x, const float * __re
     }
 }
 
-__global__ void mul_inplace_kernel(float * __restrict__ x, const float * __restrict__ y,
-                                   const long long n) {
-    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        x[i] *= y[i];
-    }
-}
-
 __global__ void add_inplace_kernel(float * __restrict__ x, const float * __restrict__ y,
                                    const long long n) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
@@ -166,15 +158,6 @@ bool rms_norm(const float * x, const float * w, float * y, const int64_t rows, c
     }
     rms_norm_kernel<<<(unsigned) rows, kBlock, kBlock * sizeof(float), stream>>>(
         x, w, y, (long long) n, eps, scale);
-    return hipGetLastError() == hipSuccess;
-}
-
-bool mul_inplace(float * x, const float * y, const int64_t n, hipStream_t stream) {
-    if (x == nullptr || y == nullptr || n <= 0) {
-        return false;
-    }
-    mul_inplace_kernel<<<(unsigned) ((n + kBlock - 1) / kBlock), kBlock, 0, stream>>>(x, y,
-                                                                                      (long long) n);
     return hipGetLastError() == hipSuccess;
 }
 
