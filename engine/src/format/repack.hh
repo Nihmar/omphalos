@@ -8,13 +8,13 @@
 // each 32-weight sub-block occupies 16 contiguous, 16-byte aligned bytes:
 //
 //   [ qs  ] n_blocks * 128 B   sub-block s at s*16, value v in nibble v&1 of byte v/2
-//   [ sc  ] n_blocks * 8 B     6-bit scales, decoded to bytes
-//   [ mn  ] n_blocks * 8 B     6-bit mins,   decoded to bytes
-//   [ d   ] n_blocks * 2 B     f16 super-block scale
-//   [ dmin] n_blocks * 2 B     f16 super-block min-scale
+//   [ meta] n_blocks * 16 B    per block, one 16-byte load: the GGUF 12-byte
+//                              6-bit scale/min area verbatim (decoded in the
+//                              kernel), then d, then dmin (f16) (#94)
 //
-// Same size as the source. Every value keeps its exact 4-bit code and every
-// scale/min keeps its exact 6-bit value, so dequantization is bit-identical.
+// Same size as the source (sections padded to 128 B). Every value keeps its
+// exact 4-bit code and the scale area is untouched, so dequantization is
+// bit-identical.
 #pragma once
 
 #include <cstdint>
@@ -26,10 +26,7 @@ namespace omph::format {
 struct Q4kLayout {
     int64_t n_blocks = 0;   // 256-weight blocks
     int64_t qs_off = 0;
-    int64_t sc_off = 0;
-    int64_t mn_off = 0;
-    int64_t d_off = 0;
-    int64_t dmin_off = 0;
+    int64_t meta_off = 0;
     int64_t total = 0;      // bytes (sections padded to 128 B)
 };
 
@@ -50,14 +47,16 @@ void unrepack_q4k(const void * src, int64_t n_blocks, void * dst);
 // kvalues_iq4nl). The codes already form one contiguous 16-byte run per
 // 32-weight sub-block, so only the scales move:
 //
-//   [ qs ] n_blocks * 128 B   16 B per sub-block, codes as in the source
-//   [ sc ] n_blocks * 8 B     the 8 six-bit scales, decoded to bytes
-//   [ d  ] n_blocks * 2 B     f16 per-block scale
+//   [ qs  ] n_blocks * 128 B   16 B per sub-block, codes as in the source
+//   [ meta] n_blocks * 8 B     per block, one 8-byte load: scales_l verbatim (low
+//                              4 bits of scale ib at bit 4*ib), scales_h verbatim
+//                              (high 2 bits at bit 2*ib), d (f16)
+//
+// 136 B per block, as the source (#94).
 struct Iq4Layout {
     int64_t n_blocks = 0;
     int64_t qs_off = 0;
-    int64_t sc_off = 0;
-    int64_t d_off = 0;
+    int64_t meta_off = 0;
     int64_t total = 0;
 };
 
