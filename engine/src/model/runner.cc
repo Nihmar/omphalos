@@ -440,7 +440,11 @@ void Runner::calibrate_overlap() {
             if (hipStreamCreateWithFlags(&fresh, hipStreamNonBlocking) != hipSuccess) {
                 break;
             }
-            (void) hipStreamDestroy(side_);
+            if (env_.test_bad_side > 0 && test_bad_side_ == nullptr) {
+                test_bad_side_ = side_;  // kept for the watchdog's test hook
+            } else {
+                (void) hipStreamDestroy(side_);
+            }
             side_ = fresh;
         }
         const float overlapped = time(true);
@@ -453,6 +457,65 @@ void Runner::calibrate_overlap() {
     overlap_ = keep;
     (void) hipEventDestroy(e0);
     (void) hipEventDestroy(e1);
+}
+
+// The side stream can turn bad during a run, after a calibration that kept a
+// good one (#144: twice, ~72 ms per step instead of 45.8). Every
+// single-token step is timed; three in a row at 1.35x a slow average of the
+// normal ones re-run the calibration at the start of the next step, when the
+// activation buffers it uses are free. A step's time grows only slowly with
+// the context, so this does not fire on long runs.
+void Runner::watch_step_begin(const int64_t T) {
+    if (T != 1 || side_ == nullptr || env_.no_overlap) {
+        return;
+    }
+    if (recal_pending_ && recalibrations_ < kMaxRecalibrations) {
+        recal_pending_ = false;
+        ++recalibrations_;
+        if (env_.timing) {
+            std::fprintf(stderr, "side stream: steps %.1fx slower than %.2f ms, recalibrating\n",
+                         kSlowStep, step_ref_);
+        }
+        calibrate_overlap();
+    }
+    if (env_.test_bad_side > 0 && ++watched_steps_ == env_.test_bad_side &&
+        test_bad_side_ != nullptr) {
+        side_ = test_bad_side_;  // test hook: the stream the calibration rejected
+        test_bad_side_ = nullptr;
+        overlap_ = true;
+        if (env_.timing) {
+            std::fprintf(stderr, "side stream: test hook, rejected stream back in\n");
+        }
+    }
+    if (mon_a_ == nullptr && (hipEventCreate(&mon_a_) != hipSuccess ||
+                              hipEventCreate(&mon_b_) != hipSuccess)) {
+        return;
+    }
+    (void) hipEventRecord(mon_a_, nullptr);
+    mon_open_ = true;
+}
+
+void Runner::watch_step_end() {
+    if (!mon_open_) {
+        return;
+    }
+    mon_open_ = false;
+    float ms = 0.0f;
+    if (hipEventRecord(mon_b_, nullptr) != hipSuccess || hipEventSynchronize(mon_b_) != hipSuccess ||
+        hipEventElapsedTime(&ms, mon_a_, mon_b_) != hipSuccess) {
+        return;
+    }
+    if (step_ref_ <= 0.0) {
+        step_ref_ = ms;
+    } else if (ms > kSlowStep * step_ref_) {
+        if (++slow_steps_ >= 3) {
+            slow_steps_ = 0;
+            recal_pending_ = true;
+        }
+    } else {
+        slow_steps_ = 0;
+        step_ref_ = 0.9 * step_ref_ + 0.1 * ms;
+    }
 }
 
 // Allocates *p on first use (the f16-path buffers, #86).

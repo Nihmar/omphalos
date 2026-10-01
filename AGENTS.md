@@ -128,13 +128,14 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 |---|---|---|
 | `OMPH_TIMING` | diagnostics | VRAM after load, per-step `step gpu` / `step wall` |
 | `OMPH_PHASES` | diagnostics | per-phase GPU totals; its ~460 events per step add ~2.6 ms, so never measure the step with it (#100) |
+| `OMPH_TEST_BAD_SIDE=N` | diagnostics | swap the side stream the calibration rejected back in after N decode steps: exercises the #144 watchdog |
 | `OMPH_SPEC_CHECK` | diagnostics | check every speculative rollback: the replay bit-exact against `gdn_step`, the FP16 ring restored (slow) |
 | `OMPH_TRACE_ALLOC` / `OMPH_TRACE_F16` / `OMPH_TRACE_STAGE` | diagnostics | f16-scratch allocations / matmuls falling back to the f16 path / f16 staging and cache hits |
 | `OMPH_KV_F32` | KV | exact f32 cache in VRAM (reference) |
 | `OMPH_KV_HOST` | KV | exact f32 cache in pinned host RAM (long-context reference) |
 | `OMPH_KV_K4` | KV | K in V's Q4 format too (#81, experiment) |
 | `OMPH_KV_WINDOW=N` | KV | FP16 ring of the last N tokens (default 128, 0 = off) |
-| `OMPH_NO_OVERLAP` | A/B | no side stream for sibling GEMVs (#71). With it on, the runner times the overlap at load and drops a side stream that loses to running in order (#132; `OMPH_TIMING` prints the outcome) |
+| `OMPH_NO_OVERLAP` | A/B | no side stream for sibling GEMVs (#71). With it on, the runner times the overlap at load and drops a side stream that loses to running in order (#132), and re-times it when single-token steps turn 1.35x slower during the run (#144; `OMPH_TIMING` prints both) |
 | `OMPH_NO_B4` | A/B | no NT = 2..4-token GEMVs (verifications, short `--gemv` prefills): one launch per token |
 | `OMPH_GEMM_MIN=T` | A/B | `--gemv` runs of T+ tokens (prefill chunks) take the GEMM path (default 16, the measured crossover with the fused GEMM; #129, #141) |
 | `OMPH_NO_FUSED_GEMM` | A/B | dequantize each weight to f16, then the GEMM, instead of the fused dequant + WMMA GEMM (#141) |
