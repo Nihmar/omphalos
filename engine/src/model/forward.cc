@@ -150,6 +150,16 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
         }
     }
 
+    // MTP (#124): the h_p the block pairs with the next tokens, every row.
+    if (mtp_) {
+        if (!omph::kernels::rms_norm(static_cast<const float *>(x_), out_norm_,
+                                     static_cast<float *>(mtp_hlast_), T, ne, (float) h_.eps,
+                                     1.0f, nullptr)) {
+            return fail("mtp h failed");
+        }
+        last_toks_ = toks;
+        last_pos0_ = start_pos;
+    }
     if (want_logits) {
         if (!lm_head(T, logits, greedy)) {
             return false;
@@ -159,6 +169,10 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
         if (hipDeviceSynchronize() != hipSuccess) {
             return fail("forward failed");
         }
+    }
+    // A verification's tokens are filled at commit(), only those kept.
+    if (mtp_ && !verifying_ && !mtp_fill(T)) {
+        return false;
     }
     report_phases();
     if (time_step) {

@@ -76,7 +76,7 @@ public:
     // `last_logits_only` keeps the lm_head to one row.
     explicit Runner(const std::string & path, const int64_t max_tokens, const bool use_gemv,
                     const omph::runtime::EnvOptions & env, const bool last_logits_only = false,
-                    const int64_t kv_capacity = 0);
+                    const int64_t kv_capacity = 0, bool mtp = false);
 
     // Memory is owned by mem_; the stream and the events are released here.
     ~Runner();
@@ -109,6 +109,16 @@ public:
     // prefix onto the old ones and restores the FP16-ring slots of the rest.
     bool commit(int64_t accepted);
 
+    // --- MTP drafting (#124), with `mtp` set at construction ---
+    // The MTP KV is filled automatically: after every forward the runner keeps
+    // (prefill chunks, decode steps) and at commit(), for the kept tokens.
+    // Drafts `k` tokens after `token` at position `pos` (the next position to
+    // fill, i.e. the length of the kept sequence): the MTP block on
+    // (h_{pos-1}, token), then chained on its own output. With `logits`, every
+    // draft's logits row is appended to it (validation).
+    bool mtp_draft(int32_t token, int64_t pos, int64_t k, std::vector<int32_t> & drafts,
+                   std::vector<float> * logits = nullptr);
+
 private:
     // Final norm and lm_head of the T rows in h16_, into `logits` on the host
     // (or, with `greedy` on a single-token GEMV step, only the argmax). Returns
@@ -137,8 +147,9 @@ private:
     bool in_stack(const std::string & name) const;
 
 
+    // il == n_layer is the MTP block (#124); kv_only writes K / V and stops.
     bool attn_layer(const int64_t il, const LayerWeights & L, const int64_t T,
-                    const int64_t pos0);
+                    const int64_t pos0, bool kv_only = false);
 
     bool gdn_layer(const int64_t il, const LayerWeights & L, const int64_t T);
 
@@ -154,10 +165,20 @@ private:
     };
     QuantKv quant_kv(const int64_t il) const;
 
+    // The cache an attention layer uses: Q8/Q4 (+ ring) or f32.
+    struct KvView {
+        bool quant = false;
+        QuantKv q{};
+        int64_t window = 0;
+        bool k_q4 = false;
+        float * k_f32 = nullptr;
+        float * v_f32 = nullptr;
+    };
+    KvView kv_view(int64_t il) const;
+
     // KV write + attention, on either the f32 cache (memcpy) or the Q8/Q4 one
-    // (quantize); attention_gqa then reads either, dequantizing on the fly.
-    bool attn_impl(const int64_t il, float * k_cache, float * v_cache, const int64_t pos0,
-                   const int64_t T);
+    // (written by attn_prep); attention_gqa then reads either.
+    bool attn_impl(const KvView & kv, int64_t pos0, int64_t T);
 
     // Runs `side` on the side stream and `main` on the default one, both after
     // everything issued so far; the default stream continues once both are done.
@@ -247,6 +268,30 @@ private:
     static constexpr int64_t kHeadRows = 32;  // logits_ rows (multiple of 4)
     std::vector<int64_t> kv_index_;
     std::vector<char> conv_flip_;
+    // --- MTP (#124) ---
+    bool mtp_ = false;
+    LayerWeights mtp_L_;        // blk.<n_layer>: an attention block + FFN
+    Mat mtp_eh_;                // nextn.eh_proj: [enorm(embed); hnorm(h)] -> n_embd
+    const float * mtp_enorm_ = nullptr;
+    const float * mtp_hnorm_ = nullptr;
+    const float * mtp_head_norm_ = nullptr;
+    void * mtp_kq_ = nullptr;   // its own Q8/Q4 cache, no FP16 ring
+    void * mtp_ks_ = nullptr;
+    void * mtp_vq_ = nullptr;
+    void * mtp_vs_ = nullptr;
+    void * mtp_hlast_ = nullptr;    // output_norm(x) rows of the last forward (the h_p)
+    void * mtp_hin_ = nullptr;      // the h rows an MTP pass reads: h_{p-1} per position
+    void * mtp_pending_ = nullptr;  // h of the last kept position (zeros at the start)
+    void * mtp_g_ = nullptr;        // the MTP block's own normed output (chaining)
+    std::vector<int32_t> last_toks_;
+    int64_t last_pos0_ = 0;
+    // The MTP block over T positions: embeddings of `toks`, h rows `h_in`,
+    // positions pos0..; kv_only stops after the K / V write, `head` also runs
+    // shared_head_norm + lm_head and returns the greedy token.
+    bool mtp_block(const int32_t * toks, const float * h_in, int64_t pos0, int64_t T,
+                   bool kv_only, int32_t * argmax = nullptr, std::vector<float> * logits = nullptr);
+    // The KV fill of the first `keep` tokens of the last forward.
+    bool mtp_fill(int64_t keep);
     std::vector<float *> state_cur_;  // recurrent layers: the state the next step reads
     std::vector<float *> state_alt_;  // speculation: the buffer a verification writes
     std::vector<int64_t> rec_index_;  // recurrent layer -> 0.. (-1 for attention)

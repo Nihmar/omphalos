@@ -25,8 +25,8 @@ namespace omph::model {
 
 Runner::Runner(const std::string & path, const int64_t max_tokens, const bool use_gemv,
                 const omph::runtime::EnvOptions & env, const bool last_logits_only,
-                const int64_t kv_capacity)
-    : env_(env), file_(path), h_(read_hparams(file_)), use_gemv_(use_gemv) {
+                const int64_t kv_capacity, const bool mtp)
+    : env_(env), file_(path), h_(read_hparams(file_)), use_gemv_(use_gemv), mtp_(mtp) {
     timer_stage_.enable(env_.phases);
     timer_gemm_.enable(env_.phases);
     timer_gemv_.enable(env_.phases);
@@ -222,6 +222,21 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     attn_work_bytes_ = omph::kernels::attention_gqa_work_bytes(T, h_.n_head, h_.n_head_kv,
                                                                h_.head_dim);
     alloc(&attn_work_, attn_work_bytes_);
+    // MTP (#124): the block's own cache (Q8/Q4, no ring) and its h buffers.
+    if (mtp_) {
+        const int64_t nblk = h_.head_dim / 32;
+        alloc(&mtp_kq_, (size_t) kvcap * attn_kv);
+        alloc(&mtp_ks_, (size_t) kvcap * h_.n_head_kv * nblk * 2);
+        alloc(&mtp_vq_, (size_t) kvcap * attn_kv / 2);
+        alloc(&mtp_vs_, (size_t) kvcap * h_.n_head_kv * nblk * 2);
+        alloc(&mtp_hlast_, (size_t) T * ne * 4);
+        alloc(&mtp_hin_, (size_t) T * ne * 4);
+        alloc(&mtp_pending_, (size_t) ne * 4);
+        alloc(&mtp_g_, (size_t) ne * 4);
+        if (hipMemset(mtp_pending_, 0, (size_t) ne * 4) != hipSuccess) {
+            throw std::runtime_error("cannot clear the MTP h");
+        }
+    }
     // Delta-net state + the two conv tails, for the recurrent layers only
     // (the attention layers have none), in one allocation (#92).
     conv_flip_.assign((size_t) h_.n_layer, 0);
@@ -318,7 +333,8 @@ bool Runner::in_stack(const std::string & name) const {
     if (name.rfind("blk.", 0) != 0) {
         return true;
     }
-    return std::atoll(name.c_str() + 4) < h_.n_layer;
+    // with MTP on, its block (blk.<n_layer>) is loaded too (#124)
+    return std::atoll(name.c_str() + 4) < h_.n_layer + (mtp_ ? 1 : 0);
 }
 
 // Allocates *p on first use (the f16-path buffers, #86).
@@ -497,6 +513,31 @@ void Runner::resolve_layers() {
             L.attn_output = resolve(p + "attn_output.weight");
         }
     }
+    if (mtp_) {
+        const std::string p = "blk." + std::to_string(h_.n_layer) + ".";
+        LayerWeights & L = mtp_L_;
+        L.attn_norm = resolve_f32(p + "attn_norm.weight");
+        L.post_norm = resolve_f32(p + "post_attention_norm.weight");
+        L.q_norm = resolve_f32(p + "attn_q_norm.weight");
+        L.k_norm = resolve_f32(p + "attn_k_norm.weight");
+        L.attn_q = resolve(p + "attn_q.weight");
+        L.attn_k = resolve(p + "attn_k.weight");
+        L.attn_v = resolve(p + "attn_v.weight");
+        L.attn_output = resolve(p + "attn_output.weight");
+        L.ffn_up = resolve(p + "ffn_up.weight");
+        L.ffn_gate = resolve(p + "ffn_gate.weight");
+        L.ffn_down = resolve(p + "ffn_down.weight");
+        mtp_eh_ = resolve(p + "nextn.eh_proj.weight");
+        mtp_enorm_ = resolve_f32(p + "nextn.enorm.weight");
+        mtp_hnorm_ = resolve_f32(p + "nextn.hnorm.weight");
+        mtp_head_norm_ = resolve_f32(p + "nextn.shared_head_norm.weight");
+        if (L.attn_norm == nullptr || L.post_norm == nullptr || L.q_norm == nullptr ||
+            L.k_norm == nullptr || mtp_eh_.t == nullptr || mtp_enorm_ == nullptr ||
+            mtp_hnorm_ == nullptr || mtp_head_norm_ == nullptr || L.attn_q.t == nullptr ||
+            L.ffn_down.t == nullptr) {
+            throw std::runtime_error("the model has no complete MTP block (" + p + "nextn.*)");
+        }
+    }
     head_ = resolve("output.weight");
     out_norm_ = resolve_f32("output_norm.weight");
     const omph::gguf::TensorInfo * te = file_.tensor("token_embd.weight");
@@ -615,7 +656,7 @@ bool Runner::commit(const int64_t accepted) {
                 std::swap(state_cur_[(size_t) il], state_alt_[(size_t) il]);
             }
         }
-        return true;
+        return !mtp_ || mtp_fill(accepted);
     }
     const int64_t n_kh = h_.ssm_n_kh;
     const int64_t n_vh = h_.ssm_n_vh;
@@ -674,7 +715,7 @@ bool Runner::commit(const int64_t accepted) {
             }
         }
     }
-    return true;
+    return !mtp_ || mtp_fill(accepted);
 }
 
 // OMPH_SPEC_CHECK: the replay of all T recorded tokens onto the state the
