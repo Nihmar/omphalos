@@ -1,0 +1,12 @@
+# Decode step (GPU time, OMPH_TIMING "step gpu", median of the last 15 of 16 steps),
+# --gemv, RX 9060 XT. "main" = 1c79662 (after PR #57) built and measured in the same
+# session; "now" = perf/66-decode-non-gemv (#62 + #65 + #67 stacked).
+prompt                 KV     main (ms)   now (ms)
+10 tokens (golden)     f32    58.0        55.2      (3 runs each: 59.16/58.01/58.00 vs 55.13/55.20/55.23)
+512 tokens (wikitext)  f32    59.5        54.5
+512 tokens             Q8/Q4  60.5        54.8
+8k tokens              Q8/Q4  99.0        58.2
+16k tokens             Q8/Q4  -           65.0      (#59, before #66's changes)
+# note: PLAN.md's M4 status quotes 55.2 ms for the 10-token prompt; main measures
+# 58.0 ms in this session under the same command. Not investigated further.
+# llama.cpp baseline (M0): 48.5 ms/token (20.6 t/s), f16 KV, short context.

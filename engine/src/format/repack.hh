@@ -72,12 +72,16 @@ extern const int8_t kIq4Codebook[16];
 //
 // GGUF IQ3_XXS: 98-byte blocks — f16 `d`, 64 bytes of 4-byte grid indices
 // (iq3xxs_grid) and 32 bytes of packed words holding a 4-bit scale plus four
-// 7-bit sign indices each. The repack only splits the fields into aligned
-// streams; the kernel resolves the sign indices with the 128-byte table from
-// kernels/iq_tables.hh, so the block keeps its 98 bytes:
+// 7-bit sign indices each. The repack splits the fields into aligned streams
+// and permutes the sign bits of each aux word (below), so the block keeps its
+// 98 bytes:
 //
 //   [ qs  ] 64 B/block : grid indices, as in the source
-//   [ aux ] 32 B/block : the scale/sign words, as in the source
+//   [ aux ] 32 B/block : the scale/sign words, sign bits permuted (#63): per
+//                        group l of 8 weights, weights 0/2/4/6 reversed in bits
+//                        [4l, 4l + 4) and 1/3/5 reversed in [16 + 3l, 16 + 3l + 3);
+//                        the scale stays in [28, 32). Weight 7's sign is the
+//                        parity of the other seven, as in the GGUF.
 //   [ d   ]  2 B/block : f16
 struct Iq3XxsLayout {
     int64_t n_blocks = 0;

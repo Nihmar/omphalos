@@ -62,6 +62,10 @@ bool gemv_iq2_xxs(const void * packed, const void * x_f16, float * y, int64_t ro
 
 // Same contract for a tensor in the repacked IQ2_S layout (10-bit grid indices
 // into a 1024-entry grid, sign masks, 4-bit scales).
+// IQ1_M on the GGUF blocks as they are (identity "repack").
+bool gemv_iq1_m(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k,
+                hipStream_t stream);
+
 bool gemv_iq2_s(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
                 hipStream_t stream);
 
