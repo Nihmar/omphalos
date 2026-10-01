@@ -29,6 +29,11 @@ add_library(omphalos SHARED
     src/runtime/context.cc
     src/runtime/matmul.cc
     src/runtime/options.cc
+    src/model/hparams.cc
+    src/model/runner.cc
+    src/model/forward.cc
+    src/model/layers.cc
+    src/model/dispatch.cc
     src/kernels/probe.hip
     src/kernels/dequant.hip
     src/kernels/elementwise.hip
