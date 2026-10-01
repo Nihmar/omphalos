@@ -5,9 +5,10 @@
 //   Logits are written as tokens x n_vocab f32 for the whole prompt (one row
 //   with --last-logits, the last N with --logits-tail N); with --trace-dir the
 //   per-layer outputs are dumped as l_out-<layer>.f32 (single-chunk prompts only).
-//   OMPH_KV_Q8Q4=1 quantizes the KV (FP16 ring of the last 128 tokens;
-//   OMPH_KV_WINDOW=N changes it, 0 disables it);
-//   OMPH_KV_HOST=1 keeps the exact f32 KV in host RAM (long-context reference).
+//   The KV cache is K Q8 / V Q4 with an FP16 ring of the last 128 tokens
+//   (OMPH_KV_WINDOW=N changes it, 0 disables it). OMPH_KV_F32=1 keeps it in f32
+//   instead (the exact reference); OMPH_KV_HOST=1 is that f32 cache in host RAM,
+//   for long contexts where it does not fit in VRAM.
 //
 // The whole quantized tensor block lives in VRAM; the weights of the current
 // layer are dequantized to f16 into a reusable scratch buffer, and every op is
@@ -283,8 +284,10 @@ public:
         }
         // The KV cache is sized by the whole sequence, the activations by the
         // chunk: that is what lets a long prompt run in pieces.
-        kv_q8q4_ = std::getenv("OMPH_KV_Q8Q4") != nullptr;
-        kv_host_ = !kv_q8q4_ && std::getenv("OMPH_KV_HOST") != nullptr;
+        // Q8/Q4 by default (#69): validated to 32k under llama.cpp's q8_0/q4_0
+        // budget at 4.9x less VRAM than f32 (#58, #61).
+        kv_host_ = std::getenv("OMPH_KV_HOST") != nullptr;
+        kv_q8q4_ = !kv_host_ && std::getenv("OMPH_KV_F32") == nullptr;
         if (kv_host_) {
             // Validation reference only: the exact f32 cache in pinned host RAM
             // (4.29 GB at 32k does not fit beside the weights), and one layer's
