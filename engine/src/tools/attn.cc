@@ -117,6 +117,9 @@ int main(int argc, char ** argv) {
     const bool k_q4 = kv_mode == "q4q4";
 
     try {
+        if (omph::kernels::kernel_wave_size() != 32) {
+            return fail("kernels not built for wave32");
+        }
         omph::gguf::File file(model_path);
         int64_t n_head = 0;
         int64_t n_head_kv = 0;

@@ -168,6 +168,10 @@ public:
     explicit Runner(const std::string & path, const int64_t max_tokens, const bool use_gemv,
                     const bool last_logits_only = false, const int64_t kv_capacity = 0)
         : file_(path), h_(read_hparams(file_)), use_gemv_(use_gemv) {
+        if (const int w = omph::kernels::kernel_wave_size(); w != 32) {
+            throw std::runtime_error("kernels built for wave size " + std::to_string(w) +
+                                     "; they need wave32");
+        }
         const int64_t ne = h_.n_embd;
         const int64_t T = max_tokens;
         max_tokens_ = max_tokens;

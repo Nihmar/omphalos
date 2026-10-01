@@ -139,7 +139,26 @@ __global__ void swiglu_f16_kernel(const float * __restrict__ x, const float * __
     }
 }
 
+__global__ void wave_size_kernel(int * out) {
+    if (threadIdx.x == 0) {
+        *out = __builtin_amdgcn_wavefrontsize();
+    }
+}
+
 } // namespace
+
+int kernel_wave_size() {
+    int * dev = nullptr;
+    int host = 0;
+    if (hipMalloc(&dev, sizeof(int)) != hipSuccess) {
+        return 0;
+    }
+    wave_size_kernel<<<1, 64, 0, nullptr>>>(dev);
+    const bool ok = hipGetLastError() == hipSuccess &&
+                    hipMemcpy(&host, dev, sizeof(int), hipMemcpyDeviceToHost) == hipSuccess;
+    (void) hipFree(dev);
+    return ok ? host : 0;
+}
 
 bool cast_f32_to_f16(const float * src, void * dst, const int64_t n, hipStream_t stream) {
     if (src == nullptr || dst == nullptr || n <= 0) {
