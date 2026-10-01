@@ -90,7 +90,6 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
             return fail("attn_norm failed");
         }
         h16_normed = false;
-        scratch_.reset();
         if (env_.skip_blocks) {
             continue;  // ablation only: the layer output is the normed input
         }
@@ -267,7 +266,7 @@ bool Runner::lm_head(const int64_t T, std::vector<float> & logits, int32_t * gre
         logits.clear();
         return true;
     }
-    if (use_gemv_ && T > 1 && head_.gemv != nullptr && head_.gemv->type == 12) {
+    if (use_gemv_ && T > 1 && T < gemm_min_ && head_.gemv != nullptr && head_.gemv->type == 12) {
         for (int64_t r0 = 0; r0 < T; r0 += kHeadRows) {
             const int64_t rows = std::min<int64_t>(kHeadRows, T - r0);
             for (int64_t t0 = 0; t0 < rows;) {
@@ -309,23 +308,21 @@ bool Runner::head_chunked(const void * x16, const int64_t T, float * out) {
     const int64_t ne = h_.n_embd;
     const omph::gguf::TensorInfo * head = head_.t;
     const int64_t head_row_bytes = (int64_t) (head->nbytes / head->ne[1]);
-    if (head_.gemv != nullptr &&
-        hipMemcpy(lazy(&raw_stage_, raw_stage_bytes()), file_.tensor_data(*head),
-                  (size_t) head->nbytes, hipMemcpyHostToDevice) != hipSuccess) {
-        return fail("cannot stage the lm_head");
-    }
     void * head16 = lazy(&head16_, head16_bytes_);
     void * tmp_logits = lazy(&tmp_logits_, tmp_logits_bytes_);
-    const uint8_t * head_src = head_.gemv != nullptr ? static_cast<const uint8_t *>(raw_stage_)
-                                                     : static_cast<const uint8_t *>(head_.dev);
+    const auto * head_src = static_cast<const uint8_t *>(head_.dev);
     const int64_t chunk = std::min<int64_t>(h_.n_vocab, 32768);
     for (int64_t v0 = 0; v0 < h_.n_vocab; v0 += chunk) {
         const int64_t rows = std::min(chunk, h_.n_vocab - v0);
         void * wh = head16;
         timer_stage_.start();
-        const bool head_dq = omph::kernels::dequantize(head->type,
-                                                       head_src + v0 * head_row_bytes, wh,
-                                                       rows * ne, true, nullptr);
+        // the repacked head's rows v0.. straight from its layout (M8)
+        const bool head_dq =
+            head_.gemv != nullptr
+                ? omph::kernels::dequant_repacked(head_.gemv->type, head_src, wh, h_.n_vocab, ne,
+                                                  nullptr, v0, rows)
+                : omph::kernels::dequantize(head->type, head_src + v0 * head_row_bytes, wh,
+                                            rows * ne, true, nullptr);
         timer_stage_.stop(t_stage_);
         timer_gemm_.start();
         const bool head_gm =

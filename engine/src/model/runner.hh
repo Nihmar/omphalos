@@ -212,11 +212,8 @@ private:
     // Allocates *p on first use (the f16-path buffers, #86).
     void * lazy(void ** p, const size_t bytes);
 
-    // raw_stage_ holds the original bytes of any one repacked tensor.
-    size_t raw_stage_bytes() const;
-
-    // Device pointer to the original GGUF bytes: they live in the image unless
-    // the tensor was repacked, in which case they are staged from the file.
+    // Device pointer to the original GGUF bytes of a tensor that was not
+    // repacked (repacked ones are dequantized from their layout).
     const void * raw_bytes(const std::string & name);
 
     // Types that have a fused GEMV kernel: for these the f16 form is never worth
@@ -224,7 +221,9 @@ private:
     // bulk of the model).
     static bool has_gemv_type(const uint32_t type);
 
-    void * stage_w(const std::string & name);
+    void * stage_scratch(size_t bytes);
+    void * stage_w(const std::string & name, int64_t row0 = 0, int64_t nrows = -1);
+    int64_t stage_rows(int64_t n_out, int64_t k) const;
 
     Mat resolve(const std::string & name) const;
 
@@ -353,10 +352,12 @@ private:
     void * argmax_key_ = nullptr;  // 8 bytes: the greedy decode's packed argmax (#102)
     void * tmp_logits_ = nullptr;
     void * head16_ = nullptr;
-    void * raw_stage_ = nullptr;
     size_t tmp_logits_bytes_ = 0;
     size_t head16_bytes_ = 0;
     std::map<std::string, void *> f16_cache_;  // into mem_
+    size_t scratch_bytes_ = 0;    // the largest f16 weight slice (stage_rows)
+    bool scratch_ready_ = false;  // allocated (at load without --gemv, else on first use)
+    int64_t gemm_min_ = 0;        // tokens from which a --gemv runner uses the GEMM path
 };
 
 } // namespace omph::model
