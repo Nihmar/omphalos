@@ -83,6 +83,15 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
                    bool v_rotated, void * work, size_t work_bytes, hipStream_t stream,
                    void * out_f16 = nullptr);  // set: out is ignored, f16 written here
 
+// Copies the FP16-ring slots of positions pos_first .. pos_first + count - 1
+// (slot = position % window) of every layer from (src_k, src_v) to
+// (dst_k, dst_v), all laid out as the ring: layers x window x row_bytes. Saves
+// the slots a speculative verification overwrites, and restores those of the
+// rejected positions (#98, #122). row_bytes % 16 == 0.
+bool kv_ring_copy(const void * src_k, const void * src_v, void * dst_k, void * dst_v,
+                  int64_t layers, int64_t window, int64_t row_bytes, int64_t pos_first,
+                  int64_t count, hipStream_t stream);
+
 // Workspace for any call with up to `max_tokens` query tokens.
 size_t attention_gqa_work_bytes(int64_t max_tokens, int64_t nh, int64_t nkv, int64_t hd);
 

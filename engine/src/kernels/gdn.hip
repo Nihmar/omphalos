@@ -57,6 +57,12 @@ __global__ __launch_bounds__(256) void delta_step_kernel(const GdnStep a) {
                 a.conv_new[r * a.channels + c] = src < rows ? a.conv_cur[src * a.channels + c]
                                                             : a.qkv[(src - rows) * a.channels + c];
             }
+            if (a.conv_hist != nullptr) {  // the whole input history, for a rollback
+                for (long long r = 0; r < rows + a.tokens; ++r) {
+                    a.conv_hist[r * a.channels + c] = r < rows ? a.conv_cur[r * a.channels + c]
+                                                               : a.qkv[(r - rows) * a.channels + c];
+                }
+            }
         };
         if (h < a.n_kh) {
             shift(c_qk);
@@ -110,6 +116,17 @@ __global__ __launch_bounds__(256) void delta_step_kernel(const GdnStep a) {
     const float b = 1.0f / (1.0f + expf(-beta_raw));
     const float ar = alpha_raw + a.dt_bias[h];
     const float decay = expf((log1pf(expf(-fabsf(ar))) + fmaxf(ar, 0.0f)) * a.ssm_a[h]);
+    float * rec = a.replay != nullptr
+                      ? a.replay + a.t * (gridDim.x + a.n_kh * kDeltaS + gridDim.x * kDeltaS)
+                      : nullptr;
+    if (rec != nullptr) {
+        if (tid == 0) {
+            rec[h] = decay;
+        }
+        if (h < a.n_kh && half == 0) {  // block h owns key head h's k (kh == h here)
+            rec[gridDim.x + h * kDeltaS + col] = y;
+        }
+    }
 
     float st[kDeltaRows];
 #pragma unroll
@@ -127,15 +144,19 @@ __global__ __launch_bounds__(256) void delta_step_kernel(const GdnStep a) {
     __syncthreads();
     if (half == 0) {
         dd[col] = (vval - (part[col] + part[kDeltaS + col])) * b;
+        if (rec != nullptr) {
+            rec[gridDim.x + a.n_kh * kDeltaS + h * kDeltaS + col] = dd[col];
+        }
     }
     __syncthreads();
     const float dc = dd[col];
     float acc2 = 0.0f;
+    float * S_out = a.state_out != nullptr ? a.state_out + h * kDeltaS * kDeltaS : S;
 #pragma unroll
     for (int r = 0; r < kDeltaRows; ++r) {
         st[r] = fmaf(kq[lo + r], dc, st[r]);
         acc2 = fmaf(st[r], kq[kDeltaS + lo + r], acc2);
-        S[(lo + r) * kDeltaS + col] = st[r];
+        S_out[(lo + r) * kDeltaS + col] = st[r];
     }
     __syncthreads();  // part is reused
     part[half * kDeltaS + col] = acc2;
@@ -163,7 +184,80 @@ __global__ __launch_bounds__(256) void delta_step_kernel(const GdnStep a) {
 }
 
 
+// The rank-1 updates of recorded tokens, on the state of the step before them:
+// gdn_step's thread layout and float operations (decay, then fma with k and d).
+__global__ __launch_bounds__(256) void gdn_replay_kernel(float * __restrict__ state,
+                                                         const float * __restrict__ replay,
+                                                         const long long tokens,
+                                                         const long long n_kh) {
+    const long long h = blockIdx.x;
+    const long long heads = gridDim.x;
+    const int tid = (int) threadIdx.x;
+    const int col = tid & (kDeltaS - 1);
+    const int lo = (tid >> 7) * kDeltaRows;
+    const long long kh = h % n_kh;
+    const long long stride = heads + n_kh * kDeltaS + heads * kDeltaS;
+    float * S = state + h * kDeltaS * kDeltaS;
+    float st[kDeltaRows];
+#pragma unroll
+    for (int r = 0; r < kDeltaRows; ++r) {
+        st[r] = S[(lo + r) * kDeltaS + col];
+    }
+    for (long long t = 0; t < tokens; ++t) {
+        const float * rec = replay + t * stride;
+        const float decay = rec[h];
+        const float * k = rec + heads + kh * kDeltaS;
+        const float dc = rec[heads + n_kh * kDeltaS + h * kDeltaS + col];
+#pragma unroll
+        for (int r = 0; r < kDeltaRows; ++r) {
+            st[r] *= decay;
+        }
+#pragma unroll
+        for (int r = 0; r < kDeltaRows; ++r) {
+            st[r] = fmaf(k[lo + r], dc, st[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kDeltaRows; ++r) {
+        S[(lo + r) * kDeltaS + col] = st[r];
+    }
+}
+
+__global__ void gdn_conv_select_kernel(const float * __restrict__ hist, float * __restrict__ dst,
+                                       const long long accepted, const long long rows,
+                                       const long long channels) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * channels) {
+        dst[i] = hist[accepted * channels + i];
+    }
+}
+
 } // namespace
+
+bool gdn_replay(float * state, const float * replay, const int64_t tokens, const int64_t heads,
+                const int64_t n_kh, hipStream_t stream) {
+    if (state == nullptr || replay == nullptr || tokens < 0 || heads <= 0 || n_kh <= 0) {
+        return false;
+    }
+    if (tokens == 0) {
+        return true;
+    }
+    gdn_replay_kernel<<<(unsigned) heads, 256, 0, stream>>>(state, replay, (long long) tokens,
+                                                           (long long) n_kh);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool gdn_conv_select(const float * conv_hist, float * conv_dst, const int64_t accepted,
+                     const int64_t conv_k, const int64_t channels, hipStream_t stream) {
+    if (conv_hist == nullptr || conv_dst == nullptr || accepted < 0 || conv_k <= 1 ||
+        channels <= 0) {
+        return false;
+    }
+    const long long n = (long long) (conv_k - 1) * channels;
+    gdn_conv_select_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(
+        conv_hist, conv_dst, (long long) accepted, (long long) (conv_k - 1), (long long) channels);
+    return hipGetLastError() == hipSuccess;
+}
 
 bool gdn_step(const GdnStep & a, const int64_t heads, hipStream_t stream) {
     if (a.state == nullptr || a.qkv == nullptr || a.conv_w == nullptr || a.conv_cur == nullptr ||

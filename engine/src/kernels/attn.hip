@@ -501,6 +501,43 @@ int gqa_splits(const int64_t tokens, const int64_t seq, const int64_t nkv,
 
 } // namespace
 
+namespace {
+
+// grid: (count, layers, 2 = k / v); a block copies one ring row.
+__global__ void kv_ring_copy_kernel(const uint4 * __restrict__ src_k, const uint4 * __restrict__ src_v,
+                                    uint4 * __restrict__ dst_k, uint4 * __restrict__ dst_v,
+                                    const long long window, const long long row_vec,
+                                    const long long pos_first) {
+    const long long slot = (pos_first + blockIdx.x) % window;
+    const long long off = ((long long) blockIdx.y * window + slot) * row_vec;
+    const uint4 * src = (blockIdx.z == 0 ? src_k : src_v) + off;
+    uint4 * dst = (blockIdx.z == 0 ? dst_k : dst_v) + off;
+    for (long long i = threadIdx.x; i < row_vec; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+} // namespace
+
+bool kv_ring_copy(const void * src_k, const void * src_v, void * dst_k, void * dst_v,
+                  const int64_t layers, const int64_t window, const int64_t row_bytes,
+                  const int64_t pos_first, const int64_t count, hipStream_t stream) {
+    if (src_k == nullptr || src_v == nullptr || dst_k == nullptr || dst_v == nullptr ||
+        layers <= 0 || window <= 0 || row_bytes <= 0 || row_bytes % 16 != 0 || pos_first < 0 ||
+        count < 0 || count > window) {
+        return false;
+    }
+    if (count == 0) {
+        return true;
+    }
+    const dim3 grid((unsigned) count, (unsigned) layers, 2);
+    kv_ring_copy_kernel<<<grid, 128, 0, stream>>>(
+        static_cast<const uint4 *>(src_k), static_cast<const uint4 *>(src_v),
+        static_cast<uint4 *>(dst_k), static_cast<uint4 *>(dst_v), (long long) window,
+        (long long) (row_bytes / 16), (long long) pos_first);
+    return hipGetLastError() == hipSuccess;
+}
+
 size_t attention_gqa_work_bytes(const int64_t max_tokens, const int64_t nh, const int64_t nkv,
                                 const int64_t hd) {
     // Worst case over the token counts a call can have, at any sequence length
