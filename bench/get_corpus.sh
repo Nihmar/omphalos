@@ -13,7 +13,8 @@ mkdir -p "$dest"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-hf download ggml-org/ci --repo-type dataset --include 'wikitext-2-raw-v1.zip' \
+# the Hugging Face CLI through uv, as every Python tool here (AGENTS.md)
+uvx --from huggingface_hub hf download ggml-org/ci --repo-type dataset --include 'wikitext-2-raw-v1.zip' \
     --local-dir "$tmp"
 uv run --no-project python -m zipfile -e "$tmp/wikitext-2-raw-v1.zip" "$dest/"
 

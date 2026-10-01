@@ -1,7 +1,7 @@
 [project]
 name = "omphalos-tools"
 version = "0.1.0"
-description = "Add your description here"
+description = "omphalos tooling: GGUF inspection, the NumPy reference forward pass, and the checks of the engine against the golden dump"
 readme = "README.md"
 authors = [
     { name = "Nihmar", email = "manente.alessandro@proton.me" }
@@ -11,9 +11,6 @@ dependencies = [
     "gguf>=0.19.0",
     "numpy>=2.5.3",
 ]
-
-[project.scripts]
-omphalos-tools = "omphalos_tools:main"
 
 [build-system]
 requires = ["uv_build>=0.12.0,<0.13.0"]
