@@ -38,7 +38,6 @@ class Runner {
         int64_t rows = 0;
         int64_t k = 0;
         uint32_t type = 0;
-        bool has_b4 = false;  // a small-batch kernel exists for this type
     };
 
     // A weight matrix resolved once at load (#100): the hot path looks nothing
@@ -203,11 +202,6 @@ private:
     // One fused GEMV launch for a single token, dispatched on the GGUF type.
     static bool gemv_one(const int type, const void * w, const void * x, float * y,
                          const int64_t n_out, const int64_t k, hipStream_t st);
-
-    // Small-batch GEMV: one weight read per four tokens. Only the types that have
-    // this form answer true; the others stay on the f16 path.
-    static bool gemv_batch4(const int type, const void * w, const void * x, float * y,
-                            const int64_t n_out, const int64_t k, hipStream_t st);
 
     // One matmul: the fused GEMV for single-token steps when it is available for
     // this tensor, the small-batch GEMV for a few tokens, otherwise the f16

@@ -86,8 +86,6 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 e.rows = (int64_t) t.ne[1];
                 e.k = (int64_t) t.ne[0];
                 e.type = t.type;
-                e.has_b4 = !env_.no_b4 &&
-                           (t.type == 12 || t.type == 18 || t.type == 21 || t.type == 23);
                 gems_[t.name] = e;
                 total += ((size_t) packed_bytes + 255) & ~(size_t) 255;
                 places.push_back(p);
