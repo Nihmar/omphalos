@@ -1,0 +1,18 @@
+# Sublayer-boundary fusion (#103). RX 9060 XT, --gemv, Q8/Q4 KV, wikitext 512-token prompt.
+# Main at 13fecef. "step gpu" medians.
+#
+# 1. Ablation (launches skipped on T = 1 steps; wrong results, valid timing),
+#    median of the last 15 of 16 steps, 3 runs each:
+run  base   no add_rms_norm (128)  no swiglu (64)  neither
+1    47.87  47.36                  48.00           47.46
+2    47.87  47.37                  48.00           47.48
+3    47.87  47.38                  48.06           47.52
+#
+# 2. Prototype: add + RMSNorm folded into the output GEMV's last workgroup (atomic ticket,
+#    add_rms_norm_f16's reduction order replayed, bit-exact on every tensor of every type over
+#    20 runs). Same binary, 5 alternating runs, 64 steps each:
+#    off (OMPH_NO_FOLD=1): 48.95 48.92 48.90 48.89 48.90
+#    on:                   49.14 49.13 49.14 49.13 49.14
+#    main (no epilogue code in the kernels): 47.8-47.9
+# -> the fold is 0.2 ms slower than the separate kernel, and the epilogue code alone costs ~1 ms.
+#    Prototype not merged.
