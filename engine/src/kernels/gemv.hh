@@ -1,4 +1,5 @@
-// Fused dequant+dot GEMV for the repacked Q4_K layout (PLAN.md §10.1).
+// Fused dequant + dot GEMVs, one per GGUF type, on the repacked layouts of
+// format/repack.hh (PLAN.md §10.1).
 #pragma once
 
 #include <cstdint>

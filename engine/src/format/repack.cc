@@ -373,7 +373,7 @@ void unrepack_q2k(const void * src, const int64_t n_blocks, void * dst) {
 
 int64_t quant_block_bytes(const uint32_t type) {
     switch (type) {
-        case 10: return 84;    // Q2_K   (layout only, no kernel yet)
+        case 10: return 84;    // Q2_K
         case 29: return 56;    // IQ1_M  (identity layout: the GGUF bytes)
         case 12: return 144;   // Q4_K
         case 14: return 210;   // Q6_K

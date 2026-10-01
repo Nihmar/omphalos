@@ -1230,10 +1230,11 @@ private:
         if (t == nullptr) {
             throw std::runtime_error("missing tensor " + name);
         }
-        // Small tensors that never got a quantized kernel (IQ1_M) were being
-        // converted to f16 on every call — 1.6 ms of every decode step for one
-        // 18.6 MiB tensor. Convert once, keep it: at most 64 MiB, which keeps the
-        // big repacked weights (whose f16 form would not fit VRAM) out.
+        // Tensors of a type without a fused GEMV were converted to f16 on every
+        // call (1.6 ms of every decode step for the 18.6 MiB IQ1_M tensor before
+        // it got one). Convert once and keep it, up to 256 MiB of f16 per
+        // tensor; the big GEMV types (whose f16 form would not fit VRAM) never
+        // take this path.
         const int64_t n_elems = numel(*t);
         bool cacheable = std::getenv("OMPH_NO_F16_CACHE") == nullptr &&
                          !has_gemv_type(t->type) && n_elems * 2 <= (256 << 20);

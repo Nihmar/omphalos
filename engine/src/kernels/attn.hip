@@ -479,14 +479,14 @@ __global__ __launch_bounds__(kGqaHd) void attention_gqa_merge_kernel(
     }
 }
 
-// Splits for a call: enough workgroups to fill the GPU, never more than the key
-// blocks of the longest tile.
 // Query tokens per workgroup: a whole prefill chunk shares each K/V read four
 // ways; a decode step (or a few MTP tokens) keeps the six-row form.
 int gqa_tq(const int64_t tokens) {
     return tokens >= 8 ? 4 : 1;
 }
 
+// Splits for a call: enough workgroups to fill the GPU, never more than the key
+// blocks of the longest tile.
 int gqa_splits(const int64_t tokens, const int64_t seq, const int64_t nkv,
                long long & blocks_per_split) {
     const long long tq = gqa_tq(tokens);
