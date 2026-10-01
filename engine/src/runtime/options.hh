@@ -1,0 +1,43 @@
+// Every OMPH_* environment switch of the runner, parsed once (#100).
+//
+// They are A/B switches, validation references and ablations, not features:
+// the defaults are what the engine runs. Ablations give wrong results with
+// valid timings.
+#pragma once
+
+#include <cstdint>
+
+namespace omph::runtime {
+
+struct EnvOptions {
+    // --- KV cache
+    bool kv_host = false;       // OMPH_KV_HOST: exact f32 cache in pinned host RAM (reference)
+    bool kv_f32 = false;        // OMPH_KV_F32: exact f32 cache in VRAM instead of K Q8 / V Q4
+    bool kv_k4 = false;         // OMPH_KV_K4: K in V's Q4 format too (#81, experiment)
+    int64_t kv_window = 128;    // OMPH_KV_WINDOW=N: FP16 ring of the last N tokens (0 = off)
+
+    // --- decode paths (A/B switches)
+    bool no_overlap = false;    // OMPH_NO_OVERLAP: no side stream for sibling GEMVs (#71)
+    bool no_b4 = false;         // OMPH_NO_B4: no four-token GEMVs in a --gemv prefill
+    bool no_bf16_gemv = false;  // OMPH_NO_BF16_GEMV: BF16 weights through the f16 path
+    bool no_f16_cache = false;  // OMPH_NO_F16_CACHE: re-convert f16-path weights every call
+    bool host_argmax = false;   // OMPH_HOST_ARGMAX: greedy argmax on the host (#102)
+
+    // --- ablations (wrong results, valid timings)
+    bool skip_attn = false;     // OMPH_SKIP_ATTN: no attention blocks
+    bool skip_ffn = false;      // OMPH_SKIP_FFN: no FFN blocks
+    bool skip_blocks = false;   // OMPH_SKIP_BLOCKS: no attention / delta-net / FFN at all
+    bool skip_gemv = false;     // OMPH_SKIP_GEMV: no fused GEMVs
+    int skip_gemv_type = -1;    // OMPH_SKIP_GEMV_TYPE=T: no GEMVs of GGUF type T (#63)
+    bool skip_stage = false;    // OMPH_SKIP_STAGE: no f16 staging + hipBLASLt matmuls
+
+    // --- diagnostics
+    bool timing = false;        // OMPH_TIMING: VRAM after load, phase totals, step times
+    bool trace_alloc = false;   // OMPH_TRACE_ALLOC: every f16 scratch allocation
+    bool trace_f16 = false;     // OMPH_TRACE_F16: matmuls that fall back to the f16 path
+    bool trace_stage = false;   // OMPH_TRACE_STAGE: every f16 staging / cache hit
+
+    static EnvOptions from_env();
+};
+
+} // namespace omph::runtime

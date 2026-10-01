@@ -21,6 +21,7 @@
 #include "kernels/gdn.hh"
 #include "kernels/gemv.hh"
 #include "runtime/matmul.hh"
+#include "runtime/options.hh"
 
 #include <hip/hip_runtime.h>
 
@@ -42,14 +43,15 @@ namespace {
 
 class Scratch {
 public:
-    bool init(const size_t bytes) {
+    bool init(const size_t bytes, const bool trace) {
         cap_ = bytes;
+        trace_ = trace;
         return hipMalloc(&base_, bytes) == hipSuccess;
     }
     void reset() { used_ = 0; }
     void * alloc(const size_t bytes) {
         const size_t off = (used_ + 255) & ~(size_t) 255;
-        if (std::getenv("OMPH_TRACE_ALLOC") != nullptr) {
+        if (trace_) {
             std::fprintf(stderr, "  alloc %8zu MiB (used %8zu MiB)\n", bytes >> 20,
                          (off + bytes) >> 20);
         }
@@ -66,6 +68,7 @@ private:
     void * base_ = nullptr;
     size_t cap_ = 0;
     size_t used_ = 0;
+    bool trace_ = false;
 };
 
 struct HParams {
@@ -137,7 +140,7 @@ void write_f32(const std::string & path, const std::vector<float> & data) {
 // run (reusing one pair made every total `calls x last interval`, #64).
 class PhaseTimer {
 public:
-    PhaseTimer() : on_(std::getenv("OMPH_TIMING") != nullptr) {}
+    void enable(const bool on) { on_ = on; }
     void start() {
         if (on_) {
             (void) hipEventCreate(&a_);
@@ -175,8 +178,13 @@ private:
 class Runner {
 public:
     explicit Runner(const std::string & path, const int64_t max_tokens, const bool use_gemv,
-                    const bool last_logits_only = false, const int64_t kv_capacity = 0)
-        : file_(path), h_(read_hparams(file_)), use_gemv_(use_gemv) {
+                    const omph::runtime::EnvOptions & env, const bool last_logits_only = false,
+                    const int64_t kv_capacity = 0)
+        : env_(env), file_(path), h_(read_hparams(file_)), use_gemv_(use_gemv) {
+        timer_stage_.enable(env_.timing);
+        timer_gemm_.enable(env_.timing);
+        timer_gemv_.enable(env_.timing);
+        timer_block_.enable(env_.timing);
         if (const int w = omph::kernels::kernel_wave_size(); w != 32) {
             throw std::runtime_error("kernels built for wave size " + std::to_string(w) +
                                      "; they need wave32");
@@ -234,7 +242,7 @@ public:
                     e.rows = (int64_t) t.ne[1];
                     e.k = (int64_t) t.ne[0];
                     e.type = t.type;
-                    e.has_b4 = std::getenv("OMPH_NO_B4") == nullptr &&
+                    e.has_b4 = !env_.no_b4 &&
                                (t.type == 12 || t.type == 18 || t.type == 21 || t.type == 23);
                     gems_[t.name] = e;
                     total += ((size_t) packed_bytes + 255) & ~(size_t) 255;
@@ -291,7 +299,7 @@ public:
                 scratch_bytes = std::max(scratch_bytes, kv.second);
             }
         }
-        if (!scratch_.init(scratch_bytes)) {
+        if (!scratch_.init(scratch_bytes, env_.trace_alloc)) {
             throw std::runtime_error("cannot allocate the weight scratch");
         }
         const auto alloc = [&](void ** p, const size_t bytes) {
@@ -335,8 +343,8 @@ public:
         // chunk: that is what lets a long prompt run in pieces.
         // Q8/Q4 by default (#69): validated to 32k under llama.cpp's q8_0/q4_0
         // budget at 4.9x less VRAM than f32 (#58, #61).
-        kv_host_ = std::getenv("OMPH_KV_HOST") != nullptr;
-        kv_q8q4_ = !kv_host_ && std::getenv("OMPH_KV_F32") == nullptr;
+        kv_host_ = env_.kv_host;
+        kv_q8q4_ = !kv_host_ && !env_.kv_f32;
         if (kv_host_) {
             // Validation reference only: the exact f32 cache in pinned host RAM
             // (4.29 GB at 32k does not fit beside the weights), and one layer's
@@ -356,7 +364,7 @@ public:
             // token, against 1024 B each in f32 (PLAN.md §13).
             const int64_t nblk = h_.head_dim / 32;
             // OMPH_KV_K4=1: K in V's Q4 format too (#81, experiment).
-            kv_k4_ = std::getenv("OMPH_KV_K4") != nullptr;
+            kv_k4_ = env_.kv_k4;
             alloc(&kv_kq_, (size_t) n_kv * kvcap * attn_kv / (kv_k4_ ? 2 : 1));
             alloc(&kv_ks_, (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2);
             alloc(&kv_vq_, (size_t) n_kv * kvcap * attn_kv / 2);
@@ -365,14 +373,11 @@ public:
             // rotated basis, in a ring (PLAN §13.4). 128 by default: it keeps the
             // KL under llama.cpp's q8_0/q4_0 up to 32k for 8.4 MB (#61);
             // OMPH_KV_WINDOW=0 turns it off.
-            kv_window_ = 128;
-            if (const char * w = std::getenv("OMPH_KV_WINDOW")) {
-                kv_window_ = std::atoll(w);
-            }
+            kv_window_ = env_.kv_window;
             alloc(&kv_k16_, (size_t) n_kv * kv_window_ * attn_kv * 2);
             alloc(&kv_v16_, (size_t) n_kv * kv_window_ * attn_kv * 2);
         }
-        overlap_ = use_gemv_ && std::getenv("OMPH_NO_OVERLAP") == nullptr;
+        overlap_ = use_gemv_ && !env_.no_overlap;
         if (overlap_ && (hipStreamCreateWithFlags(&side_, hipStreamNonBlocking) != hipSuccess ||
                          hipEventCreateWithFlags(&ev_fork_, hipEventDisableTiming) != hipSuccess ||
                          hipEventCreateWithFlags(&ev_join_, hipEventDisableTiming) != hipSuccess)) {
@@ -403,7 +408,7 @@ public:
                 at += per_layer;
             }
         }
-        if (std::getenv("OMPH_TIMING") != nullptr) {
+        if (env_.timing) {
             size_t free_b = 0;
             size_t total_b = 0;
             (void) hipMemGetInfo(&free_b, &total_b);
@@ -449,7 +454,7 @@ public:
             return fail("forward: tokens exceed the activation or KV capacity");
         }
         hipEvent_t step_a{}, step_b{};
-        const bool time_step = T == 1 && std::getenv("OMPH_TIMING") != nullptr;
+        const bool time_step = T == 1 && env_.timing;
         if (time_step) {
             (void) hipEventCreate(&step_a);
             (void) hipEventCreate(&step_b);
@@ -485,8 +490,8 @@ public:
         for (int64_t il = 0; il < h_.n_layer; ++il) {
             const std::string p = "blk." + std::to_string(il) + ".";
             const bool recurrent = file_.tensor(p + "ssm_a") != nullptr;
-            const bool skip_attn = !recurrent && std::getenv("OMPH_SKIP_ATTN") != nullptr;
-            const bool skip_ffn = std::getenv("OMPH_SKIP_FFN") != nullptr;
+            const bool skip_attn = !recurrent && env_.skip_attn;
+            const bool skip_ffn = env_.skip_ffn;
             const float * attn_norm = vec(p + "attn_norm.weight");
             const float * post_norm = vec(p + "post_attention_norm.weight");
             if (attn_norm == nullptr || post_norm == nullptr) {
@@ -500,7 +505,7 @@ public:
             }
             h16_normed = false;
             scratch_.reset();
-            if (std::getenv("OMPH_SKIP_BLOCKS") != nullptr) {
+            if (env_.skip_blocks) {
                 continue;  // ablation only: the layer output is the normed input
             }
             timer_block_.start();
@@ -727,7 +732,7 @@ public:
     }
 
     void report_phases() {
-        if (std::getenv("OMPH_TIMING") == nullptr) {
+        if (!env_.timing) {
             return;
         }
         (void) hipDeviceSynchronize();
@@ -1104,7 +1109,7 @@ private:
             // product beats converting to f16 and running a tiny M = 1 GEMM.
             const omph::gguf::TensorInfo * ti = file_.tensor(name);
             if (ti != nullptr && ti->type == 30 && (int64_t) ti->ne[1] == n_out && (int64_t) ti->ne[0] == k &&
-                std::getenv("OMPH_NO_BF16_GEMV") == nullptr) {
+                !env_.no_bf16_gemv) {
                 const void * w = static_cast<const uint8_t *>(dev_weights_) + off_.at(name);
                 timer_gemv_.start();
                 const bool ok = omph::kernels::gemv_bf16(w, x16, y, n_out, k, gemv_stream_);
@@ -1118,16 +1123,15 @@ private:
             const auto it = gems_.find(name);
             if (it != gems_.end() && it->second.rows == n_out && it->second.k == k) {
                 const void * w = static_cast<const uint8_t *>(dev_weights_) + it->second.off;
-                if (std::getenv("OMPH_SKIP_GEMV") != nullptr) {
+                if (env_.skip_gemv) {
                     return true;  // ablation only: wrong results, valid timing
                 }
                 // Ablation only: skip the GEMVs of one GGUF type. The step time
                 // difference is that type's real cost; rocprofv3's per-kernel
                 // times inflate some kernels by up to 40 % (#63).
-                if (const char * st = std::getenv("OMPH_SKIP_GEMV_TYPE")) {
-                    if ((uint32_t) std::atoi(st) == it->second.type) {
-                        return true;
-                    }
+                if (env_.skip_gemv_type >= 0 &&
+                    (uint32_t) env_.skip_gemv_type == it->second.type) {
+                    return true;
                 }
                 timer_gemv_.start();
                 const bool gemv_ok = gemv_one(it->second.type, w, x16, y, n_out, k, gemv_stream_);
@@ -1135,7 +1139,7 @@ private:
                 if (gemv_ok) {
                     return true;
                 }
-                if (std::getenv("OMPH_TRACE_F16") != nullptr) {
+                if (env_.trace_f16) {
                     const omph::gguf::TensorInfo * ti = file_.tensor(name);
                     std::fprintf(stderr,
                                  "f16 path: %s (entry %s, type %u, ne %lld x %lld, %lld B)\n",
@@ -1145,7 +1149,7 @@ private:
                                  ti != nullptr ? (long long) ti->ne[1] : 0,
                                  ti != nullptr ? (long long) ti->nbytes : 0);
                 }
-            } else if (std::getenv("OMPH_TRACE_F16") != nullptr) {
+            } else if (env_.trace_f16) {
                 const omph::gguf::TensorInfo * ti = file_.tensor(name);
                 std::fprintf(stderr, "f16 path: %s (not a gemv tensor, type %u, %lld B)\n",
                              name.c_str(), ti != nullptr ? (unsigned) ti->type : 0u,
@@ -1193,7 +1197,7 @@ private:
                 }
             }
         }
-        if (std::getenv("OMPH_SKIP_STAGE") != nullptr) {
+        if (env_.skip_stage) {
             return true;  // ablation only
         }
         void * w = stage_w(name);
@@ -1268,18 +1272,18 @@ private:
         // tensor; the big GEMV types (whose f16 form would not fit VRAM) never
         // take this path.
         const int64_t n_elems = numel(*t);
-        bool cacheable = std::getenv("OMPH_NO_F16_CACHE") == nullptr &&
+        bool cacheable = !env_.no_f16_cache &&
                          !has_gemv_type(t->type) && n_elems * 2 <= (256 << 20);
         if (cacheable) {
             const auto it = f16_cache_.find(name);
             if (it != f16_cache_.end()) {
-                if (std::getenv("OMPH_TRACE_STAGE") != nullptr) {
+                if (env_.trace_stage) {
                     std::fprintf(stderr, "stage %-40s CACHED\n", name.c_str());
                 }
                 return it->second;
             }
         }
-        if (std::getenv("OMPH_TRACE_STAGE") != nullptr) {
+        if (env_.trace_stage) {
             std::fprintf(stderr, "stage %-40s type %u %lld B cacheable %d\n", name.c_str(),
                          (unsigned) t->type, (long long) t->nbytes, cacheable ? 1 : 0);
         }
@@ -1299,7 +1303,7 @@ private:
         } else {
             dst = scratch_.alloc((size_t) n * 2);
         }
-        if (std::getenv("OMPH_TRACE_ALLOC") != nullptr) {
+        if (env_.trace_alloc) {
             std::fprintf(stderr, "stage %-40s %10lld elems  ne=[", name.c_str(), (long long) n);
             for (const uint64_t d : t->ne) {
                 std::fprintf(stderr, "%llu,", (unsigned long long) d);
@@ -1335,6 +1339,7 @@ private:
         bool has_b4 = false;  // a small-batch kernel exists for this type
     };
 
+    const omph::runtime::EnvOptions env_;  // first: the other members' setup reads it
     omph::gguf::File file_;
     HParams h_;
     bool use_gemv_ = false;
@@ -1512,7 +1517,8 @@ int main(int argc, char ** argv) {
                          (long long) act_chunk);
             return 2;
         }
-        Runner runner(model, act_chunk, use_gemv && generate > 0, last_logits, total_len);
+        const omph::runtime::EnvOptions env = omph::runtime::EnvOptions::from_env();
+        Runner runner(model, act_chunk, use_gemv && generate > 0, env, last_logits, total_len);
         const HParams & h = runner.hparams();
         // An id past the vocabulary would index the embedding out of bounds.
         for (const int32_t t : toks) {
@@ -1559,11 +1565,11 @@ int main(int argc, char ** argv) {
         if (generate > 0) {
             // greedy decode: one token per step, reusing the KV cache, the conv
             // state and the delta-net state
-            const bool timing = std::getenv("OMPH_TIMING") != nullptr;
+            const bool timing = env.timing;
             std::vector<float> step_logits;  // `logits` keeps the file's rows for the report
             // OMPH_HOST_ARGMAX=1: copy the logits back and take the argmax on the
             // host, as before #102 (A/B and validation).
-            const bool host_argmax = std::getenv("OMPH_HOST_ARGMAX") != nullptr;
+            const bool host_argmax = env.host_argmax;
             std::vector<int32_t> gen;
             int32_t next = argmax(logits.data() + (logits.size() - h.n_vocab));
             for (int64_t i = 0; i < generate; ++i) {

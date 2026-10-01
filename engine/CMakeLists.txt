@@ -28,6 +28,7 @@ add_library(omphalos SHARED
     src/format/repack.cc
     src/runtime/context.cc
     src/runtime/matmul.cc
+    src/runtime/options.cc
     src/kernels/probe.hip
     src/kernels/dequant.hip
     src/kernels/elementwise.hip
