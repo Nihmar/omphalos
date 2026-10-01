@@ -1,0 +1,54 @@
+# M8: --gemv prefill on the dequant + hipBLASLt path (#129). Engine 84fc66a vs main 7527726.
+# RX 9060 XT, wikitext 512-token prompt, Q8/Q4 KV, median of 5 runs unless noted.
+# "prefill" = OMPH_TIMING's prefill wall; the decode configuration is
+# --gemv --last-logits --generate N.
+#
+# 1. --gemv prefill (ms) per prompt length: NT-token GEMVs (OMPH_GEMM_MIN=100000) vs the GEMM
+#    path (whole-tensor f16 staging, no warmup in the first row; 8 MiB slices, warm, below).
+#    T      GEMVs    GEMM (whole, warm)   GEMM (8 MiB slices, warm)
+#    4       76.0         487.8
+#    8      141.7         485.0
+#    16     272.1         496.4             451.8
+#    24     400.4         502.1             455.4
+#    32     517.3         506.3             462.8
+#    48     712.3         519.1
+#    128   1583.1         589.3             580.1
+#    512   5714.7        1050.6            1026.4
+#    -> crossover at ~28 tokens: OMPH_GEMM_MIN = 32. The GEMM path's ~450 ms floor is the f16
+#    round trip of every weight (dequant + GEMM read); a fused dequant + WMMA GEMM removes it.
+#    hipBLASLt's first use costs ~0.47 s (kernel loading): T=64 GEMM was 912 ms cold, 534 warm.
+#
+# 2. f16 staging slice size (OMPH_STAGE_MIB), 512-token --gemv prefill, ms:
+#    0 (whole tensor, <= 178 MiB) 1041   4: 1129   8: 1033   12: 1190   16: 1057   24: 1030
+#    32: 1150   48: 1248   64: 1124
+#    8 MiB: as fast as whole tensors at T=512 and faster below (T=32: 507 -> 463 ms, the slice
+#    stays in the 32 MB Infinity Cache between the dequant and the GEMM). Shape-dependent
+#    hipBLASLt picks explain the non-monotonic sizes. Logits vs whole tensors: KL 6e-5 nats
+#    mean, top-1 100 % (32 / 48 / 64 MiB happen to be bit-identical).
+#
+# 3. Correctness (default settings):
+#    --gemv prefill logits == f16-path logits, bit for bit (the dequant from the repacked
+#    layouts is bit-identical to the GGUF bytes'). f16 path vs main: KL mean 5.9e-5, max 3.7e-3,
+#    top-1 100 % (512 positions); 1000-token tail 4.8e-5. check_gpu_run --layers PASS,
+#    check_gpu_decode --gemv PASS (greedy identical). Speculative oracle runs identical in every
+#    KV mode. A 16-token --gemv run (all on GEMVs) is bit-identical to main.
+#
+# 4. Decode step (ms, median of 15 steps, 5 alternating runs): main 45.47 45.44 45.46 45.46
+#    45.44 / new 45.45 45.41 45.42 45.46 45.45. Unchanged.
+#
+# 5. Peak VRAM over idle (MiB, sampled every 20 ms; 3 runs each, identical):
+#                                   main     new
+#    --gemv --generate 16           11511    11552   (+41: hipBLASLt's kernels ~107, the 8 MiB
+#                                                     scratch; its 64 MiB workspace is gone)
+#    same, OMPH_GEMM_MIN=100000      -       11445   (-66: no GEMM, no warmup)
+#    f16 path, full logits          12759    11954   (-805: slice scratch instead of a layer)
+#    f16 path, last logits          12727    11922
+#
+# 6. Load + one token (s, 5 runs): --gemv 12.7 -> 1.6 (parallel repack on 8 workers, uploads
+#    on the main thread, byte-table sign permutation); f16 path 2.18 -> 2.37 (it now repacks
+#    and warms up the head's plan).
+#    Repack thread time per type before -> after the byte tables: IQ3_S 11.1 -> 2.3 s,
+#    Q4_K 2.2 -> 0.9 s, IQ2_S 1.4 -> 0.3 s. 8 HIP-calling threads kept +15 MiB of VRAM.
+#
+# 7. f16-path (no --gemv) prefill, 512 tokens, ms: main 1283.0 1284.2 1283.9 1285.0 1283.7 /
+#    new 1045.1 1043.9 1044.0 1041.8 1041.4 (-19 %).
