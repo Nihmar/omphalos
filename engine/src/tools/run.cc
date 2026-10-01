@@ -280,8 +280,6 @@ public:
         alloc(&gate_, T * attn_q * 4);
         alloc(&k_, T * attn_kv * 4);  // attention only: the delta-net reads qkv itself
         alloc(&v_, T * attn_kv * 4);
-        alloc(&beta_, T * h_.ssm_n_vh * 4);
-        alloc(&alpha_, T * h_.ssm_n_vh * 4);
         alloc(&ffn1_, T * h_.n_ff * 4);
         alloc(&ffn2_, T * h_.n_ff * 4);
         alloc(&ffn16_, T * h_.n_ff * 2);
@@ -823,11 +821,8 @@ private:
         const bool proj_ok = fork_join(
             T,
             [&] {
+                // beta / alpha (BF16, 48 rows each) are dotted inside gdn_step (#88)
                 return matmul(p + "attn_gate.weight", h16_, static_cast<float *>(z_), v_dims, ne,
-                              T) &&
-                       matmul(p + "ssm_beta.weight", h16_, static_cast<float *>(beta_), n_vh, ne,
-                              T) &&
-                       matmul(p + "ssm_alpha.weight", h16_, static_cast<float *>(alpha_), n_vh, ne,
                               T);
             },
             [&] {
@@ -845,6 +840,16 @@ private:
         step.conv_w = conv_w;
         step.conv_cur = conv_cur;
         step.conv_new = conv_new;
+        const omph::gguf::TensorInfo * wb = file_.tensor(p + "ssm_beta.weight");
+        const omph::gguf::TensorInfo * wa = file_.tensor(p + "ssm_alpha.weight");
+        if (wb == nullptr || wa == nullptr || wb->type != 30 || wa->type != 30) {
+            return fail("gdn: ssm_beta / ssm_alpha must be BF16");
+        }
+        step.w_beta = reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(dev_weights_) +
+                                                         off_.at(wb->name));
+        step.w_alpha = reinterpret_cast<const uint16_t *>(
+            static_cast<const uint8_t *>(dev_weights_) + off_.at(wa->name));
+        step.k_in = ne;
         step.dt_bias = dt_bias;
         step.ssm_a = ssm_a;
         step.norm_w = ssm_norm;
@@ -859,8 +864,8 @@ private:
         step.eps_norm = (float) h_.eps;
         for (int64_t t = 0; t < T; ++t) {
             step.t = t;
-            step.beta = static_cast<const float *>(beta_) + t * n_vh;
-            step.alpha = static_cast<const float *>(alpha_) + t * n_vh;
+            step.x16 = reinterpret_cast<const __half *>(static_cast<const uint8_t *>(h16_) +
+                                                        t * ne * 2);
             step.z = static_cast<const float *>(z_) + t * v_dims;
             step.out16 = reinterpret_cast<__half *>(static_cast<uint8_t *>(ffn16_) + t * v_dims * 2);
             if (!omph::kernels::gdn_step(step, n_vh, nullptr)) {
@@ -1290,8 +1295,6 @@ private:
     void * gate_ = nullptr;
     void * k_ = nullptr;
     void * v_ = nullptr;
-    void * beta_ = nullptr;
-    void * alpha_ = nullptr;
     void * ffn1_ = nullptr;
     void * ffn2_ = nullptr;
     void * ffn16_ = nullptr;
