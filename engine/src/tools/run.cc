@@ -281,6 +281,7 @@ int main(int argc, char ** argv) {
                         break;
                     }
                     std::vector<int32_t> batch{next};
+                    const double c0 = omph::runtime::now_ms();
                     if (draft_mtp) {
                         std::vector<int32_t> drafts;
                         if (!runner.mtp_draft(next, pos, draft_k, drafts)) {
@@ -302,15 +303,24 @@ int main(int argc, char ** argv) {
                         batch.push_back(d);
                     }
                     std::vector<int32_t> am;
+                    const double c1 = omph::runtime::now_ms();
                     if (!runner.verify(batch, pos, am)) {
                         return 1;
                     }
+                    const double c2 = omph::runtime::now_ms();
                     int64_t a = 0;
                     while (a + 1 < (int64_t) batch.size() && batch[(size_t) a + 1] == am[(size_t) a]) {
                         ++a;
                     }
                     if (!runner.commit(a + 1)) {
                         return 1;
+                    }
+                    if (timing) {
+                        (void) hipDeviceSynchronize();
+                        std::fprintf(stderr, "spec cycle: draft %.2f verify %.2f commit %.2f ms "
+                                             "(T %zu, kept %lld)\n",
+                                     c1 - c0, c2 - c1, omph::runtime::now_ms() - c2, batch.size(),
+                                     (long long) a + 1);
                     }
                     ++n_steps;
                     n_accepted += a;

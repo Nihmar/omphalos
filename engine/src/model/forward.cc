@@ -235,13 +235,16 @@ bool Runner::lm_head(const int64_t T, std::vector<float> & logits, int32_t * gre
     if (use_gemv_ && T > 1 && head_.gemv != nullptr && head_.gemv->type == 12) {
         for (int64_t r0 = 0; r0 < T; r0 += kHeadRows) {
             const int64_t rows = std::min<int64_t>(kHeadRows, T - r0);
-            for (int64_t t0 = 0; t0 < rows; t0 += t0 + 4 <= rows ? 4 : 1) {
+            for (int64_t t0 = 0; t0 < rows;) {
+                const int64_t n = std::min<int64_t>(4, rows - t0);
                 const uint8_t * x = static_cast<const uint8_t *>(h16_) + (r0 + t0) * ne * 2;
                 float * y = static_cast<float *>(logits_) + t0 * h_.n_vocab;
+                // up to four tokens per read of the 682 MB head (#126)
                 const bool ok =
-                    t0 + 4 <= rows
-                        ? omph::kernels::gemv_q4k_b4(head_.dev, x, y, h_.n_vocab, ne, nullptr)
-                        : omph::kernels::gemv_q4k(head_.dev, x, y, h_.n_vocab, ne, nullptr);
+                    n > 1 ? omph::kernels::gemv_multi(12, head_.dev, x, y, h_.n_vocab, ne, (int) n,
+                                                      nullptr)
+                          : omph::kernels::gemv_q4k(head_.dev, x, y, h_.n_vocab, ne, nullptr);
+                t0 += n;
                 if (!ok) {
                     return fail("lm_head batch4 failed");
                 }

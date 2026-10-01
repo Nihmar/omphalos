@@ -104,8 +104,40 @@ bool Runner::matmul(const Mat & m, const void * x16, float * y, const int64_t n_
         }
     }
     if (use_gemv_ && T > 1 && g != nullptr && g->rows == n_out && g->k == k) {
+        // the ablations of the single-token path apply here too
+        if (env_.skip_gemv ||
+            (env_.skip_gemv_type >= 0 && (uint32_t) env_.skip_gemv_type == g->type)) {
+            return true;
+        }
         const auto * w = static_cast<const uint8_t *>(m.dev);
         const auto * xb = static_cast<const uint8_t *>(x16);
+        // NT-token kernels (#126): groups of up to four tokens per weight read,
+        // a remainder of 2 or 3 included; a type without them falls through.
+        if (!env_.no_b4) {
+            timer_gemv_.start(gemv_stream_);
+            bool ok = true;
+            bool supported = true;
+            for (int64_t t0 = 0; t0 < T && ok; ) {
+                const int64_t n = std::min<int64_t>(4, T - t0);
+                if (n == 1) {
+                    ok = gemv_one(g->type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
+                                  gemv_stream_);
+                } else {
+                    ok = omph::kernels::gemv_multi(g->type, w, xb + t0 * k * 2, y + t0 * n_out,
+                                                   n_out, k, (int) n, gemv_stream_);
+                    if (!ok && t0 == 0) {
+                        supported = false;  // nothing issued yet: fall through
+                        (void) hipGetLastError();
+                        break;
+                    }
+                }
+                t0 += n;
+            }
+            timer_gemv_.stop(t_gemv_, gemv_stream_);
+            if (supported && ok) {
+                return true;
+            }
+        }
         if (!g->has_b4 && has_gemv_type(g->type)) {
             // Types with a single-token kernel but no small-batch form: run one
             // per token. No staging, so a long prefill stays inside VRAM — it
