@@ -58,20 +58,28 @@ bool delta_o(const float * state, const float * q, float * o, int64_t heads, int
 bool gated_norm(const float * o, const float * w, const float * z, float * out, int64_t rows,
                 int64_t n, float eps, hipStream_t stream);
 
-// One-token delta rule in a single launch (PLAN.md §10.2): decay, sk = S^T k,
-// d = (v - sk) * beta, S += k (x) d and o = scale * S^T q for every head.
-//   state: (heads, s, s); q/k: (n_kh, s); v/o: (heads, s); gate: (heads,)
-//   beta: (heads,); one workgroup per head, 256 threads; s must be 128.
-bool delta_step_fused(float * state, const float * q, const float * k, const float * v,
-                      const float * beta, const float * gate, float * o, int64_t heads,
-                      int64_t n_kh, int64_t s, float scale, hipStream_t stream);
+// Same, written as f16: the input of the ssm_out GEMV, without a cast kernel (#78).
+bool gated_norm_f16(const float * o, const float * w, const float * z, void * out_f16,
+                    int64_t rows, int64_t n, float eps, hipStream_t stream);
 
-// Delta-net front end in one launch: the depthwise causal conv over
-// [state; qkv], silu, the q/k/v split and the state shift. The grid covers
-// tokens*channels conv elements plus (kernel-1)*channels state elements.
-bool conv_silu_split_fused(const float * qkv, const float * w, const float * state,
-                           float * new_state, float * q, float * k, float * v, int64_t tokens,
-                           int64_t channels, int64_t kernel, int64_t q_dims, int64_t kv_dims,
-                           int64_t v_dims, hipStream_t stream);
+// One-token delta rule in a single launch (PLAN.md §10.2): decay, sk = S^T k,
+// d = (v - sk) * beta, S += k (x) d and o = scale * S^T q for every head. The
+// gates come raw from the projections and are resolved in the kernel (#78):
+// beta = sigmoid(beta_raw), decay = exp(softplus(alpha_raw + dt_bias) * ssm_a).
+//   state: (heads, s, s); q/k: (n_kh, s); v/o: (heads, s);
+//   beta/alpha/dt_bias/ssm_a: (heads,); one workgroup per head, 256 threads;
+//   s must be 128.
+bool delta_step_fused(float * state, const float * q, const float * k, const float * v,
+                      const float * beta, const float * alpha, const float * dt_bias,
+                      const float * ssm_a, float * o, int64_t heads, int64_t n_kh, int64_t s,
+                      float scale, hipStream_t stream);
+
+// conv1d + silu + q/k/v split plus the per-head L2 normalization of q and k
+// (y = x / sqrt(mean(x^2) + eps) * scale over each head_dim-wide head) in one
+// launch (#78). head_dim must be 128 and every part a multiple of it.
+bool conv_silu_split_l2(const float * qkv, const float * w, const float * state, float * new_state,
+                        float * q, float * k, float * v, int64_t tokens, int64_t channels,
+                        int64_t kernel, int64_t q_dims, int64_t kv_dims, int64_t v_dims,
+                        int64_t head_dim, float eps, float scale, hipStream_t stream);
 
 } // namespace omph::kernels

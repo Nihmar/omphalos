@@ -1,6 +1,7 @@
 // Gated delta net kernels (PLAN.md §10.2, autoregressive path).
 #include "kernels/gdn.hh"
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 namespace omph::kernels {
@@ -170,14 +171,15 @@ __global__ void delta_o_kernel(const float * __restrict__ state, const float * _
     o[i] = acc * scale;
 }
 
+template <typename OutT>
 __global__ void gated_norm_kernel(const float * __restrict__ o, const float * __restrict__ w,
-                                  const float * __restrict__ z, float * __restrict__ out,
+                                  const float * __restrict__ z, OutT * __restrict__ out,
                                   const long long n, const float eps) {
     extern __shared__ float sdata[];
     const long long row = blockIdx.x;
     const float * orow = o + row * n;
     const float * zrow = z + row * n;
-    float * yrow = out + row * n;
+    OutT * yrow = out + row * n;
 
     float acc = 0.0f;
     for (long long i = threadIdx.x; i < n; i += blockDim.x) {
@@ -194,7 +196,7 @@ __global__ void gated_norm_kernel(const float * __restrict__ o, const float * __
     const float scale = 1.0f / sqrtf(sdata[0] / (float) n + eps);
     for (long long i = threadIdx.x; i < n; i += blockDim.x) {
         const float zn = zrow[i];
-        yrow[i] = orow[i] * scale * (w != nullptr ? w[i] : 1.0f) * (zn / (1.0f + expf(-zn)));
+        yrow[i] = (OutT) (orow[i] * scale * (w != nullptr ? w[i] : 1.0f) * (zn / (1.0f + expf(-zn))));
     }
 }
 
@@ -212,7 +214,8 @@ constexpr int kDeltaRows = kDeltaS / 2;   // rows per thread
 __global__ __launch_bounds__(256) void delta_step_kernel(
     float * __restrict__ state, const float * __restrict__ q, const float * __restrict__ k,
     const float * __restrict__ v, const float * __restrict__ beta,
-    const float * __restrict__ gate, float * __restrict__ o, const long long n_kh,
+    const float * __restrict__ alpha, const float * __restrict__ dt_bias,
+    const float * __restrict__ ssm_a, float * __restrict__ o, const long long n_kh,
     const long long s, const float scale) {
     __shared__ float part[2 * kDeltaS];
     __shared__ float dd[kDeltaS];
@@ -224,8 +227,11 @@ __global__ __launch_bounds__(256) void delta_step_kernel(
     const int half = tid >> 7;
     const int lo = half * kDeltaRows;
     kq[tid] = tid < kDeltaS ? k[(h % n_kh) * kDeltaS + tid] : q[(h % n_kh) * kDeltaS + tid - kDeltaS];
-    const float decay = expf(gate[h]);
-    const float b = beta[h];
+    // The gates from the raw projections (formerly three kernels, #78):
+    // b = sigmoid(beta), decay = exp(softplus(alpha + dt_bias) * A).
+    const float b = 1.0f / (1.0f + expf(-beta[h]));
+    const float ar = alpha[h] + dt_bias[h];
+    const float decay = expf((log1pf(expf(-fabsf(ar))) + fmaxf(ar, 0.0f)) * ssm_a[h]);
 
     float st[kDeltaRows];
 #pragma unroll
@@ -263,49 +269,59 @@ __global__ __launch_bounds__(256) void delta_step_kernel(
 }
 
 
-// Delta-net front end: conv + silu + q/k/v split + state shift in one launch.
-// Threads [0, tokens*channels) do the conv elements; the rest shift the state.
-__global__ void conv_silu_split_kernel(const float * __restrict__ qkv,
-                                       const float * __restrict__ w,
-                                       const float * __restrict__ state,
-                                       float * __restrict__ new_state, float * __restrict__ q,
-                                       float * __restrict__ k, float * __restrict__ v,
-                                       const long long tokens, const long long channels,
-                                       const long long kernel, const long long q_dims,
-                                       const long long kv_dims, const long long v_dims) {
-    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
-    const long long n_conv = tokens * channels;
+// conv1d + silu + q/k/v split + the L2 normalization of q and k per head, in
+// one launch (#78; formerly conv_silu_split + two rms_norm launches). grid:
+// (tokens, q heads + k heads + v channels / 128); 128 threads, one channel
+// each. A q or k workgroup is exactly one head, so its norm is a block
+// reduction: y = x / sqrt(mean(x^2) + eps) * scale, as rms_norm computed it.
+// The workgroups of token 0 also shift the conv state for their channels.
+constexpr int kConvHead = 128;
+
+__global__ __launch_bounds__(kConvHead) void conv_silu_split_l2_kernel(
+    const float * __restrict__ qkv, const float * __restrict__ w,
+    const float * __restrict__ state, float * __restrict__ new_state, float * __restrict__ q,
+    float * __restrict__ k, float * __restrict__ v, const long long tokens,
+    const long long channels, const long long kernel, const long long q_dims,
+    const long long kv_dims, const long long v_dims, const float eps, const float scale) {
+    __shared__ float wsum[kConvHead / 32];
+    const long long t = blockIdx.x;
+    const long long c = (long long) blockIdx.y * kConvHead + threadIdx.x;
     const long long rows = kernel - 1;
-    if (i < n_conv) {
-        const long long c = i % channels;
-        const long long t = i / channels;
-        float acc = 0.0f;
-        for (long long j = 0; j < kernel; ++j) {
-            const long long r = t + j;
-            const float xv = (r < rows) ? state[r * channels + c]
-                                        : qkv[(r - rows) * channels + c];
-            acc += w[c * kernel + j] * xv;
-        }
-        const float yv = acc / (1.0f + expf(-acc));  // silu
-        if (c < q_dims) {
-            q[t * q_dims + c] = yv;
-        } else if (c < q_dims + kv_dims) {
-            k[t * kv_dims + (c - q_dims)] = yv;
-        } else {
-            v[t * v_dims + (c - q_dims - kv_dims)] = yv;
-        }
-        return;
+    float acc = 0.0f;
+    for (long long j = 0; j < kernel; ++j) {
+        const long long r = t + j;
+        const float xv = (r < rows) ? state[r * channels + c] : qkv[(r - rows) * channels + c];
+        acc = fmaf(w[c * kernel + j], xv, acc);
     }
-    const long long s = i - n_conv;
-    if (s < rows * channels) {
-        const long long r = s / channels;
-        const long long c = s % channels;
-        const long long src = tokens + r;
-        new_state[r * channels + c] = (src < rows) ? state[src * channels + c]
-                                                   : qkv[(src - rows) * channels + c];
+    float y = acc / (1.0f + expf(-acc));  // silu
+    if (t == 0) {
+        for (long long r = 0; r < rows; ++r) {
+            const long long src = tokens + r;
+            new_state[r * channels + c] =
+                (src < rows) ? state[src * channels + c] : qkv[(src - rows) * channels + c];
+        }
+    }
+    if (c < q_dims + kv_dims) {  // a whole q or k head: normalize it
+        float ss = y * y;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            ss += __shfl_xor(ss, off);
+        }
+        if ((threadIdx.x & 31) == 0) {
+            wsum[threadIdx.x >> 5] = ss;
+        }
+        __syncthreads();
+        const float tot = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+        y = y * (1.0f / sqrtf(tot / (float) kConvHead + eps)) * scale;
+    }
+    if (c < q_dims) {
+        q[t * q_dims + c] = y;
+    } else if (c < q_dims + kv_dims) {
+        k[t * kv_dims + (c - q_dims)] = y;
+    } else {
+        v[t * v_dims + (c - q_dims - kv_dims)] = y;
     }
 }
-
 
 unsigned grid_for(const long long n) {
     return (unsigned) ((n + kBlock - 1) / kBlock);
@@ -440,38 +456,52 @@ bool gated_norm(const float * o, const float * w, const float * z, float * out, 
     if (o == nullptr || z == nullptr || out == nullptr || rows <= 0 || n <= 0) {
         return false;
     }
-    gated_norm_kernel<<<(unsigned) rows, kBlock, kBlock * sizeof(float), stream>>>(o, w, z, out,
+    gated_norm_kernel<float><<<(unsigned) rows, kBlock, kBlock * sizeof(float), stream>>>(o, w, z, out,
                                                                                    (long long) n,
                                                                                    eps);
     return hipGetLastError() == hipSuccess;
 }
 
-bool delta_step_fused(float * state, const float * q, const float * k, const float * v,
-                      const float * beta, const float * gate, float * o, const int64_t heads,
-                      const int64_t n_kh, const int64_t s, const float scale,
-                      hipStream_t stream) {
-    if (state == nullptr || q == nullptr || k == nullptr || v == nullptr || beta == nullptr ||
-        gate == nullptr || o == nullptr || heads <= 0 || n_kh <= 0 || s != 128) {
-        return false;  // the kernel's thread mapping is written for s == 128
+bool gated_norm_f16(const float * o, const float * w, const float * z, void * out_f16,
+                    const int64_t rows, const int64_t n, const float eps, hipStream_t stream) {
+    if (o == nullptr || z == nullptr || out_f16 == nullptr || rows <= 0 || n <= 0) {
+        return false;
     }
-    delta_step_kernel<<<(unsigned) heads, 256, 0, stream>>>(state, q, k, v, beta, gate, o, n_kh,
-                                                            s, scale);
+    gated_norm_kernel<__half><<<(unsigned) rows, kBlock, kBlock * sizeof(float), stream>>>(
+        o, w, z, static_cast<__half *>(out_f16), (long long) n, eps);
     return hipGetLastError() == hipSuccess;
 }
 
-bool conv_silu_split_fused(const float * qkv, const float * w, const float * state,
-                           float * new_state, float * q, float * k, float * v,
-                           const int64_t tokens, const int64_t channels, const int64_t kernel,
-                           const int64_t q_dims, const int64_t kv_dims, const int64_t v_dims,
-                           hipStream_t stream) {
-    if (qkv == nullptr || w == nullptr || state == nullptr || new_state == nullptr || q == nullptr ||
-        k == nullptr || v == nullptr || tokens <= 0 || channels <= 0 || kernel <= 1) {
+bool delta_step_fused(float * state, const float * q, const float * k, const float * v,
+                      const float * beta, const float * alpha, const float * dt_bias,
+                      const float * ssm_a, float * o, const int64_t heads, const int64_t n_kh,
+                      const int64_t s, const float scale, hipStream_t stream) {
+    if (state == nullptr || q == nullptr || k == nullptr || v == nullptr || beta == nullptr ||
+        alpha == nullptr || dt_bias == nullptr || ssm_a == nullptr || o == nullptr ||
+        heads <= 0 || n_kh <= 0 || s != 128) {
+        return false;  // the kernel's thread mapping is written for s == 128
+    }
+    delta_step_kernel<<<(unsigned) heads, 256, 0, stream>>>(state, q, k, v, beta, alpha, dt_bias,
+                                                            ssm_a, o, n_kh, s, scale);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool conv_silu_split_l2(const float * qkv, const float * w, const float * state, float * new_state,
+                        float * q, float * k, float * v, const int64_t tokens,
+                        const int64_t channels, const int64_t kernel, const int64_t q_dims,
+                        const int64_t kv_dims, const int64_t v_dims, const int64_t head_dim,
+                        const float eps, const float scale, hipStream_t stream) {
+    if (qkv == nullptr || w == nullptr || state == nullptr || new_state == nullptr ||
+        q == nullptr || k == nullptr || v == nullptr || tokens <= 0 || kernel <= 1 ||
+        head_dim != kConvHead || q_dims % kConvHead != 0 || kv_dims % kConvHead != 0 ||
+        v_dims % kConvHead != 0 || channels != q_dims + kv_dims + v_dims) {
         return false;
     }
-    const long long n = (long long) tokens * channels + (long long) (kernel - 1) * channels;
-    conv_silu_split_kernel<<<grid_for(n), kBlock, 0, stream>>>(
+    const dim3 grid((unsigned) tokens, (unsigned) (channels / kConvHead));
+    conv_silu_split_l2_kernel<<<grid, kConvHead, 0, stream>>>(
         qkv, w, state, new_state, q, k, v, (long long) tokens, (long long) channels,
-        (long long) kernel, (long long) q_dims, (long long) kv_dims, (long long) v_dims);
+        (long long) kernel, (long long) q_dims, (long long) kv_dims, (long long) v_dims, eps,
+        scale);
     return hipGetLastError() == hipSuccess;
 }
 

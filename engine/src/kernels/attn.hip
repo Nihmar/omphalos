@@ -86,111 +86,153 @@ namespace {
 constexpr long long kKvBlock = 32;
 
 
-__global__ void hadamard_kernel(float * __restrict__ x, const long long rows, const int n) {
-    extern __shared__ float sh[];
-    const long long row = blockIdx.x;
-    if (row >= rows) {
-        return;
+} // namespace
+
+// ------------------------------------------------------- fused attention prep
+
+namespace {
+
+constexpr int kPrepHd = 256;  // head_dim: one thread per dimension, 8 waves = 8 quant blocks
+
+// Block-wide sum over the 256 threads (8 wave32s).
+__device__ inline float prep_block_sum(float v, float * red) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        v += __shfl_xor(v, off);
     }
-    float * xr = x + row * n;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        sh[i] = xr[i];
+    if ((threadIdx.x & 31) == 0) {
+        red[threadIdx.x >> 5] = v;
     }
     __syncthreads();
-    for (int len = 1; len < n; len <<= 1) {
-        for (int i = (int) threadIdx.x; i < n / 2; i += (int) blockDim.x) {
-            const int a = (i / len) * 2 * len + (i % len);
+    float t = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kPrepHd / 32; ++i) {
+        t += red[i];
+    }
+    __syncthreads();
+    return t;
+}
+
+// NeoX RoPE on the first n_rot dimensions of a head held one value per thread.
+__device__ inline float prep_rope(const float x, float * buf, const long long pos,
+                                  const int n_rot, const float freq_base) {
+    const int d = (int) threadIdx.x;
+    buf[d] = x;
+    __syncthreads();
+    float y = x;
+    const int half = n_rot / 2;
+    if (d < n_rot) {
+        const int i = d < half ? d : d - half;
+        const float theta = (float) pos / powf(freq_base, (float) (2 * i) / (float) n_rot);
+        const float c = cosf(theta);
+        const float s = sinf(theta);
+        const float x0 = buf[i];
+        const float x1 = buf[i + half];
+        y = d < half ? x0 * c - x1 * s : x0 * s + x1 * c;
+    }
+    __syncthreads();
+    return y;
+}
+
+// Orthonormal fast Walsh-Hadamard over the 256 values of a head.
+__device__ inline float prep_hadamard(const float x, float * buf) {
+    const int d = (int) threadIdx.x;
+    buf[d] = x;
+    __syncthreads();
+    for (int len = 1; len < kPrepHd; len <<= 1) {
+        if (d < kPrepHd / 2) {
+            const int a = (d / len) * 2 * len + (d % len);
             const int b = a + len;
-            const float u = sh[a];
-            const float v = sh[b];
-            sh[a] = u + v;
-            sh[b] = u - v;
+            const float u = buf[a];
+            const float v = buf[b];
+            buf[a] = u + v;
+            buf[b] = u - v;
         }
         __syncthreads();
     }
-    const float norm = rsqrtf((float) n);  // orthonormal, so scores are exactly Q.K
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        xr[i] = sh[i] * norm;
-    }
+    const float y = buf[d] * rsqrtf((float) kPrepHd);
+    __syncthreads();
+    return y;
 }
 
-__global__ void kv_quant_kernel(const float * __restrict__ k_src, const float * __restrict__ v_src,
-                                uint8_t * __restrict__ k_q8, __half * __restrict__ k_scales,
-                                uint8_t * __restrict__ v_q4, __half * __restrict__ v_scales,
-                                __half * __restrict__ k16, __half * __restrict__ v16,
-                                const long long pos, const long long n_rows,
-                                const long long nkv, const long long hd,
-                                const long long window) {
-    const long long row = blockIdx.x;  // token * nkv + kv head
-    if (row >= n_rows) {
+// grid: (tokens, nh + 2 * nkv); 256 threads. Workgroup y < nh: query head
+// (split q / gate, RMSNorm, RoPE, rotation); < nh + nkv: key head (RMSNorm,
+// RoPE, rotation, written back and, with a quantized cache, quantized into
+// it); else value head (rotation, written back, quantized). Each wave is one
+// 32-element quantization block, so the block max is a wave reduction. The
+// arithmetic is that of the separate kernels it replaced (split_qg, rms_norm,
+// rope_neox, a Hadamard kernel and the KV quantizer, #79).
+__global__ __launch_bounds__(kPrepHd) void attn_prep_kernel(const AttnPrep a) {
+    __shared__ float buf[kPrepHd];
+    __shared__ float red[kPrepHd / 32];
+    const long long t = blockIdx.x;
+    const long long role = blockIdx.y;
+    const int d = (int) threadIdx.x;
+    const long long pos = a.pos0 + t;
+    if (role < a.nh) {
+        const long long h = role;
+        const float * src = a.qg + (t * a.nh + h) * 2 * kPrepHd;
+        a.gate[(t * a.nh + h) * kPrepHd + d] = src[kPrepHd + d];
+        float x = src[d];
+        const float inv = 1.0f / sqrtf(prep_block_sum(x * x, red) / (float) kPrepHd + a.eps);
+        x = x * inv * a.q_norm[d] * 1.0f;
+        x = prep_rope(x, buf, pos, a.n_rot, a.freq_base);
+        if (a.rotate) {
+            x = prep_hadamard(x, buf);
+        }
+        a.q[(t * a.nh + h) * kPrepHd + d] = x;
         return;
     }
-    const long long token = pos + row / nkv;
-    const long long head = row % nkv;
-    const long long dst = (token * nkv + head) * hd;   // quantized element offset
-    const long long sdst = (token * nkv + head) * (hd / kKvBlock);  // scale offset
-    const long long nb = hd / kKvBlock;
-    const int lane = (int) threadIdx.x;
-
-    // FP16 window (PLAN §13.4): the most recent `window` tokens keep an exact K
-    // and V in the rotated basis, in a ring, so the attention can read them
-    // instead of the quantized form. Only the last `window` tokens of this launch
-    // are written: in a prefill chunk longer than the window, earlier tokens
-    // would share a slot with later ones (a write race), and the ring must end
-    // up holding exactly the last `window` positions of the sequence.
-    if (k16 != nullptr && token + window >= pos + n_rows / nkv) {
-        const long long slot = (token % window) * nkv + head;
-        for (long long i = lane; i < hd; i += 32) {
-            k16[slot * hd + i] = __float2half(k_src[row * hd + i]);
-            v16[slot * hd + i] = __float2half(v_src[row * hd + i]);
-        }
+    const bool is_k = role < a.nh + a.nkv;
+    const long long h = is_k ? role - a.nh : role - a.nh - a.nkv;
+    float * row = (is_k ? a.k : a.v) + (t * a.nkv + h) * kPrepHd;
+    float x = row[d];
+    if (is_k) {
+        const float inv = 1.0f / sqrtf(prep_block_sum(x * x, red) / (float) kPrepHd + a.eps);
+        x = x * inv * a.k_norm[d] * 1.0f;
+        x = prep_rope(x, buf, pos, a.n_rot, a.freq_base);
     }
-    for (long long b = 0; b < nb; ++b) {
-        const long long off = row * hd + b * kKvBlock;
-        float amax = 0.0f;
-        if (lane < kKvBlock / 8) {  // 4 lanes x 8 values
-            for (int i = 0; i < 8; ++i) {
-                amax = fmaxf(amax, fabsf(k_src[off + lane * 8 + i]));
-            }
-        }
+    if (a.rotate) {
+        x = prep_hadamard(x, buf);
+    }
+    row[d] = x;
+    if (a.k_q8 == nullptr) {
+        return;  // f32 cache: the caller copies the rows
+    }
+    const long long dst = (pos * a.nkv + h) * kPrepHd;               // element offset
+    const long long sdst = (pos * a.nkv + h) * (kPrepHd / kKvBlock);  // scale offset
+    const int b = d / (int) kKvBlock;
+    const int lane = d & 31;
+    if (a.k16 != nullptr && pos + a.window >= a.pos0 + a.tokens) {  // FP16 ring (#48)
+        const long long slot = (pos % a.window) * a.nkv + h;
+        (is_k ? a.k16 : a.v16)[slot * kPrepHd + d] = __float2half(x);
+    }
+    float amax = fabsf(x);
 #pragma unroll
-        for (int s = 16; s > 0; s >>= 1) {  // all 32 lanes, so every writer sees it
-            amax = fmaxf(amax, __shfl_xor(amax, s));
-        }
+    for (int s = 16; s > 0; s >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, s));
+    }
+    if (is_k) {
         const float sc = amax / 127.0f;
         const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
         if (lane == 0) {
-            k_scales[sdst + b] = __float2half(sc);
+            a.k_scales[sdst + b] = __float2half(sc);
         }
-        if (lane < kKvBlock / 8) {
-            for (int i = 0; i < 8; ++i) {
-                const int q = (int) rintf(k_src[off + lane * 8 + i] * inv);
-                k_q8[dst + b * kKvBlock + lane * 8 + i] =
-                    (uint8_t) (int8_t) (q > 127 ? 127 : (q < -127 ? -127 : q));
-            }
-        }
-        // V: the same block, packed two values per byte
-        float vmax = 0.0f;
-        if (lane < kKvBlock / 8) {
-            for (int i = 0; i < 8; ++i) {
-                vmax = fmaxf(vmax, fabsf(v_src[off + lane * 8 + i]));
-            }
-        }
-#pragma unroll
-        for (int s = 16; s > 0; s >>= 1) {  // all 32 lanes: 16 of them write V bytes
-            vmax = fmaxf(vmax, __shfl_xor(vmax, s));
-        }
-        const float vsc = vmax / 7.0f;
-        const float vinv = vmax > 0.0f ? 7.0f / vmax : 0.0f;
+        const int q = (int) rintf(x * inv);
+        a.k_q8[dst + d] = (uint8_t) (int8_t) (q > 127 ? 127 : (q < -127 ? -127 : q));
+    } else {
+        const float vsc = amax / 7.0f;
+        const float vinv = amax > 0.0f ? 7.0f / amax : 0.0f;
         if (lane == 0) {
-            v_scales[sdst + b] = __float2half(vsc);
+            a.v_scales[sdst + b] = __float2half(vsc);
         }
-        if (lane < kKvBlock / 2) {  // 16 lanes, one output byte each: values i, i+16
-            const int q0 = (int) rintf(v_src[off + lane] * vinv);
-            const int q1 = (int) rintf(v_src[off + 16 + lane] * vinv);
+        const float x_hi = __shfl(x, (lane + 16) & 31);  // value lane + 16 of the block
+        if (lane < (int) kKvBlock / 2) {
+            const int q0 = (int) rintf(x * vinv);
+            const int q1 = (int) rintf(x_hi * vinv);
             const int c0 = q0 > 7 ? 7 : (q0 < -8 ? -8 : q0);
             const int c1 = q1 > 7 ? 7 : (q1 < -8 ? -8 : q1);
-            v_q4[dst / 2 + b * (kKvBlock / 2) + lane] =
+            a.v_q4[dst / 2 + b * (kKvBlock / 2) + lane] =
                 (uint8_t) (((c0 + 8) & 0xF) | (((c1 + 8) & 0xF) << 4));
         }
     }
@@ -198,30 +240,17 @@ __global__ void kv_quant_kernel(const float * __restrict__ k_src, const float * 
 
 } // namespace
 
-bool hadamard_f32(float * x, const int64_t rows, const int64_t n, hipStream_t stream) {
-    if (x == nullptr || rows <= 0 || n <= 0 || (n & (n - 1)) != 0) {
+bool attn_prep(const AttnPrep & a, hipStream_t stream) {
+    if (a.qg == nullptr || a.q == nullptr || a.gate == nullptr || a.k == nullptr ||
+        a.v == nullptr || a.q_norm == nullptr || a.k_norm == nullptr || a.tokens <= 0 ||
+        a.hd != kPrepHd || a.nh <= 0 || a.nkv <= 0 || a.n_rot <= 0 || a.n_rot % 2 != 0 ||
+        a.n_rot > a.hd || (a.k_q8 != nullptr && (a.k_scales == nullptr || a.v_q4 == nullptr ||
+                                                 a.v_scales == nullptr)) ||
+        (a.k16 == nullptr) != (a.v16 == nullptr) || (a.k16 != nullptr && a.window <= 0)) {
         return false;
     }
-    hadamard_kernel<<<(unsigned) rows, 256, (size_t) n * sizeof(float), stream>>>(x, rows,
-                                                                                  (int) n);
-    return hipGetLastError() == hipSuccess;
-}
-
-bool kv_quant(const float * k_src, const float * v_src, uint8_t * k_q8, void * k_scales,
-              uint8_t * v_q4, void * v_scales, void * k16, void * v16, const int64_t pos,
-              const int64_t tokens, const int64_t nkv, const int64_t hd, const int64_t window,
-              hipStream_t stream) {
-    if (k_src == nullptr || v_src == nullptr || k_q8 == nullptr || k_scales == nullptr ||
-        v_q4 == nullptr || v_scales == nullptr || tokens <= 0 || nkv <= 0 || hd <= 0 ||
-        hd % kKvBlock != 0 || (k16 == nullptr) != (v16 == nullptr) ||
-        (k16 != nullptr && window <= 0)) {
-        return false;
-    }
-    const long long n_rows = tokens * nkv;
-    kv_quant_kernel<<<(unsigned) n_rows, 32, 0, stream>>>(
-        k_src, v_src, k_q8, static_cast<__half *>(k_scales), v_q4,
-        static_cast<__half *>(v_scales), static_cast<__half *>(k16), static_cast<__half *>(v16),
-        pos, n_rows, nkv, hd, window > 0 ? window : 1);
+    const dim3 grid((unsigned) a.tokens, (unsigned) (a.nh + 2 * a.nkv));
+    attn_prep_kernel<<<grid, kPrepHd, 0, stream>>>(a);
     return hipGetLastError() == hipSuccess;
 }
 
@@ -456,7 +485,7 @@ __global__ __launch_bounds__(kGqaHd) void attention_gqa_kernel(
 // applies the gate.
 __global__ __launch_bounds__(kGqaHd) void attention_gqa_merge_kernel(
     const float * __restrict__ work, const float * __restrict__ gate, float * __restrict__ out,
-    const int nh, const int splits, const bool v_rotated) {
+    __half * __restrict__ out16, const int nh, const int splits, const bool v_rotated) {
     __shared__ float row[kGqaHd];
     __shared__ float ms[kGqaMaxSplits];
     __shared__ float ls[kGqaMaxSplits];
@@ -502,7 +531,11 @@ __global__ __launch_bounds__(kGqaHd) void attention_gqa_merge_kernel(
     if (gate != nullptr) {
         val *= 1.0f / (1.0f + expf(-gate[(t * nh + h) * kGqaHd + d]));
     }
-    out[(t * nh + h) * kGqaHd + d] = val;
+    if (out16 != nullptr) {  // straight into the output projection's f16 input (#79)
+        out16[(t * nh + h) * kGqaHd + d] = __float2half(val);
+    } else {
+        out[(t * nh + h) * kGqaHd + d] = val;
+    }
 }
 
 // Splits for a call: enough workgroups to fill the GPU, never more than the key
@@ -543,9 +576,9 @@ size_t attention_gqa_work_bytes(const int64_t max_tokens, const int64_t nh, cons
 bool attention_gqa(const float * q, const KvCache & kv, const float * gate, float * out,
                    const int64_t tokens, const int64_t seq, const int64_t nh, const int64_t nkv,
                    const int64_t hd, const float scale, const bool v_rotated, void * work,
-                   const size_t work_bytes, hipStream_t stream) {
+                   const size_t work_bytes, hipStream_t stream, void * out_f16) {
     const bool q8 = kv.k_q8 != nullptr;
-    if (q == nullptr || out == nullptr || work == nullptr || tokens <= 0 || seq < tokens ||
+    if (q == nullptr || (out == nullptr && out_f16 == nullptr) || work == nullptr || tokens <= 0 || seq < tokens ||
         nh <= 0 || nkv <= 0 || nh / nkv != kGqaGroup || nh % nkv != 0 || hd != kGqaHd) {
         return false;
     }
@@ -589,7 +622,7 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
     }
 #undef OMPH_GQA_LAUNCH
     attention_gqa_merge_kernel<<<dim3((unsigned) tokens, (unsigned) nh), kGqaHd, 0, stream>>>(
-        w, gate, out, (int) nh, splits, v_rotated);
+        w, gate, out, static_cast<__half *>(out_f16), (int) nh, splits, v_rotated);
     return hipGetLastError() == hipSuccess;
 }
 

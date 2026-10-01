@@ -260,7 +260,6 @@ public:
         alloc(&o_, T * ssm_v * 4);
         alloc(&q_, T * attn_q * 4);
         alloc(&gate_, T * attn_q * 4);
-        alloc(&attn_, T * attn_q * 4);
         alloc(&k_, T * std::max(ssm_q, attn_kv) * 4);
         alloc(&v_, T * std::max(ssm_v, attn_kv) * 4);
         alloc(&sk_, h_.ssm_n_vh * h_.ssm_s * 4);
@@ -727,33 +726,37 @@ private:
                 return matmul(p + "attn_q.weight", h16_, static_cast<float *>(fused_), q_out, ne,
                               T);
             });
-        if (!proj_ok ||
-            !omph::kernels::split_qg(static_cast<const float *>(fused_),
-                                     static_cast<float *>(q_), static_cast<float *>(gate_), T,
-                                     h_.n_head, h_.head_dim, nullptr) ||
-            !omph::kernels::rms_norm(static_cast<const float *>(q_), q_norm,
-                                     static_cast<float *>(q_), T * h_.n_head, h_.head_dim,
-                                     (float) h_.eps, 1.0f, nullptr) ||
-            !omph::kernels::rms_norm(static_cast<const float *>(k_), k_norm,
-                                     static_cast<float *>(k_), T * h_.n_head_kv, h_.head_dim,
-                                     (float) h_.eps, 1.0f, nullptr) ||
-            !omph::kernels::rope_neox(static_cast<float *>(q_), T, h_.n_head, h_.head_dim, h_.n_rot,
-                                      (float) h_.freq_base, pos0, nullptr) ||
-            !omph::kernels::rope_neox(static_cast<float *>(k_), T, h_.n_head_kv, h_.head_dim,
-                                      h_.n_rot, (float) h_.freq_base, pos0, nullptr) ||
-            // Quantized KV: rotate Q and K after QK-norm and RoPE, neither of which
-            // commutes with H, so that (HQ)·(HK) = Q·K (PLAN.md §13.3). V has no
-            // norm or RoPE; the attention epilogue un-rotates it.
-            (kv_q8q4_ &&
-             (!omph::kernels::hadamard_f32(static_cast<float *>(q_), T * h_.n_head,
-                                           h_.head_dim, nullptr) ||
-              !omph::kernels::hadamard_f32(static_cast<float *>(k_), T * h_.n_head_kv,
-                                           h_.head_dim, nullptr) ||
-              !omph::kernels::hadamard_f32(static_cast<float *>(v_), T * h_.n_head_kv,
-                                           h_.head_dim, nullptr))) ||
+        // split, QK-norm, RoPE, the Hadamard rotation and (quantized cache)
+        // the KV write, in one launch (#79).
+        omph::kernels::AttnPrep prep;
+        prep.qg = static_cast<const float *>(fused_);
+        prep.q = static_cast<float *>(q_);
+        prep.gate = static_cast<float *>(gate_);
+        prep.k = static_cast<float *>(k_);
+        prep.v = static_cast<float *>(v_);
+        prep.q_norm = q_norm;
+        prep.k_norm = k_norm;
+        prep.tokens = T;
+        prep.pos0 = pos0;
+        prep.nh = h_.n_head;
+        prep.nkv = h_.n_head_kv;
+        prep.hd = h_.head_dim;
+        prep.n_rot = (int) h_.n_rot;
+        prep.freq_base = (float) h_.freq_base;
+        prep.eps = (float) h_.eps;
+        prep.rotate = kv_q8q4_;
+        if (kv_q8q4_) {
+            const QuantKv c = quant_kv(il);
+            prep.k_q8 = c.kq;
+            prep.k_scales = reinterpret_cast<__half *>(c.ksc);
+            prep.v_q4 = c.vq;
+            prep.v_scales = reinterpret_cast<__half *>(c.vsc);
+            prep.k16 = kv_window_ > 0 ? reinterpret_cast<__half *>(c.k16) : nullptr;
+            prep.v16 = kv_window_ > 0 ? reinterpret_cast<__half *>(c.v16) : nullptr;
+            prep.window = kv_window_;
+        }
+        if (!proj_ok || !omph::kernels::attn_prep(prep, nullptr) ||
             !attn_impl(il, k_cache, v_cache, pos0, T) ||
-            !omph::kernels::cast_f32_to_f16(static_cast<const float *>(attn_), ffn16_,
-                                            T * h_.n_head * h_.head_dim, nullptr) ||
             !matmul(p + "attn_output.weight", ffn16_, static_cast<float *>(blk_), ne,
                     h_.n_head * h_.head_dim, T)) {
             return fail("attention layer failed");
@@ -803,21 +806,12 @@ private:
         if (!proj_ok) {
             return fail("gdn projection failed");
         }
-        if (!omph::kernels::sigmoid_inplace(static_cast<float *>(beta_), T * n_vh, nullptr) ||
-            !omph::kernels::softplus_bias_inplace(static_cast<float *>(alpha_), dt_bias, T, n_vh,
-                                                  nullptr) ||
-            !omph::kernels::mul_row_inplace(static_cast<float *>(alpha_), ssm_a, T, n_vh,
-                                            nullptr) ||
-            !omph::kernels::conv_silu_split_fused(
+        // conv + silu + split + L2 norm of q and k: rms_norm(x, eps/s) / sqrt(s)
+        if (!omph::kernels::conv_silu_split_l2(
                 static_cast<const float *>(fused_), conv_w, conv_cur, conv_new,
                 static_cast<float *>(q_), static_cast<float *>(k_), static_cast<float *>(v_), T,
-                channels, h_.ssm_conv_k, q_dims, k_dims, v_dims, nullptr) ||
-            !omph::kernels::rms_norm(static_cast<const float *>(q_), nullptr,
-                                     static_cast<float *>(q_), T * n_kh, s,
-                                     (float) (h_.eps / (double) s), l2_scale, nullptr) ||
-            !omph::kernels::rms_norm(static_cast<const float *>(k_), nullptr,
-                                     static_cast<float *>(k_), T * n_kh, s,
-                                     (float) (h_.eps / (double) s), l2_scale, nullptr)) {
+                channels, h_.ssm_conv_k, q_dims, k_dims, v_dims, s, (float) (h_.eps / (double) s),
+                l2_scale, nullptr)) {
             return fail("gdn preprocessing failed");
         }
         for (int64_t t = 0; t < T; ++t) {
@@ -826,16 +820,14 @@ private:
                     static_cast<const float *>(k_) + t * k_dims,
                     static_cast<const float *>(v_) + t * v_dims,
                     static_cast<const float *>(beta_) + t * n_vh,
-                    static_cast<const float *>(alpha_) + t * n_vh,
+                    static_cast<const float *>(alpha_) + t * n_vh, dt_bias, ssm_a,
                     static_cast<float *>(o_) + t * v_dims, n_vh, n_kh, s, l2_scale, nullptr)) {
                 return fail("delta rule failed");
             }
         }
-        if (!omph::kernels::gated_norm(static_cast<const float *>(o_), ssm_norm,
-                                       static_cast<const float *>(z_), static_cast<float *>(o_),
-                                       T * n_vh, v_dim, (float) h_.eps, nullptr) ||
-            !omph::kernels::cast_f32_to_f16(static_cast<const float *>(o_), ffn16_, T * v_dims,
-                                            nullptr) ||
+        if (!omph::kernels::gated_norm_f16(static_cast<const float *>(o_), ssm_norm,
+                                           static_cast<const float *>(z_), ffn16_, T * n_vh,
+                                           v_dim, (float) h_.eps, nullptr) ||
             !matmul(p + "ssm_out.weight", ffn16_, static_cast<float *>(blk_), ne, v_dims, T)) {
             return fail("gdn output failed");
         }
@@ -843,41 +835,49 @@ private:
         return true;
     }
 
+    // One attention layer's slice of the quantized cache (indexed by attention
+    // layer, kv_index_, not by model layer: 16 of the 64 layers have one).
+    struct QuantKv {
+        uint8_t * kq;
+        void * ksc;
+        uint8_t * vq;
+        void * vsc;
+        void * k16;
+        void * v16;
+    };
+    QuantKv quant_kv(const int64_t il) const {
+        const int64_t kv_out = h_.n_head_kv * h_.head_dim;
+        const int64_t nblk = h_.head_dim / 32;
+        const int64_t kvl = kv_index_[il];
+        return {static_cast<uint8_t *>(kv_kq_) + kvl * max_seq_ * kv_out,
+                static_cast<uint8_t *>(kv_ks_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2,
+                static_cast<uint8_t *>(kv_vq_) + kvl * max_seq_ * kv_out / 2,
+                static_cast<uint8_t *>(kv_vs_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2,
+                static_cast<uint8_t *>(kv_k16_) + kvl * kv_window_ * kv_out * 2,
+                static_cast<uint8_t *>(kv_v16_) + kvl * kv_window_ * kv_out * 2};
+    }
+
     // KV write + attention, on either the f32 cache (memcpy) or the Q8/Q4 one
     // (quantize); attention_gqa then reads either, dequantizing on the fly.
     bool attn_impl(const int64_t il, float * k_cache, float * v_cache, const int64_t pos0,
                    const int64_t T) {
         const int64_t kv_out = h_.n_head_kv * h_.head_dim;
-        const int64_t nblk = h_.head_dim / 32;
         const float scale = 1.0f / std::sqrt((float) h_.head_dim);
         if (kv_q8q4_) {
-            // The KV caches are indexed by attention layer (kv_index_), not by model
-            // layer: 16 of the 64 layers have one.
-            const int64_t kvl = kv_index_[il];
-            uint8_t * kq = static_cast<uint8_t *>(kv_kq_) + kvl * max_seq_ * kv_out;
-            uint8_t * vq = static_cast<uint8_t *>(kv_vq_) + kvl * max_seq_ * kv_out / 2;
-            auto * ksc = static_cast<uint8_t *>(kv_ks_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2;
-            auto * vsc = static_cast<uint8_t *>(kv_vs_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2;
-            auto * k16 = static_cast<uint8_t *>(kv_k16_) + kvl * kv_window_ * kv_out * 2;
-            auto * v16 = static_cast<uint8_t *>(kv_v16_) + kvl * kv_window_ * kv_out * 2;
-            if (!omph::kernels::kv_quant(static_cast<const float *>(k_),
-                                         static_cast<const float *>(v_), kq, ksc, vq, vsc, k16,
-                                         v16, pos0, T, h_.n_head_kv, h_.head_dim, kv_window_,
-                                         nullptr)) {
-                return false;
-            }
+            // The rows were quantized into the cache by attn_prep.
+            const QuantKv c = quant_kv(il);
             omph::kernels::KvCache kv;
-            kv.k_q8 = kq;
-            kv.k_scales = ksc;
-            kv.v_q4 = vq;
-            kv.v_scales = vsc;
-            kv.k16 = kv_window_ > 0 ? k16 : nullptr;
-            kv.v16 = kv_window_ > 0 ? v16 : nullptr;
+            kv.k_q8 = c.kq;
+            kv.k_scales = c.ksc;
+            kv.v_q4 = c.vq;
+            kv.v_scales = c.vsc;
+            kv.k16 = kv_window_ > 0 ? c.k16 : nullptr;
+            kv.v16 = kv_window_ > 0 ? c.v16 : nullptr;
             kv.window = kv_window_;
             return omph::kernels::attention_gqa(
                 static_cast<const float *>(q_), kv, static_cast<const float *>(gate_),
-                static_cast<float *>(attn_), T, pos0 + T, h_.n_head, h_.n_head_kv, h_.head_dim,
-                scale, true, attn_work_, attn_work_bytes_, nullptr);
+                nullptr, T, pos0 + T, h_.n_head, h_.n_head_kv, h_.head_dim, scale, true,
+                attn_work_, attn_work_bytes_, nullptr, ffn16_);
         }
         if (k_cache == nullptr || v_cache == nullptr) {
             return false;
@@ -904,9 +904,9 @@ private:
         kv.v_f32 = v_cache;
         return omph::kernels::attention_gqa(static_cast<const float *>(q_), kv,
                                             static_cast<const float *>(gate_),
-                                            static_cast<float *>(attn_), T, pos0 + T, h_.n_head,
-                                            h_.n_head_kv, h_.head_dim, scale, false, attn_work_,
-                                            attn_work_bytes_, nullptr);
+                                            nullptr, T, pos0 + T, h_.n_head, h_.n_head_kv,
+                                            h_.head_dim, scale, false, attn_work_,
+                                            attn_work_bytes_, nullptr, ffn16_);
     }
 
     // Runs `side` on the side stream and `main` on the default one, both after
@@ -1239,7 +1239,6 @@ private:
     void * o_ = nullptr;
     void * q_ = nullptr;
     void * gate_ = nullptr;
-    void * attn_ = nullptr;
     void * k_ = nullptr;
     void * v_ = nullptr;
     void * sk_ = nullptr;
