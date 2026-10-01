@@ -32,7 +32,9 @@ struct EnvOptions {
     bool skip_stage = false;    // OMPH_SKIP_STAGE: no f16 staging + hipBLASLt matmuls
 
     // --- diagnostics
-    bool timing = false;        // OMPH_TIMING: VRAM after load, phase totals, step times
+    bool timing = false;        // OMPH_TIMING: VRAM after load, per-step GPU and wall times
+    bool phases = false;        // OMPH_PHASES: per-phase GPU totals (stage / gemm / gemv /
+                                // blocks); their events perturb the step, keep apart
     bool trace_alloc = false;   // OMPH_TRACE_ALLOC: every f16 scratch allocation
     bool trace_f16 = false;     // OMPH_TRACE_F16: matmuls that fall back to the f16 path
     bool trace_stage = false;   // OMPH_TRACE_STAGE: every f16 staging / cache hit

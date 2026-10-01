@@ -142,17 +142,20 @@ void write_f32(const std::string & path, const std::vector<float> & data) {
 class PhaseTimer {
 public:
     void enable(const bool on) { on_ = on; }
-    void start() {
+    // On the stream the timed work is issued to: the GEMVs forked onto the
+    // side stream would otherwise be timed by the default stream (#100).
+    void start(hipStream_t stream = nullptr) {
         if (on_) {
             (void) hipEventCreate(&a_);
-            (void) hipEventRecord(a_, nullptr);
+            (void) hipEventRecord(a_, stream);
         }
     }
-    void stop(std::vector<std::pair<hipEvent_t, hipEvent_t>> & sink) {
+    void stop(std::vector<std::pair<hipEvent_t, hipEvent_t>> & sink,
+              hipStream_t stream = nullptr) {
         if (on_) {
             hipEvent_t b{};
             (void) hipEventCreate(&b);
-            (void) hipEventRecord(b, nullptr);
+            (void) hipEventRecord(b, stream);
             sink.emplace_back(a_, b);
         }
     }
@@ -182,10 +185,10 @@ public:
                     const omph::runtime::EnvOptions & env, const bool last_logits_only = false,
                     const int64_t kv_capacity = 0)
         : env_(env), file_(path), h_(read_hparams(file_)), use_gemv_(use_gemv) {
-        timer_stage_.enable(env_.timing);
-        timer_gemm_.enable(env_.timing);
-        timer_gemv_.enable(env_.timing);
-        timer_block_.enable(env_.timing);
+        timer_stage_.enable(env_.phases);
+        timer_gemm_.enable(env_.phases);
+        timer_gemv_.enable(env_.phases);
+        timer_block_.enable(env_.phases);
         if (const int w = omph::kernels::kernel_wave_size(); w != 32) {
             throw std::runtime_error("kernels built for wave size " + std::to_string(w) +
                                      "; they need wave32");
@@ -713,8 +716,11 @@ public:
         return true;
     }
 
+    // OMPH_PHASES: GPU time per phase since the last report. Each GEMV is timed
+    // on its own stream, so GEMVs overlapped on the side stream count in full
+    // and the gemv total can exceed the step.
     void report_phases() {
-        if (!env_.timing) {
+        if (!env_.phases) {
             return;
         }
         (void) hipDeviceSynchronize();
@@ -1093,9 +1099,9 @@ private:
             if (ti != nullptr && ti->type == 30 && (int64_t) ti->ne[1] == n_out && (int64_t) ti->ne[0] == k &&
                 !env_.no_bf16_gemv) {
                 const void * w = static_cast<const uint8_t *>(dev_weights_) + off_.at(name);
-                timer_gemv_.start();
+                timer_gemv_.start(gemv_stream_);
                 const bool ok = omph::kernels::gemv_bf16(w, x16, y, n_out, k, gemv_stream_);
-                timer_gemv_.stop(t_gemv_);
+                timer_gemv_.stop(t_gemv_, gemv_stream_);
                 if (ok) {
                     return true;
                 }
@@ -1115,9 +1121,9 @@ private:
                     (uint32_t) env_.skip_gemv_type == it->second.type) {
                     return true;
                 }
-                timer_gemv_.start();
+                timer_gemv_.start(gemv_stream_);
                 const bool gemv_ok = gemv_one(it->second.type, w, x16, y, n_out, k, gemv_stream_);
-                timer_gemv_.stop(t_gemv_);
+                timer_gemv_.stop(t_gemv_, gemv_stream_);
                 if (gemv_ok) {
                     return true;
                 }
@@ -1147,13 +1153,13 @@ private:
                 // just does not amortize the weight read (the b4 port is the fix).
                 const uint8_t * w = static_cast<const uint8_t *>(dev_weights_) + it->second.off;
                 const auto * xb = static_cast<const uint8_t *>(x16);
-                timer_gemv_.start();
+                timer_gemv_.start(gemv_stream_);
                 bool ok = true;
                 for (int64_t t0 = 0; t0 < T && ok; ++t0) {
                     ok = gemv_one(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
                                   gemv_stream_);
                 }
-                timer_gemv_.stop(t_gemv_);
+                timer_gemv_.stop(t_gemv_, gemv_stream_);
                 if (ok) {
                     return true;
                 }
@@ -1162,7 +1168,7 @@ private:
                 it->second.has_b4) {
                 const uint8_t * w = static_cast<const uint8_t *>(dev_weights_) + it->second.off;
                 const auto * xb = static_cast<const uint8_t *>(x16);
-                timer_gemv_.start();
+                timer_gemv_.start(gemv_stream_);
                 bool ok = true;
                 int64_t t0 = 0;
                 for (; t0 + 4 <= T && ok; t0 += 4) {
@@ -1173,7 +1179,7 @@ private:
                     ok = gemv_one(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
                                   gemv_stream_);
                 }
-                timer_gemv_.stop(t_gemv_);
+                timer_gemv_.stop(t_gemv_, gemv_stream_);
                 if (ok) {
                     return true;
                 }

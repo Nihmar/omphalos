@@ -32,6 +32,7 @@ EnvOptions EnvOptions::from_env() {
     }
     o.skip_stage = flag("OMPH_SKIP_STAGE");
     o.timing = flag("OMPH_TIMING");
+    o.phases = flag("OMPH_PHASES");
     o.trace_alloc = flag("OMPH_TRACE_ALLOC");
     o.trace_f16 = flag("OMPH_TRACE_F16");
     o.trace_stage = flag("OMPH_TRACE_STAGE");

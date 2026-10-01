@@ -1,0 +1,13 @@
+# Cost of the per-phase timer events in the decode step (#100). RX 9060 XT, --gemv, Q8/Q4 KV,
+# wikitext 512-token prompt, 64 generated tokens; medians of the 64 steps; same binary.
+# "timing only" = OMPH_TIMING (one event pair per step); "+phases" = OMPH_PHASES as well
+# (an event pair around every GEMV / staging / GEMM / block, ~460 events per step), which is
+# what OMPH_TIMING alone recorded before #100.
+run  timing-only gpu  timing-only wall  +phases gpu  +phases wall
+1    45.50            45.53             48.08        48.11
+2    45.48            45.50             48.08        48.09
+3    45.49            45.51             48.09        48.11
+# -> the decode step is 45.5 ms (eta = 35.7 / 45.5 = 0.785, ~22 tokens/s); every absolute
+#    "step gpu" before #100 is ~2.5 ms high (A/B deltas unaffected).
+# A/B against main 9dccbd1 under OMPH_TIMING (5 runs): main 47.85-47.89, this branch
+# 45.42-45.45, same tokens -- the same 2.4-2.6 ms, from removing the events alone.
