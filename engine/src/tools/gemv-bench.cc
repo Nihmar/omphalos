@@ -98,7 +98,9 @@ bool prepare(const omph::gguf::File & file, const omph::gguf::TensorInfo * t, Ca
     c.t = t;
     c.k = k;
     c.rows = rows;
-    c.bytes = rows * (k / 2 + (k / 256) * 8 + (k / 256) * 2);  // qs + scales + d
+    // Every byte of the repacked tensor is read once (the Q4_K formula used here
+    // before overstated the low-bit types, e.g. IQ2_S by 1.7x; #63).
+    c.bytes = (int64_t) host.size();
     return true;
 }
 
