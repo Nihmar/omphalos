@@ -1,0 +1,31 @@
+# M8: token-parallel delta rule (#96). Engine 16e8118 vs main a3033e4. RX 9060 XT, wikitext prompt,
+# Q8/Q4 KV, median of 5 runs ("prefill wall" of OMPH_TIMING; --gemv --last-logits --generate 1).
+#
+# 1. Kernel time of a 512-token prefill (rocprofv3, 48 delta-net layers):
+#    main   delta_chunk_kernel (one workgroup per head, serial tokens)   236.0 ms
+#    new    delta_conv_kernel  11.7 ms   delta_gate_kernel 11.2 ms   delta_rec_kernel 43.8 ms
+#           delta_post_kernel   5.8 ms   (total 72.5 ms)
+#    Steps on the way: splitting off the recurrence with LDS-staged k / q and 2 lanes per column
+#    123 ms; one lane per column with k / q from scalar loads 50 ms; per-token gate dots inside
+#    the token loop 67 ms -> separate kernels 11.7 + 44.8 ms -> branch-free gate loop 11.2 ms.
+#
+# 2. The recurrence is now latency-bound on its two 64-deep FMA chains per column (gdn_step's
+#    summation order) and the k / q broadcast. Micro-benchmark (48 heads, 512 tokens, ms/layer):
+#    current 0.97; v / gates prefetched 1.01; k / q via readlane 1.00; 4 or 8 accumulator
+#    chains 0.96 / 1.14 (with real loads; compute-only with 4 chains 0.42). Not pursued: any
+#    reordering would change the rounding of every path to stay consistent with the decode.
+#
+# 3. Prefill (ms):          main                                new
+#    --gemv, 512 tokens     1051.9 1041.9 1045.7 1039.6 1040.8  901.8 903.6 904.0 895.7 903.4
+#    --gemv, 128 tokens     586.0 587.6 592.1 589.1 586.9       543.5 545.3 543.7 543.2 544.9
+#    f16 path, 512 tokens   1061.8 1062.5 1060.9 1061.5 1056.4  916.2 917.1 915.2 914.5 913.7
+#
+# 4. Speculative decode (--draft-mtp 3, 64 tokens, ms/token): main 17.59 / 17.57, new 17.55 /
+#    17.49 (verifications take the 4-launch form too; single launch measured 17.41 vs 17.36).
+#
+# 5. Correctness: every output bit-identical to main: f16 prefill (512 and 1000-token tail),
+#    --gemv prefill + 16 generated tokens, f32-KV generate; chunk lengths 5 / 37 / 512 / 2 x 500
+#    against OMPH_GDN_SERIAL=1. Speculative oracle runs identical in every KV mode and with
+#    OMPH_SPEC_CHECK=1 (replay bit-exact). check_gpu_run --layers, check_gpu_decode --gemv,
+#    check_gpu_mtp, check_gpu_gdn 0/1/20, check_gpu_attn 3/7/63: PASS.
+#    Decode step 45.80 vs 45.81 ms (unchanged); peak VRAM 11552 MiB both (scratch in ffn1_).
