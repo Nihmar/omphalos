@@ -95,6 +95,20 @@ public:
 
     const HParams & hparams() const { return h_; }
 
+    // --- speculative decoding (#122) ---
+    // Allocates what a verification of up to `max_tokens` tokens needs to be
+    // rolled back (the alternate delta-net states, +151 MB, the replay records,
+    // the conv histories, the FP16-ring backup). Call once, after construction.
+    void enable_speculation(int64_t max_tokens);
+    // Runs `toks` at positions pos0.. as one verification and returns every
+    // row's greedy token in `argmax`. The caches and states then hold all of
+    // them until commit() says how many to keep.
+    bool verify(const std::vector<int32_t> & toks, int64_t pos0, std::vector<int32_t> & argmax);
+    // Keeps the first `accepted` (1 .. T) tokens of the last verification:
+    // swaps in the advanced states when all are kept, else replays the kept
+    // prefix onto the old ones and restores the FP16-ring slots of the rest.
+    bool commit(int64_t accepted);
+
 private:
     // Final norm and lm_head of the T rows in h16_, into `logits` on the host
     // (or, with `greedy` on a single-token GEMV step, only the argmax). Returns
@@ -233,6 +247,23 @@ private:
     static constexpr int64_t kHeadRows = 32;  // logits_ rows (multiple of 4)
     std::vector<int64_t> kv_index_;
     std::vector<char> conv_flip_;
+    std::vector<float *> state_cur_;  // recurrent layers: the state the next step reads
+    std::vector<float *> state_alt_;  // speculation: the buffer a verification writes
+    std::vector<int64_t> rec_index_;  // recurrent layer -> 0.. (-1 for attention)
+    int64_t spec_max_ = 0;            // 0: speculation off
+    bool verifying_ = false;
+    int64_t verify_tokens_ = 0;
+    int64_t verify_pos0_ = 0;
+    void * replay_pool_ = nullptr;
+    void * conv_hist_pool_ = nullptr;
+    void * ring_backup_k_ = nullptr;
+    void * ring_backup_v_ = nullptr;
+    std::vector<uint8_t> check_ring_k_;  // OMPH_SPEC_CHECK: the rings before a verification
+    std::vector<uint8_t> check_ring_v_;
+    // OMPH_SPEC_CHECK: replaying all recorded tokens reproduces gdn_step's state.
+    bool check_replay();
+    int64_t check_tokens_ = 0;           // the T of the verification being checked
+    void * spec_check_scratch_ = nullptr;
     int64_t max_seq_ = 0;
     int64_t max_tokens_ = 0;
     void * kv_k_ = nullptr;

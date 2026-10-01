@@ -202,7 +202,7 @@ bool Runner::lm_head(const int64_t T, std::vector<float> & logits, int32_t * gre
     }
     // Only the last token's logits: at 32k the full (T, 248320) f32 buffer is
     // 33 GB, and the long-context KV validation only needs the final row.
-    if (last_logits_only_) {
+    if (last_logits_only_ && !verifying_) {
         const uint8_t * xlast = static_cast<const uint8_t *>(h16_) + (T - 1) * ne * 2;
         logits.resize((size_t) h_.n_vocab);
         if (use_gemv_ && head_.gemv != nullptr) {

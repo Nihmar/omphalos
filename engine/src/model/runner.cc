@@ -243,6 +243,16 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
             states_.push_back(static_cast<uint8_t *>(state_pool_) + at);
             at += per_layer;
         }
+        // The recurrent state proper sits after the two conv tails; speculation
+        // swaps it with a second buffer (#122).
+        state_cur_.assign((size_t) h_.n_layer, nullptr);
+        state_alt_.assign((size_t) h_.n_layer, nullptr);
+        for (int64_t il = 0; il < h_.n_layer; ++il) {
+            if (states_[(size_t) il] != nullptr) {
+                state_cur_[(size_t) il] = reinterpret_cast<float *>(
+                    static_cast<uint8_t *>(states_[(size_t) il]) + 2 * n_conv * 4);
+            }
+        }
     }
     if (env_.timing) {
         size_t free_b = 0;
@@ -495,6 +505,214 @@ void Runner::resolve_layers() {
     }
     embd_type_ = te->type;
     embd_row_bytes_ = (int64_t) (te->nbytes / te->ne[1]);
+}
+
+// --- speculative decoding (#122) ---
+
+void Runner::enable_speculation(const int64_t max_tokens) {
+    if (spec_max_ > 0 || max_tokens <= 1) {
+        return;
+    }
+    if (max_tokens > max_tokens_) {
+        throw std::runtime_error("speculation: verification longer than the activations");
+    }
+    spec_max_ = max_tokens;
+    const int64_t n_kh = h_.ssm_n_kh;
+    const int64_t n_vh = h_.ssm_n_vh;
+    const int64_t channels = 2 * n_kh * h_.ssm_s + h_.ssm_inner;
+    const int64_t n_state = n_vh * h_.ssm_s * h_.ssm_s;
+    int64_t n_rec = 0;
+    rec_index_.assign((size_t) h_.n_layer, -1);
+    for (int64_t il = 0; il < h_.n_layer; ++il) {
+        if (state_cur_[(size_t) il] != nullptr) {
+            rec_index_[(size_t) il] = n_rec++;
+        }
+    }
+    auto * alt = static_cast<float *>(
+        mem_.device((size_t) std::max<int64_t>(n_rec, 1) * n_state * 4,
+                    "out of VRAM (speculation states)"));
+    for (int64_t il = 0; il < h_.n_layer; ++il) {
+        if (rec_index_[(size_t) il] >= 0) {
+            state_alt_[(size_t) il] = alt + rec_index_[(size_t) il] * n_state;
+        }
+    }
+    replay_pool_ = mem_.device((size_t) std::max<int64_t>(n_rec, 1) * max_tokens *
+                               omph::kernels::gdn_replay_floats(n_vh, n_kh) * 4);
+    conv_hist_pool_ = mem_.device((size_t) std::max<int64_t>(n_rec, 1) *
+                                  (h_.ssm_conv_k - 1 + max_tokens) * channels * 4);
+    if (kv_q8q4_ && kv_window_ > 0) {
+        const int64_t n_kv = (int64_t) std::count_if(kv_index_.begin(), kv_index_.end(),
+                                                     [](int64_t k) { return k >= 0; });
+        const size_t ring = (size_t) n_kv * kv_window_ * h_.n_head_kv * h_.head_dim * 2;
+        ring_backup_k_ = mem_.device(ring);
+        ring_backup_v_ = mem_.device(ring);
+    }
+    // A verification brings every row back, also with --last-logits.
+    if (last_logits_only_ || max_tokens > kHeadRows) {
+        logits_ = mem_.device((size_t) std::max<int64_t>(max_tokens, kHeadRows) * h_.n_vocab * 4);
+    }
+}
+
+bool Runner::verify(const std::vector<int32_t> & toks, const int64_t pos0,
+                    std::vector<int32_t> & argmax) {
+    const int64_t T = (int64_t) toks.size();
+    if (spec_max_ == 0 || T < 1 || T > spec_max_) {
+        return fail("verify: speculation not enabled, or too many tokens");
+    }
+    const int64_t n_kv = (int64_t) std::count_if(kv_index_.begin(), kv_index_.end(),
+                                                 [](int64_t k) { return k >= 0; });
+    const int64_t row_bytes = h_.n_head_kv * h_.head_dim * 2;
+    if (ring_backup_k_ != nullptr &&
+        !omph::kernels::kv_ring_copy(kv_k16_, kv_v16_, ring_backup_k_, ring_backup_v_, n_kv,
+                                     kv_window_, row_bytes, pos0, T, nullptr)) {
+        return fail("verify: ring backup failed");
+    }
+    if (env_.spec_check && ring_backup_k_ != nullptr) {
+        const size_t ring = (size_t) n_kv * kv_window_ * row_bytes;
+        check_ring_k_.resize(ring);
+        check_ring_v_.resize(ring);
+        if (hipMemcpy(check_ring_k_.data(), kv_k16_, ring, hipMemcpyDeviceToHost) != hipSuccess ||
+            hipMemcpy(check_ring_v_.data(), kv_v16_, ring, hipMemcpyDeviceToHost) != hipSuccess) {
+            return fail("verify: ring check copy failed");
+        }
+    }
+    verifying_ = true;
+    verify_tokens_ = T;
+    verify_pos0_ = pos0;
+    std::vector<float> logits;
+    const bool ok = forward(toks, logits, std::string(), pos0, true, nullptr);
+    verifying_ = false;
+    if (!ok) {
+        return false;
+    }
+    argmax.resize((size_t) T);
+    for (int64_t t = 0; t < T; ++t) {
+        const float * row = logits.data() + t * h_.n_vocab;
+        int64_t best = 0;
+        for (int64_t i = 1; i < h_.n_vocab; ++i) {
+            if (row[i] > row[best]) {
+                best = i;
+            }
+        }
+        argmax[(size_t) t] = (int32_t) best;
+    }
+    return true;
+}
+
+bool Runner::commit(const int64_t accepted) {
+    const int64_t T = verify_tokens_;
+    if (T == 0 || accepted < 1 || accepted > T) {
+        return fail("commit: no verification, or accepted out of range");
+    }
+    check_tokens_ = T;
+    verify_tokens_ = 0;
+    if (env_.spec_check && !check_replay()) {
+        return false;
+    }
+    if (accepted == T) {
+        for (int64_t il = 0; il < h_.n_layer; ++il) {
+            if (rec_index_[(size_t) il] >= 0) {
+                std::swap(state_cur_[(size_t) il], state_alt_[(size_t) il]);
+            }
+        }
+        return true;
+    }
+    const int64_t n_kh = h_.ssm_n_kh;
+    const int64_t n_vh = h_.ssm_n_vh;
+    const int64_t channels = 2 * n_kh * h_.ssm_s + h_.ssm_inner;
+    const int64_t n_conv_f = (h_.ssm_conv_k - 1) * channels;
+    for (int64_t il = 0; il < h_.n_layer; ++il) {
+        const int64_t r = rec_index_[(size_t) il];
+        if (r < 0) {
+            continue;
+        }
+        const float * rec = static_cast<const float *>(replay_pool_) +
+                            r * spec_max_ * omph::kernels::gdn_replay_floats(n_vh, n_kh);
+        const float * hist = static_cast<const float *>(conv_hist_pool_) +
+                             r * (h_.ssm_conv_k - 1 + spec_max_) * channels;
+        // the verification flipped the conv buffers: the current one is its tail
+        auto * conv_a = static_cast<float *>(states_[(size_t) il]);
+        float * conv_now = conv_flip_[(size_t) il] ? conv_a + n_conv_f : conv_a;
+        if (!omph::kernels::gdn_replay(state_cur_[(size_t) il], rec, accepted, n_vh, n_kh,
+                                       nullptr) ||
+            !omph::kernels::gdn_conv_select(hist, conv_now, accepted, h_.ssm_conv_k, channels,
+                                            nullptr)) {
+            return fail("commit: delta-net rollback failed");
+        }
+    }
+    if (ring_backup_k_ != nullptr) {
+        const int64_t n_kv = (int64_t) std::count_if(kv_index_.begin(), kv_index_.end(),
+                                                     [](int64_t k) { return k >= 0; });
+        if (!omph::kernels::kv_ring_copy(ring_backup_k_, ring_backup_v_, kv_k16_, kv_v16_, n_kv,
+                                         kv_window_, h_.n_head_kv * h_.head_dim * 2,
+                                         verify_pos0_ + accepted, T - accepted, nullptr)) {
+            return fail("commit: ring restore failed");
+        }
+        if (env_.spec_check) {
+            // Every slot but those of the kept positions is back to its state
+            // before the verification, byte for byte.
+            const int64_t row = h_.n_head_kv * h_.head_dim * 2;
+            std::vector<uint8_t> k(check_ring_k_.size()), v(check_ring_v_.size());
+            if (hipMemcpy(k.data(), kv_k16_, k.size(), hipMemcpyDeviceToHost) != hipSuccess ||
+                hipMemcpy(v.data(), kv_v16_, v.size(), hipMemcpyDeviceToHost) != hipSuccess) {
+                return fail("commit: ring check copy failed");
+            }
+            for (int64_t l = 0; l < n_kv; ++l) {
+                for (int64_t slot = 0; slot < kv_window_; ++slot) {
+                    bool kept = false;
+                    for (int64_t i = 0; i < accepted; ++i) {
+                        kept = kept || (verify_pos0_ + i) % kv_window_ == slot;
+                    }
+                    const size_t off = (size_t) ((l * kv_window_ + slot) * row);
+                    if (!kept && (std::memcmp(k.data() + off, check_ring_k_.data() + off, row) != 0 ||
+                                  std::memcmp(v.data() + off, check_ring_v_.data() + off, row) != 0)) {
+                        std::fprintf(stderr, "spec check: ring slot %lld of layer %lld not restored\n",
+                                     (long long) slot, (long long) l);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// OMPH_SPEC_CHECK: the replay of all T recorded tokens onto the state the
+// verification started from must give, bit for bit, the state gdn_step reached
+// (the alternate buffer). Checked on every recurrent layer before commit()
+// changes anything.
+bool Runner::check_replay() {
+    const int64_t n_kh = h_.ssm_n_kh;
+    const int64_t n_vh = h_.ssm_n_vh;
+    const size_t n_state = (size_t) n_vh * h_.ssm_s * h_.ssm_s;
+    float * scratch = static_cast<float *>(lazy(&spec_check_scratch_, n_state * 4));
+    std::vector<float> a(n_state), b(n_state);
+    int64_t mismatched = 0;
+    for (int64_t il = 0; il < h_.n_layer; ++il) {
+        const int64_t r = rec_index_[(size_t) il];
+        if (r < 0) {
+            continue;
+        }
+        const float * rec = static_cast<const float *>(replay_pool_) +
+                            r * spec_max_ * omph::kernels::gdn_replay_floats(n_vh, n_kh);
+        if (hipMemcpy(scratch, state_cur_[(size_t) il], n_state * 4, hipMemcpyDeviceToDevice) !=
+                hipSuccess ||
+            !omph::kernels::gdn_replay(scratch, rec, check_tokens_, n_vh, n_kh, nullptr) ||
+            hipMemcpy(a.data(), scratch, n_state * 4, hipMemcpyDeviceToHost) != hipSuccess ||
+            hipMemcpy(b.data(), state_alt_[(size_t) il], n_state * 4, hipMemcpyDeviceToHost) !=
+                hipSuccess) {
+            return fail("spec check: replay failed");
+        }
+        if (std::memcmp(a.data(), b.data(), n_state * 4) != 0) {
+            ++mismatched;
+        }
+    }
+    if (mismatched > 0) {
+        std::fprintf(stderr, "spec check: replay differs from gdn_step in %lld layers\n",
+                     (long long) mismatched);
+        return false;
+    }
+    return true;
 }
 
 } // namespace omph::model

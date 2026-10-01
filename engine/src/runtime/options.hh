@@ -38,6 +38,7 @@ struct EnvOptions {
     bool trace_alloc = false;   // OMPH_TRACE_ALLOC: every f16 scratch allocation
     bool trace_f16 = false;     // OMPH_TRACE_F16: matmuls that fall back to the f16 path
     bool trace_stage = false;   // OMPH_TRACE_STAGE: every f16 staging / cache hit
+    bool spec_check = false;    // OMPH_SPEC_CHECK: verify every speculative rollback (slow)
 
     static EnvOptions from_env();
 };
