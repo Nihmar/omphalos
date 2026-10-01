@@ -808,24 +808,33 @@ private:
         if (!proj_ok) {
             return fail("gdn projection failed");
         }
-        // conv + silu + split + L2 norm of q and k: rms_norm(x, eps/s) / sqrt(s)
-        if (!omph::kernels::conv_silu_split_l2(
-                static_cast<const float *>(fused_), conv_w, conv_cur, conv_new,
-                static_cast<float *>(q_), static_cast<float *>(k_), static_cast<float *>(v_), T,
-                channels, h_.ssm_conv_k, q_dims, k_dims, v_dims, s, (float) (h_.eps / (double) s),
-                l2_scale, nullptr)) {
-            return fail("gdn preprocessing failed");
-        }
+        // conv, L2 norms, gates, delta rule and gated norm: one launch per token
+        // (#78, #83). The L2 norm is rms_norm(x, eps/s) / sqrt(s).
+        omph::kernels::GdnStep step;
+        step.state = seq_state;
+        step.qkv = static_cast<const float *>(fused_);
+        step.conv_w = conv_w;
+        step.conv_cur = conv_cur;
+        step.conv_new = conv_new;
+        step.dt_bias = dt_bias;
+        step.ssm_a = ssm_a;
+        step.norm_w = ssm_norm;
+        step.tokens = T;
+        step.channels = channels;
+        step.q_dims = q_dims;
+        step.kv_dims = k_dims;
+        step.conv_k = h_.ssm_conv_k;
+        step.n_kh = n_kh;
+        step.eps_l2 = (float) (h_.eps / (double) s);
+        step.l2_scale = l2_scale;
+        step.eps_norm = (float) h_.eps;
         for (int64_t t = 0; t < T; ++t) {
-            if (!omph::kernels::delta_step_fused(
-                    seq_state, static_cast<const float *>(q_) + t * q_dims,
-                    static_cast<const float *>(k_) + t * k_dims,
-                    static_cast<const float *>(v_) + t * v_dims,
-                    static_cast<const float *>(beta_) + t * n_vh,
-                    static_cast<const float *>(alpha_) + t * n_vh, dt_bias, ssm_a, nullptr,
-                    n_vh, n_kh, s, l2_scale, nullptr, static_cast<const float *>(z_) + t * v_dims,
-                    ssm_norm, (float) h_.eps,
-                    static_cast<uint8_t *>(ffn16_) + t * v_dims * 2)) {  // gated norm fused (#83)
+            step.t = t;
+            step.beta = static_cast<const float *>(beta_) + t * n_vh;
+            step.alpha = static_cast<const float *>(alpha_) + t * n_vh;
+            step.z = static_cast<const float *>(z_) + t * v_dims;
+            step.out16 = reinterpret_cast<__half *>(static_cast<uint8_t *>(ffn16_) + t * v_dims * 2);
+            if (!omph::kernels::gdn_step(step, n_vh, nullptr)) {
                 return fail("delta rule failed");
             }
         }
