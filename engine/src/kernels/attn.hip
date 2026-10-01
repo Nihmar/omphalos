@@ -258,23 +258,6 @@ __device__ inline void gqa_load_k16(const KvArgs & kv, const long long p, const 
     }
 }
 
-template <bool Q8>
-__device__ inline float gqa_load_v(const KvArgs & kv, const long long p, const long long kvh,
-                                   const long long nkv, const int d, const long long seq) {
-    if constexpr (Q8) {
-        if (kv.v16 != nullptr && p + kv.window >= seq) {
-            return __half2float(kv.v16[((p % kv.window) * nkv + kvh) * kGqaHd + d]);
-        }
-        const long long row = p * nkv + kvh;
-        const uint8_t byte = kv.v_q4[row * (kGqaHd / 2) + (d / kKvBlock) * (kKvBlock / 2) + (d & 15)];
-        const int nib = (d & 16) ? (byte >> 4) : (byte & 0xF);
-        return (float) (nib - 8) *
-               __half2float(kv.v_scales[row * (kGqaHd / kKvBlock) + d / kKvBlock]);
-    } else {
-        return kv.v_f32[(p * nkv + kvh) * kGqaHd + d];
-    }
-}
-
 // Dimensions [16c, 16c + 16) of the V row of position p (dequantized; inside
 // the FP16 window: the exact copy).
 template <bool Q8>
