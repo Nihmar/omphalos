@@ -1,0 +1,26 @@
+# Decode / verification attention at long context (#136). Engine 8b38613 vs main 4bc9a42.
+# RX 9060 XT, Q8/Q4 KV with the 128-token FP16 window, --gemv --last-logits.
+#
+# 1. Decode attention kernel at 16k context (wiki16k.txt, rocprofv3, OMPH_NO_OVERLAP=1, per step):
+#    main (per-call splits, scalar V loads, ds_bpermute reductions)        7.27 ms
+#    fixed key chunks (128 keys, 129 splits)                               ~7.9 ms (wall +0.6)
+#    + 16-byte V loads staged in LDS, DPP score reduction, exp2, 64 splits 3.45 ms
+#    + softmax on 16 lanes per row                                         3.32 ms
+#    + next block loaded ahead                                             3.33 ms (dropped)
+#    + q chunks padded to 20 floats (ds_read_b128)                         3.32 ms
+#    merge kernel 0.11 ms. Decode step at 16k without overlap: 55.8 -> 51.9 ms.
+#
+# 2. Speculative decoding, --draft-mtp 3, 48 tokens after the 16k prompt (OMPH_NO_OVERLAP=1):
+#    main 35.27 / 35.32 ms per generated token, verification 78.3 / 78.4 ms per cycle
+#    new  29.75 / 29.58 ms per generated token, verification 65.0 / 64.2 ms per cycle
+#
+# 3. At 512 tokens (median of 5 alternating runs): decode step main 45.77 45.79 45.79 45.75 45.77,
+#    new 45.66 45.64 45.64 45.68 45.67 ms; --draft-mtp 3 main 17.56 / 17.55, new 17.44 / 17.41.
+#    Prefill and peak VRAM unchanged (11459 MiB).
+#
+# 4. Correctness: prefill logits (512, 1000-token tail) and greedy tokens bit-identical to main;
+#    speculative oracle runs identical to plain greedy in every KV mode and with OMPH_SPEC_CHECK=1
+#    (15 / 15). check_gpu_* , run --layers, decode --gemv, mtp: PASS. The decode path's own
+#    rounding at long context changes with the new summation order (fixed chunks, DPP trees);
+#    a long-context decode KL against the f32 KV is not measured here (omph-run compares
+#    prefill logits only).
