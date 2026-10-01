@@ -68,7 +68,7 @@
 | Compute units | 32 | wave32 execution |
 | VRAM | 16 GB GDDR6, 128-bit bus | |
 | Memory bandwidth (spec) | ~320 GB/s | **Measured (M0): 318.3 GB/s** streaming read — 99.5% of spec, not the usual 85–90% (`bench/bw_membench.hip`) |
-| FP16 matrix (WMMA) throughput | ~100 TFLOPS dense (spec) | **Measured (M0): ~46 TFLOPS** at the model's M=512 shapes via hipBLASLt; INT8 measured **~26 TOPS (0.57×)**, i.e. *not* ~2× |
+| FP16 matrix (WMMA) throughput | ~100 TFLOPS dense (spec) | **Measured (M8, #132): ~100 TFLOPS raw** (independent `v_wmma_f32_16x16x16_f16` chains, f32 accumulate; 70 with 4 chains); hipBLASLt ~46-49 at the model's M=512 shapes, the engine's own WMMA GEMM 60-64; INT8 measured **~26 TOPS (0.57×)**, i.e. *not* ~2× |
 | LDS | 64 KB per workgroup | Enough for IQ codebook tables + GEMM tiles |
 | Bus | PCIe 5.0 x16 | Host↔device transfers of embeddings/logits are cheap |
 
@@ -558,7 +558,7 @@ Listed in order of how much runtime they account for.
 
 Measured so far (M3.1, `bench/results/m3-gemv-q4k.txt`): fused Q4_K on `output.weight`
 = 253.2 GB/s = **79.6 %** of the 318.3 GB/s ceiling (target ≥ 60 %), 28.6× the
-f16 dequant + hipBLASLt path.
+f16 dequant + GEMM path (the engine's WMMA GEMM since #132).
 
 ### 10.2 Gated DeltaNet — decode
 
@@ -913,7 +913,7 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 - Fixed conditions: headless (or fixed minimal desktop), same power profile, card warmed up, fixed fan curve.
 - Warm-up runs discarded; report **median of ≥5 runs**.
 - Decode t/s at context depths **0 / 4k / 16k / 32k**; prefill t/s at **512 / 4k** prompt lengths; **peak VRAM**; time to first token.
-- Report efficiency, not just speed: decode as % of *measured* achievable bandwidth; prefill as % of *measured* hipBLASLt FP16 GEMM throughput.
+- Report efficiency, not just speed: decode as % of *measured* achievable bandwidth; prefill as % of the *measured* FP16 WMMA throughput (~100 TFLOPS raw, #132).
 - MTP: acceptance rate per workload type (code / chat / prose), tokens per step, effective t/s.
 - Quality: KL divergence vs llama.cpp reference (and vs FP16 KV for KV experiments), top-1 agreement, perplexity on a fixed slice; greedy-output identity with/without MTP.
 - Keep results as CSV in `bench/` with git commit hash of the engine.
@@ -938,7 +938,7 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 
 Status: **M0-M5 are complete; M6 is functionally complete (#121).** Greedy speculative decoding with the model's MTP head (`--draft-mtp 3`): output identical to plain greedy; 18.9 ms/token on wikitext, 19.4 on prose, 24-25 on code / repetitive text, against 45.5 ms plain (1.8-2.4x). Rollback is bit-exact (A/B delta-net states + rank-1 replay, FP16-ring restore, #122), the MTP KV fill costs +1.1-1.5 % of a `--gemv` prefill, verifications run on NT-token GEMVs (#126). Not done: truncated-vocab drafts (measured, not worth it), adaptive k (k = 3 always best or tied), sampling (temperature > 0). Measurements: `bench/results/m6-speculative.txt`.
 
-M8 (fast prefill) in progress. #129: the decode configuration (`--gemv`) prefills runs of 32+ tokens on the dequant + hipBLASLt path, dequantizing straight from the repacked layouts (bit-identical to the GGUF bytes) in ~8 MiB row slices that stay in the Infinity Cache: 512 tokens 5.7 s -> 1.03 s (~500 t/s), bit-identical to the f16 path, decode unchanged. The f16 path: 1.28 -> 1.04 s and -805 MiB peak; `--gemv` peak +41 MiB (hipBLASLt's kernels); load 12.7 -> 1.6 s (parallel repack). Measurements: `bench/results/m8-gemv-prefill.txt`. #96: the multi-token delta rule runs token-parallel (conv + L2 norms and gates for all tokens, then the recurrence alone with one lane per value column, then the gated norms), bit-identical to the per-token kernel: 236 -> 73 ms, 512-token prefill 1044 -> 902 ms (`bench/results/m8-gdn-token-parallel.txt`). Now ~57 % of the prefill is hipBLASLt GEMMs (~49 TFLOPS at T = 512), ~10 % the dequant.
+M8 (fast prefill) in progress. #129: the decode configuration (`--gemv`) prefills runs of 32+ tokens on the dequant + hipBLASLt path, dequantizing straight from the repacked layouts (bit-identical to the GGUF bytes) in ~8 MiB row slices that stay in the Infinity Cache: 512 tokens 5.7 s -> 1.03 s (~500 t/s), bit-identical to the f16 path, decode unchanged. The f16 path: 1.28 -> 1.04 s and -805 MiB peak; `--gemv` peak +41 MiB (hipBLASLt's kernels); load 12.7 -> 1.6 s (parallel repack). Measurements: `bench/results/m8-gemv-prefill.txt`. #96: the multi-token delta rule runs token-parallel (conv + L2 norms and gates for all tokens, then the recurrence alone with one lane per value column, then the gated norms), bit-identical to the per-token kernel: 236 -> 73 ms, 512-token prefill 1044 -> 902 ms (`bench/results/m8-gdn-token-parallel.txt`). #132: the prefill GEMMs run on the engine's own WMMA kernel (60-64 TFLOPS against hipBLASLt's ~49 and the units' measured ~100) and hipBLASLt left the build: 512-token prefill 897 -> 747 ms, -107 MiB peak VRAM (`bench/results/m8-wmma-gemm.txt`). Removing it exposed a run-to-run hazard of the decode's side stream (a bad pair of hardware queues made the step 72 ms); the runner now times the overlap at load and keeps only a side stream that wins.
 
 Status: **M0-M5 are complete.** M5 (quantized KV, issues #43, #58-#61): K Q8 + V Q4
 with the Hadamard rotation and a 128-token FP16 window, 4.92x less KV VRAM (4.29 GB ->
@@ -990,7 +990,7 @@ whatever the remaining ~15 us-per-launch kernels cost.
 - [x] Tied embeddings? (decides whether `token_embd` can go to host RAM separately). → **untied** (separate `output.weight`, Q4_K).
 - [x] Allocation file: all quant types present; do `gate`/`up` and Q/K/V share types? `lm_head` type? → see §3: mix listed; `gate`/`up` differ in 40/65 layers; DeltaNet `attn_qkv` is fused, full-attention layers have separate Q/K/V; `lm_head` = Q4_K.
 - [x] MTP: exact inputs (`h` pre- or post-norm), chaining for k > 1. → **#121/#124** (llama.cpp `graph_mtp` + draft-mtp): `h` is the target's hidden **after `output_norm`**; `x = eh_proj([enorm(embed(t)); hnorm(h)])` (embedding first), then a full-attention block with its own KV, `shared_head_norm` and the shared `output.weight`; position p pairs (h_{p-1}, t_p), h = 0 at p = 0; a chained draft feeds back the block's own `shared_head_norm` output. GPU vs NumPy (fed llama.cpp's `h_nextn`): rel 4.5e-2 on both drafts (`check_gpu_mtp.py`). Image positions: open, M7.
-- [x] RDNA4 specs: FP16/INT8 matrix peak, LDS size, cache sizes; ROCm version on CachyOS. → ROCm 7.2.4; measured fp16 ~46 TFLOPS / INT8 ~26 TOPS at M=512; LDS 64 KB; vendor peak still [verify].
+- [x] RDNA4 specs: FP16/INT8 matrix peak, LDS size, cache sizes; ROCm version on CachyOS. → ROCm 7.2.4; fp16 WMMA **~100 TFLOPS raw** (#132; hipBLASLt reached ~46-49 at M=512, the engine's own GEMM 60-64); INT8 ~26 TOPS; LDS 64 KB per workgroup.
 - [x] llama.cpp `new_state` buffer layout vs the engine kernels → **settled in M2**: the engine keeps the delta-net state as `(n_vh, state_size, state_size)` with the ggml k-head tiling (`h % n_kh`); the per-token outputs match the reference, so the fused kernel's internal (dumped) buffer layout is irrelevant for us.
 - [ ] `mtmd.h` API for extracting image embeddings. → M7.
 - [ ] RDNA4 memory OC support in LACT.
