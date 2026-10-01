@@ -19,6 +19,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace omph::model {
@@ -96,25 +97,65 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         }
         dev_weights_ = mem_.device(total, "cannot allocate the weight image");
         auto * base = static_cast<uint8_t *>(dev_weights_);
-        for (const Place & p : places) {
-            const omph::gguf::TensorInfo * t = file_.tensor(p.name);
-            const int64_t bb = omph::format::quant_block_bytes(t->type);
-            const bool repacked = gems_.count(p.name) != 0 && bb > 0;
-            std::vector<uint8_t> packed;
-            const void * src = file_.tensor_data(*t);
-            size_t bytes = (size_t) t->nbytes;
-            if (repacked) {
-                if (!omph::format::repack_any(t->type, src,
-                                              (int64_t) (t->nbytes / (uint64_t) bb), packed) ||
-                    packed.size() != gems_.at(p.name).bytes) {
+        // The host repack is the bulk of the load (~7 s of thread time): the
+        // tensors are independent, so worker threads repack the next batch of
+        // them (the biggest first) while this thread uploads the current one.
+        // Every HIP call stays on this thread: each thread that touches HIP
+        // keeps ~2 MiB of VRAM for good (#129).
+        std::sort(places.begin(), places.end(), [&](const Place & a, const Place & b) {
+            return file_.tensor(a.name)->nbytes > file_.tensor(b.name)->nbytes;
+        });
+        const size_t n_workers = std::max(1u, std::min(std::thread::hardware_concurrency(), 8u));
+        const size_t n_batches = (places.size() + n_workers - 1) / n_workers;
+        std::vector<std::vector<uint8_t>> packed(2 * n_workers);  // two batches in flight
+        std::vector<char> failed(2 * n_workers);
+        const auto repack_batch = [&](const size_t batch) {
+            std::vector<std::thread> workers;
+            for (size_t j = 0; j < n_workers && batch * n_workers + j < places.size(); ++j) {
+                workers.emplace_back([&, batch, j] {
+                    const size_t slot = (batch % 2) * n_workers + j;
+                    const omph::gguf::TensorInfo * t =
+                        file_.tensor(places[batch * n_workers + j].name);
+                    const auto g = gems_.find(t->name);
+                    const int64_t bb = omph::format::quant_block_bytes(t->type);
+                    failed[slot] = g != gems_.end() && bb > 0 &&
+                                   (!omph::format::repack_any(t->type, file_.tensor_data(*t),
+                                                              (int64_t) (t->nbytes / (uint64_t) bb),
+                                                              packed[slot]) ||
+                                    packed[slot].size() != g->second.bytes);
+                });
+            }
+            return workers;
+        };
+        std::vector<std::thread> current = repack_batch(0);
+        for (size_t batch = 0; batch < n_batches; ++batch) {
+            for (std::thread & w : current) {
+                w.join();
+            }
+            current = batch + 1 < n_batches ? repack_batch(batch + 1) : std::vector<std::thread>{};
+            for (size_t j = 0; j < n_workers && batch * n_workers + j < places.size(); ++j) {
+                const size_t slot = (batch % 2) * n_workers + j;
+                const Place & p = places[batch * n_workers + j];
+                const omph::gguf::TensorInfo * t = file_.tensor(p.name);
+                if (failed[slot] != 0) {
+                    for (std::thread & w : current) {
+                        w.join();
+                    }
                     throw std::runtime_error("repack failed for " + p.name);
                 }
-                src = packed.data();
-                bytes = packed.size();
+                const bool repacked = gems_.count(p.name) != 0 &&
+                                      omph::format::quant_block_bytes(t->type) > 0;
+                const void * src = repacked ? packed[slot].data() : file_.tensor_data(*t);
+                const size_t bytes = repacked ? packed[slot].size() : (size_t) t->nbytes;
+                if (hipMemcpy(base + p.off, src, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+                    for (std::thread & w : current) {
+                        w.join();
+                    }
+                    throw std::runtime_error("cannot upload " + p.name);
+                }
             }
-            if (hipMemcpy(base + p.off, src, bytes, hipMemcpyHostToDevice) != hipSuccess) {
-                throw std::runtime_error("cannot upload " + p.name);
-            }
+        }
+        for (const Place & p : places) {
             off_[p.name] = p.off;
         }
     }
