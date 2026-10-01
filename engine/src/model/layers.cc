@@ -22,21 +22,41 @@
 
 namespace omph::model {
 
+// Which cache an attention layer reads and writes: the stack's (by kv_index_)
+// in whatever mode it runs, or the MTP block's (always Q8/Q4, no FP16 ring:
+// draft rows must never overwrite slots of older positions, #124).
+Runner::KvView Runner::kv_view(const int64_t il) const {
+    KvView v;
+    if (il == h_.n_layer) {
+        v.quant = true;
+        v.q = {static_cast<uint8_t *>(mtp_kq_), mtp_ks_, static_cast<uint8_t *>(mtp_vq_), mtp_vs_,
+               nullptr, nullptr};
+        return v;
+    }
+    const int64_t kv_out = h_.n_head_kv * h_.head_dim;
+    v.quant = kv_q8q4_;
+    if (kv_q8q4_) {
+        v.q = quant_kv(il);
+        v.window = kv_window_;
+        v.k_q4 = kv_k4_;
+    } else {
+        // Null in the quantized-KV mode, where the f32 cache is never allocated.
+        v.k_f32 = static_cast<float *>(kv_k_) + kv_index_[il] * max_seq_ * kv_out;
+        v.v_f32 = static_cast<float *>(kv_v_) + kv_index_[il] * max_seq_ * kv_out;
+    }
+    return v;
+}
+
 bool Runner::attn_layer(const int64_t il, const LayerWeights & L, const int64_t T,
-                const int64_t pos0) {
+                        const int64_t pos0, const bool kv_only) {
     const int64_t ne = h_.n_embd;
     const int64_t q_out = h_.n_head * 2 * h_.head_dim;
     const int64_t kv_out = h_.n_head_kv * h_.head_dim;
-    // Null in the quantized-KV mode, where the f32 cache is never allocated.
-    float * k_cache = kv_k_ == nullptr
-                          ? nullptr
-                          : static_cast<float *>(kv_k_) + kv_index_[il] * max_seq_ * kv_out;
-    float * v_cache = kv_v_ == nullptr
-                          ? nullptr
-                          : static_cast<float *>(kv_v_) + kv_index_[il] * max_seq_ * kv_out;
-    const float * q_norm = L.q_norm;
-    const float * k_norm = L.k_norm;
+    const KvView kv = kv_view(il);
 
+    // kv_only (the MTP KV fill, #124): K and V into the cache, nothing else.
+    // attn_prep still runs its q heads on whatever fused_ holds; nobody reads
+    // their output.
     const bool proj_ok = fork_join(
         T,
         [&] {
@@ -44,7 +64,8 @@ bool Runner::attn_layer(const int64_t il, const LayerWeights & L, const int64_t 
                    matmul(L.attn_v, h16_, static_cast<float *>(v_), kv_out, ne, T);
         },
         [&] {
-            return matmul(L.attn_q, h16_, static_cast<float *>(fused_), q_out, ne, T);
+            return kv_only ||
+                   matmul(L.attn_q, h16_, static_cast<float *>(fused_), q_out, ne, T);
         });
     // split, QK-norm, RoPE, the Hadamard rotation and (quantized cache)
     // the KV write, in one launch (#79).
@@ -54,8 +75,8 @@ bool Runner::attn_layer(const int64_t il, const LayerWeights & L, const int64_t 
     prep.gate = static_cast<float *>(gate_);
     prep.k = static_cast<float *>(k_);
     prep.v = static_cast<float *>(v_);
-    prep.q_norm = q_norm;
-    prep.k_norm = k_norm;
+    prep.q_norm = L.q_norm;
+    prep.k_norm = L.k_norm;
     prep.tokens = T;
     prep.pos0 = pos0;
     prep.nh = h_.n_head;
@@ -64,20 +85,31 @@ bool Runner::attn_layer(const int64_t il, const LayerWeights & L, const int64_t 
     prep.n_rot = (int) h_.n_rot;
     prep.freq_base = (float) h_.freq_base;
     prep.eps = (float) h_.eps;
-    prep.rotate = kv_q8q4_;
-    if (kv_q8q4_) {
-        const QuantKv c = quant_kv(il);
-        prep.k_q8 = c.kq;
-        prep.k_scales = reinterpret_cast<__half *>(c.ksc);
-        prep.v_q4 = c.vq;
-        prep.v_scales = reinterpret_cast<__half *>(c.vsc);
-        prep.k16 = kv_window_ > 0 ? reinterpret_cast<__half *>(c.k16) : nullptr;
-        prep.v16 = kv_window_ > 0 ? reinterpret_cast<__half *>(c.v16) : nullptr;
-        prep.window = kv_window_;
-        prep.k_q4 = kv_k4_;
+    prep.rotate = kv.quant;
+    if (kv.quant) {
+        prep.k_q8 = kv.q.kq;
+        prep.k_scales = reinterpret_cast<__half *>(kv.q.ksc);
+        prep.v_q4 = kv.q.vq;
+        prep.v_scales = reinterpret_cast<__half *>(kv.q.vsc);
+        prep.k16 = kv.window > 0 ? reinterpret_cast<__half *>(kv.q.k16) : nullptr;
+        prep.v16 = kv.window > 0 ? reinterpret_cast<__half *>(kv.q.v16) : nullptr;
+        prep.window = kv.window;
+        prep.k_q4 = kv.k_q4;
     }
-    if (!proj_ok || !omph::kernels::attn_prep(prep, nullptr) ||
-        !attn_impl(il, k_cache, v_cache, pos0, T) ||
+    if (!proj_ok || !omph::kernels::attn_prep(prep, nullptr)) {
+        return fail("attention prep failed");
+    }
+    if (kv_only) {
+        if (!kv.quant &&
+            (hipMemcpy(kv.k_f32 + pos0 * kv_out, k_, (size_t) T * kv_out * 4, hipMemcpyDefault) !=
+                 hipSuccess ||
+             hipMemcpy(kv.v_f32 + pos0 * kv_out, v_, (size_t) T * kv_out * 4, hipMemcpyDefault) !=
+                 hipSuccess)) {
+            return fail("kv write failed");
+        }
+        return true;
+    }
+    if (!attn_impl(kv, pos0, T) ||
         !matmul(L.attn_output, ffn16_, static_cast<float *>(blk_), ne,
                 h_.n_head * h_.head_dim, T)) {
         return fail("attention layer failed");
@@ -192,27 +224,28 @@ Runner::QuantKv Runner::quant_kv(const int64_t il) const {
 
 // KV write + attention, on either the f32 cache (memcpy) or the Q8/Q4 one
 // (quantize); attention_gqa then reads either, dequantizing on the fly.
-bool Runner::attn_impl(const int64_t il, float * k_cache, float * v_cache, const int64_t pos0,
-               const int64_t T) {
+// KV write + attention, on either the f32 cache (memcpy) or the Q8/Q4 one
+// (written by attn_prep); attention_gqa then reads either, dequantizing on the fly.
+bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T) {
     const int64_t kv_out = h_.n_head_kv * h_.head_dim;
     const float scale = 1.0f / std::sqrt((float) h_.head_dim);
-    if (kv_q8q4_) {
-        // The rows were quantized into the cache by attn_prep.
-        const QuantKv c = quant_kv(il);
+    if (kv_in.quant) {
         omph::kernels::KvCache kv;
-        kv.k_q8 = c.kq;
-        kv.k_scales = c.ksc;
-        kv.v_q4 = c.vq;
-        kv.v_scales = c.vsc;
-        kv.k16 = kv_window_ > 0 ? c.k16 : nullptr;
-        kv.v16 = kv_window_ > 0 ? c.v16 : nullptr;
-        kv.window = kv_window_;
-        kv.k_q4 = kv_k4_;
+        kv.k_q8 = kv_in.q.kq;
+        kv.k_scales = kv_in.q.ksc;
+        kv.v_q4 = kv_in.q.vq;
+        kv.v_scales = kv_in.q.vsc;
+        kv.k16 = kv_in.window > 0 ? kv_in.q.k16 : nullptr;
+        kv.v16 = kv_in.window > 0 ? kv_in.q.v16 : nullptr;
+        kv.window = kv_in.window;
+        kv.k_q4 = kv_in.k_q4;
         return omph::kernels::attention_gqa(
             static_cast<const float *>(q_), kv, static_cast<const float *>(gate_),
             nullptr, T, pos0 + T, h_.n_head, h_.n_head_kv, h_.head_dim, scale, true,
             attn_work_, attn_work_bytes_, nullptr, ffn16_);
     }
+    float * k_cache = kv_in.k_f32;
+    float * v_cache = kv_in.v_f32;
     if (k_cache == nullptr || v_cache == nullptr) {
         return false;
     }

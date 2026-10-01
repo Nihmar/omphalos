@@ -56,8 +56,9 @@ class Reference:
     def __init__(self, model: Model):
         self.m = model
         self.hp = model.hp
-        self.kv_k: list[np.ndarray | None] = [None] * self.hp.n_layer
-        self.kv_v: list[np.ndarray | None] = [None] * self.hp.n_layer
+        # one more slot: the MTP block's own cache (index n_layer)
+        self.kv_k: list[np.ndarray | None] = [None] * (self.hp.n_layer + 1)
+        self.kv_v: list[np.ndarray | None] = [None] * (self.hp.n_layer + 1)
         self.conv: list[np.ndarray | None] = [None] * self.hp.n_layer
         self.ssm: list[np.ndarray | None] = [None] * self.hp.n_layer
 
@@ -296,3 +297,30 @@ class Reference:
             cap.put("result_norm", x)
         logits = x @ m.matrix("output.weight").T
         return logits
+
+    # ------------------------------------------------------------------ mtp
+
+    def mtp(self, tokens: list[int], h: np.ndarray, start_pos: int = 0) -> tuple[np.ndarray, np.ndarray]:
+        """The MTP block (blk.<n_layer>) over T positions, as llama.cpp's graph_mtp.
+
+        Position start_pos + t reads the pair (h[t], tokens[t]), h being the
+        target's output_norm hidden of the previous position (zeros at 0).
+        Returns (logits (T, vocab), g (T, n_embd)), g = shared_head_norm(x), the
+        h a chained draft feeds back.
+        """
+        hp = self.hp
+        m = self.m
+        il = hp.n_layer
+        p = f"blk.{il}."
+        T = len(tokens)
+        e = np.stack([m.embedding_row(t) for t in tokens]).astype(F32)
+        en = rms_norm(e, m.vector(p + "nextn.enorm.weight"), hp.eps)
+        hn = rms_norm(np.asarray(h, dtype=F32), m.vector(p + "nextn.hnorm.weight"), hp.eps)
+        x = np.concatenate([en, hn], axis=1) @ m.matrix(p + "nextn.eh_proj.weight").T
+        pos = np.arange(start_pos, start_pos + T, dtype=F32)
+        cur = rms_norm(x, m.vector(p + "attn_norm.weight"), hp.eps)
+        x = self.layer_attention(il, cur, pos, None) + x
+        cur = rms_norm(x, m.vector(p + "post_attention_norm.weight"), hp.eps)
+        x = self.layer_ffn(il, cur) + x
+        g = rms_norm(x, m.vector(p + "nextn.shared_head_norm.weight"), hp.eps)
+        return g @ m.matrix("output.weight").T, g

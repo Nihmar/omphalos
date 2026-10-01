@@ -71,6 +71,9 @@ int main(int argc, char ** argv) {
     std::string oracle_path;   // --draft-oracle: drafts from a token file (#122)
     int64_t draft_k = 3;
     int64_t draft_corrupt = 0;  // corrupt every N-th draft (0: never)
+    bool mtp = false;           // --mtp: load the MTP block (#124)
+    bool draft_mtp = false;     // --draft-mtp K: speculative decode with MTP drafts
+    std::string mtp_out;        // --mtp-out: the first two drafts' logits (validation)
     // A flag's numeric value: a whole non-negative number or nothing.
     const auto count = [](const char * s, int64_t & out) {
         char * end = nullptr;
@@ -96,6 +99,15 @@ int main(int argc, char ** argv) {
             gen_path = argv[++i];
         } else if (std::strcmp(argv[i], "--draft-oracle") == 0 && has_value) {
             oracle_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--mtp") == 0) {
+            mtp = true;
+        } else if (std::strcmp(argv[i], "--draft-mtp") == 0 && has_value) {
+            if (!count(argv[++i], draft_k) || draft_k < 1) return usage();
+            mtp = true;
+            draft_mtp = true;
+        } else if (std::strcmp(argv[i], "--mtp-out") == 0 && has_value) {
+            mtp_out = argv[++i];
+            mtp = true;
         } else if (std::strcmp(argv[i], "--draft-k") == 0 && has_value) {
             if (!count(argv[++i], draft_k) || draft_k < 1) return usage();
         } else if (std::strcmp(argv[i], "--draft-corrupt") == 0 && has_value) {
@@ -156,8 +168,12 @@ int main(int argc, char ** argv) {
             return 2;
         }
         const omph::runtime::EnvOptions env = omph::runtime::EnvOptions::from_env();
+        if (mtp && !(use_gemv && generate > 0)) {
+            std::fprintf(stderr, "--mtp needs --gemv and --generate\n");
+            return 2;
+        }
         omph::model::Runner runner(model, act_chunk, use_gemv && generate > 0, env, last_logits,
-                                   total_len);
+                                   total_len, mtp);
         std::vector<int32_t> oracle;
         if (!oracle_path.empty()) {
             std::ifstream in(oracle_path);
@@ -167,6 +183,13 @@ int main(int argc, char ** argv) {
             }
             if (oracle.empty() || generate == 0) {
                 std::fprintf(stderr, "--draft-oracle needs a token file and --generate\n");
+                return 2;
+            }
+            runner.enable_speculation(draft_k + 1);
+        }
+        if (draft_mtp) {
+            if (!oracle.empty()) {
+                std::fprintf(stderr, "--draft-mtp and --draft-oracle are exclusive\n");
                 return 2;
             }
             runner.enable_speculation(draft_k + 1);
@@ -224,8 +247,24 @@ int main(int argc, char ** argv) {
             const bool host_argmax = env.host_argmax;
             std::vector<int32_t> gen;
             int32_t next = argmax(logits.data() + (logits.size() - h.n_vocab));
-            if (!oracle.empty()) {
-                // Speculative greedy decode with oracle drafts (#122): the drafts
+            if (!mtp_out.empty()) {
+                // MTP validation (#124): two chained drafts after the prompt and
+                // its greedy token, their logits rows to the file.
+                std::vector<int32_t> drafts;
+                std::vector<float> dl;
+                if (!runner.mtp_draft(next, (int64_t) toks.size(), 2, drafts, &dl)) {
+                    return 1;
+                }
+                write_f32(mtp_out, dl);
+                std::printf("mtp drafts after %d:", next);
+                for (const int32_t d : drafts) {
+                    std::printf(" %d", d);
+                }
+                std::printf("\n");
+            }
+            if (!oracle.empty() || draft_mtp) {
+                // Speculative greedy decode (#122, #124), the drafts from the MTP
+                // head or, for validation, an oracle file. Oracle: the drafts
                 // for generated token g are oracle[g ..], every draft_corrupt-th
                 // one deliberately wrong. Each step verifies [next, drafts] in one
                 // forward, keeps the drafts that match the verifier's own greedy
@@ -242,7 +281,15 @@ int main(int argc, char ** argv) {
                         break;
                     }
                     std::vector<int32_t> batch{next};
-                    for (int64_t j = 0; j < draft_k; ++j) {
+                    if (draft_mtp) {
+                        std::vector<int32_t> drafts;
+                        if (!runner.mtp_draft(next, pos, draft_k, drafts)) {
+                            return 1;
+                        }
+                        n_drafted += (int64_t) drafts.size();
+                        batch.insert(batch.end(), drafts.begin(), drafts.end());
+                    }
+                    for (int64_t j = 0; j < draft_k && !draft_mtp; ++j) {
                         const size_t g = gen.size() + (size_t) j;
                         if (g >= oracle.size()) {
                             break;

@@ -82,6 +82,7 @@ uv run python check_gpu_attn.py <model> <layer>   # attention layers 3 / 7 / 63 
 uv run python check_gpu_gdn.py  <model> <layer>   # delta-net layers 0 / 1 / 20 (gdn_step);
     # [--chunk 1|3] the decode path / the conv state carried across calls
 uv run python check_gpu_run.py  <model> --layers  # 64-layer stack vs the dump
+uv run python check_gpu_mtp.py                    # MTP draft head vs NumPy fed llama.cpp's h
 uv run python check_gpu_decode.py [--gemv]        # greedy decode vs the NumPy reference
                                                   # (cached in models/golden/cpu; --refresh)
 uv run python compare_logits.py ref.f32 test.f32  # KL + top-1 agreement over every
@@ -111,6 +112,8 @@ tools/native/build.sh <llama.cpp-dir> && tools/native/dump_tensors ...
 | `--last-logits` / `--logits-tail N` | write only the last row / the last N rows of logits (long prompts) |
 | `--tokens N` | use only the first N prompt tokens |
 | `--trace-dir DIR` | dump every layer's output (one-chunk prompts only) |
+| `--draft-mtp K` | speculative greedy decode with K MTP drafts per step (#124); output identical to plain greedy |
+| `--mtp` / `--mtp-out FILE` | load the MTP block (needs `--gemv --generate`) / write two chained drafts' logits after the prompt (validation) |
 | `--draft-oracle FILE [--draft-k K] [--draft-corrupt N]` | speculative greedy decode with drafts from a token file (a plain greedy run's `--gen-out`), every N-th draft corrupted: validates the verification + rollback (#122); the output must equal the plain greedy run |
 
 The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (the authoritative list). Defaults are what the engine runs; ablations give wrong results with valid timings.

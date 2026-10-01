@@ -34,6 +34,7 @@ add_library(omphalos SHARED
     src/model/forward.cc
     src/model/layers.cc
     src/model/dispatch.cc
+    src/model/mtp.cc
     src/kernels/probe.hip
     src/kernels/dequant.hip
     src/kernels/elementwise.hip
