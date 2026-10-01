@@ -1,0 +1,31 @@
+# M6 speculative decoding with MTP drafts (#121, #122, #124, #126). RX 9060 XT, --gemv, Q8/Q4 KV,
+# greedy; omph-run --draft-mtp K vs plain --generate. Output identical to plain greedy in every
+# run below. Plain decode: 45.5 ms/token.
+#
+# 1. 64 tokens after the wikitext 512 prompt, per k (ms per generated token):
+#    k   accepted   after #124   + NT kernels (#126)   + device verify argmax
+#    1   31/33      48.8         28.2                  28.0
+#    2   42/44      47.6         21.5                  21.3
+#    3   47/51      24.3         19.1                  18.9
+#    Cycle at k = 3 (medians): drafts 10.9 ms (3 x [MTP block ~1.3 + full lm_head ~2.3]),
+#    verification of 4 tokens 53.7 ms (1.18x one decode step: the GEMVs 1.16x, the rest
+#    +1.7 ms), commit + MTP KV fill 0.9 ms.
+#
+# 2. 128 tokens per prompt (bench/prompts, tokenized with llama-tokenize), ms/token, accepted:
+#    prompt           k=1                k=2                k=3
+#    prose (61 tok)   26.64  61/67       21.51  80/96       19.43  90/114
+#    code (2890 tok)  29.26  59/69       24.59  77/100      24.16  84/129
+#    repetitive       29.34  56/72       25.40  72/110      25.32  82/144
+#    -> k = 3 is best or tied everywhere; adaptive k would gain little at k <= 3.
+#
+# 3. Truncated-vocabulary draft head (PLAN §12.5), not done: top-N tokens of wikitext-2 train +
+#    3M tokens of C++ cover 94.9 % (32k) / 97.5 % (64k) of the 448 tokens generated above; the
+#    ~2 ms a draft would save is about what the lost acceptance costs, and the ranking depends
+#    on the corpus (an Italian conversation would fall outside it).
+#
+# 4. Prefill cost of the MTP KV fill (KV-only shadow pass), --gemv prefill, 2 runs each:
+#    wiki512: 5898.7 / 5919.6 -> 5992.9 / 6003.8 ms (+1.5 %); wiki2k: 23563 / 23422 -> 23773 /
+#    23745 ms (+1.1 %): within M6's ~2 % target. (The prefill itself is M8's.)
+#
+# 5. VRAM: +352 MiB at load with --mtp (blk.64 + its KV), +151 MB for the alternate delta-net
+#    state when speculation is on.

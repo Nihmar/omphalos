@@ -210,6 +210,7 @@ int main(int argc, char ** argv) {
                                                                 : n_toks);
         std::vector<float> logits;
         std::vector<float> part_logits;
+        const double prefill_t0 = omph::runtime::now_ms();
         for (int64_t off = 0; off < n_toks; off += act_chunk) {
             const int64_t n = std::min<int64_t>(act_chunk, n_toks - off);
             const std::vector<int32_t> part(toks.begin() + (size_t) off,
@@ -226,6 +227,11 @@ int main(int argc, char ** argv) {
                 logits.insert(logits.end(), part_logits.begin() + (size_t) (first * h.n_vocab),
                               part_logits.end());
             }
+        }
+        if (env.timing) {
+            (void) hipDeviceSynchronize();
+            std::fprintf(stderr, "prefill wall %.1f ms (%lld tokens)\n",
+                         omph::runtime::now_ms() - prefill_t0, (long long) n_toks);
         }
         write_f32(logits_path, logits);
         const auto argmax = [&](const float * row) {
