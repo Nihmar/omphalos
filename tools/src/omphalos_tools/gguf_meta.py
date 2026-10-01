@@ -8,7 +8,7 @@ import numpy as np
 def field_value(field):
     try:
         value = field.contents()
-    except Exception:
+    except Exception:  # noqa: BLE001 -- any field gguf-py cannot decode is just skipped
         return None
     if isinstance(value, np.ndarray):
         if value.dtype.kind in "OSU":

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Compare two omph-run logits dumps: KL(ref || test) per position and top-1 agreement.
 
 usage: uv run python compare_logits.py <ref.f32> <test.f32> [--vocab N | --model M.gguf]

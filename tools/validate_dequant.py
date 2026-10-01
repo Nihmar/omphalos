@@ -15,7 +15,8 @@ import ctypes
 from pathlib import Path
 
 import numpy as np
-from gguf import GGUFReader, GGMLQuantizationType as GT
+from gguf import GGMLQuantizationType as GT
+from gguf import GGUFReader
 from gguf.quants import GGML_QUANT_SIZES
 
 from omphalos_tools import quant
