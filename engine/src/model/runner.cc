@@ -267,6 +267,46 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
             }
         }
     }
+    // hipBLASLt loads each kernel family on its first use (~0.1-0.35 s each,
+    // ~0.47 s in all for a prefill): pay it at load, not in the first prefill
+    // (M8), with one GEMM of every weight shape at the chunk size. Garbage in,
+    // garbage out: the scratch is overwritten before any real use.
+    if (!use_gemv_) {
+        const int64_t wt = std::min<int64_t>(T, 512);
+        std::vector<std::pair<int64_t, int64_t>> shapes;
+        const auto add = [&](const Mat & m) {
+            if (m.t != nullptr && m.t->ne.size() >= 2) {
+                shapes.emplace_back((int64_t) m.t->ne[1], (int64_t) m.t->ne[0]);
+            }
+        };
+        for (const LayerWeights & L : layers_) {
+            for (const Mat * m : {&L.attn_q, &L.attn_k, &L.attn_v, &L.attn_output, &L.attn_qkv,
+                                  &L.attn_gate, &L.ssm_out, &L.ffn_up, &L.ffn_gate, &L.ffn_down}) {
+                add(*m);
+            }
+        }
+        shapes.emplace_back(std::min<int64_t>(h_.n_vocab, 32768), ne);  // the chunked head
+        std::sort(shapes.begin(), shapes.end());
+        shapes.erase(std::unique(shapes.begin(), shapes.end()), shapes.end());
+        // existing buffers: the scratch as W, ffn16_ as x, ffn1_ (or the head's
+        // chunk output, which the f16 path allocates anyway) as y
+        void * w = scratch_.alloc(scratch_bytes);
+        for (const auto & sh : shapes) {
+            if ((size_t) sh.first * sh.second * 2 > scratch_bytes || sh.second > h_.n_ff) {
+                continue;
+            }
+            float * yout = sh.first <= h_.n_ff ? static_cast<float *>(ffn1_)
+                                               : static_cast<float *>(
+                                                     lazy(&tmp_logits_, tmp_logits_bytes_));
+            if (!linear_.run(w, ffn16_, yout, sh.first, sh.second, wt)) {
+                throw std::runtime_error("hipBLASLt warmup failed");
+            }
+        }
+        if (hipDeviceSynchronize() != hipSuccess) {
+            throw std::runtime_error("hipBLASLt warmup failed");
+        }
+        scratch_.reset();
+    }
     if (env_.timing) {
         size_t free_b = 0;
         size_t total_b = 0;
