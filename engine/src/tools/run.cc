@@ -574,17 +574,28 @@ public:
             }
         }
 
-        if (!want_logits) {
+        if (want_logits) {
+            if (!lm_head(T, logits, greedy)) {
+                return false;
+            }
+        } else {
             logits.clear();
             if (hipDeviceSynchronize() != hipSuccess) {
                 return fail("forward failed");
             }
-            report_phases();
-            if (time_step) {
-                step_event(step_a, step_b);
-            }
-            return true;
         }
+        report_phases();
+        if (time_step) {
+            step_event(step_a, step_b);
+        }
+        return true;
+    }
+
+    // Final norm and lm_head of the T rows in h16_, into `logits` on the host
+    // (or, with `greedy` on a single-token GEMV step, only the argmax). Returns
+    // once the results are on the host.
+    bool lm_head(const int64_t T, std::vector<float> & logits, int32_t * greedy) {
+        const int64_t ne = h_.n_embd;
         if (!omph::kernels::rms_norm(static_cast<const float *>(x_), out_norm_,
                                      static_cast<float *>(cur_), T, ne, (float) h_.eps, 1.0f,
                                      nullptr) ||
@@ -592,12 +603,13 @@ public:
                                             nullptr)) {
             return fail("output_norm failed");
         }
+        // Decode: the fused GEMV, and on the greedy path only the argmax comes back.
         if (use_gemv_ && T == 1 && head_.gemv != nullptr) {
             if (!matmul(head_, h16_, static_cast<float *>(logits_), h_.n_vocab, ne, T)) {
                 return fail("lm_head (gemv) failed");
             }
             if (greedy != nullptr) {
-                // 8 bytes back instead of 1 MB of logits and a host argmax
+                // 8 bytes back instead of 1 MB of logits and a host argmax (#102)
                 unsigned long long key = 0;
                 if (!omph::kernels::argmax_f32(static_cast<const float *>(logits_), h_.n_vocab,
                                                static_cast<unsigned long long *>(argmax_key_),
@@ -607,80 +619,57 @@ public:
                     return fail("argmax failed");
                 }
                 *greedy = omph::kernels::argmax_key_index(key);
-            } else {
-                if (hipDeviceSynchronize() != hipSuccess) {
-                    return fail("lm_head (gemv) failed");
-                }
-                logits.resize((size_t) T * h_.n_vocab);
-                (void) hipMemcpy(logits.data(), logits_, logits.size() * 4,
-                                 hipMemcpyDeviceToHost);
+                return true;
             }
-            report_phases();
-            if (time_step) {
-                step_event(step_a, step_b);
-            }
-            return true;
+            logits.resize((size_t) h_.n_vocab);
+            return copy_logits(logits.data(), 1);
         }
         // Only the last token's logits: at 32k the full (T, 248320) f32 buffer is
         // 33 GB, and the long-context KV validation only needs the final row.
         if (last_logits_only_) {
             const uint8_t * xlast = static_cast<const uint8_t *>(h16_) + (T - 1) * ne * 2;
+            logits.resize((size_t) h_.n_vocab);
             if (use_gemv_ && head_.gemv != nullptr) {
-                if (!gemv_one(head_.gemv->type, head_.dev, xlast, static_cast<float *>(logits_), h_.n_vocab, ne, nullptr)) {
+                if (!gemv_one(head_.gemv->type, head_.dev, xlast, static_cast<float *>(logits_),
+                              h_.n_vocab, ne, nullptr)) {
                     return fail("lm_head gemv failed");
                 }
-                if (hipDeviceSynchronize() != hipSuccess) {
-                    return fail("lm_head failed");
-                }
-                logits.resize((size_t) h_.n_vocab);
-                (void) hipMemcpy(logits.data(), logits_, logits.size() * 4,
-                                 hipMemcpyDeviceToHost);
-            } else {
-                logits.resize((size_t) h_.n_vocab);
-                if (!head_chunked(xlast, 1, logits.data())) {
-                    return fail("lm_head failed");
-                }
+                return copy_logits(logits.data(), 1);
             }
-            report_phases();
-            if (time_step) {
-                step_event(step_a, step_b);
-            }
-            return true;
+            return head_chunked(xlast, 1, logits.data());
         }
+        logits.resize((size_t) T * h_.n_vocab);
         // Small-batch head: for a Q4_K head with 2+ tokens, run four tokens per
-        // weight read instead of materializing f16 (PLAN.md §10.1's N = 1..5).
+        // weight read instead of materializing f16 (PLAN.md §10.1's N = 1..5),
+        // kHeadRows (a multiple of 4) rows at a time into logits_, then out.
         if (use_gemv_ && T > 1 && head_.gemv != nullptr && head_.gemv->type == 12) {
-            const void * w = head_.dev;
-            logits.resize((size_t) T * h_.n_vocab);
-            // kHeadRows (a multiple of 4) rows at a time into logits_, then out
             for (int64_t r0 = 0; r0 < T; r0 += kHeadRows) {
                 const int64_t rows = std::min<int64_t>(kHeadRows, T - r0);
-                int64_t t0 = 0;
-                for (; t0 < rows; t0 += t0 + 4 <= rows ? 4 : 1) {
+                for (int64_t t0 = 0; t0 < rows; t0 += t0 + 4 <= rows ? 4 : 1) {
                     const uint8_t * x = static_cast<const uint8_t *>(h16_) + (r0 + t0) * ne * 2;
                     float * y = static_cast<float *>(logits_) + t0 * h_.n_vocab;
-                    const bool ok = t0 + 4 <= rows
-                                        ? omph::kernels::gemv_q4k_b4(w, x, y, h_.n_vocab, ne, nullptr)
-                                        : omph::kernels::gemv_q4k(w, x, y, h_.n_vocab, ne, nullptr);
+                    const bool ok =
+                        t0 + 4 <= rows
+                            ? omph::kernels::gemv_q4k_b4(head_.dev, x, y, h_.n_vocab, ne, nullptr)
+                            : omph::kernels::gemv_q4k(head_.dev, x, y, h_.n_vocab, ne, nullptr);
                     if (!ok) {
                         return fail("lm_head batch4 failed");
                     }
                 }
-                if (hipMemcpy(logits.data() + r0 * h_.n_vocab, logits_,
-                              (size_t) rows * h_.n_vocab * 4, hipMemcpyDeviceToHost) != hipSuccess) {
-                    return fail("lm_head failed");
+                if (!copy_logits(logits.data() + r0 * h_.n_vocab, rows)) {
+                    return false;
                 }
             }
-            report_phases();
             return true;
         }
-        logits.resize((size_t) T * h_.n_vocab);
-        if (!head_chunked(h16_, T, logits.data())) {
-            return false;
-        }
-        report_phases();
-        if (time_step) {
-            step_event(step_a, step_b);
+        return head_chunked(h16_, T, logits.data());
+    }
+
+    // The first `rows` rows of logits_ to the host (synchronous).
+    bool copy_logits(float * dst, const int64_t rows) {
+        if (hipMemcpy(dst, logits_, (size_t) rows * h_.n_vocab * 4, hipMemcpyDeviceToHost) !=
+            hipSuccess) {
+            return fail("lm_head failed");
         }
         return true;
     }
