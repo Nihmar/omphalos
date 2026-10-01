@@ -50,8 +50,8 @@ void Linear::destroy(Plan & p) {
 }
 
 const Linear::Plan * Linear::plan(const int64_t out_features, const int64_t in_features,
-                                  const int64_t tokens) {
-    const auto key = std::make_tuple(out_features, in_features, tokens);
+                                  const int64_t tokens, const int64_t ldy) {
+    const auto key = std::make_tuple(out_features, in_features, tokens, ldy);
     const auto it = plans_.find(key);
     if (it != plans_.end()) {
         return &it->second;
@@ -65,8 +65,8 @@ const Linear::Plan * Linear::plan(const int64_t out_features, const int64_t in_f
     if (ok) ok = check(hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_TRANSB, &kTransB, sizeof(kTransB)), "transB");
     if (ok) ok = check(hipblasLtMatrixLayoutCreate(&p.a, HIP_R_16F, in_features, out_features, in_features), "layout A");
     if (ok) ok = check(hipblasLtMatrixLayoutCreate(&p.b, HIP_R_16F, in_features, tokens, in_features), "layout B");
-    if (ok) ok = check(hipblasLtMatrixLayoutCreate(&p.c, HIP_R_32F, out_features, tokens, out_features), "layout C");
-    if (ok) ok = check(hipblasLtMatrixLayoutCreate(&p.d, HIP_R_32F, out_features, tokens, out_features), "layout D");
+    if (ok) ok = check(hipblasLtMatrixLayoutCreate(&p.c, HIP_R_32F, out_features, tokens, ldy), "layout C");
+    if (ok) ok = check(hipblasLtMatrixLayoutCreate(&p.d, HIP_R_32F, out_features, tokens, ldy), "layout D");
     if (ok) ok = check(hipblasLtMatmulPreferenceCreate(&pref), "preference");
     if (ok) ok = check(hipblasLtMatmulPreferenceSetAttribute(
                            pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size_,
@@ -89,11 +89,11 @@ const Linear::Plan * Linear::plan(const int64_t out_features, const int64_t in_f
 }
 
 bool Linear::run(const void * w, const void * x, float * y, const int64_t out_features,
-                 const int64_t in_features, const int64_t tokens) {
+                 const int64_t in_features, const int64_t tokens, const int64_t ldy) {
     if (handle_ == nullptr || workspace_ == nullptr) {
         return false;
     }
-    const Plan * p = plan(out_features, in_features, tokens);
+    const Plan * p = plan(out_features, in_features, tokens, ldy > 0 ? ldy : out_features);
     if (p == nullptr) {
         return false;
     }
