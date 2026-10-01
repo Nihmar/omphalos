@@ -19,6 +19,7 @@
 
 namespace {
 
+constexpr int64_t kCanary = 1024;  // floats of sentinel after the largest y
 constexpr double kMeasuredBandwidthGBs = 318.3;  // bench/results/m0-bandwidth.csv
 
 int fail(const char * msg) {
@@ -144,11 +145,14 @@ double time_ms(const std::vector<Case> & cases, const void * x, float * y, const
         (void) hipEventCreate(&done);
         (void) hipEventRecord(done, st[(size_t) k]);
         (void) hipStreamWaitEvent(st[0], done, 0);
+        (void) hipEventDestroy(done);
     }
     (void) hipEventRecord(e1, st[0]);
     (void) hipDeviceSynchronize();
     float ms = 0.0f;
     (void) hipEventElapsedTime(&ms, e0, e1);
+    (void) hipEventDestroy(e0);
+    (void) hipEventDestroy(e1);
     for (int k = 1; k < ns; ++k) {
         (void) hipStreamDestroy(st[(size_t) k]);
     }
@@ -159,14 +163,15 @@ double time_ms(const std::vector<Case> & cases, const void * x, float * y, const
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <model.gguf> [tensor] [--iters N] [--iq4-all]\n",
+        std::fprintf(stderr,
+                     "usage: %s <model.gguf> [tensor] [--iters N] [--iq4-all] "
+                     "[--all-of-type T] [--batch4] [--repack-only T]\n",
                      argv[0]);
         return 2;
     }
     const std::string model = argv[1];
     std::string name = "output.weight";
     int iters = 50;
-    bool iq4_all = false;
     bool batch4 = false;
     int all_type = -1;
     int repack_only = -1;
@@ -174,7 +179,6 @@ int main(int argc, char ** argv) {
         if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
             iters = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--iq4-all") == 0) {
-            iq4_all = true;
             all_type = 23;
         } else if (std::strcmp(argv[i], "--all-of-type") == 0 && i + 1 < argc) {
             all_type = std::atoi(argv[++i]);
@@ -196,8 +200,12 @@ int main(int argc, char ** argv) {
                 if ((int) t.type != repack_only) {
                     continue;
                 }
-                const int64_t n_blocks =
-                    (int64_t) (t.nbytes / (uint64_t) omph::format::quant_block_bytes(t.type));
+                const int64_t bb = omph::format::quant_block_bytes(t.type);
+                if (bb <= 0) {
+                    std::fprintf(stderr, "unsupported type for %s\n", t.name.c_str());
+                    return 1;
+                }
+                const int64_t n_blocks = (int64_t) (t.nbytes / (uint64_t) bb);
                 std::vector<uint8_t> packed;
                 std::vector<uint8_t> rebuilt((size_t) t.nbytes);
                 if (!repack_tensor(t.type, file.tensor_data(t), n_blocks, packed) ||
@@ -257,23 +265,46 @@ int main(int argc, char ** argv) {
             total_bytes = (double) c.bytes;
         }
 
-        const int64_t kmax = cases.front().k;
+        if (cases.empty()) {
+            return fail("no tensor of that type");
+        }
+        // One x and one y serve every case: size them to the largest (#90).
+        int64_t kmax = 0;
+        int64_t rmax = 0;
+        for (const Case & c : cases) {
+            kmax = std::max(kmax, c.k);
+            rmax = std::max(rmax, c.rows);
+        }
+        // Four distinct activation vectors: token 0 is the one the single-token
+        // runs use, all four feed the --batch4 check.
         void * dev_x = nullptr;
         void * dev_y = nullptr;
         void * dev_act32 = nullptr;
-        if (hipMalloc(&dev_x, (size_t) kmax * 2) != hipSuccess ||
-            hipMalloc(&dev_y, (size_t) cases.front().rows * 4) != hipSuccess ||
-            hipMalloc(&dev_act32, (size_t) kmax * 4) != hipSuccess) {
+        if (hipMalloc(&dev_x, (size_t) kmax * 4 * 2) != hipSuccess ||
+            hipMalloc(&dev_y, (size_t) (rmax + kCanary) * 4) != hipSuccess ||
+            hipMalloc(&dev_act32, (size_t) kmax * 4 * 4) != hipSuccess) {
             return fail("out of VRAM");
         }
-        std::vector<float> act((size_t) kmax);
+        std::vector<float> act((size_t) kmax * 4);
         uint32_t rng = 12345u;
-        for (int64_t i = 0; i < kmax; ++i) {
+        for (float & a : act) {
             rng = rng * 1664525u + 1013904223u;
-            act[(size_t) i] = ((float) (rng >> 8) / (float) (1u << 24) - 0.5f) * 2.0f;
+            a = ((float) (rng >> 8) / (float) (1u << 24) - 0.5f) * 2.0f;
         }
-        (void) hipMemcpy(dev_act32, act.data(), (size_t) kmax * 4, hipMemcpyHostToDevice);
-        (void) omph::kernels::cast_f32_to_f16((const float *) dev_act32, dev_x, kmax, nullptr);
+        (void) hipMemcpy(dev_act32, act.data(), act.size() * 4, hipMemcpyHostToDevice);
+        (void) omph::kernels::cast_f32_to_f16((const float *) dev_act32, dev_x,
+                                              (int64_t) act.size(), nullptr);
+        // Canary past the largest y: a GEMV writing out of its rows trips it.
+        const std::vector<float> canary((size_t) kCanary, 1234.5f);
+        (void) hipMemcpy(static_cast<float *>(dev_y) + rmax, canary.data(), canary.size() * 4,
+                         hipMemcpyHostToDevice);
+        const auto canary_ok = [&]() {
+            std::vector<float> got((size_t) kCanary);
+            (void) hipDeviceSynchronize();
+            (void) hipMemcpy(got.data(), static_cast<float *>(dev_y) + rmax, got.size() * 4,
+                             hipMemcpyDeviceToHost);
+            return got == canary;
+        };
 
         if (const char * occ = std::getenv("OMPH_OCCUPANCY")) {
             (void) occ;
@@ -290,17 +321,20 @@ int main(int argc, char ** argv) {
             if (c.t->type != 12 && c.t->type != 21 && c.t->type != 23 && c.t->type != 18) {
                 return fail("--batch4 needs a Q4_K, IQ3_S, IQ4_XS or IQ3_XXS tensor");
             }
+            // The b4 kernels read token t at x + t * k: pack the four distinct
+            // vectors at this case's k.
             void * x4 = nullptr;
             void * y1 = nullptr;
             void * y4 = nullptr;
-            if (hipMalloc(&x4, (size_t) kmax * 4 * 2) != hipSuccess ||
+            if (hipMalloc(&x4, (size_t) c.k * 4 * 2) != hipSuccess ||
                 hipMalloc(&y1, (size_t) c.rows * 4) != hipSuccess ||
                 hipMalloc(&y4, (size_t) c.rows * 4 * 4) != hipSuccess) {
                 return fail("out of VRAM (batch4)");
             }
             for (int t = 0; t < 4; ++t) {
-                (void) hipMemcpy(static_cast<uint8_t *>(x4) + (size_t) t * kmax * 2, dev_x,
-                                 (size_t) kmax * 2, hipMemcpyDeviceToDevice);
+                (void) hipMemcpy(static_cast<uint8_t *>(x4) + (size_t) t * c.k * 2,
+                                 static_cast<uint8_t *>(dev_x) + (size_t) t * kmax * 2,
+                                 (size_t) c.k * 2, hipMemcpyDeviceToDevice);
             }
             const auto launch_b4 = [&](void * xa, float * ya) {
                 if (c.t->type == 12) {
@@ -328,6 +362,8 @@ int main(int argc, char ** argv) {
             (void) hipDeviceSynchronize();
             float ms4 = 0.0f;
             (void) hipEventElapsedTime(&ms4, e0, e1);
+            (void) hipEventDestroy(e0);
+            (void) hipEventDestroy(e1);
             const double per_batch = ms4 / iters;
             const double bytes = (double) c.bytes;
             const double per_token = per_batch / 4.0;
@@ -335,9 +371,12 @@ int main(int argc, char ** argv) {
                         "%.1f GB/s effective per token\n",
                         per_batch, per_token, bytes / (per_batch * 1e6),
                         bytes / (per_token * 1e6));
+            // Token t against the single-token GEMV on token t's own vector, so
+            // a swapped x or y offset fails.
             double maxd = 0.0;
             for (int t = 0; t < 4; ++t) {
-                (void) launch(c, dev_x, (float *) y1, nullptr);
+                (void) launch(c, static_cast<uint8_t *>(x4) + (size_t) t * c.k * 2, (float *) y1,
+                              nullptr);
                 (void) hipDeviceSynchronize();
                 std::vector<float> a((size_t) c.rows);
                 std::vector<float> b((size_t) c.rows);
@@ -352,6 +391,9 @@ int main(int argc, char ** argv) {
             return maxd < 1e-3 ? 0 : 1;
         }
         const double ms = time_ms(cases, dev_x, (float *) dev_y, iters, nullptr);
+        if (!canary_ok()) {
+            return fail("a GEMV wrote past its output rows");
+        }
         const double gbs = total_bytes / ms / 1e6;
         std::printf("fused      : %.3f ms  (%.1f MiB read)  -> %.1f GB/s  (%.1f%% of %.1f)\n", ms,
                     total_bytes / (1024 * 1024), gbs, 100.0 * gbs / kMeasuredBandwidthGBs,
