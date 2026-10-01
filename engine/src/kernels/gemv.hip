@@ -1735,7 +1735,7 @@ GemvOccupancy gemv_occupancy() {
     GemvOccupancy o;
     const void * kernels[4] = {(const void *) gemv_q4k_kernel, (const void *) gemv_iq4_kernel,
                                (const void *) gemv_iq3_kernel, (const void *) gemv_iq3s_kernel};
-    o.smem_q4k = 0;
+    o.smem_q4k = (size_t) kQ4kChunkSub * 64;
     o.smem_iq4 = (size_t) kIq4ChunkSub * 64 + 16 * sizeof(float);
     o.smem_iq3 = (size_t) kIq3ChunkSub * kXPitch * 2 + 256 * 4;
     o.smem_iq3s = (size_t) kIq3sChunkSub * 64 + 512 * 4;
