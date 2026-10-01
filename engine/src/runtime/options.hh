@@ -22,6 +22,7 @@ struct EnvOptions {
     bool no_bf16_gemv = false;  // OMPH_NO_BF16_GEMV: BF16 weights through the f16 path
     bool no_f16_cache = false;  // OMPH_NO_F16_CACHE: re-convert f16-path weights every call
     bool host_argmax = false;   // OMPH_HOST_ARGMAX: greedy argmax on the host (#102)
+    bool gdn_per_token = false; // OMPH_GDN_PER_TOKEN: one delta-net launch per token (#96)
 
     // --- ablations (wrong results, valid timings)
     bool skip_attn = false;     // OMPH_SKIP_ATTN: no attention blocks

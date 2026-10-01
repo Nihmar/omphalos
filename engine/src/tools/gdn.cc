@@ -258,6 +258,16 @@ int main(int argc, char ** argv) {
             step.conv_cur = static_cast<const float *>(flip ? conv_b : conv_a);
             step.conv_new = static_cast<float *>(flip ? conv_a : conv_b);
             step.tokens = n;
+            if (n > 1) {  // what the engine runs for several tokens (#96)
+                step.x16 = static_cast<const __half *>(ex16) + t0 * n_embd;
+                step.z = static_cast<const float *>(z) + t0 * v_dims;
+                step.out16 = static_cast<__half *>(final16) + t0 * v_dims;
+                if (!omph::kernels::gdn_chunk(step, n_vh, nullptr)) {
+                    return fail("gdn_chunk failed");
+                }
+                flip = !flip;
+                continue;
+            }
             for (int64_t t = 0; t < n; ++t) {
                 step.t = t;
                 step.x16 = static_cast<const __half *>(ex16) + (t0 + t) * n_embd;

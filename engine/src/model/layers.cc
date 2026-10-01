@@ -189,7 +189,20 @@ bool Runner::gdn_layer(const int64_t il, const LayerWeights & L, const int64_t T
         step.conv_hist = static_cast<float *>(conv_hist_pool_) +
                          rec_index_[(size_t) il] * (h_.ssm_conv_k - 1 + spec_max_) * channels;
     }
-    for (int64_t t = 0; t < T; ++t) {
+    // Several tokens (prefill chunks, verifications): one launch for all of
+    // them, the state in registers throughout (#96); bit-identical to a launch
+    // per token. OMPH_GDN_PER_TOKEN=1 keeps the per-token launches (A/B).
+    if (T > 1 && !env_.gdn_per_token) {
+        step.state = seq_state;
+        step.state_out = alt;
+        step.x16 = static_cast<const __half *>(h16_);
+        step.z = static_cast<const float *>(z_);
+        step.out16 = static_cast<__half *>(ffn16_);
+        if (!omph::kernels::gdn_chunk(step, n_vh, nullptr)) {
+            return fail("delta rule (chunk) failed");
+        }
+    }
+    for (int64_t t = 0; t < T && (T == 1 || env_.gdn_per_token); ++t) {
         step.t = t;
         if (alt != nullptr) {
             step.state = t == 0 ? seq_state : alt;
