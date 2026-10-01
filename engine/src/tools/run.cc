@@ -253,11 +253,12 @@ public:
         }
 
         // The f16 staging scratch holds one layer's weights on the dequant +
-        // hipBLASLt path. With --gemv only the weights without a GEMV take it
-        // (the BF16 beta / alpha projections in a prefill, ~1 MB a layer), so it
-        // is sized to the largest per-layer sum of those instead of 1.28 GB (#86).
-        size_t scratch_bytes = (size_t) 1280 * 1024 * 1024;
-        if (use_gemv_) {
+        // hipBLASLt path, so it is sized to the largest per-layer sum of the
+        // tensors that can take it: every 2D weight of a block (~770 MiB, #93),
+        // and with --gemv only the ones without a GEMV (the BF16 beta / alpha
+        // projections in a prefill, ~1 MB a layer, #86).
+        size_t scratch_bytes = 1 << 20;
+        {
             std::unordered_map<std::string, size_t> per_layer;
             for (const omph::gguf::TensorInfo & t : file_.tensors()) {
                 if (t.ne.size() < 2 || t.type == 0 || gems_.count(t.name) != 0 ||
@@ -267,7 +268,6 @@ public:
                 const std::string layer = t.name.substr(0, t.name.find('.', 4));
                 per_layer[layer] += (((size_t) numel(t) * 2) + 255) & ~(size_t) 255;
             }
-            scratch_bytes = 1 << 20;
             for (const auto & kv : per_layer) {
                 scratch_bytes = std::max(scratch_bytes, kv.second);
             }
@@ -295,7 +295,10 @@ public:
         alloc(&ffn2_, T * h_.n_ff * 4);
         alloc(&ffn16_, T * h_.n_ff * 2);
         last_logits_only_ = last_logits_only;
-        alloc(&logits_, (last_logits_only ? 1 : T) * h_.n_vocab * 4);
+        // The head's rows go to the host in batches of kHeadRows: a whole chunk
+        // of f32 logits would be T x 248320 x 4 = 508 MB at T = 512 (#93).
+        alloc(&logits_, (size_t) (last_logits_only ? 1 : std::min<int64_t>(T, kHeadRows)) *
+                             h_.n_vocab * 4);
         // tmp_logits_, head16_ (the vocab-chunked f16 lm_head) and raw_stage_ (raw
         // bytes of a repacked tensor for the f16 path) are allocated on first
         // use: the GEMV decode never touches them (#86).
@@ -580,14 +583,18 @@ public:
                 if (!gemv_one(e.type, w, xlast, static_cast<float *>(logits_), h_.n_vocab, ne, nullptr)) {
                     return fail("lm_head gemv failed");
                 }
-            } else if (!head_chunked(xlast, 1)) {
-                return fail("lm_head failed");
+                if (hipDeviceSynchronize() != hipSuccess) {
+                    return fail("lm_head failed");
+                }
+                logits.resize((size_t) h_.n_vocab);
+                (void) hipMemcpy(logits.data(), logits_, logits.size() * 4,
+                                 hipMemcpyDeviceToHost);
+            } else {
+                logits.resize((size_t) h_.n_vocab);
+                if (!head_chunked(xlast, 1, logits.data())) {
+                    return fail("lm_head failed");
+                }
             }
-            if (hipDeviceSynchronize() != hipSuccess) {
-                return fail("lm_head failed");
-            }
-            logits.resize((size_t) h_.n_vocab);
-            (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
             report_phases();
             if (time_step) {
                 step_event(step_a, step_b);
@@ -600,38 +607,33 @@ public:
             gems_.at("output.weight").type == 12) {
             const auto & e = gems_.at("output.weight");
             const void * w = static_cast<const uint8_t *>(dev_weights_) + e.off;
-            int64_t t0 = 0;
-            for (; t0 + 4 <= T; t0 += 4) {
-                if (!omph::kernels::gemv_q4k_b4(w, static_cast<const uint8_t *>(h16_) + t0 * ne * 2,
-                                                static_cast<float *>(logits_) + t0 * h_.n_vocab,
-                                                h_.n_vocab, ne, nullptr)) {
-                    return fail("lm_head batch4 failed");
-                }
-            }
-            for (; t0 < T; ++t0) {
-                if (!omph::kernels::gemv_q4k(
-                        w, static_cast<const uint8_t *>(h16_) + t0 * ne * 2,
-                        static_cast<float *>(logits_) + t0 * h_.n_vocab, h_.n_vocab, ne,
-                        nullptr)) {
-                    return fail("lm_head tail failed");
-                }
-            }
-            if (hipDeviceSynchronize() != hipSuccess) {
-                return fail("lm_head failed");
-            }
             logits.resize((size_t) T * h_.n_vocab);
-            (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
+            // kHeadRows (a multiple of 4) rows at a time into logits_, then out
+            for (int64_t r0 = 0; r0 < T; r0 += kHeadRows) {
+                const int64_t rows = std::min<int64_t>(kHeadRows, T - r0);
+                int64_t t0 = 0;
+                for (; t0 < rows; t0 += t0 + 4 <= rows ? 4 : 1) {
+                    const uint8_t * x = static_cast<const uint8_t *>(h16_) + (r0 + t0) * ne * 2;
+                    float * y = static_cast<float *>(logits_) + t0 * h_.n_vocab;
+                    const bool ok = t0 + 4 <= rows
+                                        ? omph::kernels::gemv_q4k_b4(w, x, y, h_.n_vocab, ne, nullptr)
+                                        : omph::kernels::gemv_q4k(w, x, y, h_.n_vocab, ne, nullptr);
+                    if (!ok) {
+                        return fail("lm_head batch4 failed");
+                    }
+                }
+                if (hipMemcpy(logits.data() + r0 * h_.n_vocab, logits_,
+                              (size_t) rows * h_.n_vocab * 4, hipMemcpyDeviceToHost) != hipSuccess) {
+                    return fail("lm_head failed");
+                }
+            }
             report_phases();
             return true;
         }
-        if (!head_chunked(h16_, T)) {
+        logits.resize((size_t) T * h_.n_vocab);
+        if (!head_chunked(h16_, T, logits.data())) {
             return false;
         }
-        if (hipDeviceSynchronize() != hipSuccess) {
-            return fail("lm_head failed");
-        }
-        logits.resize((size_t) T * h_.n_vocab);
-        (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
         report_phases();
         if (time_step) {
             step_event(step_a, step_b);
@@ -641,8 +643,8 @@ public:
 
     // lm head in vocab chunks, through the f16 dequant + hipBLASLt path: the
     // whole f16 head (248k x 5120, 2.5 GB) would not fit. Writes (T, n_vocab)
-    // into logits_.
-    bool head_chunked(const void * x16, const int64_t T) {
+    // to `out` on the host, one vocab chunk at a time.
+    bool head_chunked(const void * x16, const int64_t T, float * out) {
         const int64_t ne = h_.n_embd;
         const omph::gguf::TensorInfo * head = file_.tensor("output.weight");
         if (head == nullptr) {
@@ -674,9 +676,8 @@ public:
                 linear_.run(wh, x16, static_cast<float *>(tmp_logits), rows, ne, T);
             timer_gemm_.stop(t_gemm_);
             if (!head_dq || !head_gm ||
-                hipMemcpy2D(static_cast<uint8_t *>(logits_) + v0 * 4, (size_t) h_.n_vocab * 4,
-                            tmp_logits, (size_t) rows * 4, (size_t) rows * 4, (size_t) T,
-                            hipMemcpyDeviceToDevice) != hipSuccess) {
+                hipMemcpy2D(out + v0, (size_t) h_.n_vocab * 4, tmp_logits, (size_t) rows * 4,
+                            (size_t) rows * 4, (size_t) T, hipMemcpyDeviceToHost) != hipSuccess) {
                 return fail("lm_head failed");
             }
         }
@@ -1292,6 +1293,7 @@ private:
     void * state_pool_ = nullptr;
     void * embd_host_ = nullptr;   // token_embd, raw GGUF bytes, pinned host memory
     bool last_logits_only_ = false;
+    static constexpr int64_t kHeadRows = 32;  // logits_ rows (multiple of 4)
     std::vector<int64_t> kv_index_;
     std::vector<char> conv_flip_;
     int64_t max_seq_ = 0;
