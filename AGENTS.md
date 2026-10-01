@@ -92,6 +92,11 @@ uv run python compare_logits.py ref.f32 test.f32  # KL + top-1 agreement over ev
 OMPH_KV_HOST=1 engine/build/omph-run <model> <tokens.txt> ref.f32 --logits-tail 512
 engine/build/omph-run <model> <tokens.txt> q8.f32 --logits-tail 512   # default: Q8/Q4 KV
 bench/m5_llama_kv_kl.sh <llama.cpp-bin-dir> <ctx>   # llama.cpp's own KV-quant KL (budget)
+# the same for decode steps: the f32-KV run's greedy tokens forced into the others (#138)
+OMPH_KV_F32=1 engine/build/omph-run <model> <tokens.txt> /tmp/p.f32 --last-logits --gemv \
+    --generate 64 --gen-out ref.txt --gen-logits ref.f32
+engine/build/omph-run <model> <tokens.txt> /tmp/p.f32 --last-logits --gemv --generate 64 \
+    --gen-out q.txt --gen-logits q.f32 --gen-force ref.txt   # then compare_logits.py ref.f32 q.f32
 
 # CPU-only tests (no GPU, no ROCm; what CI runs, .github/workflows/ci.yml)
 cmake -S engine/tests -B engine/build-tests && cmake --build engine/build-tests -j
@@ -109,6 +114,7 @@ tools/native/build.sh <llama.cpp-dir> && tools/native/dump_tensors ...
 |---|---|
 | `--gemv` | decode with the fused GEMVs on repacked weights: the fast path. Only effective with `--generate`; a prefill-only run stays on the f16 + GEMM path |
 | `--generate N --gen-out FILE` | greedy-decode N tokens after the prompt, ids to FILE |
+| `--gen-logits FILE` / `--gen-force FILE` | write each decode step's logits (N - 1 rows) / decode the tokens of FILE instead of the greedy ones: decode-step comparisons between KV settings or kernels (#138) |
 | `--last-logits` / `--logits-tail N` | write only the last row / the last N rows of logits (long prompts) |
 | `--tokens N` | use only the first N prompt tokens |
 | `--trace-dir DIR` | dump every layer's output (one-chunk prompts only) |
