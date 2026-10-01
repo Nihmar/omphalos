@@ -8,6 +8,10 @@
 //   --tokens N          use only the first N prompt tokens
 //   --generate N        greedy-decode N tokens after the prompt ...
 //   --gen-out FILE      ... and write them here (one id per line); required with --generate
+//   --gen-logits FILE   also write each decode step's logits (generate - 1 rows of f32)
+//   --gen-force FILE    decode these tokens (one id each) instead of the greedy ones:
+//                       runs with other KV settings then see the same sequence, and
+//                       their --gen-logits compare row by row (#138)
 //   --gemv              decode with the fused GEMVs on repacked weights (the fast
 //                       path; only effective with --generate, a prefill-only run
 //                       stays on the f16 + GEMM path)
@@ -63,6 +67,8 @@ int main(int argc, char ** argv) {
     const std::string logits_path = argv[3];
     std::string trace_dir;
     std::string gen_path;
+    std::string gen_logits_path;
+    std::string gen_force_path;
     int64_t max_tokens = 0;
     bool last_logits = false;
     int64_t logits_tail = 0;
@@ -97,6 +103,10 @@ int main(int argc, char ** argv) {
             use_gemv = true;
         } else if (std::strcmp(argv[i], "--gen-out") == 0 && has_value) {
             gen_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--gen-logits") == 0 && has_value) {
+            gen_logits_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--gen-force") == 0 && has_value) {
+            gen_force_path = argv[++i];
         } else if (std::strcmp(argv[i], "--draft-oracle") == 0 && has_value) {
             oracle_path = argv[++i];
         } else if (std::strcmp(argv[i], "--mtp") == 0) {
@@ -250,9 +260,36 @@ int main(int argc, char ** argv) {
             std::vector<float> step_logits;  // `logits` keeps the file's rows for the report
             // OMPH_HOST_ARGMAX=1: copy the logits back and take the argmax on the
             // host, as before #102 (A/B and validation).
-            const bool host_argmax = env.host_argmax;
+            // --gen-logits needs the rows on the host: the same computation,
+            // only the argmax moves.
+            const bool host_argmax = env.host_argmax || !gen_logits_path.empty();
             std::vector<int32_t> gen;
+            std::vector<int32_t> force;
+            if (!gen_force_path.empty()) {
+                if (!oracle.empty() || draft_mtp) {
+                    std::fprintf(stderr, "--gen-force does not combine with speculation\n");
+                    return 2;
+                }
+                std::ifstream in(gen_force_path);
+                int64_t v = 0;
+                while (in >> v) {
+                    force.push_back((int32_t) v);
+                }
+                if ((int64_t) force.size() < generate) {
+                    std::fprintf(stderr, "--gen-force: %zu tokens, --generate %lld\n",
+                                 force.size(), (long long) generate);
+                    return 2;
+                }
+            }
+            if (!gen_logits_path.empty() && (!oracle.empty() || draft_mtp)) {
+                std::fprintf(stderr, "--gen-logits does not combine with speculation\n");
+                return 2;
+            }
+            std::vector<float> gen_logits;
             int32_t next = argmax(logits.data() + (logits.size() - h.n_vocab));
+            if (!force.empty()) {
+                next = force[0];
+            }
             if (!mtp_out.empty()) {
                 // MTP validation (#124): two chained drafts after the prompt and
                 // its greedy token, their logits rows to the file.
@@ -358,9 +395,19 @@ int main(int argc, char ** argv) {
                     return 1;
                 }
                 next = on_device >= 0 ? on_device : argmax(step_logits.data());
+                if (!force.empty()) {
+                    next = force[(size_t) i + 1];
+                }
+                if (!gen_logits_path.empty()) {
+                    gen_logits.insert(gen_logits.end(), step_logits.begin(),
+                                      step_logits.begin() + h.n_vocab);
+                }
                 if (timing) {
                     std::fprintf(stderr, "step wall %.2f ms\n", omph::runtime::now_ms() - w0);
                 }
+            }
+            if (!gen_logits_path.empty()) {
+                write_f32(gen_logits_path, gen_logits);
             }
             FILE * f = std::fopen(gen_path.c_str(), "w");
             bool ok = f != nullptr;
