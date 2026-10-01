@@ -87,12 +87,32 @@ __device__ inline uint32_t iq3xxs_group_signs(const uint32_t a, const int l) {
 // and IQ3_S loses occupancy to the bigger chunk, so they keep 32.
 constexpr long long kXPitch = 40;
 
+// Q4_K: d * scale and dmin * min of sub-block j (0..7) from a block's 16-byte
+// meta record: the GGUF 12-byte 6-bit scale/min area (ggml's
+// get_scale_min_k4), then d and dmin (#94).
+__device__ inline void q4k_meta(const uint4 m, const int j, float & ds, float & ms) {
+    const int sh = 8 * (j & 3);
+    const uint32_t b0 = (m.x >> sh) & 0xFFu;
+    const uint32_t b1 = (m.y >> sh) & 0xFFu;
+    const uint32_t b2 = (m.z >> sh) & 0xFFu;
+    const uint32_t sc = j < 4 ? (b0 & 63u) : ((b2 & 0xFu) | ((b0 >> 6) << 4));
+    const uint32_t mn = j < 4 ? (b1 & 63u) : ((b2 >> 4) | ((b1 >> 6) << 4));
+    ds = __half2float(__ushort_as_half((unsigned short) (m.w & 0xFFFFu))) * (float) sc;
+    ms = __half2float(__ushort_as_half((unsigned short) (m.w >> 16))) * (float) mn;
+}
+
+// IQ4_XS: d * (scale - 32) of sub-block ib (0..7) from a block's 8-byte meta
+// record: scales_l (4 bits at 4*ib), scales_h (2 bits at 2*ib), d (#94).
+__device__ inline float iq4_meta(const uint2 m, const int ib) {
+    const uint32_t sc = ((m.x >> (4 * ib)) & 0xFu) | (((m.y >> (2 * ib)) & 3u) << 4);
+    return __half2float(__ushort_as_half((unsigned short) (m.y >> 16))) * (float) ((int) sc - 32);
+}
+
 constexpr long long kQ4kChunkSub = 256;  // 8192 weights staged per LDS refill
 constexpr long long kQ4kRows = 4;        // output rows computed per warp
 
-__global__ void gemv_q4k_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ sc,
-                                const uint8_t * __restrict__ mn, const uint8_t * __restrict__ d,
-                                const uint8_t * __restrict__ dmin, const __half * __restrict__ x,
+__global__ void gemv_q4k_kernel(const uint8_t * __restrict__ qs,
+                                const uint8_t * __restrict__ meta, const __half * __restrict__ x,
                                 float * __restrict__ y, const long long rows,
                                 const long long n_sub) {
     extern __shared__ __half xs[];  // activation chunk
@@ -127,12 +147,8 @@ __global__ void gemv_q4k_kernel(const uint8_t * __restrict__ qs, const uint8_t *
             for (int r = 0; r < kQ4kRows; ++r) {
                 const long long row = row0 + r <= rlast ? row0 + r : rlast;
                 q[r] = *reinterpret_cast<const uint4 *>(qs + row * blocks * 128 + s * 16);
-                ds[r] = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 +
-                                                                       2 * blk)) *
-                        (float) sc[row * blocks * 8 + blk * 8 + sub];
-                ms[r] = __half2float(
-                            *reinterpret_cast<const __half *>(dmin + row * blocks * 2 + 2 * blk)) *
-                        (float) mn[row * blocks * 8 + blk * 8 + sub];
+                q4k_meta(*reinterpret_cast<const uint4 *>(meta + (row * blocks + blk) * 16), sub,
+                         ds[r], ms[r]);
             }
             float part[kQ4kRows] = {};
 #pragma unroll
@@ -173,8 +189,7 @@ __device__ const int8_t kIq4Table[16] = {-127, -104, -83, -65, -49, -35, -22, -1
 constexpr long long kIq4ChunkSub = 256;  // 8192 weights staged per LDS refill
 constexpr long long kIq4Rows = 4;        // output rows computed per warp
 
-__global__ void gemv_iq4_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ sc,
-                                const uint8_t * __restrict__ d, const __half * __restrict__ x,
+__global__ void gemv_iq4_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ meta, const __half * __restrict__ x,
                                 float * __restrict__ y, const long long rows,
                                 const long long n_sub, const long long chunk_sub) {
     extern __shared__ uint8_t smem[];
@@ -216,9 +231,8 @@ __global__ void gemv_iq4_kernel(const uint8_t * __restrict__ qs, const uint8_t *
                                                                              // used when masked
                 q[r] = *reinterpret_cast<const uint4 *>(
                     qs + row * blocks * 128 + s * 16);
-                dl[r] = __half2float(*reinterpret_cast<const __half *>(
-                            d + row * blocks * 2 + 2 * blk)) *
-                        (float) ((int) sc[row * blocks * 8 + blk * 8 + sub] - 32);
+                dl[r] = iq4_meta(*reinterpret_cast<const uint2 *>(meta + (row * blocks + blk) * 8),
+                                 sub);
             }
             float part[kIq4Rows] = {};
 #pragma unroll
@@ -991,9 +1005,8 @@ constexpr long long kB4Rows = 4;
 constexpr long long kB4Nt = 4;
 constexpr long long kB4ChunkSub = 128;  // 4096 weights per token staged
 
-__global__ void gemv_q4k_b4_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ sc,
-                                   const uint8_t * __restrict__ mn, const uint8_t * __restrict__ d,
-                                   const uint8_t * __restrict__ dmin,
+__global__ void gemv_q4k_b4_kernel(const uint8_t * __restrict__ qs,
+                                   const uint8_t * __restrict__ meta,
                                    const __half * __restrict__ x, float * __restrict__ y,
                                    const long long rows, const long long n_sub,
                                    const long long chunk_sub, const long long k) {
@@ -1020,12 +1033,8 @@ __global__ void gemv_q4k_b4_kernel(const uint8_t * __restrict__ qs, const uint8_
             for (int r = 0; r < kB4Rows; ++r) {
                 const long long row = row0 + r <= rlast ? row0 + r : rlast;
                 q[r] = *reinterpret_cast<const uint4 *>(qs + row * blocks * 128 + s * 16);
-                ds[r] = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 +
-                                                                       2 * blk)) *
-                        (float) sc[row * blocks * 8 + blk * 8 + sub];
-                ms[r] = __half2float(
-                            *reinterpret_cast<const __half *>(dmin + row * blocks * 2 + 2 * blk)) *
-                        (float) mn[row * blocks * 8 + blk * 8 + sub];
+                q4k_meta(*reinterpret_cast<const uint4 *>(meta + (row * blocks + blk) * 16), sub,
+                         ds[r], ms[r]);
             }
             float part[kB4Rows * kB4Nt] = {};
 #pragma unroll
@@ -1176,8 +1185,7 @@ __global__ void gemv_iq3s_b4_kernel(const uint8_t * __restrict__ qs,
 // nibbles the next 16, and one scale d * (sc - 32) per sub-block. Only the
 // 16-entry codebook stays in LDS (64 bytes).
 __global__ void gemv_iq4_b4_kernel(const uint8_t * __restrict__ qs,
-                                   const uint8_t * __restrict__ sc,
-                                   const uint8_t * __restrict__ d, const __half * __restrict__ x,
+                                   const uint8_t * __restrict__ meta, const __half * __restrict__ x,
                                    float * __restrict__ y, const long long rows,
                                    const long long n_sub, const long long k) {
     extern __shared__ float table[];
@@ -1208,9 +1216,8 @@ __global__ void gemv_iq4_b4_kernel(const uint8_t * __restrict__ qs,
             for (int r = 0; r < kB4Rows; ++r) {
                 const long long row = row0 + r <= rlast ? row0 + r : rlast;
                 qw[r] = *reinterpret_cast<const uint4 *>(qs + row * blocks * 128 + s * 16);
-                dl[r] = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 +
-                                                                       2 * blk)) *
-                        (float) ((int) sc[row * blocks * 8 + blk * 8 + sub] - 32);
+                dl[r] = iq4_meta(*reinterpret_cast<const uint2 *>(meta + (row * blocks + blk) * 8),
+                                 sub);
             }
             float part[kB4Rows * kB4Nt] = {};
 #pragma unroll
@@ -1516,9 +1523,7 @@ bool gemv_q4k_b4(const void * packed, const void * x_f16, float * y, const int64
     const size_t smem = 0;
     const auto * base = static_cast<const uint8_t *>(packed);
     const dim3 grid((unsigned) ((rows + 8 * kB4Rows - 1) / (8 * kB4Rows)));
-    gemv_q4k_b4_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.sc_off,
-                                                    base + l.mn_off, base + l.d_off,
-                                                    base + l.dmin_off,
+    gemv_q4k_b4_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.meta_off,
                                                     static_cast<const __half *>(x_f16), y, rows,
                                                     n_sub, chunk, k);
     return hipGetLastError() == hipSuccess;
@@ -1553,7 +1558,7 @@ bool gemv_q4k(const void * packed, const void * x_f16, float * y, const int64_t 
     const int64_t n_sub = k / 32;
     const dim3 grid((unsigned) ((rows + 8 * kQ4kRows - 1) / (8 * kQ4kRows)));
     gemv_q4k_kernel<<<grid, 256, smem, stream>>>(
-        base + l.qs_off, base + l.sc_off, base + l.mn_off, base + l.d_off, base + l.dmin_off,
+        base + l.qs_off, base + l.meta_off,
         static_cast<const __half *>(x_f16), y, rows, n_sub);
     return hipGetLastError() == hipSuccess;
 }
@@ -1714,7 +1719,7 @@ bool gemv_iq4_xs(const void * packed, const void * x_f16, float * y, const int64
     }
     const auto * base = static_cast<const uint8_t *>(packed);
     const dim3 grid((unsigned) ((rows + 8 * kIq4Rows - 1) / (8 * kIq4Rows)));
-    gemv_iq4_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.sc_off, base + l.d_off,
+    gemv_iq4_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.meta_off,
                                                  static_cast<const __half *>(x_f16), y, rows,
                                                  n_sub, chunk);
     return hipGetLastError() == hipSuccess;
@@ -1775,8 +1780,8 @@ bool gemv_iq4_xs_b4(const void * packed, const void * x_f16, float * y, const in
     const auto * base = static_cast<const uint8_t *>(packed);
     const dim3 grid((unsigned) ((rows + 8 * kB4Rows - 1) / (8 * kB4Rows)));
     gemv_iq4_b4_kernel<<<grid, 256, 16 * sizeof(float), stream>>>(
-        base + l.qs_off, base + l.sc_off, base + l.d_off, static_cast<const __half *>(x_f16), y,
-        rows, n_sub, k);
+        base + l.qs_off, base + l.meta_off, static_cast<const __half *>(x_f16), y, rows, n_sub,
+        k);
     return hipGetLastError() == hipSuccess;
 }
 
