@@ -30,3 +30,10 @@ prompt                 KV     main (ms)   now (ms)
 # + attention prep fused, f16 merge: 48.63 48.64 48.61 48.61 48.65
 # rocprofv3 kernel trace before #78 (profiled step 57.6 ms): busy 51.6 ms, idle 6.0 ms
 # over 1130 inter-kernel gaps (median 4.0 us, p90 8.9 us).
+
+# #86: VRAM during a GEMV decode (512-token prompt, --last-logits --gemv --generate 40),
+# sysfs mem_info_vram_used sampled every 0.1-0.25 s, idle desktop 154 MiB:
+# main (d55c10a): 12063 MiB through load and prefill, 15143 MiB from the first decode
+#                 step to the end (the f16-path buffers become resident)
+# #86:            12063 MiB through load and prefill, 12663 MiB during decode
+# hipMemGetInfo after load (#86): 12442 MiB used of 16304 MiB

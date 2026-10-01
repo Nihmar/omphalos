@@ -241,7 +241,27 @@ public:
             }
         }
 
-        if (!scratch_.init((size_t) 1280 * 1024 * 1024)) {
+        // The f16 staging scratch holds one layer's weights on the dequant +
+        // hipBLASLt path. With --gemv only the weights without a GEMV take it
+        // (the BF16 beta / alpha projections in a prefill, ~1 MB a layer), so it
+        // is sized to the largest per-layer sum of those instead of 1.28 GB (#86).
+        size_t scratch_bytes = (size_t) 1280 * 1024 * 1024;
+        if (use_gemv_) {
+            std::unordered_map<std::string, size_t> per_layer;
+            for (const omph::gguf::TensorInfo & t : file_.tensors()) {
+                if (t.ne.size() < 2 || t.type == 0 || gems_.count(t.name) != 0 ||
+                    t.name.rfind("blk.", 0) != 0) {
+                    continue;  // f32 vectors, GEMV tensors, embedding / head
+                }
+                const std::string layer = t.name.substr(0, t.name.find('.', 4));
+                per_layer[layer] += (((size_t) numel(t) * 2) + 255) & ~(size_t) 255;
+            }
+            scratch_bytes = 1 << 20;
+            for (const auto & kv : per_layer) {
+                scratch_bytes = std::max(scratch_bytes, kv.second);
+            }
+        }
+        if (!scratch_.init(scratch_bytes)) {
             throw std::runtime_error("cannot allocate the weight scratch");
         }
         const auto alloc = [&](void ** p, const size_t bytes) {
@@ -255,15 +275,11 @@ public:
         alloc(&blk_, T * ne * 4);
         alloc(&h16_, T * ne * 2);
         alloc(&fused_, T * fused * 4);
-        alloc(&conv_out_, T * fused * 4);
         alloc(&z_, T * ssm_v * 4);
-        alloc(&o_, T * ssm_v * 4);
         alloc(&q_, T * attn_q * 4);
         alloc(&gate_, T * attn_q * 4);
-        alloc(&k_, T * std::max(ssm_q, attn_kv) * 4);
-        alloc(&v_, T * std::max(ssm_v, attn_kv) * 4);
-        alloc(&sk_, h_.ssm_n_vh * h_.ssm_s * 4);
-        alloc(&dvec_, h_.ssm_n_vh * h_.ssm_s * 4);
+        alloc(&k_, T * attn_kv * 4);  // attention only: the delta-net reads qkv itself
+        alloc(&v_, T * attn_kv * 4);
         alloc(&beta_, T * h_.ssm_n_vh * 4);
         alloc(&alpha_, T * h_.ssm_n_vh * 4);
         alloc(&ffn1_, T * h_.n_ff * 4);
@@ -271,9 +287,11 @@ public:
         alloc(&ffn16_, T * h_.n_ff * 2);
         last_logits_only_ = last_logits_only;
         alloc(&logits_, (last_logits_only ? 1 : T) * h_.n_vocab * 4);
-        alloc(&tmp_logits_, T * std::min<int64_t>(h_.n_vocab, 32768) * 4);
-        alloc(&head16_, (size_t) std::min<int64_t>(h_.n_vocab, 32768) * ne * 2);
-        alloc(&raw_stage_, (size_t) 768 * 1024 * 1024);  // raw bytes for the f16 fallback
+        // tmp_logits_, head16_ (the vocab-chunked f16 lm_head) and raw_stage_ (raw
+        // bytes of a repacked tensor for the f16 path) are allocated on first
+        // use: the GEMV decode never touches them (#86).
+        tmp_logits_bytes_ = (size_t) T * std::min<int64_t>(h_.n_vocab, 32768) * 4;
+        head16_bytes_ = (size_t) std::min<int64_t>(h_.n_vocab, 32768) * ne * 2;
         const int64_t kvcap = kv_capacity > 0 ? kv_capacity : T;
         max_seq_ = kvcap;
         int64_t n_kv = 0;
@@ -341,6 +359,13 @@ public:
                 throw std::runtime_error("out of VRAM (state)");
             }
             states_.push_back(st);
+        }
+        if (std::getenv("OMPH_TIMING") != nullptr) {
+            size_t free_b = 0;
+            size_t total_b = 0;
+            (void) hipMemGetInfo(&free_b, &total_b);
+            std::fprintf(stderr, "vram: %zu MiB used of %zu MiB after load\n",
+                         (total_b - free_b) >> 20, total_b >> 20);
         }
     }
 
@@ -598,9 +623,12 @@ public:
         }
         const int64_t head_row_bytes = (int64_t) (head->nbytes / head->ne[1]);
         if (gems_.count(head->name) != 0) {
-            (void) hipMemcpy(raw_stage_, file_.tensor_data(*head), (size_t) head->nbytes,
+            (void) hipMemcpy(lazy(&raw_stage_, (size_t) 768 * 1024 * 1024),
+                             file_.tensor_data(*head), (size_t) head->nbytes,
                              hipMemcpyHostToDevice);
         }
+        void * head16 = lazy(&head16_, head16_bytes_);
+        void * tmp_logits = lazy(&tmp_logits_, tmp_logits_bytes_);
         const uint8_t * head_src = gems_.count(head->name) != 0
                                        ? static_cast<const uint8_t *>(raw_stage_)
                                        : static_cast<const uint8_t *>(dev_weights_) +
@@ -608,7 +636,7 @@ public:
         const int64_t chunk = std::min<int64_t>(h_.n_vocab, 32768);
         for (int64_t v0 = 0; v0 < h_.n_vocab; v0 += chunk) {
             const int64_t rows = std::min(chunk, h_.n_vocab - v0);
-            void * wh = head16_;
+            void * wh = head16;
             timer_stage_.start();
             const bool head_dq = omph::kernels::dequantize(head->type,
                                                            head_src + v0 * head_row_bytes, wh,
@@ -616,11 +644,11 @@ public:
             timer_stage_.stop(t_stage_);
             timer_gemm_.start();
             const bool head_gm =
-                linear_.run(wh, x16, static_cast<float *>(tmp_logits_), rows, ne, T);
+                linear_.run(wh, x16, static_cast<float *>(tmp_logits), rows, ne, T);
             timer_gemm_.stop(t_gemm_);
             if (!head_dq || !head_gm ||
                 hipMemcpy2D(static_cast<uint8_t *>(logits_) + v0 * 4, (size_t) h_.n_vocab * 4,
-                            tmp_logits_, (size_t) rows * 4, (size_t) rows * 4, (size_t) T,
+                            tmp_logits, (size_t) rows * 4, (size_t) rows * 4, (size_t) T,
                             hipMemcpyDeviceToDevice) != hipSuccess) {
                 return fail("lm_head failed");
             }
@@ -809,29 +837,37 @@ private:
         if (!proj_ok) {
             return fail("gdn projection failed");
         }
-        // conv + silu + split + L2 norm of q and k: rms_norm(x, eps/s) / sqrt(s)
-        if (!omph::kernels::conv_silu_split_l2(
-                static_cast<const float *>(fused_), conv_w, conv_cur, conv_new,
-                static_cast<float *>(q_), static_cast<float *>(k_), static_cast<float *>(v_), T,
-                channels, h_.ssm_conv_k, q_dims, k_dims, v_dims, s, (float) (h_.eps / (double) s),
-                l2_scale, nullptr)) {
-            return fail("gdn preprocessing failed");
-        }
+        // conv, L2 norms, gates, delta rule and gated norm: one launch per token
+        // (#78, #83). The L2 norm is rms_norm(x, eps/s) / sqrt(s).
+        omph::kernels::GdnStep step;
+        step.state = seq_state;
+        step.qkv = static_cast<const float *>(fused_);
+        step.conv_w = conv_w;
+        step.conv_cur = conv_cur;
+        step.conv_new = conv_new;
+        step.dt_bias = dt_bias;
+        step.ssm_a = ssm_a;
+        step.norm_w = ssm_norm;
+        step.tokens = T;
+        step.channels = channels;
+        step.q_dims = q_dims;
+        step.kv_dims = k_dims;
+        step.conv_k = h_.ssm_conv_k;
+        step.n_kh = n_kh;
+        step.eps_l2 = (float) (h_.eps / (double) s);
+        step.l2_scale = l2_scale;
+        step.eps_norm = (float) h_.eps;
         for (int64_t t = 0; t < T; ++t) {
-            if (!omph::kernels::delta_step_fused(
-                    seq_state, static_cast<const float *>(q_) + t * q_dims,
-                    static_cast<const float *>(k_) + t * k_dims,
-                    static_cast<const float *>(v_) + t * v_dims,
-                    static_cast<const float *>(beta_) + t * n_vh,
-                    static_cast<const float *>(alpha_) + t * n_vh, dt_bias, ssm_a,
-                    static_cast<float *>(o_) + t * v_dims, n_vh, n_kh, s, l2_scale, nullptr)) {
+            step.t = t;
+            step.beta = static_cast<const float *>(beta_) + t * n_vh;
+            step.alpha = static_cast<const float *>(alpha_) + t * n_vh;
+            step.z = static_cast<const float *>(z_) + t * v_dims;
+            step.out16 = reinterpret_cast<__half *>(static_cast<uint8_t *>(ffn16_) + t * v_dims * 2);
+            if (!omph::kernels::gdn_step(step, n_vh, nullptr)) {
                 return fail("delta rule failed");
             }
         }
-        if (!omph::kernels::gated_norm_f16(static_cast<const float *>(o_), ssm_norm,
-                                           static_cast<const float *>(z_), ffn16_, T * n_vh,
-                                           v_dim, (float) h_.eps, nullptr) ||
-            !matmul(p + "ssm_out.weight", ffn16_, static_cast<float *>(blk_), ne, v_dims, T)) {
+        if (!matmul(p + "ssm_out.weight", ffn16_, static_cast<float *>(blk_), ne, v_dims, T)) {
             return fail("gdn output failed");
         }
         conv_flip_[il] ^= 1;
@@ -1073,6 +1109,15 @@ private:
         return ok;
     }
 
+    // Allocates *p on first use (the f16-path buffers, #86).
+    static void * lazy(void ** p, const size_t bytes) {
+        if (*p == nullptr && hipMalloc(p, bytes) != hipSuccess) {
+            (void) hipGetLastError();
+            throw std::runtime_error("out of VRAM (f16-path buffer)");
+        }
+        return *p;
+    }
+
     // Device pointer to the original GGUF bytes: they live in the image unless
     // the tensor was repacked, in which case they are staged from the file.
     const void * raw_bytes(const std::string & name) {
@@ -1081,7 +1126,8 @@ private:
             return static_cast<const uint8_t *>(dev_weights_) + off_.at(name);
         }
         const omph::gguf::TensorInfo * t = file_.tensor(name);
-        if (hipMemcpy(raw_stage_, file_.tensor_data(*t), (size_t) t->nbytes,
+        if (hipMemcpy(lazy(&raw_stage_, (size_t) 768 * 1024 * 1024), file_.tensor_data(*t),
+                      (size_t) t->nbytes,
                       hipMemcpyHostToDevice) != hipSuccess) {
             throw std::runtime_error("cannot stage " + name);
         }
@@ -1239,15 +1285,11 @@ private:
     void * blk_ = nullptr;
     void * h16_ = nullptr;
     void * fused_ = nullptr;
-    void * conv_out_ = nullptr;
     void * z_ = nullptr;
-    void * o_ = nullptr;
     void * q_ = nullptr;
     void * gate_ = nullptr;
     void * k_ = nullptr;
     void * v_ = nullptr;
-    void * sk_ = nullptr;
-    void * dvec_ = nullptr;
     void * beta_ = nullptr;
     void * alpha_ = nullptr;
     void * ffn1_ = nullptr;
@@ -1257,6 +1299,8 @@ private:
     void * tmp_logits_ = nullptr;
     void * head16_ = nullptr;
     void * raw_stage_ = nullptr;
+    size_t tmp_logits_bytes_ = 0;
+    size_t head16_bytes_ = 0;
     std::map<std::string, void *> f16_cache_;
     std::vector<void *> f16_cache_owned_;
 };

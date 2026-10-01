@@ -3,6 +3,7 @@
 
 #include <cstdint>
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 namespace omph::kernels {
@@ -58,28 +59,40 @@ bool delta_o(const float * state, const float * q, float * o, int64_t heads, int
 bool gated_norm(const float * o, const float * w, const float * z, float * out, int64_t rows,
                 int64_t n, float eps, hipStream_t stream);
 
-// Same, written as f16: the input of the ssm_out GEMV, without a cast kernel (#78).
-bool gated_norm_f16(const float * o, const float * w, const float * z, void * out_f16,
-                    int64_t rows, int64_t n, float eps, hipStream_t stream);
-
-// One-token delta rule in a single launch (PLAN.md §10.2): decay, sk = S^T k,
-// d = (v - sk) * beta, S += k (x) d and o = scale * S^T q for every head. The
-// gates come raw from the projections and are resolved in the kernel (#78):
-// beta = sigmoid(beta_raw), decay = exp(softplus(alpha_raw + dt_bias) * ssm_a).
-//   state: (heads, s, s); q/k: (n_kh, s); v/o: (heads, s);
-//   beta/alpha/dt_bias/ssm_a: (heads,); one workgroup per head, 256 threads;
-//   s must be 128.
-bool delta_step_fused(float * state, const float * q, const float * k, const float * v,
-                      const float * beta, const float * alpha, const float * dt_bias,
-                      const float * ssm_a, float * o, int64_t heads, int64_t n_kh, int64_t s,
-                      float scale, hipStream_t stream);
-
-// conv1d + silu + q/k/v split plus the per-head L2 normalization of q and k
-// (y = x / sqrt(mean(x^2) + eps) * scale over each head_dim-wide head) in one
-// launch (#78). head_dim must be 128 and every part a multiple of it.
-bool conv_silu_split_l2(const float * qkv, const float * w, const float * state, float * new_state,
-                        float * q, float * k, float * v, int64_t tokens, int64_t channels,
-                        int64_t kernel, int64_t q_dims, int64_t kv_dims, int64_t v_dims,
-                        int64_t head_dim, float eps, float scale, hipStream_t stream);
+// One token of a Gated DeltaNet layer after its projections, in one launch
+// (PLAN.md §10.2; #78, #83): per value head, the conv1d + silu of its q / k
+// (key head h % n_kh) and v from the qkv projection and the conv state, the L2
+// norm of q and k, the gates (beta = sigmoid(beta_raw), decay =
+// exp(softplus(alpha_raw + dt_bias) * ssm_a)), the delta rule on the head's
+// state (decay, sk = S^T k, d = (v - sk) * beta, S += k (x) d, o = l2_scale *
+// S^T q) and the gated RMSNorm (o / sqrt(mean(o^2) + eps_norm) * norm_w *
+// silu(z)) written as f16. State size s = 128; one 256-thread workgroup per
+// value head. Launch t = 0 .. tokens - 1 in order; t = 0 also shifts the conv
+// state from conv_cur into conv_new.
+struct GdnStep {
+    float * state = nullptr;           // (heads, 128, 128)
+    const float * qkv = nullptr;       // (tokens, channels): q | k | v
+    const float * conv_w = nullptr;    // (channels, conv_k)
+    const float * conv_cur = nullptr;  // (conv_k - 1, channels)
+    float * conv_new = nullptr;        // (conv_k - 1, channels)
+    const float * beta = nullptr;      // (heads) raw, token t
+    const float * alpha = nullptr;     // (heads) raw, token t
+    const float * dt_bias = nullptr;   // (heads)
+    const float * ssm_a = nullptr;     // (heads)
+    const float * z = nullptr;         // (heads, 128), token t
+    const float * norm_w = nullptr;    // (128)
+    __half * out16 = nullptr;          // (heads, 128), token t
+    long long tokens = 0;
+    long long t = 0;
+    long long channels = 0;
+    long long q_dims = 0;
+    long long kv_dims = 0;
+    long long conv_k = 0;
+    long long n_kh = 0;
+    float eps_l2 = 0.0f;               // the L2 norm's eps / s
+    float l2_scale = 0.0f;             // 1 / sqrt(s), also the output scale
+    float eps_norm = 0.0f;
+};
+bool gdn_step(const GdnStep & a, int64_t heads, hipStream_t stream);
 
 } // namespace omph::kernels
