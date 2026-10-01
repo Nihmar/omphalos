@@ -173,6 +173,7 @@ int main(int argc, char ** argv) {
     std::string name = "output.weight";
     int iters = 50;
     bool batch4 = false;
+    bool multi = false;
     int all_type = -1;
     int repack_only = -1;
     for (int i = 2; i < argc; ++i) {
@@ -184,6 +185,8 @@ int main(int argc, char ** argv) {
             all_type = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--batch4") == 0) {
             batch4 = true;
+        } else if (std::strcmp(argv[i], "--multi") == 0) {
+            multi = true;
         } else if (std::strcmp(argv[i], "--repack-only") == 0 && i + 1 < argc) {
             repack_only = std::atoi(argv[++i]);
         } else if (argv[i][0] != '-') {
@@ -316,6 +319,68 @@ int main(int argc, char ** argv) {
                         "(block %d, smem %zu/%zu/%zu/%zu)\n",
                         o.q4k, o.iq4, o.iq3, o.iq3s, o.block, o.smem_q4k, o.smem_iq4, o.smem_iq3,
                         o.smem_iq3s);
+        }
+        if (multi) {
+            // NT = 2..4 tokens per weight read (#126): each token's result against
+            // the single-token GEMV on its own vector, and the time per call.
+            const Case & c = cases.front();
+            void * xn = nullptr;
+            void * y1 = nullptr;
+            void * yn = nullptr;
+            if (hipMalloc(&xn, (size_t) c.k * 4 * 2) != hipSuccess ||
+                hipMalloc(&y1, (size_t) c.rows * 4) != hipSuccess ||
+                hipMalloc(&yn, (size_t) c.rows * 4 * 4) != hipSuccess) {
+                return fail("out of VRAM (multi)");
+            }
+            for (int t = 0; t < 4; ++t) {
+                (void) hipMemcpy(static_cast<uint8_t *>(xn) + (size_t) t * c.k * 2,
+                                 static_cast<uint8_t *>(dev_x) + (size_t) t * kmax * 2,
+                                 (size_t) c.k * 2, hipMemcpyDeviceToDevice);
+            }
+            const double t1 = time_ms(cases, dev_x, (float *) dev_y, iters, nullptr);
+            int bad = 0;
+            for (int nt = 2; nt <= 4; ++nt) {
+                if (!omph::kernels::gemv_multi(c.t->type, c.dev, xn, (float *) yn, c.rows, c.k, nt,
+                                               nullptr)) {
+                    std::printf("multi %d: not supported for type %u\n", nt, c.t->type);
+                    return 1;
+                }
+                hipEvent_t e0, e1;
+                (void) hipEventCreate(&e0);
+                (void) hipEventCreate(&e1);
+                (void) hipEventRecord(e0, nullptr);
+                for (int i = 0; i < iters; ++i) {
+                    (void) omph::kernels::gemv_multi(c.t->type, c.dev, xn, (float *) yn, c.rows,
+                                                     c.k, nt, nullptr);
+                }
+                (void) hipEventRecord(e1, nullptr);
+                (void) hipDeviceSynchronize();
+                float ms = 0.0f;
+                (void) hipEventElapsedTime(&ms, e0, e1);
+                (void) hipEventDestroy(e0);
+                (void) hipEventDestroy(e1);
+                double maxd = 0.0;
+                double ref = 1e-12;
+                for (int t = 0; t < nt; ++t) {
+                    (void) launch(c, static_cast<uint8_t *>(xn) + (size_t) t * c.k * 2,
+                                  (float *) y1, nullptr);
+                    (void) hipDeviceSynchronize();
+                    std::vector<float> a((size_t) c.rows), b((size_t) c.rows);
+                    (void) hipMemcpy(a.data(), static_cast<uint8_t *>(yn) + (size_t) t * c.rows * 4,
+                                     a.size() * 4, hipMemcpyDeviceToHost);
+                    (void) hipMemcpy(b.data(), y1, b.size() * 4, hipMemcpyDeviceToHost);
+                    for (size_t i = 0; i < a.size(); ++i) {
+                        maxd = std::max(maxd, (double) std::fabs(a[i] - b[i]));
+                        ref = std::max(ref, (double) std::fabs(b[i]));
+                    }
+                }
+                const double per = ms / iters;
+                bad += maxd / ref > 1e-5;
+                std::printf("multi %d    : %.3f ms per call (%.2fx one token's %.3f ms), "
+                            "max|d| vs single %.2e (rel %.2e)\n",
+                            nt, per, per / t1, t1, maxd, maxd / ref);
+            }
+            return bad == 0 ? 0 : 1;
         }
         if (batch4) {
             // Small-batch path: four tokens per weight read, verified against four

@@ -88,4 +88,10 @@ bool gemv_iq3_xxs_b4(const void * packed, const void * x_f16, float * y, int64_t
 bool gemv_bf16(const void * w, const void * x_f16, float * y, int64_t rows, int64_t k,
                hipStream_t stream);
 
+// NT = 2..4 tokens per weight read for a repacked tensor of `type` (#126):
+// x_f16 holds the NT activation vectors back to back (stride k), y the NT
+// result vectors (stride rows). False for a type without the form.
+bool gemv_multi(uint32_t type, const void * packed, const void * x_f16, float * y, int64_t rows,
+                int64_t k, int nt, hipStream_t stream);
+
 } // namespace omph::kernels
