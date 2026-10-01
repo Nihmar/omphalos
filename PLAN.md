@@ -609,6 +609,14 @@ Measured on the decode step (M4, issue #41):
   for the decode.
 - **Fusions into the prologue/epilogue of the GEMV are the right shape** (this section), but
   fusing two or three small kernels at a time measures as noise: three rounds gave 0-1 ms.
+- **The sublayer boundary stays a separate launch (#103).** Removing all 128 `add_rms_norm_f16`
+  launches of a step (ablation, wrong results) saves at most 0.50 ms; removing the 64
+  `swiglu_f16` launches saves nothing.
+  - **Folding the add + norm into the output GEMV's last workgroup**: bit-exact, but the step
+    is 0.2 ms *slower* than with the separate kernel. On top of that, the epilogue code alone,
+    never taken, cost ~1.1 ms through the GEMVs' codegen.
+  - **Normalizing in the consumers' prologue**: not pursued. The ceiling is 0.5 ms, minus a
+    redundant 5120-element reduction in every workgroup of every consumer.
 - **The non-GEMV quarter of the step is dominated by per-launch latency, not work.** The
   GEMVs are 82 % of the step and run near the achievable rate; the rest is ~165 calls of
   ~15 us each. Two of those were bugs, not tuning: a 178 MB f16 conversion of one IQ1_M
