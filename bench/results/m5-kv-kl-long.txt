@@ -16,3 +16,11 @@ context  omphalos Q8/Q4           +FP16 window 128         llama q8_0/q4_0      
 # max KL: omphalos Q8/Q4 16k 0.271 nats (one position); with the window 0.051
 # wall time (omphalos, prefill + 512-row tail): ref 8k 34 s / 16k 78 s / 32k 203 s;
 #   Q8/Q4 37 / 93 / 305 s (at 32k the f16 weight cache no longer fits and restages)
+
+# #81: K at Q4 (OMPH_KV_K4=1, V's Q4 format), FP16 window 128, same method
+# (KL vs exact f32 KV in host RAM, last 512 positions); llama.cpp q4_0/q4_0 added.
+context  ours K8/V4  ours K4/V4 (p99, max, top-1)          llama q8_0/q4_0  llama q4_0/q4_0
+8k       0.00078     0.00169 (0.0157, 0.046, 97.46 %)       0.00162          0.00252
+16k      0.00091     0.00349 (0.0286, 0.329, 98.24 %)       0.00149          0.00275
+32k      0.00072     0.00211 (0.0205, 0.033, 97.46 %)       0.00135          0.00256
+# 512 tokens: K8/V4 0.00125, K4/V4 0.00225.
