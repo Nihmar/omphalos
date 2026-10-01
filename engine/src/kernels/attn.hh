@@ -56,6 +56,7 @@ struct AttnPrep {
     __half * k16 = nullptr;          // FP16 ring, or null
     __half * v16 = nullptr;
     long long window = 0;
+    bool k_q4 = false;               // quantize K as Q4 into k_q8 (V's format, #81)
 };
 bool attn_prep(const AttnPrep & a, hipStream_t stream);
 
@@ -73,6 +74,7 @@ struct KvCache {
     const void * k16 = nullptr;
     const void * v16 = nullptr;
     int64_t window = 0;
+    bool k_q4 = false;  // k_q8 holds K in V's Q4 format (#81)
 };
 
 // Causal attention with GQA and the sigmoid output gate. q, gate, out:

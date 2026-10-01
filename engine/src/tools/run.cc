@@ -305,7 +305,9 @@ public:
             // K Q8 + V Q4 with 32-element blocks: 272 B and 144 B per head per
             // token, against 1024 B each in f32 (PLAN.md §13).
             const int64_t nblk = h_.head_dim / 32;
-            alloc(&kv_kq_, (size_t) n_kv * kvcap * attn_kv);
+            // OMPH_KV_K4=1: K in V's Q4 format too (#81, experiment).
+            kv_k4_ = std::getenv("OMPH_KV_K4") != nullptr;
+            alloc(&kv_kq_, (size_t) n_kv * kvcap * attn_kv / (kv_k4_ ? 2 : 1));
             alloc(&kv_ks_, (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2);
             alloc(&kv_vq_, (size_t) n_kv * kvcap * attn_kv / 2);
             alloc(&kv_vs_, (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2);
@@ -754,6 +756,7 @@ private:
             prep.k16 = kv_window_ > 0 ? reinterpret_cast<__half *>(c.k16) : nullptr;
             prep.v16 = kv_window_ > 0 ? reinterpret_cast<__half *>(c.v16) : nullptr;
             prep.window = kv_window_;
+            prep.k_q4 = kv_k4_;
         }
         if (!proj_ok || !omph::kernels::attn_prep(prep, nullptr) ||
             !attn_impl(il, k_cache, v_cache, pos0, T) ||
@@ -849,7 +852,7 @@ private:
         const int64_t kv_out = h_.n_head_kv * h_.head_dim;
         const int64_t nblk = h_.head_dim / 32;
         const int64_t kvl = kv_index_[il];
-        return {static_cast<uint8_t *>(kv_kq_) + kvl * max_seq_ * kv_out,
+        return {static_cast<uint8_t *>(kv_kq_) + kvl * max_seq_ * kv_out / (kv_k4_ ? 2 : 1),
                 static_cast<uint8_t *>(kv_ks_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2,
                 static_cast<uint8_t *>(kv_vq_) + kvl * max_seq_ * kv_out / 2,
                 static_cast<uint8_t *>(kv_vs_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2,
@@ -874,6 +877,7 @@ private:
             kv.k16 = kv_window_ > 0 ? c.k16 : nullptr;
             kv.v16 = kv_window_ > 0 ? c.v16 : nullptr;
             kv.window = kv_window_;
+            kv.k_q4 = kv_k4_;
             return omph::kernels::attention_gqa(
                 static_cast<const float *>(q_), kv, static_cast<const float *>(gate_),
                 nullptr, T, pos0 + T, h_.n_head, h_.n_head_kv, h_.head_dim, scale, true,
@@ -1212,6 +1216,7 @@ private:
     void * kv_v16_ = nullptr;
     int64_t kv_window_ = 0;  // Q8/Q4 mode: 128 unless OMPH_KV_WINDOW says otherwise
     bool kv_q8q4_ = false;
+    bool kv_k4_ = false;  // K stored as Q4 (experiment, #81)
     bool kv_host_ = false;  // f32 KV in pinned host RAM (validation reference)
     void * kv_stage_k_ = nullptr;
     // Overlap of independent GEMVs (#71): the decode forks a layer's sibling

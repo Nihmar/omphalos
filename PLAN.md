@@ -934,6 +934,9 @@ every length — the budget chosen in #58 (`bench/results/m5-kv-kl-long.txt`). T
 GQA-grouped flash attention (#59) makes the decode nearly flat in context: 58.4 ms at
 512, 61.7 ms at 8k, 65.0 ms at 16k with the quantized KV (was 99.0 ms at 8k).
 Since #69 the Q8/Q4 KV is the engine's default (`OMPH_KV_F32=1` for the f32 reference).
+K at Q4 (#81, `OMPH_KV_K4=1`, -0.32 GB at 32k): KL 0.0017 / 0.0035 / 0.0021 at 8k / 16k /
+32k — about llama.cpp's q4_0/q4_0 (0.0025 / 0.0028 / 0.0026) but over the q8_0/q4_0
+budget, so K stays Q8 by default; a per-layer K choice (§13.5) is the open follow-up.
 
 Decode after M5 (#63, #66; `bench/results/decode-step-20261001.txt`): **55.2 ms/token** at
 a 10-token prompt (58.0 on main measured the same day), 54.8 ms at 512 and 58.2 ms at 8k
