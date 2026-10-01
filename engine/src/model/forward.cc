@@ -53,6 +53,7 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
     if (T <= 0 || T > max_tokens_ || start_pos < 0 || start_pos + T > max_seq_) {
         return fail("forward: tokens exceed the activation or KV capacity");
     }
+    watch_step_begin(T);
     hipEvent_t step_a{}, step_b{};
     const bool time_step = T == 1 && env_.timing;
     if (time_step) {
@@ -174,6 +175,7 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
         return false;
     }
     report_phases();
+    watch_step_end();
     if (time_step) {
         step_event(step_a, step_b);
     }

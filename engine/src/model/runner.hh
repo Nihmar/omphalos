@@ -211,6 +211,9 @@ private:
 
     // Keeps the side stream only if overlapping beats running in order (#132).
     void calibrate_overlap();
+    // Times single-token steps and re-runs the calibration when they turn slow (#144).
+    void watch_step_begin(int64_t T);
+    void watch_step_end();
 
     // Allocates *p on first use (the f16-path buffers, #86).
     void * lazy(void ** p, const size_t bytes);
@@ -362,6 +365,18 @@ private:
     bool scratch_ready_ = false;  // allocated on first use (a weight without a decoder, #141)
     int64_t gemm_min_ = 0;        // tokens from which a --gemv runner uses the GEMM path
     int64_t key_chunk_ = 0;       // attention keys per split, fixed for the run (#136)
+    // side-stream watchdog (#144)
+    static constexpr double kSlowStep = 1.35;
+    static constexpr int kMaxRecalibrations = 8;
+    hipEvent_t mon_a_ = nullptr;
+    hipEvent_t mon_b_ = nullptr;
+    bool mon_open_ = false;
+    bool recal_pending_ = false;
+    double step_ref_ = 0.0;       // slow average of the normal single-token steps, ms
+    int slow_steps_ = 0;
+    int recalibrations_ = 0;
+    int64_t watched_steps_ = 0;
+    hipStream_t test_bad_side_ = nullptr;  // OMPH_TEST_BAD_SIDE
 };
 
 } // namespace omph::model
