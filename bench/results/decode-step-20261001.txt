@@ -10,3 +10,11 @@ prompt                 KV     main (ms)   now (ms)
 # note: PLAN.md's M4 status quotes 55.2 ms for the 10-token prompt; main measures
 # 58.0 ms in this session under the same command. Not investigated further.
 # llama.cpp baseline (M0): 48.5 ms/token (20.6 t/s), f16 KV, short context.
+
+# #71: independent GEMVs overlapped on a side stream (per-thread default stream build),
+# 512 tokens, Q8/Q4 KV (now default), --last-logits, 5 alternating runs each:
+# OMPH_NO_OVERLAP=1: 54.83 54.86 54.80 54.83 54.86   -> median 54.83 ms
+# overlap (default): 50.99 51.01 50.98 51.03 50.99   -> median 51.00 ms
+# 10-token prompt: 51.67 ms; 8k prompt: 54.35 ms
+# omph-gemv-bench --all-of-type, launches alternated over 1 / 2 non-blocking streams:
+# IQ3_S 79.4 / 96.0 %, IQ4_XS 84.5 / 96.7 %, IQ3_XXS 70.9 / 83.8 %

@@ -10,6 +10,12 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Per-thread default stream (#71): the legacy null stream synchronizes with every
+# other stream, which turns the side stream that overlaps independent GEMVs into
+# a full serialization.
+add_compile_definitions(HIP_API_PER_THREAD_DEFAULT_STREAM=1)
+add_compile_options($<$<COMPILE_LANGUAGE:HIP>:-fgpu-default-stream=per-thread>)
+
 find_package(hip REQUIRED)
 find_package(hipblaslt REQUIRED)
 
