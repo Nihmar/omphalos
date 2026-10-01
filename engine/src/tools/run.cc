@@ -321,6 +321,12 @@ public:
             alloc(&kv_k16_, (size_t) n_kv * kv_window_ * attn_kv * 2);
             alloc(&kv_v16_, (size_t) n_kv * kv_window_ * attn_kv * 2);
         }
+        overlap_ = use_gemv_ && std::getenv("OMPH_NO_OVERLAP") == nullptr;
+        if (overlap_ && (hipStreamCreateWithFlags(&side_, hipStreamNonBlocking) != hipSuccess ||
+                         hipEventCreateWithFlags(&ev_fork_, hipEventDisableTiming) != hipSuccess ||
+                         hipEventCreateWithFlags(&ev_join_, hipEventDisableTiming) != hipSuccess)) {
+            throw std::runtime_error("cannot create the side stream");
+        }
         attn_work_bytes_ = omph::kernels::attention_gqa_work_bytes(T, h_.n_head, h_.n_head_kv,
                                                                    h_.head_dim);
         alloc(&attn_work_, attn_work_bytes_);
@@ -432,8 +438,17 @@ public:
                                                  T, ne, (float) h_.eps, nullptr)) {
                 return fail("residual/norm failed");
             }
-            if (!matmul(p + "ffn_gate.weight", h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T) ||
-                !matmul(p + "ffn_up.weight", h16_, static_cast<float *>(ffn2_), h_.n_ff, ne, T) ||
+            const bool gate_up_ok = fork_join(
+                T,
+                [&] {
+                    return matmul(p + "ffn_up.weight", h16_, static_cast<float *>(ffn2_), h_.n_ff,
+                                  ne, T);
+                },
+                [&] {
+                    return matmul(p + "ffn_gate.weight", h16_, static_cast<float *>(ffn1_),
+                                  h_.n_ff, ne, T);
+                });
+            if (!gate_up_ok ||
                 !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
                                            static_cast<const float *>(ffn2_), ffn16_, T * h_.n_ff,
                                            nullptr) ||
@@ -509,7 +524,7 @@ public:
             if (use_gemv_ && gems_.count("output.weight") != 0) {
                 const auto & e = gems_.at("output.weight");
                 const void * w = static_cast<const uint8_t *>(dev_weights_) + e.off;
-                if (!gemv_one(e.type, w, xlast, static_cast<float *>(logits_), h_.n_vocab, ne)) {
+                if (!gemv_one(e.type, w, xlast, static_cast<float *>(logits_), h_.n_vocab, ne, nullptr)) {
                     return fail("lm_head gemv failed");
                 }
             } else if (!head_chunked(xlast, 1)) {
@@ -702,9 +717,17 @@ private:
         const float * q_norm = f32_ref(p + "attn_q_norm.weight");
         const float * k_norm = f32_ref(p + "attn_k_norm.weight");
 
-        if (!matmul(p + "attn_q.weight", h16_, static_cast<float *>(fused_), q_out, ne, T) ||
-            !matmul(p + "attn_k.weight", h16_, static_cast<float *>(k_), kv_out, ne, T) ||
-            !matmul(p + "attn_v.weight", h16_, static_cast<float *>(v_), kv_out, ne, T) ||
+        const bool proj_ok = fork_join(
+            T,
+            [&] {
+                return matmul(p + "attn_k.weight", h16_, static_cast<float *>(k_), kv_out, ne, T) &&
+                       matmul(p + "attn_v.weight", h16_, static_cast<float *>(v_), kv_out, ne, T);
+            },
+            [&] {
+                return matmul(p + "attn_q.weight", h16_, static_cast<float *>(fused_), q_out, ne,
+                              T);
+            });
+        if (!proj_ok ||
             !omph::kernels::split_qg(static_cast<const float *>(fused_),
                                      static_cast<float *>(q_), static_cast<float *>(gate_), T,
                                      h_.n_head, h_.head_dim, nullptr) ||
@@ -763,10 +786,21 @@ private:
         float * seq_state = reinterpret_cast<float *>(st + 2 * n_conv_f * 4);
 
 
-        if (!matmul(p + "attn_qkv.weight", h16_, static_cast<float *>(fused_), channels, ne, T) ||
-            !matmul(p + "attn_gate.weight", h16_, static_cast<float *>(z_), v_dims, ne, T) ||
-            !matmul(p + "ssm_beta.weight", h16_, static_cast<float *>(beta_), n_vh, ne, T) ||
-            !matmul(p + "ssm_alpha.weight", h16_, static_cast<float *>(alpha_), n_vh, ne, T)) {
+        const bool proj_ok = fork_join(
+            T,
+            [&] {
+                return matmul(p + "attn_gate.weight", h16_, static_cast<float *>(z_), v_dims, ne,
+                              T) &&
+                       matmul(p + "ssm_beta.weight", h16_, static_cast<float *>(beta_), n_vh, ne,
+                              T) &&
+                       matmul(p + "ssm_alpha.weight", h16_, static_cast<float *>(alpha_), n_vh, ne,
+                              T);
+            },
+            [&] {
+                return matmul(p + "attn_qkv.weight", h16_, static_cast<float *>(fused_), channels,
+                              ne, T);
+            });
+        if (!proj_ok) {
             return fail("gdn projection failed");
         }
         if (!omph::kernels::sigmoid_inplace(static_cast<float *>(beta_), T * n_vh, nullptr) ||
@@ -875,20 +909,40 @@ private:
                                             attn_work_bytes_, nullptr);
     }
 
+    // Runs `side` on the side stream and `main` on the default one, both after
+    // everything issued so far; the default stream continues once both are done.
+    // Without overlap (prefill, or OMPH_NO_OVERLAP) they simply run in order.
+    template <typename Side, typename Main>
+    bool fork_join(const int64_t T, Side && side, Main && main) {
+        if (!overlap_ || T != 1) {
+            return side() && main();
+        }
+        if (hipEventRecord(ev_fork_, nullptr) != hipSuccess ||
+            hipStreamWaitEvent(side_, ev_fork_, 0) != hipSuccess) {
+            return false;
+        }
+        gemv_stream_ = side_;
+        const bool ok_side = side();
+        gemv_stream_ = nullptr;
+        const bool ok_main = main();
+        return ok_side && ok_main && hipEventRecord(ev_join_, side_) == hipSuccess &&
+               hipStreamWaitEvent(nullptr, ev_join_, 0) == hipSuccess;
+    }
+
     // One fused GEMV launch for a single token, dispatched on the GGUF type.
     static bool gemv_one(const int type, const void * w, const void * x, float * y,
-                         const int64_t n_out, const int64_t k) {
+                         const int64_t n_out, const int64_t k, hipStream_t st) {
         switch (type) {
-            case 10: return omph::kernels::gemv_q2k(w, x, y, n_out, k, nullptr);
-            case 12: return omph::kernels::gemv_q4k(w, x, y, n_out, k, nullptr);
-            case 14: return omph::kernels::gemv_q6k(w, x, y, n_out, k, nullptr);
-            case 16: return omph::kernels::gemv_iq2_xxs(w, x, y, n_out, k, nullptr);
-            case 17: return omph::kernels::gemv_iq2_xs(w, x, y, n_out, k, nullptr);
-            case 18: return omph::kernels::gemv_iq3_xxs(w, x, y, n_out, k, nullptr);
-            case 21: return omph::kernels::gemv_iq3_s(w, x, y, n_out, k, nullptr);
-            case 22: return omph::kernels::gemv_iq2_s(w, x, y, n_out, k, nullptr);
-            case 23: return omph::kernels::gemv_iq4_xs(w, x, y, n_out, k, nullptr);
-            case 29: return omph::kernels::gemv_iq1_m(w, x, y, n_out, k, nullptr);
+            case 10: return omph::kernels::gemv_q2k(w, x, y, n_out, k, st);
+            case 12: return omph::kernels::gemv_q4k(w, x, y, n_out, k, st);
+            case 14: return omph::kernels::gemv_q6k(w, x, y, n_out, k, st);
+            case 16: return omph::kernels::gemv_iq2_xxs(w, x, y, n_out, k, st);
+            case 17: return omph::kernels::gemv_iq2_xs(w, x, y, n_out, k, st);
+            case 18: return omph::kernels::gemv_iq3_xxs(w, x, y, n_out, k, st);
+            case 21: return omph::kernels::gemv_iq3_s(w, x, y, n_out, k, st);
+            case 22: return omph::kernels::gemv_iq2_s(w, x, y, n_out, k, st);
+            case 23: return omph::kernels::gemv_iq4_xs(w, x, y, n_out, k, st);
+            case 29: return omph::kernels::gemv_iq1_m(w, x, y, n_out, k, st);
             default: return false;
         }
     }
@@ -896,12 +950,12 @@ private:
     // Small-batch GEMV: one weight read per four tokens. Only the types that have
     // this form answer true; the others stay on the f16 path.
     static bool gemv_batch4(const int type, const void * w, const void * x, float * y,
-                            const int64_t n_out, const int64_t k) {
+                            const int64_t n_out, const int64_t k, hipStream_t st) {
         switch (type) {
-            case 12: return omph::kernels::gemv_q4k_b4(w, x, y, n_out, k, nullptr);
-            case 21: return omph::kernels::gemv_iq3s_b4(w, x, y, n_out, k, nullptr);
-            case 23: return omph::kernels::gemv_iq4_xs_b4(w, x, y, n_out, k, nullptr);
-            case 18: return omph::kernels::gemv_iq3_xxs_b4(w, x, y, n_out, k, nullptr);
+            case 12: return omph::kernels::gemv_q4k_b4(w, x, y, n_out, k, st);
+            case 21: return omph::kernels::gemv_iq3s_b4(w, x, y, n_out, k, st);
+            case 23: return omph::kernels::gemv_iq4_xs_b4(w, x, y, n_out, k, st);
+            case 18: return omph::kernels::gemv_iq3_xxs_b4(w, x, y, n_out, k, st);
             default: return false;
         }
     }
@@ -919,7 +973,7 @@ private:
                 std::getenv("OMPH_NO_BF16_GEMV") == nullptr) {
                 const void * w = static_cast<const uint8_t *>(dev_weights_) + off_.at(name);
                 timer_gemv_.start();
-                const bool ok = omph::kernels::gemv_bf16(w, x16, y, n_out, k, nullptr);
+                const bool ok = omph::kernels::gemv_bf16(w, x16, y, n_out, k, gemv_stream_);
                 timer_gemv_.stop(t_gemv_);
                 if (ok) {
                     return true;
@@ -942,7 +996,7 @@ private:
                     }
                 }
                 timer_gemv_.start();
-                const bool gemv_ok = gemv_one(it->second.type, w, x16, y, n_out, k);
+                const bool gemv_ok = gemv_one(it->second.type, w, x16, y, n_out, k, gemv_stream_);
                 timer_gemv_.stop(t_gemv_);
                 if (gemv_ok) {
                     return true;
@@ -976,7 +1030,8 @@ private:
                 timer_gemv_.start();
                 bool ok = true;
                 for (int64_t t0 = 0; t0 < T && ok; ++t0) {
-                    ok = gemv_one(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k);
+                    ok = gemv_one(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
+                                  gemv_stream_);
                 }
                 timer_gemv_.stop(t_gemv_);
                 if (ok) {
@@ -991,10 +1046,12 @@ private:
                 bool ok = true;
                 int64_t t0 = 0;
                 for (; t0 + 4 <= T && ok; t0 += 4) {
-                    ok = gemv_batch4(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k);
+                    ok = gemv_batch4(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
+                                     gemv_stream_);
                 }
                 for (; t0 < T && ok; ++t0) {
-                    ok = gemv_one(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k);
+                    ok = gemv_one(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
+                                  gemv_stream_);
                 }
                 timer_gemv_.stop(t_gemv_);
                 if (ok) {
@@ -1157,6 +1214,16 @@ private:
     bool kv_q8q4_ = false;
     bool kv_host_ = false;  // f32 KV in pinned host RAM (validation reference)
     void * kv_stage_k_ = nullptr;
+    // Overlap of independent GEMVs (#71): the decode forks a layer's sibling
+    // projections onto side_ and joins before their consumers. Consecutive
+    // kernels on one stream leave a gap between one's tail and the next one's
+    // start that caps the GEMVs at ~80 % of the bandwidth; overlapped, they
+    // reach ~96 % (omph-gemv-bench).
+    hipStream_t side_ = nullptr;
+    hipEvent_t ev_fork_{};
+    hipEvent_t ev_join_{};
+    hipStream_t gemv_stream_ = nullptr;  // where matmul's GEMVs go
+    bool overlap_ = false;
     void * attn_work_ = nullptr;  // split-K partials of attention_gqa
     size_t attn_work_bytes_ = 0;
     void * kv_stage_v_ = nullptr;
