@@ -255,14 +255,11 @@ public:
         alloc(&blk_, T * ne * 4);
         alloc(&h16_, T * ne * 2);
         alloc(&fused_, T * fused * 4);
-        alloc(&conv_out_, T * fused * 4);
         alloc(&z_, T * ssm_v * 4);
         alloc(&q_, T * attn_q * 4);
         alloc(&gate_, T * attn_q * 4);
-        alloc(&k_, T * std::max(ssm_q, attn_kv) * 4);
-        alloc(&v_, T * std::max(ssm_v, attn_kv) * 4);
-        alloc(&sk_, h_.ssm_n_vh * h_.ssm_s * 4);
-        alloc(&dvec_, h_.ssm_n_vh * h_.ssm_s * 4);
+        alloc(&k_, T * attn_kv * 4);  // attention only: the delta-net reads qkv itself
+        alloc(&v_, T * attn_kv * 4);
         alloc(&beta_, T * h_.ssm_n_vh * 4);
         alloc(&alpha_, T * h_.ssm_n_vh * 4);
         alloc(&ffn1_, T * h_.n_ff * 4);
@@ -1246,14 +1243,11 @@ private:
     void * blk_ = nullptr;
     void * h16_ = nullptr;
     void * fused_ = nullptr;
-    void * conv_out_ = nullptr;
     void * z_ = nullptr;
     void * q_ = nullptr;
     void * gate_ = nullptr;
     void * k_ = nullptr;
     void * v_ = nullptr;
-    void * sk_ = nullptr;
-    void * dvec_ = nullptr;
     void * beta_ = nullptr;
     void * alpha_ = nullptr;
     void * ffn1_ = nullptr;
