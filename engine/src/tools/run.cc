@@ -241,7 +241,27 @@ public:
             }
         }
 
-        if (!scratch_.init((size_t) 1280 * 1024 * 1024)) {
+        // The f16 staging scratch holds one layer's weights on the dequant +
+        // hipBLASLt path. With --gemv only the weights without a GEMV take it
+        // (the BF16 beta / alpha projections in a prefill, ~1 MB a layer), so it
+        // is sized to the largest per-layer sum of those instead of 1.28 GB (#86).
+        size_t scratch_bytes = (size_t) 1280 * 1024 * 1024;
+        if (use_gemv_) {
+            std::unordered_map<std::string, size_t> per_layer;
+            for (const omph::gguf::TensorInfo & t : file_.tensors()) {
+                if (t.ne.size() < 2 || t.type == 0 || gems_.count(t.name) != 0 ||
+                    t.name.rfind("blk.", 0) != 0) {
+                    continue;  // f32 vectors, GEMV tensors, embedding / head
+                }
+                const std::string layer = t.name.substr(0, t.name.find('.', 4));
+                per_layer[layer] += (((size_t) numel(t) * 2) + 255) & ~(size_t) 255;
+            }
+            scratch_bytes = 1 << 20;
+            for (const auto & kv : per_layer) {
+                scratch_bytes = std::max(scratch_bytes, kv.second);
+            }
+        }
+        if (!scratch_.init(scratch_bytes)) {
             throw std::runtime_error("cannot allocate the weight scratch");
         }
         const auto alloc = [&](void ** p, const size_t bytes) {
@@ -267,9 +287,11 @@ public:
         alloc(&ffn16_, T * h_.n_ff * 2);
         last_logits_only_ = last_logits_only;
         alloc(&logits_, (last_logits_only ? 1 : T) * h_.n_vocab * 4);
-        alloc(&tmp_logits_, T * std::min<int64_t>(h_.n_vocab, 32768) * 4);
-        alloc(&head16_, (size_t) std::min<int64_t>(h_.n_vocab, 32768) * ne * 2);
-        alloc(&raw_stage_, (size_t) 768 * 1024 * 1024);  // raw bytes for the f16 fallback
+        // tmp_logits_, head16_ (the vocab-chunked f16 lm_head) and raw_stage_ (raw
+        // bytes of a repacked tensor for the f16 path) are allocated on first
+        // use: the GEMV decode never touches them (#86).
+        tmp_logits_bytes_ = (size_t) T * std::min<int64_t>(h_.n_vocab, 32768) * 4;
+        head16_bytes_ = (size_t) std::min<int64_t>(h_.n_vocab, 32768) * ne * 2;
         const int64_t kvcap = kv_capacity > 0 ? kv_capacity : T;
         max_seq_ = kvcap;
         int64_t n_kv = 0;
@@ -337,6 +359,13 @@ public:
                 throw std::runtime_error("out of VRAM (state)");
             }
             states_.push_back(st);
+        }
+        if (std::getenv("OMPH_TIMING") != nullptr) {
+            size_t free_b = 0;
+            size_t total_b = 0;
+            (void) hipMemGetInfo(&free_b, &total_b);
+            std::fprintf(stderr, "vram: %zu MiB used of %zu MiB after load\n",
+                         (total_b - free_b) >> 20, total_b >> 20);
         }
     }
 
@@ -594,9 +623,12 @@ public:
         }
         const int64_t head_row_bytes = (int64_t) (head->nbytes / head->ne[1]);
         if (gems_.count(head->name) != 0) {
-            (void) hipMemcpy(raw_stage_, file_.tensor_data(*head), (size_t) head->nbytes,
+            (void) hipMemcpy(lazy(&raw_stage_, (size_t) 768 * 1024 * 1024),
+                             file_.tensor_data(*head), (size_t) head->nbytes,
                              hipMemcpyHostToDevice);
         }
+        void * head16 = lazy(&head16_, head16_bytes_);
+        void * tmp_logits = lazy(&tmp_logits_, tmp_logits_bytes_);
         const uint8_t * head_src = gems_.count(head->name) != 0
                                        ? static_cast<const uint8_t *>(raw_stage_)
                                        : static_cast<const uint8_t *>(dev_weights_) +
@@ -604,7 +636,7 @@ public:
         const int64_t chunk = std::min<int64_t>(h_.n_vocab, 32768);
         for (int64_t v0 = 0; v0 < h_.n_vocab; v0 += chunk) {
             const int64_t rows = std::min(chunk, h_.n_vocab - v0);
-            void * wh = head16_;
+            void * wh = head16;
             timer_stage_.start();
             const bool head_dq = omph::kernels::dequantize(head->type,
                                                            head_src + v0 * head_row_bytes, wh,
@@ -612,11 +644,11 @@ public:
             timer_stage_.stop(t_stage_);
             timer_gemm_.start();
             const bool head_gm =
-                linear_.run(wh, x16, static_cast<float *>(tmp_logits_), rows, ne, T);
+                linear_.run(wh, x16, static_cast<float *>(tmp_logits), rows, ne, T);
             timer_gemm_.stop(t_gemm_);
             if (!head_dq || !head_gm ||
                 hipMemcpy2D(static_cast<uint8_t *>(logits_) + v0 * 4, (size_t) h_.n_vocab * 4,
-                            tmp_logits_, (size_t) rows * 4, (size_t) rows * 4, (size_t) T,
+                            tmp_logits, (size_t) rows * 4, (size_t) rows * 4, (size_t) T,
                             hipMemcpyDeviceToDevice) != hipSuccess) {
                 return fail("lm_head failed");
             }
@@ -1077,6 +1109,15 @@ private:
         return ok;
     }
 
+    // Allocates *p on first use (the f16-path buffers, #86).
+    static void * lazy(void ** p, const size_t bytes) {
+        if (*p == nullptr && hipMalloc(p, bytes) != hipSuccess) {
+            (void) hipGetLastError();
+            throw std::runtime_error("out of VRAM (f16-path buffer)");
+        }
+        return *p;
+    }
+
     // Device pointer to the original GGUF bytes: they live in the image unless
     // the tensor was repacked, in which case they are staged from the file.
     const void * raw_bytes(const std::string & name) {
@@ -1085,7 +1126,8 @@ private:
             return static_cast<const uint8_t *>(dev_weights_) + off_.at(name);
         }
         const omph::gguf::TensorInfo * t = file_.tensor(name);
-        if (hipMemcpy(raw_stage_, file_.tensor_data(*t), (size_t) t->nbytes,
+        if (hipMemcpy(lazy(&raw_stage_, (size_t) 768 * 1024 * 1024), file_.tensor_data(*t),
+                      (size_t) t->nbytes,
                       hipMemcpyHostToDevice) != hipSuccess) {
             throw std::runtime_error("cannot stage " + name);
         }
@@ -1257,6 +1299,8 @@ private:
     void * tmp_logits_ = nullptr;
     void * head16_ = nullptr;
     void * raw_stage_ = nullptr;
+    size_t tmp_logits_bytes_ = 0;
+    size_t head16_bytes_ = 0;
     std::map<std::string, void *> f16_cache_;
     std::vector<void *> f16_cache_owned_;
 };
