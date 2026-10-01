@@ -261,7 +261,7 @@ bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T
         return omph::kernels::attention_gqa(
             static_cast<const float *>(q_), kv, static_cast<const float *>(gate_),
             nullptr, T, pos0 + T, h_.n_head, h_.n_head_kv, h_.head_dim, scale, true,
-            attn_work_, attn_work_bytes_, nullptr, ffn16_);
+            attn_work_, attn_work_bytes_, nullptr, ffn16_, !env_.attn_scalar);
     }
     float * k_cache = kv_in.k_f32;
     float * v_cache = kv_in.v_f32;
@@ -292,7 +292,7 @@ bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T
                                         static_cast<const float *>(gate_),
                                         nullptr, T, pos0 + T, h_.n_head, h_.n_head_kv,
                                         h_.head_dim, scale, false, attn_work_,
-                                        attn_work_bytes_, nullptr, ffn16_);
+                                        attn_work_bytes_, nullptr, ffn16_, !env_.attn_scalar);
 }
 
 } // namespace omph::model

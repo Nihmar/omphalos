@@ -421,6 +421,287 @@ __global__ __launch_bounds__(kGqaHd) void attention_gqa_kernel(
     }
 }
 
+// --- WMMA prefill attention (#97) ------------------------------------------
+//
+// A workgroup takes 16 query tokens of one KV head: 6 waves, wave g the query
+// head kvh * 6 + g. Per tile of 32 keys, K and V are dequantized to f16 in LDS
+// once for the 6 heads (V transposed, so both WMMA operands are 16-byte
+// loads), each wave computes its 16 x 32 scores with v_wmma (q in registers,
+// f16, prescaled), updates the online softmax in registers (the score tiles'
+// rows sit in the same lanes as the output accumulators' rows), passes P
+// through LDS into the A layout and accumulates O (16 x 256) += P V. The
+// output goes to `work` as one partial (m, l, acc) per (token, head), which
+// the merge kernel (splits = 1) normalizes, un-rotates and gates.
+typedef _Float16 wmma_half8 __attribute__((ext_vector_type(8)));
+typedef float wmma_float8 __attribute__((ext_vector_type(8)));
+
+constexpr int kFaTokens = 16;            // query tokens per workgroup (one WMMA row tile)
+constexpr int kFaKeys = 32;              // keys per tile (16: slower, 64: over the LDS)
+constexpr int kFaSt = kFaKeys / 16;      // 16-key WMMA tiles per key tile
+constexpr int kFaThreads = 32 * kGqaGroup;
+constexpr int kFaKLd = kGqaHd + 8;       // Ks row stride (halves): conflict-free 16-lane reads
+constexpr int kFaVLd = kFaKeys + 8;      // Vt row stride
+constexpr int kFaPLd = kFaKeys + 8;      // Ps row stride
+
+// Dimensions [16c, 16c + 16) of the V row of position p (dequantized; inside
+// the FP16 window: the exact copy).
+template <bool Q8>
+__device__ inline void gqa_load_v16(const KvArgs & kv, const long long p, const long long kvh,
+                                    const long long nkv, const int c, const long long seq,
+                                    float * v) {
+    const long long row = p * nkv + kvh;
+    if constexpr (Q8) {
+        if (kv.v16 != nullptr && p + kv.window >= seq) {
+            const uint4 * src = reinterpret_cast<const uint4 *>(
+                kv.v16 + ((p % kv.window) * nkv + kvh) * kGqaHd + c * 16);
+            uint4 h[2] = {src[0], src[1]};
+            const __half * hv = reinterpret_cast<const __half *>(h);
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                v[i] = __half2float(hv[i]);
+            }
+            return;
+        }
+        // byte j of block b holds dims 32b + j (low nibble) and 32b + 16 + j (high)
+        const float sc = __half2float(kv.v_scales[row * (kGqaHd / kKvBlock) + c / 2]);
+        const uint4 b4 = *reinterpret_cast<const uint4 *>(kv.v_q4 + row * (kGqaHd / 2) +
+                                                          (c / 2) * (kKvBlock / 2));
+        const uint8_t * bv4 = reinterpret_cast<const uint8_t *>(&b4);
+        const int sh = (c & 1) ? 4 : 0;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            v[i] = (float) ((int) ((bv4[i] >> sh) & 0xF) - 8) * sc;
+        }
+    } else {
+        const float4 * src = reinterpret_cast<const float4 *>(kv.v_f32 + row * kGqaHd + c * 16);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float4 f = src[i];
+            v[4 * i] = f.x;
+            v[4 * i + 1] = f.y;
+            v[4 * i + 2] = f.z;
+            v[4 * i + 3] = f.w;
+        }
+    }
+}
+
+// xor-shuffles within the 16 lanes of a row through DPP (row_xmask): the
+// ds_bpermute of __shfl_xor serialized the softmax on LDS round trips (#97).
+template <int Mask>
+__device__ inline float row_xor(const float x) {
+    return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), 0x160 | Mask, 0xF, 0xF,
+                                                   false));
+}
+__device__ inline float row_max16(float x) {
+    x = fmaxf(x, row_xor<1>(x));
+    x = fmaxf(x, row_xor<2>(x));
+    x = fmaxf(x, row_xor<4>(x));
+    return fmaxf(x, row_xor<8>(x));
+}
+__device__ inline float row_sum16(float x) {
+    x += row_xor<1>(x);
+    x += row_xor<2>(x);
+    x += row_xor<4>(x);
+    return x + row_xor<8>(x);
+}
+
+// grid: (ceil(tokens / 16), nkv); 192 threads. Scores are in log2 units (q is
+// prescaled by scale * log2(e)): with one split the merge only divides by l.
+template <bool Q8>
+__global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
+    const float * __restrict__ q, const KvArgs kv, float * __restrict__ work,
+    const long long tokens, const long long seq, const int nh, const int nkv,
+    const float scale) {
+    __shared__ _Float16 ks[kFaKeys * kFaKLd];
+    __shared__ _Float16 vt[kGqaHd * kFaVLd];
+    __shared__ _Float16 ps[kGqaGroup][kFaTokens * kFaPLd];
+    const int tid = (int) threadIdx.x;
+    const int lane = tid & 31;
+    const int g = tid >> 5;
+    const int kvh = (int) blockIdx.y;
+    const int h = kvh * kGqaGroup + g;
+    const long long t0 = (long long) blockIdx.x * kFaTokens;
+    const int nt = (int) (tokens - t0 < kFaTokens ? tokens - t0 : kFaTokens);
+    const long long qpos0 = seq - tokens + t0;  // cache position of the tile's first query
+
+    // q as 16 A operands (k16 steps over the 256 dims): lane -> token lane % 16,
+    // dims (lane / 16) * 8 .. + 7 of each step; prescaled, rows past the end 0
+    wmma_half8 qa[kGqaHd / 16];
+    {
+        const int r = lane & 15;
+        const bool in = r < nt;
+        const float * qr = q + ((t0 + (in ? r : 0)) * nh + h) * kGqaHd + (lane >> 4) * 8;
+#pragma unroll
+        for (int s = 0; s < kGqaHd / 16; ++s) {
+            const float4 a = *reinterpret_cast<const float4 *>(qr + s * 16);
+            const float4 b = *reinterpret_cast<const float4 *>(qr + s * 16 + 4);
+            const float f = in ? scale * 1.44269504088896341f : 0.0f;
+            qa[s] = wmma_half8{(_Float16) (a.x * f), (_Float16) (a.y * f), (_Float16) (a.z * f),
+                               (_Float16) (a.w * f), (_Float16) (b.x * f), (_Float16) (b.y * f),
+                               (_Float16) (b.z * f), (_Float16) (b.w * f)};
+        }
+    }
+    // O: 16 dim tiles; lane -> dim lane % 16 of the tile, rows (lane / 16) * 8 + v
+    wmma_float8 o[kGqaHd / 16];
+#pragma unroll
+    for (int j = 0; j < kGqaHd / 16; ++j) {
+        o[j] = wmma_float8{};
+    }
+    // running max / sum of rows (lane / 16) * 8 + v, the same in the 16 lanes of a half
+    float m_run[8];
+    float l_run[8];
+#pragma unroll
+    for (int v = 0; v < 8; ++v) {
+        m_run[v] = -INFINITY;
+        l_run[v] = 0.0f;
+    }
+    const long long n_keys = qpos0 + nt;  // keys up to the tile's last query
+    const long long n_tiles = (n_keys + kFaKeys - 1) / kFaKeys;
+    _Float16 * pw = ps[g];
+    for (long long kt = 0; kt < n_tiles; ++kt) {
+        const long long s0 = kt * kFaKeys;
+        // K and V of keys s0 .. s0 + 31 into LDS as f16 (positions past n_keys: 0)
+        __syncthreads();  // the previous tile is consumed
+        // (one 16-dim chunk of one key per job; K and V in separate passes keep
+        // the staging registers down)
+        for (int job = tid; job < kFaKeys * (kGqaHd / 16); job += kFaThreads) {
+            const int key = job / (kGqaHd / 16);
+            const int c = job % (kGqaHd / 16);
+            float kc[16];
+            if (s0 + key < n_keys) {
+                gqa_load_k16<Q8>(kv, s0 + key, kvh, nkv, c, seq, kc);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    kc[i] = 0.0f;
+                }
+            }
+            wmma_half8 k0;
+            wmma_half8 k1;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                k0[i] = (_Float16) kc[i];
+                k1[i] = (_Float16) kc[8 + i];
+            }
+            *reinterpret_cast<wmma_half8 *>(&ks[key * kFaKLd + c * 16]) = k0;
+            *reinterpret_cast<wmma_half8 *>(&ks[key * kFaKLd + c * 16 + 8]) = k1;
+        }
+        for (int job = tid; job < kFaKeys * (kGqaHd / 16); job += kFaThreads) {
+            const int key = job / (kGqaHd / 16);
+            const int c = job % (kGqaHd / 16);
+            float vc[16];
+            if (s0 + key < n_keys) {
+                gqa_load_v16<Q8>(kv, s0 + key, kvh, nkv, c, seq, vc);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    vc[i] = 0.0f;
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                vt[(c * 16 + i) * kFaVLd + key] = (_Float16) vc[i];
+            }
+        }
+        __syncthreads();
+        // S (16 x 32) = q k^T, two key tiles; lane -> key lane % 16, rows (lane / 16) * 8 + v
+        wmma_float8 sc[kFaSt];
+#pragma unroll
+        for (int jt = 0; jt < kFaSt; ++jt) {
+            sc[jt] = wmma_float8{};
+        }
+#pragma unroll
+        for (int s = 0; s < kGqaHd / 16; ++s) {
+#pragma unroll
+            for (int jt = 0; jt < kFaSt; ++jt) {
+                const wmma_half8 kb = *reinterpret_cast<const wmma_half8 *>(
+                    &ks[(jt * 16 + (lane & 15)) * kFaKLd + s * 16 + (lane >> 4) * 8]);
+                sc[jt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(qa[s], kb, sc[jt]);
+            }
+        }
+        // causal mask and the online softmax of this lane's 8 rows
+        float corr[8];
+#pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            const int r = (lane >> 4) * 8 + v;
+            const long long qpos = qpos0 + r;
+            float x[kFaSt];
+#pragma unroll
+            for (int jt = 0; jt < kFaSt; ++jt) {
+                const long long key = s0 + jt * 16 + (lane & 15);
+                x[jt] = (r < nt && key <= qpos) ? sc[jt][v] : -INFINITY;
+            }
+            float mx = x[0];
+#pragma unroll
+            for (int jt = 1; jt < kFaSt; ++jt) {
+                mx = fmaxf(mx, x[jt]);
+            }
+            mx = row_max16(mx);
+            const float m_new = fmaxf(m_run[v], mx);
+            // branch-free: a row with no key yet (or a padding row) keeps m = -inf,
+            // corr = 1 and weights 0
+            const bool none = m_new == -INFINITY;
+            const float m_use = none ? 0.0f : m_new;
+            corr[v] = none ? 1.0f : exp2f(m_run[v] - m_use);
+            float sum = 0.0f;
+#pragma unroll
+            for (int jt = 0; jt < kFaSt; ++jt) {
+                const float w = exp2f(x[jt] - m_use);  // exp2(-inf) = 0
+                sc[jt][v] = w;
+                sum += w;
+            }
+            sum = row_sum16(sum);
+            l_run[v] = l_run[v] * corr[v] + sum;
+            m_run[v] = m_new;
+        }
+        // P to the A layout through this wave's LDS: row r, keys contiguous
+#pragma unroll
+        for (int jt = 0; jt < kFaSt; ++jt) {
+#pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                pw[((lane >> 4) * 8 + v) * kFaPLd + jt * 16 + (lane & 15)] = (_Float16) sc[jt][v];
+            }
+        }
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+#pragma unroll
+        for (int j = 0; j < kGqaHd / 16; ++j) {
+#pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                o[j][v] *= corr[v];
+            }
+        }
+#pragma unroll
+        for (int s = 0; s < kFaKeys / 16; ++s) {
+            const wmma_half8 pa = *reinterpret_cast<const wmma_half8 *>(
+                &pw[(lane & 15) * kFaPLd + s * 16 + (lane >> 4) * 8]);
+#pragma unroll
+            for (int j = 0; j < kGqaHd / 16; ++j) {
+                const wmma_half8 vb = *reinterpret_cast<const wmma_half8 *>(
+                    &vt[(j * 16 + (lane & 15)) * kFaVLd + s * 16 + (lane >> 4) * 8]);
+                o[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pa, vb, o[j]);
+            }
+        }
+    }
+    // the partial of each (token, head), splits = 1: m, l, acc[hd]
+#pragma unroll
+    for (int v = 0; v < 8; ++v) {
+        const int r = (lane >> 4) * 8 + v;
+        if (r < nt) {
+            float * dst = work + ((t0 + r) * nh + h) * (kGqaHd + 2);
+#pragma unroll
+            for (int j = 0; j < kGqaHd / 16; ++j) {
+                dst[2 + j * 16 + (lane & 15)] = o[j][v];
+            }
+            if ((lane & 15) == 0) {
+                dst[0] = m_run[v];
+                dst[1] = l_run[v];
+            }
+        }
+    }
+}
+
 // grid: (tokens, nh); 256 threads. Merges the splits in order, then un-rotates V
 // (Q8/Q4 cache: stored rotated, H symmetric, before the elementwise gate) and
 // applies the gate.
@@ -558,7 +839,8 @@ size_t attention_gqa_work_bytes(const int64_t max_tokens, const int64_t nh, cons
 bool attention_gqa(const float * q, const KvCache & kv, const float * gate, float * out,
                    const int64_t tokens, const int64_t seq, const int64_t nh, const int64_t nkv,
                    const int64_t hd, const float scale, const bool v_rotated, void * work,
-                   const size_t work_bytes, hipStream_t stream, void * out_f16) {
+                   const size_t work_bytes, hipStream_t stream, void * out_f16,
+                   const bool allow_wmma) {
     const bool q8 = kv.k_q8 != nullptr;
     if (q == nullptr || (out == nullptr && out_f16 == nullptr) || work == nullptr || tokens <= 0 || seq < tokens ||
         nh <= 0 || nkv <= 0 || nh / nkv != kGqaGroup || nh % nkv != 0 || hd != kGqaHd) {
@@ -569,8 +851,9 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
            : (kv.k_f32 == nullptr || kv.v_f32 == nullptr)) {
         return false;
     }
+    const bool fa = allow_wmma && tokens >= kFaTokens;
     long long bps = 0;
-    const int splits = gqa_splits(tokens, seq, nkv, bps);
+    const int splits = fa ? 1 : gqa_splits(tokens, seq, nkv, bps);
     if ((size_t) tokens * nh * splits * (hd + 2) * sizeof(float) > work_bytes) {
         return false;
     }
@@ -584,9 +867,22 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
                       static_cast<const __half *>(kv.v16),
                       kv.window > 0 ? kv.window : 1,
                       kv.k_q4};
+    auto * w = static_cast<float *>(work);
+    if (fa) {
+        const dim3 fgrid((unsigned) ((tokens + kFaTokens - 1) / kFaTokens), (unsigned) nkv);
+        if (q8) {
+            attention_wmma_kernel<true><<<fgrid, kFaThreads, 0, stream>>>(q, args, w, tokens, seq,
+                                                                         (int) nh, (int) nkv, scale);
+        } else {
+            attention_wmma_kernel<false><<<fgrid, kFaThreads, 0, stream>>>(
+                q, args, w, tokens, seq, (int) nh, (int) nkv, scale);
+        }
+        attention_gqa_merge_kernel<<<dim3((unsigned) tokens, (unsigned) nh), kGqaHd, 0, stream>>>(
+            w, gate, out, static_cast<__half *>(out_f16), (int) nh, 1, v_rotated);
+        return hipGetLastError() == hipSuccess;
+    }
     const int tq = gqa_tq(tokens);
     const dim3 grid((unsigned) ((tokens + tq - 1) / tq), (unsigned) nkv, (unsigned) splits);
-    auto * w = static_cast<float *>(work);
 #define OMPH_GQA_LAUNCH(Q8, TQ)                                                              \
     attention_gqa_kernel<Q8, TQ><<<grid, kGqaHd, 0, stream>>>(q, args, w, tokens, seq, (int) nh, \
                                                               (int) nkv, scale, splits, bps)
