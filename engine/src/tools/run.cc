@@ -184,17 +184,28 @@ public:
             std::vector<Place> places;
             size_t total = 0;
             for (const omph::gguf::TensorInfo & t : file_.tensors()) {
+                // The MTP block (blk.<n_layer>.*) is not run until M6 (#92).
+                if (!in_stack(t.name)) {
+                    continue;
+                }
+                // The token embedding is a row gather, not a matmul: it stays in
+                // pinned host memory and the dequant kernel reads the one row a
+                // token needs (10 KB at IQ2_S) over PCIe, which keeps 388 MiB out
+                // of VRAM (#92).
+                if (t.name == "token_embd.weight") {
+                    if (hipHostMalloc(&embd_host_, (size_t) t.nbytes) != hipSuccess) {
+                        throw std::runtime_error("cannot allocate the host embedding");
+                    }
+                    std::memcpy(embd_host_, file_.tensor_data(t), (size_t) t.nbytes);
+                    continue;
+                }
                 Place p;
                 p.name = t.name;
                 p.off = total;
                 const int64_t bb = omph::format::quant_block_bytes(t.type);
-                // The token embedding is a row gather, not a matmul: keep its raw
-                // bytes in the image so the per-token lookup never stages 388 MiB
-                // over PCIe.
-                const bool embed = t.name == "token_embd.weight";
                 // Sized from the layout: the repack itself runs once, at upload.
                 const int64_t packed_bytes =
-                    use_gemv_ && !embed && bb > 0 && t.nbytes % (uint64_t) bb == 0
+                    use_gemv_ && bb > 0 && t.nbytes % (uint64_t) bb == 0
                         ? omph::format::repacked_bytes(t.type, (int64_t) (t.nbytes / (uint64_t) bb))
                         : 0;
                 if (packed_bytes > 0) {
@@ -250,7 +261,7 @@ public:
             std::unordered_map<std::string, size_t> per_layer;
             for (const omph::gguf::TensorInfo & t : file_.tensors()) {
                 if (t.ne.size() < 2 || t.type == 0 || gems_.count(t.name) != 0 ||
-                    t.name.rfind("blk.", 0) != 0) {
+                    t.name.rfind("blk.", 0) != 0 || !in_stack(t.name)) {
                     continue;  // f32 vectors, GEMV tensors, embedding / head
                 }
                 const std::string layer = t.name.substr(0, t.name.find('.', 4));
@@ -347,16 +358,27 @@ public:
         attn_work_bytes_ = omph::kernels::attention_gqa_work_bytes(T, h_.n_head, h_.n_head_kv,
                                                                    h_.head_dim);
         alloc(&attn_work_, attn_work_bytes_);
+        // Delta-net state + the two conv tails, for the recurrent layers only
+        // (the attention layers have none), in one allocation (#92).
         conv_flip_.assign((size_t) h_.n_layer, 0);
-        for (int64_t il = 0; il < h_.n_layer; ++il) {
-            void * st = nullptr;
+        {
             const int64_t n_state = h_.ssm_n_vh * h_.ssm_s * h_.ssm_s;
             const int64_t n_conv = (h_.ssm_conv_k - 1) * ssm_channels;
-            if (hipMalloc(&st, (n_state + 2 * n_conv) * 4) != hipSuccess ||
-                hipMemset(st, 0, (n_state + 2 * n_conv) * 4) != hipSuccess) {
-                throw std::runtime_error("out of VRAM (state)");
+            const size_t per_layer = (((size_t) (n_state + 2 * n_conv) * 4) + 255) & ~(size_t) 255;
+            const size_t n_rec = (size_t) std::count(kv_index_.begin(), kv_index_.end(), -1);
+            alloc(&state_pool_, std::max<size_t>(n_rec, 1) * per_layer);
+            if (hipMemset(state_pool_, 0, std::max<size_t>(n_rec, 1) * per_layer) != hipSuccess) {
+                throw std::runtime_error("cannot clear the delta-net state");
             }
-            states_.push_back(st);
+            size_t at = 0;
+            for (int64_t il = 0; il < h_.n_layer; ++il) {
+                if (kv_index_[il] >= 0) {
+                    states_.push_back(nullptr);
+                    continue;
+                }
+                states_.push_back(static_cast<uint8_t *>(state_pool_) + at);
+                at += per_layer;
+            }
         }
         if (std::getenv("OMPH_TIMING") != nullptr) {
             size_t free_b = 0;
@@ -377,6 +399,12 @@ public:
         }
         if (dev_weights_ != nullptr) {
             (void) hipFree(dev_weights_);
+        }
+        if (embd_host_ != nullptr) {
+            (void) hipHostFree(embd_host_);
+        }
+        if (state_pool_ != nullptr) {
+            (void) hipFree(state_pool_);
         }
     }
 
@@ -400,13 +428,14 @@ public:
         }
         const int64_t ne = h_.n_embd;
 
-        // token embeddings, one row at a time (the table is quantized)
+        // token embeddings, one row at a time (the table is quantized and lives
+        // in pinned host memory: the kernel reads the row over PCIe)
         const omph::gguf::TensorInfo * te = file_.tensor("token_embd.weight");
-        if (te == nullptr) return fail("token_embd.weight missing");
+        if (te == nullptr || embd_host_ == nullptr) return fail("token_embd.weight missing");
         const int64_t row_bytes = (int64_t) (te->nbytes / te->ne[1]);
         for (int64_t t = 0; t < T; ++t) {
             const uint8_t * src =
-                static_cast<const uint8_t *>(raw_bytes(te->name)) + (size_t) toks[t] * row_bytes;
+                static_cast<const uint8_t *>(embd_host_) + (size_t) toks[t] * row_bytes;
             if (!omph::kernels::dequantize(te->type, src,
                                            static_cast<uint8_t *>(x_) + t * ne * 4, ne, false,
                                            nullptr)) {
@@ -693,6 +722,14 @@ private:
         std::fprintf(stderr, "%s%s%s\n", msg, err != hipSuccess ? ": " : "",
                      err != hipSuccess ? hipGetErrorString(err) : "");
         return false;
+    }
+
+    // False for the tensors of the blocks past the stack (the MTP block).
+    bool in_stack(const std::string & name) const {
+        if (name.rfind("blk.", 0) != 0) {
+            return true;
+        }
+        return std::atoll(name.c_str() + 4) < h_.n_layer;
     }
 
     static HParams read_hparams(const omph::gguf::File & f) {
@@ -1251,7 +1288,9 @@ private:
     std::unordered_map<std::string, size_t> off_;
     std::unordered_map<std::string, GemvEntry> gems_;
     Scratch scratch_;
-    std::vector<void *> states_;
+    std::vector<void *> states_;  // per layer, into state_pool_; null for attention
+    void * state_pool_ = nullptr;
+    void * embd_host_ = nullptr;   // token_embd, raw GGUF bytes, pinned host memory
     bool last_logits_only_ = false;
     std::vector<int64_t> kv_index_;
     std::vector<char> conv_flip_;

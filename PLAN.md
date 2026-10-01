@@ -881,9 +881,10 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 
 ### 16.6 VRAM-specific
 
-- `token_embd` in host pinned RAM (if untied).
+- `token_embd` in host pinned RAM (if untied). **Done (#92)**: the dequant kernel reads the row over PCIe; −388 MiB, decode step unchanged.
 - Vision on CPU.
-- MTP section loaded only when used.
+- MTP section loaded only when used. **Done for now (#92)**: `blk.<n_layer>.*` is not uploaded; M6 gates it behind the MTP option.
+- DeltaNet state allocated for the 48 recurrent layers only (#92).
 - **Prompt-prefix cache in host RAM**: store quantized KV + DeltaNet state checkpoint at the end of a system prompt / common prefix; restore with an upload (PCIe 5.0) instead of re-running prefill.
 - Preallocated arena → no fragmentation, predictable peak.
 - Extreme option (slow): offload old KV blocks to host RAM for very long contexts.
