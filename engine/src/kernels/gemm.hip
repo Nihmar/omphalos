@@ -174,21 +174,23 @@ __global__ __launch_bounds__(kThreads) void gemm_f16_kernel(
 // bit-identical to dequantizing to f16 and calling gemm_f16. No f16 copy of
 // W is written anywhere (the round trip through the cache cost ~23 % of a
 // 512-token prefill, #135 / #140).
-template <class Dec>
+template <class Dec, int BN>
 __global__ __launch_bounds__(kThreads) void gemm_q_kernel(
     const Dec dec, const _Float16 * __restrict__ x, float * __restrict__ y, const int n_out,
     const int k, const int tokens, const long long ldy) {
     static_assert(kBM * kBK / 32 == kThreads, "one sub-block per thread per k-step");
     // (the codebooks stay in global memory: an LDS copy measured slower, #141)
     __shared__ _Float16 as[kBM * kLDK];
-    __shared__ _Float16 bs[kBN * kLDK];
+    constexpr int TN = BN / kWN / 16;
+    constexpr int BCh = BN * kChunks / kThreads;
+    __shared__ _Float16 bs[BN * kLDK];
     const int tid = (int) threadIdx.x;
     const int lane = tid & 31;
     const int wave = tid >> 5;
     const int wm = wave % kWM;
     const int wn = wave / kWM;
     const int m0 = (int) blockIdx.y * kBM;
-    const int n0 = (int) blockIdx.x * kBN;
+    const int n0 = (int) blockIdx.x * BN;
 
     // this thread's W row and sub-block slot
     const int ar = tid >> 1;
@@ -216,12 +218,12 @@ __global__ __launch_bounds__(kThreads) void gemm_q_kernel(
     };
 
     // x as in gemm_f16_kernel
-    uint4 rb[kBCh];
-    const _Float16 * xp[kBCh];
-    unsigned bm[kBCh];
-    int bo[kBCh];
+    uint4 rb[BCh];
+    const _Float16 * xp[BCh];
+    unsigned bm[BCh];
+    int bo[BCh];
 #pragma unroll
-    for (int i = 0; i < kBCh; ++i) {
+    for (int i = 0; i < BCh; ++i) {
         const int c = tid + i * kThreads;
         const int r = c / kChunks;
         const int q = c % kChunks;
@@ -230,11 +232,11 @@ __global__ __launch_bounds__(kThreads) void gemm_q_kernel(
         xp[i] = x + (long long) (in ? n0 + r : 0) * k + q * 8;
         bo[i] = r * kLDK + q * 8;
     }
-    float8 acc[kTM][kTN];
+    float8 acc[kTM][TN];
 #pragma unroll
     for (int i = 0; i < kTM; ++i) {
 #pragma unroll
-        for (int j = 0; j < kTN; ++j) {
+        for (int j = 0; j < TN; ++j) {
             acc[i][j] = float8{};
         }
     }
@@ -256,21 +258,21 @@ __global__ __launch_bounds__(kThreads) void gemm_q_kernel(
 #pragma unroll 1
         for (int kk = 0; kk < kBK; kk += 16) {
             half8 a[kTM];
-            half8 b[kTN];
+            half8 b[TN];
 #pragma unroll
             for (int i = 0; i < kTM; ++i) {
                 a[i] = *reinterpret_cast<const half8 *>(
                     &as[(wm * kTM * 16 + i * 16 + (lane & 15)) * kLDK + kk + (lane >> 4) * 8]);
             }
 #pragma unroll
-            for (int j = 0; j < kTN; ++j) {
+            for (int j = 0; j < TN; ++j) {
                 b[j] = *reinterpret_cast<const half8 *>(
-                    &bs[(wn * kTN * 16 + j * 16 + (lane & 15)) * kLDK + kk + (lane >> 4) * 8]);
+                    &bs[(wn * TN * 16 + j * 16 + (lane & 15)) * kLDK + kk + (lane >> 4) * 8]);
             }
 #pragma unroll
             for (int i = 0; i < kTM; ++i) {
 #pragma unroll
-                for (int j = 0; j < kTN; ++j) {
+                for (int j = 0; j < TN; ++j) {
                     acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a[i], b[j],
                                                                                  acc[i][j]);
                 }
@@ -287,8 +289,8 @@ __global__ __launch_bounds__(kThreads) void gemm_q_kernel(
     for (int i = 0; i < kTM; ++i) {
         const int r = m0 + wm * kTM * 16 + i * 16 + (lane >> 4) * 8;
 #pragma unroll
-        for (int j = 0; j < kTN; ++j) {
-            const int t = n0 + wn * kTN * 16 + j * 16 + (lane & 15);
+        for (int j = 0; j < TN; ++j) {
+            const int t = n0 + wn * TN * 16 + j * 16 + (lane & 15);
             if (t < tokens && r < n_out) {
                 float4 * dst = reinterpret_cast<float4 *>(y + t * ldy + r);
                 dst[0] = make_float4(acc[i][j][0], acc[i][j][1], acc[i][j][2], acc[i][j][3]);
@@ -328,11 +330,20 @@ bool gemm_q(const uint32_t type, const void * packed, const void * x, float * y,
     const auto * base = static_cast<const uint8_t *>(packed);
     const int64_t n_blocks = n_out * (k / 256);
     const long long blocks = k / 256;
-    const dim3 grid((unsigned) ((tokens + kBN - 1) / kBN), (unsigned) ((n_out + kBM - 1) / kBM));
+    // 256 tokens per block halves the decode work per FLOP (512 tokens: 625 ->
+    // 577 ms of prefill); up to 256 tokens the 128-wide tile keeps more blocks
+    // busy and wins (T = 256: 327 vs 335 ms, #141).
     const auto launch = [&](const auto dec) {
-        gemm_q_kernel<<<grid, kThreads, 0, stream>>>(dec, static_cast<const _Float16 *>(x), y,
-                                                      (int) n_out, (int) k, (int) tokens,
-                                                      (long long) ldy);
+        const auto * xh = static_cast<const _Float16 *>(x);
+        if (tokens > 256) {
+            const dim3 grid((unsigned) ((tokens + 255) / 256), (unsigned) ((n_out + kBM - 1) / kBM));
+            gemm_q_kernel<decltype(dec), 256><<<grid, kThreads, 0, stream>>>(
+                dec, xh, y, (int) n_out, (int) k, (int) tokens, (long long) ldy);
+        } else {
+            const dim3 grid((unsigned) ((tokens + 127) / 128), (unsigned) ((n_out + kBM - 1) / kBM));
+            gemm_q_kernel<decltype(dec), 128><<<grid, kThreads, 0, stream>>>(
+                dec, xh, y, (int) n_out, (int) k, (int) tokens, (long long) ldy);
+        }
     };
     switch (type) {
         case 21: launch(qd::DecIq3s::make(base, n_blocks, blocks)); break;
@@ -344,6 +355,7 @@ bool gemm_q(const uint32_t type, const void * packed, const void * x, float * y,
         case 12: launch(qd::DecQ4k::make(base, n_blocks, blocks)); break;
         case 10: launch(qd::DecQ2k::make(base, n_blocks, blocks)); break;
         case 14: launch(qd::DecQ6k::make(base, n_blocks, blocks)); break;
+        case 29: launch(qd::DecIq1m::make(base, n_blocks, blocks)); break;
         default: return false;
     }
     return hipGetLastError() == hipSuccess;

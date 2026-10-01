@@ -484,6 +484,59 @@ struct DecQ6k {  // GGUF type 14
     }
 };
 
+struct DecIq1m {  // GGUF type 29: the "repacked" layout is the GGUF blocks (56 bytes)
+    const uint8_t * base;
+    long long blocks;
+    struct Raw {
+        uint32_t qs4;  // qs[4 ib .. 4 ib + 3]
+        uint32_t qh2;  // qh[2 ib], qh[2 ib + 1]
+        uint2 sc;      // the 8 scale bytes (sc16[0..3])
+    };
+    static DecIq1m make(const uint8_t * b, const int64_t, const long long blocks) {
+        return {b, blocks};
+    }
+    __device__ Raw load(const long long row, const long long s) const {
+        const uint8_t * blk = base + (row * blocks + s / 8) * 56;
+        const int ib = (int) (s % 8);
+        Raw r;
+        r.qs4 = *reinterpret_cast<const uint32_t *>(blk + 4 * ib);
+        r.qh2 = *reinterpret_cast<const uint16_t *>(blk + 32 + 2 * ib);
+        r.sc = *reinterpret_cast<const uint2 *>(blk + 48);
+        return r;
+    }
+    // dequant_iq1_m_kernel's expressions, per weight, in its order
+    __device__ void decode(const Raw & r, const long long s, float (&v)[32]) const {
+        const int ib = (int) (s % 8);
+        const uint16_t sc16[4] = {(uint16_t) (r.sc.x & 0xFFFFu), (uint16_t) (r.sc.x >> 16),
+                                  (uint16_t) (r.sc.y & 0xFFFFu), (uint16_t) (r.sc.y >> 16)};
+        const uint16_t scale_u16 = (uint16_t) ((sc16[0] >> 12) | ((sc16[1] >> 8) & 0x00F0) |
+                                               ((sc16[2] >> 4) & 0x0F00) | (sc16[3] & 0xF000));
+        const float d = __half2float(__ushort_as_half(scale_u16));
+        const uint8_t qh_a = (uint8_t) (r.qh2 & 0xFFu);
+        const uint8_t qh_b = (uint8_t) (r.qh2 >> 8);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int sh = 6 * (ib % 2) + 3 * (l >> 1);
+            const float dl = d * (2.0f * (float) ((sc16[ib >> 1] >> sh) & 7) + 1.0f);
+            const int shift = ((l & 1) == 0) ? 8 : 4;
+            const uint8_t qh_sel = ((l >> 1) == 0) ? qh_a : qh_b;
+            const uint16_t idx =
+                (uint16_t) (((r.qs4 >> (8 * l)) & 0xFFu) | ((qh_sel << shift) & 0x700));
+            const bool neg = l == 0   ? (qh_a & 0x08) != 0
+                             : l == 1 ? (qh_a & 0x80) != 0
+                             : l == 2 ? (qh_b & 0x08) != 0
+                                      : (qh_b & 0x80) != 0;
+            const float delta = neg ? -0.125f : 0.125f;
+            const uint64_t grid = omph::quant::kIq1sGrid[idx];
+#pragma unroll
+            for (int jj = 0; jj < 8; ++jj) {
+                const int8_t g = (int8_t) ((grid >> (8 * jj)) & 0xFF);
+                v[l * 8 + jj] = dl * ((float) g + delta);
+            }
+        }
+    }
+};
+
 // 32 weights as 16 packed half2 words (RNE, as __float2half), in order.
 __device__ inline void pack32(const float (&v)[32], uint4 (&o)[4]) {
 #pragma unroll

@@ -359,7 +359,7 @@ private:
     size_t head16_bytes_ = 0;
     std::map<std::string, void *> f16_cache_;  // into mem_
     size_t scratch_bytes_ = 0;    // the largest f16 weight slice (stage_rows)
-    bool scratch_ready_ = false;  // allocated (at load without --gemv, else on first use)
+    bool scratch_ready_ = false;  // allocated on first use (a weight without a decoder, #141)
     int64_t gemm_min_ = 0;        // tokens from which a --gemv runner uses the GEMM path
     int64_t key_chunk_ = 0;       // attention keys per split, fixed for the run (#136)
 };
