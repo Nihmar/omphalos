@@ -10,12 +10,12 @@ usage: uv run python check_gpu_linear.py <model.gguf> <weight-tensor> [--tokens 
 from __future__ import annotations
 
 import argparse
-import subprocess
 import tempfile
 from pathlib import Path
 
 import numpy as np
 
+from omphalos_tools.golden import run_tool
 from omphalos_tools.model import Model
 
 
@@ -41,10 +41,8 @@ def main() -> None:
         in_path = Path(tmp) / "x.f32"
         out_path = Path(tmp) / "y.f32"
         x.tofile(in_path)
-        subprocess.run(
-            [args.tool, args.model, args.weight, str(in_path), str(out_path), str(args.tokens)],
-            check=True, capture_output=True,
-        )
+        run_tool([args.tool, args.model, args.weight, str(in_path), str(out_path),
+                  str(args.tokens)])
         y = np.fromfile(out_path, dtype=np.float32).reshape(args.tokens, out_features)
 
     diff = np.abs(y - ref)
