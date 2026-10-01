@@ -711,10 +711,11 @@ Details:
 
 ### 12.7 Rollback — the hybrid-architecture problem
 
-- Full-attention KV: rollback = truncate the KV length (trivial).
-- **DeltaNet recurrent state cannot be "un-applied".** Options:
-  - **Snapshot per position** (preferred): k+1 copies of all recurrent states + conv tails, written during verification; on acceptance of j tokens, select snapshot j (pointer swap / index in device memory). Memory = (k+1) × total state size **[verify]** — size it from real dims; fine for k = 2–3.
-  - **Checkpoint + replay:** save state before verification; on partial acceptance, re-run only accepted tokens through the DeltaNet layers. Less memory, extra small pass.
+- Full-attention KV: rollback = truncate the KV length — true for the Q8/Q4 and f32 caches (rows past the kept length are rewritten before they are read), **not** for the FP16 ring: a verification overwrites the slots of positions `seq − window ..`, still inside the window after a rollback. **Done (#122, #98):** the k+1 slots a verification writes are saved before it and those of the rejected positions restored.
+- **DeltaNet recurrent state cannot be "un-applied".** Options considered:
+  - Snapshot per position: k+1 copies of all recurrent states (151 MB each with the real dims), i.e. +604 MB at k = 3 — rejected for VRAM.
+  - Checkpoint + replay through the DeltaNet layers: re-runs the projections.
+  - **Chosen (#104, done in #122): two state buffers + rank-1 replay.** The verification reads A and writes B; every token records its rank-1 factors (decay, normalized k, d: ~33 KB per token per layer) and the first one the conv input history. All accepted → swap A/B; j accepted → a replay kernel applies `S ← decay·S; S ← S + k dᵀ` to A for the j tokens with `gdn_step`'s float operations in its order, **bit-exact** (checked on every layer by `OMPH_SPEC_CHECK=1`), and the conv tail is rebuilt from the history. +151 MB, one state read + write only on a partial acceptance.
 - MTP layer KV: after verification, write entries for accepted positions using the **true** `h` from the verification pass (not the draft-time hidden states).
 - Image positions: the "next token embedding" input of the MTP head at image positions is not a vocabulary embedding → check how the reference handles it, or simply skip image positions in the MTP shadow pass if acceptance does not suffer.
 

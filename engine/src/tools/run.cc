@@ -68,6 +68,9 @@ int main(int argc, char ** argv) {
     int64_t logits_tail = 0;
     int64_t generate = 0;
     bool use_gemv = false;
+    std::string oracle_path;   // --draft-oracle: drafts from a token file (#122)
+    int64_t draft_k = 3;
+    int64_t draft_corrupt = 0;  // corrupt every N-th draft (0: never)
     // A flag's numeric value: a whole non-negative number or nothing.
     const auto count = [](const char * s, int64_t & out) {
         char * end = nullptr;
@@ -91,6 +94,12 @@ int main(int argc, char ** argv) {
             use_gemv = true;
         } else if (std::strcmp(argv[i], "--gen-out") == 0 && has_value) {
             gen_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--draft-oracle") == 0 && has_value) {
+            oracle_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--draft-k") == 0 && has_value) {
+            if (!count(argv[++i], draft_k) || draft_k < 1) return usage();
+        } else if (std::strcmp(argv[i], "--draft-corrupt") == 0 && has_value) {
+            if (!count(argv[++i], draft_corrupt)) return usage();
         } else {
             std::fprintf(stderr, "unknown option or missing value: %s\n", argv[i]);
             return usage();
@@ -147,7 +156,21 @@ int main(int argc, char ** argv) {
             return 2;
         }
         const omph::runtime::EnvOptions env = omph::runtime::EnvOptions::from_env();
-        omph::model::Runner runner(model, act_chunk, use_gemv && generate > 0, env, last_logits, total_len);
+        omph::model::Runner runner(model, act_chunk, use_gemv && generate > 0, env, last_logits,
+                                   total_len);
+        std::vector<int32_t> oracle;
+        if (!oracle_path.empty()) {
+            std::ifstream in(oracle_path);
+            int64_t v = 0;
+            while (in >> v) {
+                oracle.push_back((int32_t) v);
+            }
+            if (oracle.empty() || generate == 0) {
+                std::fprintf(stderr, "--draft-oracle needs a token file and --generate\n");
+                return 2;
+            }
+            runner.enable_speculation(draft_k + 1);
+        }
         const omph::model::HParams & h = runner.hparams();
         // An id past the vocabulary would index the embedding out of bounds.
         for (const int32_t t : toks) {
@@ -201,7 +224,65 @@ int main(int argc, char ** argv) {
             const bool host_argmax = env.host_argmax;
             std::vector<int32_t> gen;
             int32_t next = argmax(logits.data() + (logits.size() - h.n_vocab));
-            for (int64_t i = 0; i < generate; ++i) {
+            if (!oracle.empty()) {
+                // Speculative greedy decode with oracle drafts (#122): the drafts
+                // for generated token g are oracle[g ..], every draft_corrupt-th
+                // one deliberately wrong. Each step verifies [next, drafts] in one
+                // forward, keeps the drafts that match the verifier's own greedy
+                // tokens plus the verifier's next one, and rolls back the rest.
+                // The output must equal the plain greedy decode's.
+                int64_t pos = (int64_t) toks.size();
+                int64_t n_drafted = 0;
+                int64_t n_accepted = 0;
+                int64_t n_steps = 0;
+                const double t0 = omph::runtime::now_ms();
+                while (true) {
+                    gen.push_back(next);
+                    if ((int64_t) gen.size() >= generate) {
+                        break;
+                    }
+                    std::vector<int32_t> batch{next};
+                    for (int64_t j = 0; j < draft_k; ++j) {
+                        const size_t g = gen.size() + (size_t) j;
+                        if (g >= oracle.size()) {
+                            break;
+                        }
+                        ++n_drafted;
+                        int32_t d = oracle[g];
+                        if (draft_corrupt > 0 && n_drafted % draft_corrupt == 0) {
+                            d = (int32_t) ((d + 1) % h.n_vocab);
+                        }
+                        batch.push_back(d);
+                    }
+                    std::vector<int32_t> am;
+                    if (!runner.verify(batch, pos, am)) {
+                        return 1;
+                    }
+                    int64_t a = 0;
+                    while (a + 1 < (int64_t) batch.size() && batch[(size_t) a + 1] == am[(size_t) a]) {
+                        ++a;
+                    }
+                    if (!runner.commit(a + 1)) {
+                        return 1;
+                    }
+                    ++n_steps;
+                    n_accepted += a;
+                    for (int64_t j = 0; j < a && (int64_t) gen.size() < generate; ++j) {
+                        gen.push_back(batch[(size_t) j + 1]);
+                    }
+                    if ((int64_t) gen.size() >= generate) {
+                        break;
+                    }
+                    next = am[(size_t) a];
+                    pos += a + 1;
+                }
+                std::fprintf(stderr,
+                             "speculative: %lld steps, %lld / %lld drafts accepted, %.2f ms "
+                             "per generated token\n",
+                             (long long) n_steps, (long long) n_accepted, (long long) n_drafted,
+                             (omph::runtime::now_ms() - t0) / (double) (gen.size() - 1));
+            }
+            for (int64_t i = (int64_t) gen.size(); i < generate; ++i) {
                 gen.push_back(next);
                 if (i + 1 == generate) {
                     break;
