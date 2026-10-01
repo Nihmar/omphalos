@@ -90,7 +90,10 @@ bool Runner::matmul(const Mat & m, const void * x16, float * y, const int64_t n_
                          m.name.c_str(), (unsigned) m.t->type, (long long) m.t->nbytes);
         }
     }
-    if (use_gemv_ && T > 1 && g != nullptr && g->rows == n_out && g->k == k) {
+    // Long multi-token runs (prefill chunks) take the GEMM path even with
+    // --gemv: past gemm_min_ tokens, dequantizing a weight once beats T / 4
+    // passes of the NT GEMVs over it (M8).
+    if (use_gemv_ && T > 1 && T < gemm_min_ && g != nullptr && g->rows == n_out && g->k == k) {
         // the ablations of the single-token path apply here too
         if (env_.skip_gemv ||
             (env_.skip_gemv_type >= 0 && (uint32_t) env_.skip_gemv_type == g->type)) {
@@ -143,11 +146,20 @@ bool Runner::matmul(const Mat & m, const void * x16, float * y, const int64_t n_
     if (env_.skip_stage) {
         return true;  // ablation only
     }
-    void * w = stage_w(m.name);
-    timer_gemm_.start();
-    const bool ok = linear_.run(w, x16, y, n_out, k, T);
-    timer_gemm_.stop(t_gemm_);
-    return ok;
+    // a weight over the scratch budget goes in slices of rows, each one's
+    // GEMM writing its columns of y
+    const int64_t rows = stage_rows(n_out, k);
+    for (int64_t r0 = 0; r0 < n_out; r0 += rows) {
+        const int64_t nr = std::min(rows, n_out - r0);
+        void * w = stage_w(m.name, r0, nr);
+        timer_gemm_.start();
+        const bool ok = linear_.run(w, x16, y + r0, nr, k, T, n_out);
+        timer_gemm_.stop(t_gemm_);
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace omph::model

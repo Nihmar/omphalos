@@ -18,6 +18,8 @@ struct EnvOptions {
 
     // --- decode paths (A/B switches)
     bool no_overlap = false;    // OMPH_NO_OVERLAP: no side stream for sibling GEMVs (#71)
+    int stage_mib = 8;          // OMPH_STAGE_MIB=N: f16 weight slices of ~N MiB (0: whole)
+    int gemm_min = 32;          // OMPH_GEMM_MIN=T: --gemv runs of T+ tokens take the GEMM path
     bool no_b4 = false;         // OMPH_NO_B4: no NT-token GEMVs (verification, --gemv prefill)
     bool no_bf16_gemv = false;  // OMPH_NO_BF16_GEMV: BF16 weights through the f16 path
     bool no_f16_cache = false;  // OMPH_NO_F16_CACHE: re-convert f16-path weights every call

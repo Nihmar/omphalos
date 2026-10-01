@@ -938,6 +938,8 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 
 Status: **M0-M5 are complete; M6 is functionally complete (#121).** Greedy speculative decoding with the model's MTP head (`--draft-mtp 3`): output identical to plain greedy; 18.9 ms/token on wikitext, 19.4 on prose, 24-25 on code / repetitive text, against 45.5 ms plain (1.8-2.4x). Rollback is bit-exact (A/B delta-net states + rank-1 replay, FP16-ring restore, #122), the MTP KV fill costs +1.1-1.5 % of a `--gemv` prefill, verifications run on NT-token GEMVs (#126). Not done: truncated-vocab drafts (measured, not worth it), adaptive k (k = 3 always best or tied), sampling (temperature > 0). Measurements: `bench/results/m6-speculative.txt`.
 
+M8 (fast prefill) in progress. #129: the decode configuration (`--gemv`) prefills runs of 32+ tokens on the dequant + hipBLASLt path, dequantizing straight from the repacked layouts (bit-identical to the GGUF bytes) in ~8 MiB row slices that stay in the Infinity Cache: 512 tokens 5.7 s -> 1.03 s (~500 t/s), bit-identical to the f16 path, decode unchanged. The f16 path: 1.28 -> 1.04 s and -805 MiB peak; `--gemv` peak +41 MiB (hipBLASLt's kernels); load 12.7 -> 1.6 s (parallel repack). Measurements: `bench/results/m8-gemv-prefill.txt`. Next: more delta-rule parallelism (#96), WMMA attention (#97), then a fused dequant + WMMA GEMM to remove the ~450 ms f16 round trip of the weights (and hipBLASLt's VRAM).
+
 Status: **M0-M5 are complete.** M5 (quantized KV, issues #43, #58-#61): K Q8 + V Q4
 with the Hadamard rotation and a 128-token FP16 window, 4.92x less KV VRAM (4.29 GB ->
 0.87 GB at 32k). Validated against the exact f32 KV (kept in host RAM for the purpose,

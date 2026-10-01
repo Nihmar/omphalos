@@ -19,6 +19,8 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <tuple>
 #include <vector>
 
 namespace omph::model {
@@ -76,7 +78,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
             const int64_t bb = omph::format::quant_block_bytes(t.type);
             // Sized from the layout: the repack itself runs once, at upload.
             const int64_t packed_bytes =
-                use_gemv_ && bb > 0 && t.nbytes % (uint64_t) bb == 0
+                bb > 0 && t.nbytes % (uint64_t) bb == 0
                     ? omph::format::repacked_bytes(t.type, (int64_t) (t.nbytes / (uint64_t) bb))
                     : 0;
             if (packed_bytes > 0) {
@@ -96,53 +98,89 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         }
         dev_weights_ = mem_.device(total, "cannot allocate the weight image");
         auto * base = static_cast<uint8_t *>(dev_weights_);
-        for (const Place & p : places) {
-            const omph::gguf::TensorInfo * t = file_.tensor(p.name);
-            const int64_t bb = omph::format::quant_block_bytes(t->type);
-            const bool repacked = gems_.count(p.name) != 0 && bb > 0;
-            std::vector<uint8_t> packed;
-            const void * src = file_.tensor_data(*t);
-            size_t bytes = (size_t) t->nbytes;
-            if (repacked) {
-                if (!omph::format::repack_any(t->type, src,
-                                              (int64_t) (t->nbytes / (uint64_t) bb), packed) ||
-                    packed.size() != gems_.at(p.name).bytes) {
+        // The host repack is the bulk of the load (~7 s of thread time): the
+        // tensors are independent, so worker threads repack the next batch of
+        // them (the biggest first) while this thread uploads the current one.
+        // Every HIP call stays on this thread: each thread that touches HIP
+        // keeps ~2 MiB of VRAM for good (#129).
+        std::sort(places.begin(), places.end(), [&](const Place & a, const Place & b) {
+            return file_.tensor(a.name)->nbytes > file_.tensor(b.name)->nbytes;
+        });
+        const size_t n_workers = std::max(1u, std::min(std::thread::hardware_concurrency(), 8u));
+        const size_t n_batches = (places.size() + n_workers - 1) / n_workers;
+        std::vector<std::vector<uint8_t>> packed(2 * n_workers);  // two batches in flight
+        std::vector<char> failed(2 * n_workers);
+        const auto repack_batch = [&](const size_t batch) {
+            std::vector<std::thread> workers;
+            for (size_t j = 0; j < n_workers && batch * n_workers + j < places.size(); ++j) {
+                workers.emplace_back([&, batch, j] {
+                    const size_t slot = (batch % 2) * n_workers + j;
+                    const omph::gguf::TensorInfo * t =
+                        file_.tensor(places[batch * n_workers + j].name);
+                    const auto g = gems_.find(t->name);
+                    const int64_t bb = omph::format::quant_block_bytes(t->type);
+                    failed[slot] = g != gems_.end() && bb > 0 &&
+                                   (!omph::format::repack_any(t->type, file_.tensor_data(*t),
+                                                              (int64_t) (t->nbytes / (uint64_t) bb),
+                                                              packed[slot]) ||
+                                    packed[slot].size() != g->second.bytes);
+                });
+            }
+            return workers;
+        };
+        std::vector<std::thread> current = repack_batch(0);
+        for (size_t batch = 0; batch < n_batches; ++batch) {
+            for (std::thread & w : current) {
+                w.join();
+            }
+            current = batch + 1 < n_batches ? repack_batch(batch + 1) : std::vector<std::thread>{};
+            for (size_t j = 0; j < n_workers && batch * n_workers + j < places.size(); ++j) {
+                const size_t slot = (batch % 2) * n_workers + j;
+                const Place & p = places[batch * n_workers + j];
+                const omph::gguf::TensorInfo * t = file_.tensor(p.name);
+                if (failed[slot] != 0) {
+                    for (std::thread & w : current) {
+                        w.join();
+                    }
                     throw std::runtime_error("repack failed for " + p.name);
                 }
-                src = packed.data();
-                bytes = packed.size();
+                const bool repacked = gems_.count(p.name) != 0 &&
+                                      omph::format::quant_block_bytes(t->type) > 0;
+                const void * src = repacked ? packed[slot].data() : file_.tensor_data(*t);
+                const size_t bytes = repacked ? packed[slot].size() : (size_t) t->nbytes;
+                if (hipMemcpy(base + p.off, src, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+                    for (std::thread & w : current) {
+                        w.join();
+                    }
+                    throw std::runtime_error("cannot upload " + p.name);
+                }
             }
-            if (hipMemcpy(base + p.off, src, bytes, hipMemcpyHostToDevice) != hipSuccess) {
-                throw std::runtime_error("cannot upload " + p.name);
-            }
+        }
+        for (const Place & p : places) {
             off_[p.name] = p.off;
         }
     }
 
     resolve_layers();
 
-    // The f16 staging scratch holds one layer's weights on the dequant +
-    // hipBLASLt path, so it is sized to the largest per-layer sum of the
-    // tensors that can take it: every 2D weight of a block (~770 MiB, #93),
-    // and with --gemv only the ones without a GEMV (the BF16 beta / alpha
-    // projections in a prefill, ~1 MB a layer, #86).
+    // The f16 staging scratch holds the slice of rows of one weight that a
+    // GEMM is about to read (it is reset for every slice: the dequant and the
+    // GEMM run in stream order), at most ~OMPH_STAGE_MIB (M8; it held a whole
+    // layer, ~770 MiB, #93). A --gemv runner only needs it for long
+    // multi-token runs (prefill chunks), so it allocates it on first use.
     size_t scratch_bytes = 1 << 20;
-    {
-        std::unordered_map<std::string, size_t> per_layer;
-        for (const omph::gguf::TensorInfo & t : file_.tensors()) {
-            if (t.ne.size() < 2 || t.type == 0 || gems_.count(t.name) != 0 ||
-                t.name.rfind("blk.", 0) != 0 || !in_stack(t.name)) {
-                continue;  // f32 vectors, GEMV tensors, embedding / head
-            }
-            const std::string layer = t.name.substr(0, t.name.find('.', 4));
-            per_layer[layer] += (((size_t) numel(t) * 2) + 255) & ~(size_t) 255;
+    for (const omph::gguf::TensorInfo & t : file_.tensors()) {
+        if (t.ne.size() < 2 || t.type == 0 || t.name.rfind("blk.", 0) != 0 || !in_stack(t.name)) {
+            continue;  // f32 vectors, embedding / head
         }
-        for (const auto & kv : per_layer) {
-            scratch_bytes = std::max(scratch_bytes, kv.second);
-        }
+        const int64_t rows = stage_rows((int64_t) t.ne[1], (int64_t) t.ne[0]);
+        scratch_bytes = std::max(scratch_bytes, (((size_t) rows * t.ne[0] * 2) + 255) & ~(size_t) 255);
     }
-    scratch_.init(mem_.device(scratch_bytes, "cannot allocate the weight scratch"),
-                  scratch_bytes, env_.trace_alloc);
+    scratch_bytes_ = scratch_bytes;
+    if (!use_gemv_) {
+        scratch_.init(mem_.device(scratch_bytes, "cannot allocate the weight scratch"),
+                      scratch_bytes, env_.trace_alloc);
+    }
     const auto alloc = [&](void ** p, const size_t bytes) { *p = mem_.device(bytes); };
     alloc(&x_, T * ne * 4);
     alloc(&cur_, T * ne * 4);
@@ -164,9 +202,8 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     alloc(&logits_, (size_t) (last_logits_only ? 1 : std::min<int64_t>(T, kHeadRows)) *
                          h_.n_vocab * 4);
     alloc(&argmax_key_, sizeof(unsigned long long));
-    // tmp_logits_, head16_ (the vocab-chunked f16 lm_head) and raw_stage_ (raw
-    // bytes of a repacked tensor for the f16 path) are allocated on first
-    // use: the GEMV decode never touches them (#86).
+    // tmp_logits_ and head16_ (the vocab-chunked f16 lm_head) are allocated
+    // on first use: the GEMV decode never touches them (#86).
     tmp_logits_bytes_ = (size_t) T * std::min<int64_t>(h_.n_vocab, 32768) * 4;
     head16_bytes_ = (size_t) std::min<int64_t>(h_.n_vocab, 32768) * ne * 2;
     const int64_t kvcap = kv_capacity > 0 ? kv_capacity : T;
@@ -270,13 +307,24 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     // hipBLASLt loads each kernel family on its first use (~0.1-0.35 s each,
     // ~0.47 s in all for a prefill): pay it at load, not in the first prefill
     // (M8), with one GEMM of every weight shape at the chunk size. Garbage in,
-    // garbage out: the scratch is overwritten before any real use.
-    if (!use_gemv_) {
+    // garbage out: the scratch is overwritten before any real use. A --gemv
+    // runner warms up only if its chunks can reach the GEMM path, through a
+    // buffer it frees again (its scratch is allocated on first use).
+    scratch_ready_ = !use_gemv_;
+    gemm_min_ = env_.gemm_min;
+    if (!use_gemv_ || T >= gemm_min_) {
         const int64_t wt = std::min<int64_t>(T, 512);
-        std::vector<std::pair<int64_t, int64_t>> shapes;
+        // (slice rows, k, output row stride): exactly the plans the prefill uses
+        std::vector<std::tuple<int64_t, int64_t, int64_t>> shapes;
         const auto add = [&](const Mat & m) {
             if (m.t != nullptr && m.t->ne.size() >= 2) {
-                shapes.emplace_back((int64_t) m.t->ne[1], (int64_t) m.t->ne[0]);
+                const int64_t n_out = (int64_t) m.t->ne[1];
+                const int64_t k = (int64_t) m.t->ne[0];
+                const int64_t rows = stage_rows(n_out, k);
+                shapes.emplace_back(rows, k, n_out);
+                if (n_out % rows != 0) {
+                    shapes.emplace_back(n_out % rows, k, n_out);  // the last slice
+                }
             }
         };
         for (const LayerWeights & L : layers_) {
@@ -285,25 +333,43 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 add(*m);
             }
         }
-        shapes.emplace_back(std::min<int64_t>(h_.n_vocab, 32768), ne);  // the chunked head
+        if (!use_gemv_) {
+            const int64_t chunk = std::min<int64_t>(h_.n_vocab, 32768);
+            shapes.emplace_back(chunk, ne, chunk);  // the chunked head
+        }
         std::sort(shapes.begin(), shapes.end());
         shapes.erase(std::unique(shapes.begin(), shapes.end()), shapes.end());
-        // existing buffers: the scratch as W, ffn16_ as x, ffn1_ (or the head's
-        // chunk output, which the f16 path allocates anyway) as y
-        void * w = scratch_.alloc(scratch_bytes);
-        for (const auto & sh : shapes) {
-            if ((size_t) sh.first * sh.second * 2 > scratch_bytes || sh.second > h_.n_ff) {
+        // existing buffers: the scratch as W, ffn16_ as x, ffn1_ as y
+        void * w = nullptr;
+        if (use_gemv_) {
+            if (hipMalloc(&w, scratch_bytes) != hipSuccess) {
+                throw std::runtime_error("out of VRAM (hipBLASLt warmup)");
+            }
+        } else {
+            w = scratch_.alloc(scratch_bytes);
+        }
+        for (const auto & [rows, k, ldy] : shapes) {
+            if (k > h_.n_ff) {
                 continue;
             }
-            float * yout = sh.first <= h_.n_ff ? static_cast<float *>(ffn1_)
-                                               : static_cast<float *>(
-                                                     lazy(&tmp_logits_, tmp_logits_bytes_));
-            if (!linear_.run(w, ffn16_, yout, sh.first, sh.second, wt)) {
+            // the head's chunk reads head16_ and writes tmp_logits_, which
+            // the f16 path allocates for its first head anyway
+            const bool head = ldy > h_.n_ff;
+            const void * wsrc = head ? lazy(&head16_, head16_bytes_) : w;
+            if (!head && (size_t) rows * k * 2 > scratch_bytes) {
+                continue;
+            }
+            float * yout = head ? static_cast<float *>(lazy(&tmp_logits_, tmp_logits_bytes_))
+                                : static_cast<float *>(ffn1_);
+            if (!linear_.run(wsrc, ffn16_, yout, rows, k, wt, ldy)) {
                 throw std::runtime_error("hipBLASLt warmup failed");
             }
         }
         if (hipDeviceSynchronize() != hipSuccess) {
             throw std::runtime_error("hipBLASLt warmup failed");
+        }
+        if (use_gemv_) {
+            (void) hipFree(w);
         }
         scratch_.reset();
     }
@@ -383,29 +449,14 @@ void * Runner::lazy(void ** p, const size_t bytes) {
     return *p;
 }
 
-// raw_stage_ holds the original bytes of any one repacked tensor.
-size_t Runner::raw_stage_bytes() const {
-    size_t n = 0;
-    for (const auto & kv : gems_) {
-        n = std::max(n, (size_t) file_.tensor(kv.first)->nbytes);
-    }
-    return n;
-}
-
-// Device pointer to the original GGUF bytes: they live in the image unless
-// the tensor was repacked, in which case they are staged from the file.
+// Device pointer to the original GGUF bytes of a tensor that was not
+// repacked (or whose repacked layout is the GGUF bytes, IQ1_M).
 const void * Runner::raw_bytes(const std::string & name) {
     const auto it = gems_.find(name);
-    if (it == gems_.end()) {
-        return static_cast<const uint8_t *>(dev_weights_) + off_.at(name);
+    if (it != gems_.end() && it->second.type != 29) {
+        throw std::runtime_error("raw bytes of the repacked " + name + " are not kept");
     }
-    const omph::gguf::TensorInfo * t = file_.tensor(name);
-    if (hipMemcpy(lazy(&raw_stage_, raw_stage_bytes()), file_.tensor_data(*t),
-                  (size_t) t->nbytes,
-                  hipMemcpyHostToDevice) != hipSuccess) {
-        throw std::runtime_error("cannot stage " + name);
-    }
-    return raw_stage_;
+    return static_cast<const uint8_t *>(dev_weights_) + off_.at(name);
 }
 
 // Types that have a fused GEMV kernel: for these the f16 form is never worth
@@ -428,7 +479,33 @@ bool Runner::has_gemv_type(const uint32_t type) {
     }
 }
 
-void * Runner::stage_w(const std::string & name) {
+// The f16 scratch for one weight slice. It holds one slice at a time: the
+// GEMM that reads it runs, in stream order, before the next dequant
+// overwrites it.
+void * Runner::stage_scratch(const size_t bytes) {
+    if (!scratch_ready_) {
+        scratch_.init(mem_.device(scratch_bytes_, "out of VRAM (weight scratch)"), scratch_bytes_,
+                      env_.trace_alloc);
+        scratch_ready_ = true;
+    }
+    scratch_.reset();
+    return scratch_.alloc(bytes);
+}
+
+// Rows per f16 slice of an (n_out x k) weight: the whole weight if it fits
+// the OMPH_STAGE_MIB budget, else equal slices (multiples of 256 rows) of
+// about that size. A slice's GEMM writes its columns of y in place.
+int64_t Runner::stage_rows(const int64_t n_out, const int64_t k) const {
+    const int64_t budget = (int64_t) env_.stage_mib << 20;
+    const int64_t bytes = n_out * k * 2;
+    if (budget <= 0 || bytes <= budget) {
+        return n_out;
+    }
+    const int64_t n = (bytes + budget - 1) / budget;
+    return std::min(n_out, ((n_out + n - 1) / n + 255) & ~(int64_t) 255);
+}
+
+void * Runner::stage_w(const std::string & name, const int64_t row0, int64_t nrows) {
     const omph::gguf::TensorInfo * t = file_.tensor(name);
     if (t == nullptr) {
         throw std::runtime_error("missing tensor " + name);
@@ -439,7 +516,12 @@ void * Runner::stage_w(const std::string & name) {
     // tensor; the big GEMV types (whose f16 form would not fit VRAM) never
     // take this path.
     const int64_t n_elems = numel(*t);
-    bool cacheable = !env_.no_f16_cache &&
+    const int64_t k = (int64_t) t->ne[0];
+    const int64_t n_rows = n_elems / k;
+    if (nrows < 0) {
+        nrows = n_rows - row0;
+    }
+    bool cacheable = row0 == 0 && nrows == n_rows && !env_.no_f16_cache &&
                      !has_gemv_type(t->type) && n_elems * 2 <= (256 << 20);
     if (cacheable) {
         const auto it = f16_cache_.find(name);
@@ -455,7 +537,7 @@ void * Runner::stage_w(const std::string & name) {
                      (unsigned) t->type, (long long) t->nbytes, cacheable ? 1 : 0);
     }
     timer_stage_.start();
-    const int64_t n = numel(*t);
+    const int64_t n = nrows * k;
     void * dst = nullptr;
     if (cacheable) {
         // Long contexts fill VRAM: caching is an optimization, never a
@@ -465,10 +547,10 @@ void * Runner::stage_w(const std::string & name) {
         dst = mem_.try_device((size_t) n * 2);
         if (dst == nullptr) {
             cacheable = false;
-            dst = scratch_.alloc((size_t) n * 2);
+            dst = stage_scratch((size_t) n * 2);
         }
     } else {
-        dst = scratch_.alloc((size_t) n * 2);
+        dst = stage_scratch((size_t) n * 2);
     }
     if (env_.trace_alloc) {
         std::fprintf(stderr, "stage %-40s %10lld elems  ne=[", name.c_str(), (long long) n);
@@ -477,7 +559,20 @@ void * Runner::stage_w(const std::string & name) {
         }
         std::fprintf(stderr, "] type=%u\n", t->type);
     }
-    if (!omph::kernels::dequantize(t->type, raw_bytes(name), dst, n, true, nullptr)) {
+    // repacked weights straight from their layout, at the bandwidth bound and
+    // bit-identical to dequantizing the GGUF bytes (M8)
+    const auto g = gems_.find(name);
+    const bool ok = g != gems_.end() && g->second.type != 29
+                        ? omph::kernels::dequant_repacked(g->second.type,
+                                                          static_cast<const uint8_t *>(dev_weights_) +
+                                                              g->second.off,
+                                                          dst, g->second.rows, g->second.k, nullptr,
+                                                          row0, nrows)
+                        : omph::kernels::dequantize(t->type,
+                                                    static_cast<const uint8_t *>(raw_bytes(name)) +
+                                                        row0 * (int64_t) (t->nbytes / n_rows),
+                                                    dst, n, true, nullptr);
+    if (!ok) {
         throw std::runtime_error("dequant failed for " + name);
     }
     timer_stage_.stop(t_stage_);

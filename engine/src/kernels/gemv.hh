@@ -79,4 +79,12 @@ bool gemv_bf16(const void * w, const void * x_f16, float * y, int64_t rows, int6
 bool gemv_multi(uint32_t type, const void * packed, const void * x_f16, float * y, int64_t rows,
                 int64_t k, int nt, hipStream_t stream);
 
+// f16 rows (rows x k, row-major) of a tensor in its repacked layout, for the
+// GEMM path of a --gemv runner (M8). Bit-identical to dequantize() on the
+// GGUF bytes. False for a type without a repacked layout (IQ1_M's is the GGUF
+// bytes themselves: use dequantize()).
+// Rows row0 .. row0 + nrows - 1 only (nrows < 0: to the end), written from dst_f16.
+bool dequant_repacked(uint32_t type, const void * packed, void * dst_f16, int64_t rows, int64_t k,
+                      hipStream_t stream, int64_t row0 = 0, int64_t nrows = -1);
+
 } // namespace omph::kernels

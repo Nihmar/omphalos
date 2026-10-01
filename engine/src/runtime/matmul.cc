@@ -7,6 +7,7 @@ namespace {
 
 constexpr hipblasOperation_t kTransA = HIPBLAS_OP_T;
 constexpr hipblasOperation_t kTransB = HIPBLAS_OP_N;
+constexpr std::size_t kMaxWorkspace = 64ull * 1024 * 1024;  // what a plan may ask for
 
 bool check(const hipblasStatus_t status, const char * what) {
     if (status != HIPBLAS_STATUS_SUCCESS) {
@@ -19,13 +20,7 @@ bool check(const hipblasStatus_t status, const char * what) {
 } // namespace
 
 Linear::Linear() {
-    workspace_size_ = 64ull * 1024 * 1024;
-    if (!check(hipblasLtCreate(&handle_), "create")) {
-        return;
-    }
-    if (hipMalloc(&workspace_, workspace_size_) != hipSuccess) {
-        workspace_ = nullptr;
-    }
+    (void) check(hipblasLtCreate(&handle_), "create");
 }
 
 Linear::~Linear() {
@@ -50,8 +45,8 @@ void Linear::destroy(Plan & p) {
 }
 
 const Linear::Plan * Linear::plan(const int64_t out_features, const int64_t in_features,
-                                  const int64_t tokens) {
-    const auto key = std::make_tuple(out_features, in_features, tokens);
+                                  const int64_t tokens, const int64_t ldy) {
+    const auto key = std::make_tuple(out_features, in_features, tokens, ldy);
     const auto it = plans_.find(key);
     if (it != plans_.end()) {
         return &it->second;
@@ -65,12 +60,12 @@ const Linear::Plan * Linear::plan(const int64_t out_features, const int64_t in_f
     if (ok) ok = check(hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_TRANSB, &kTransB, sizeof(kTransB)), "transB");
     if (ok) ok = check(hipblasLtMatrixLayoutCreate(&p.a, HIP_R_16F, in_features, out_features, in_features), "layout A");
     if (ok) ok = check(hipblasLtMatrixLayoutCreate(&p.b, HIP_R_16F, in_features, tokens, in_features), "layout B");
-    if (ok) ok = check(hipblasLtMatrixLayoutCreate(&p.c, HIP_R_32F, out_features, tokens, out_features), "layout C");
-    if (ok) ok = check(hipblasLtMatrixLayoutCreate(&p.d, HIP_R_32F, out_features, tokens, out_features), "layout D");
+    if (ok) ok = check(hipblasLtMatrixLayoutCreate(&p.c, HIP_R_32F, out_features, tokens, ldy), "layout C");
+    if (ok) ok = check(hipblasLtMatrixLayoutCreate(&p.d, HIP_R_32F, out_features, tokens, ldy), "layout D");
     if (ok) ok = check(hipblasLtMatmulPreferenceCreate(&pref), "preference");
     if (ok) ok = check(hipblasLtMatmulPreferenceSetAttribute(
-                           pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size_,
-                           sizeof(workspace_size_)), "workspace");
+                           pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &kMaxWorkspace,
+                           sizeof(kMaxWorkspace)), "workspace");
     hipblasLtMatmulHeuristicResult_t heur{};
     int found = 0;
     if (ok) ok = check(hipblasLtMatmulAlgoGetHeuristic(handle_, p.op, p.a, p.b, p.c, p.d, pref, 1, &heur, &found), "heuristic");
@@ -79,6 +74,21 @@ const Linear::Plan * Linear::plan(const int64_t out_features, const int64_t in_f
         std::fprintf(stderr, "hipblaslt: no algorithm for out=%lld in=%lld tokens=%lld\n",
                      (long long) out_features, (long long) in_features, (long long) tokens);
         ok = false;
+    }
+    // The workspace is allocated as large as the plans ask for, which for
+    // every shape of this model is nothing: allocating the 64 MiB maximum up
+    // front cost every runner that much VRAM (#129).
+    if (ok && heur.workspaceSize > workspace_size_) {
+        if (workspace_ != nullptr) {
+            (void) hipFree(workspace_);  // synchronizes: no GEMM still uses it
+        }
+        workspace_size_ = 0;
+        if (hipMalloc(&workspace_, heur.workspaceSize) != hipSuccess) {
+            workspace_ = nullptr;
+            ok = false;
+        } else {
+            workspace_size_ = heur.workspaceSize;
+        }
     }
     if (!ok) {
         destroy(p);
@@ -89,11 +99,11 @@ const Linear::Plan * Linear::plan(const int64_t out_features, const int64_t in_f
 }
 
 bool Linear::run(const void * w, const void * x, float * y, const int64_t out_features,
-                 const int64_t in_features, const int64_t tokens) {
-    if (handle_ == nullptr || workspace_ == nullptr) {
+                 const int64_t in_features, const int64_t tokens, const int64_t ldy) {
+    if (handle_ == nullptr) {
         return false;
     }
-    const Plan * p = plan(out_features, in_features, tokens);
+    const Plan * p = plan(out_features, in_features, tokens, ldy > 0 ? ldy : out_features);
     if (p == nullptr) {
         return false;
     }

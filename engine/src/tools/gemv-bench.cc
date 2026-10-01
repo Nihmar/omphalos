@@ -173,6 +173,7 @@ int main(int argc, char ** argv) {
     std::string name = "output.weight";
     int iters = 50;
     bool multi = false;
+    bool deq = false;
     int all_type = -1;
     int repack_only = -1;
     for (int i = 2; i < argc; ++i) {
@@ -184,6 +185,8 @@ int main(int argc, char ** argv) {
             all_type = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--multi") == 0) {
             multi = true;
+        } else if (std::strcmp(argv[i], "--dequant") == 0) {
+            deq = true;
         } else if (std::strcmp(argv[i], "--repack-only") == 0 && i + 1 < argc) {
             repack_only = std::atoi(argv[++i]);
         } else if (argv[i][0] != '-') {
@@ -316,6 +319,65 @@ int main(int argc, char ** argv) {
                         "(block %d, smem %zu/%zu/%zu/%zu)\n",
                         o.q4k, o.iq4, o.iq3, o.iq3s, o.block, o.smem_q4k, o.smem_iq4, o.smem_iq3,
                         o.smem_iq3s);
+        }
+        if (deq) {
+            // M8: f16 from the repacked layout vs dequantize() on the GGUF bytes,
+            // byte for byte, and the time of each, per case.
+            int bad = 0;
+            double t_raw = 0.0;
+            double t_rp = 0.0;
+            double bytes = 0.0;
+            for (const Case & c : cases) {
+                const size_t n = (size_t) c.rows * c.k;
+                void * raw = nullptr;
+                void * a = nullptr;
+                void * b = nullptr;
+                if (hipMalloc(&raw, c.t->nbytes) != hipSuccess || hipMalloc(&a, n * 2) != hipSuccess ||
+                    hipMalloc(&b, n * 2) != hipSuccess ||
+                    hipMemcpy(raw, file.tensor_data(*c.t), c.t->nbytes, hipMemcpyHostToDevice) !=
+                        hipSuccess) {
+                    return fail("out of VRAM (dequant)");
+                }
+                hipEvent_t e0, e1, e2;
+                (void) hipEventCreate(&e0);
+                (void) hipEventCreate(&e1);
+                (void) hipEventCreate(&e2);
+                if (!omph::kernels::dequantize(c.t->type, raw, a, (int64_t) n, true, nullptr) ||
+                    !omph::kernels::dequant_repacked(c.t->type, c.dev, b, c.rows, c.k, nullptr)) {
+                    return fail("dequant failed");
+                }
+                (void) hipEventRecord(e0, nullptr);
+                (void) omph::kernels::dequantize(c.t->type, raw, a, (int64_t) n, true, nullptr);
+                (void) hipEventRecord(e1, nullptr);
+                (void) omph::kernels::dequant_repacked(c.t->type, c.dev, b, c.rows, c.k, nullptr);
+                (void) hipEventRecord(e2, nullptr);
+                (void) hipDeviceSynchronize();
+                float m1 = 0.0f, m2 = 0.0f;
+                (void) hipEventElapsedTime(&m1, e0, e1);
+                (void) hipEventElapsedTime(&m2, e1, e2);
+                t_raw += m1;
+                t_rp += m2;
+                bytes += (double) n * 2 + (double) c.t->nbytes;
+                std::vector<uint8_t> ha(n * 2), hb(n * 2);
+                (void) hipMemcpy(ha.data(), a, n * 2, hipMemcpyDeviceToHost);
+                (void) hipMemcpy(hb.data(), b, n * 2, hipMemcpyDeviceToHost);
+                if (ha != hb) {
+                    ++bad;
+                    size_t at = 0;
+                    while (ha[at] == hb[at]) ++at;
+                    std::printf("MISMATCH %s at element %zu\n", c.t->name.c_str(), at / 2);
+                }
+                (void) hipFree(raw);
+                (void) hipFree(a);
+                (void) hipFree(b);
+                (void) hipEventDestroy(e0);
+                (void) hipEventDestroy(e1);
+                (void) hipEventDestroy(e2);
+            }
+            std::printf("dequant    : %zu tensors, %d mismatching; GGUF bytes %.2f ms, repacked "
+                        "%.2f ms (%.0f GB/s)\n",
+                        cases.size(), bad, t_raw, t_rp, bytes / (t_rp * 1e6));
+            return bad == 0 ? 0 : 1;
         }
         if (multi) {
             // NT = 2..4 tokens per weight read (#126): each token's result against

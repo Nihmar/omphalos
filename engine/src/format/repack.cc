@@ -1,5 +1,6 @@
 #include "format/repack.hh"
 
+#include <array>
 #include <cstring>
 #include <stdexcept>
 
@@ -53,16 +54,16 @@ void repack_q4k(const void * src, const int64_t n_blocks, void * dst) {
         std::memcpy(meta + 16 * b + 12, &in[b].d, 2);
         std::memcpy(meta + 16 * b + 14, &in[b].dmin, 2);
         // ggml group j (32 bytes) holds the low nibbles for sub-block 2j and the
-        // high nibbles for sub-block 2j+1; here every sub-block gets 16 bytes.
-        // The nibbles are ORed in: clear the block first, whatever dst held.
+        // high nibbles for sub-block 2j+1; here every sub-block gets 16 bytes,
+        // weight 2m in the low nibble of byte m and weight 2m + 1 in the high.
         uint8_t * sub = qs + b * 128;
-        std::memset(sub, 0, 128);
         for (int j = 0; j < 4; ++j) {
             const uint8_t * g = in[b].qs + j * 32;
-            for (int i = 0; i < 32; ++i) {
-                const uint8_t packed = g[i];
-                sub[(2 * j) * 16 + i / 2] |= (uint8_t) ((packed & 0xF) << (4 * (i & 1)));
-                sub[(2 * j + 1) * 16 + i / 2] |= (uint8_t) ((packed >> 4) << (4 * (i & 1)));
+            for (int m = 0; m < 16; ++m) {
+                const uint8_t a = g[2 * m];
+                const uint8_t c = g[2 * m + 1];
+                sub[(2 * j) * 16 + m] = (uint8_t) ((a & 0xF) | (c << 4));
+                sub[(2 * j + 1) * 16 + m] = (uint8_t) ((a >> 4) | (c & 0xF0));
             }
         }
     }
@@ -265,13 +266,29 @@ namespace {
 
 // GGUF sign order (bit w = weight w) <-> the pair order of the repacked IQ3_S
 // signs (weight 2p at bit 15 - p, weight 2p + 1 at bit 31 - p).
-uint32_t iq3s_signs_to_pairs(const uint32_t s) {
+uint32_t iq3s_signs_to_pairs_bits(const uint32_t s) {
     uint32_t t = 0;
     for (int w = 0; w < 32; ++w) {
         const int pos = (w & 1) ? 31 - w / 2 : 15 - w / 2;
         t |= ((s >> w) & 1u) << pos;
     }
     return t;
+}
+
+// The same bit permutation one byte at a time: the bit loop made the IQ3_S
+// repack ~0.3 GB/s, most of a --gemv load (#129).
+uint32_t iq3s_signs_to_pairs(const uint32_t s) {
+    static const auto lut = [] {
+        std::array<std::array<uint32_t, 256>, 4> l{};
+        for (int k = 0; k < 4; ++k) {
+            for (uint32_t v = 0; v < 256; ++v) {
+                l[k][v] = iq3s_signs_to_pairs_bits(v << (8 * k));
+            }
+        }
+        return l;
+    }();
+    return lut[0][s & 0xFF] | lut[1][(s >> 8) & 0xFF] | lut[2][(s >> 16) & 0xFF] |
+           lut[3][s >> 24];
 }
 
 uint32_t iq3s_pairs_to_signs(const uint32_t t) {

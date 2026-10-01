@@ -19,6 +19,14 @@ EnvOptions EnvOptions::from_env() {
         o.kv_window = std::atoll(w);
     }
     o.no_overlap = flag("OMPH_NO_OVERLAP");
+    if (const char * s = std::getenv("OMPH_STAGE_MIB")) {
+        o.stage_mib = std::atoi(s);
+    }
+    if (const char * g = std::getenv("OMPH_GEMM_MIN")) {
+        if (*g != '\0') {
+            o.gemm_min = std::atoi(g);
+        }
+    }
     o.no_b4 = flag("OMPH_NO_B4");
     o.no_bf16_gemv = flag("OMPH_NO_BF16_GEMV");
     o.no_f16_cache = flag("OMPH_NO_F16_CACHE");

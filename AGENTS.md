@@ -129,7 +129,9 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_KV_K4` | KV | K in V's Q4 format too (#81, experiment) |
 | `OMPH_KV_WINDOW=N` | KV | FP16 ring of the last N tokens (default 128, 0 = off) |
 | `OMPH_NO_OVERLAP` | A/B | no side stream for sibling GEMVs (#71) |
-| `OMPH_NO_B4` | A/B | no NT = 2..4-token GEMVs (verifications, `--gemv` prefill): one launch per token |
+| `OMPH_NO_B4` | A/B | no NT = 2..4-token GEMVs (verifications, short `--gemv` prefills): one launch per token |
+| `OMPH_GEMM_MIN=T` | A/B | `--gemv` runs of T+ tokens (prefill chunks) take the dequant + hipBLASLt path (default 32, the measured crossover; #129) |
+| `OMPH_STAGE_MIB=N` | A/B | f16 weights staged for hipBLASLt in row slices of ~N MiB (default 8, cache-resident; 0 = whole tensors; #129) |
 | `OMPH_NO_BF16_GEMV` | A/B | BF16 weights through the f16 path |
 | `OMPH_NO_F16_CACHE` | A/B | re-convert f16-path weights on every call |
 | `OMPH_HOST_ARGMAX` | A/B | greedy argmax on the host instead of the device (#102) |

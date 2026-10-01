@@ -2259,4 +2259,409 @@ bool gemv_multi(const uint32_t type, const void * packed, const void * x_f16, fl
     }
 }
 
+// --- dequantization from the repacked layouts (M8) --------------------------
+//
+// f16 rows of a repacked tensor for the GEMM path, read from VRAM: a --gemv
+// runner keeps no GGUF bytes, and staging them from the file costs PCIe time.
+// One thread per 32-weight sub-block: the GEMV kernels' decode, then each
+// weight as the raw dequant kernels compute it (dequant.hip: same float
+// expressions, same order), written as four uint4. The grid values come out
+// of the decode signed (exact in f16), and db * (+-g) == +-(db * g) exactly, so
+// the f16 output is bit-identical to dequantizing the GGUF bytes.
+namespace {
+
+__device__ inline float half_lo(const uint32_t w) {
+    return __half2float(__ushort_as_half((unsigned short) (w & 0xFFFFu)));
+}
+__device__ inline float half_hi(const uint32_t w) {
+    return __half2float(__ushort_as_half((unsigned short) (w >> 16)));
+}
+
+__device__ inline void store32(__half * out, const float (&v)[32]) {
+    uint4 * o = reinterpret_cast<uint4 *>(out);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        uint32_t w[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const __half lo = __float2half(v[i * 8 + 2 * j]);
+            const __half hi = __float2half(v[i * 8 + 2 * j + 1]);
+            w[j] = (uint32_t) __half_as_ushort(lo) | ((uint32_t) __half_as_ushort(hi) << 16);
+        }
+        o[i] = make_uint4(w[0], w[1], w[2], w[3]);
+    }
+}
+
+// the 8 weights of a group l from four signed half2 words, times db
+__device__ inline void put8(float (&v)[32], const int l, const float db, const uint32_t w0,
+                            const uint32_t w1, const uint32_t w2, const uint32_t w3) {
+    v[l * 8 + 0] = db * half_lo(w0);
+    v[l * 8 + 1] = db * half_hi(w0);
+    v[l * 8 + 2] = db * half_lo(w1);
+    v[l * 8 + 3] = db * half_hi(w1);
+    v[l * 8 + 4] = db * half_lo(w2);
+    v[l * 8 + 5] = db * half_hi(w2);
+    v[l * 8 + 6] = db * half_lo(w3);
+    v[l * 8 + 7] = db * half_hi(w3);
+}
+
+constexpr uint32_t kSignBits = 0x80008000u;
+
+// Thread i of a launch over rows row0 .. row0 + nrows - 1: its tensor row and
+// sub-block, and the output row (relative to row0).
+__device__ inline bool rp_index(const long long row0, const long long nrows,
+                                const long long n_sub, long long & row, long long & s,
+                                long long & out_row) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nrows * n_sub) {
+        return false;
+    }
+    out_row = i / n_sub;
+    row = row0 + out_row;
+    s = i % n_sub;
+    return true;
+}
+
+__global__ void rp_iq3s_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ qh,
+                               const uint8_t * __restrict__ signs,
+                               const uint8_t * __restrict__ scales,
+                               const uint8_t * __restrict__ d, __half * __restrict__ dst,
+                               const long long row0, const long long rows, const long long n_sub) {
+    long long row, s, out_row;
+    if (!rp_index(row0, rows, n_sub, row, s, out_row)) return;
+    const long long blocks = n_sub / 8;
+    const uint2 q = *reinterpret_cast<const uint2 *>(qs + row * blocks * 64 + s * 8);
+    const uint32_t qhb = qh[row * blocks * 8 + s];
+    const uint32_t sg = *reinterpret_cast<const uint32_t *>(signs + row * blocks * 32 + s * 4);
+    const uint8_t sc = scales[row * blocks * 4 + s / 2];
+    const float dv = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 + (s / 8) * 2));
+    const float db = dv * (1.0f + 2.0f * (float) ((s & 1) ? (sc >> 4) : (sc & 0xF)));
+    float v[32];
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t lo = (q.x >> (16 * (l & 1))) & 0xFFFFu;
+        const uint32_t word = l < 2 ? lo : (q.y >> (16 * (l & 1))) & 0xFFFFu;
+        const uint32_t i1 = (word & 0xFFu) | (((qhb >> (2 * l)) & 1u) << 8);
+        const uint32_t i2 = (word >> 8) | (((qhb >> (2 * l + 1)) & 1u) << 8);
+        const uint32_t b1 = omph::quant::kIq3sGrid[i1];
+        const uint32_t b2 = omph::quant::kIq3sGrid[i2];
+        put8(v, l, db, ((sg << (4 * l)) & kSignBits) | grid_pair_to_half2<0x04010400u>(b1),
+             ((sg << (4 * l + 1)) & kSignBits) | grid_pair_to_half2<0x04030402u>(b1),
+             ((sg << (4 * l + 2)) & kSignBits) | grid_pair_to_half2<0x04010400u>(b2),
+             ((sg << (4 * l + 3)) & kSignBits) | grid_pair_to_half2<0x04030402u>(b2));
+    }
+    store32(dst + out_row * n_sub * 32 + s * 32, v);
+}
+
+__global__ void rp_iq3xxs_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ aux,
+                                 const uint8_t * __restrict__ d, __half * __restrict__ dst,
+                                 const long long row0, const long long rows, const long long n_sub) {
+    long long row, s, out_row;
+    if (!rp_index(row0, rows, n_sub, row, s, out_row)) return;
+    const long long blocks = n_sub / 8;
+    const uint2 q = *reinterpret_cast<const uint2 *>(qs + row * blocks * 64 + s * 8);
+    const uint32_t a = *reinterpret_cast<const uint32_t *>(aux + row * blocks * 32 + s * 4);
+    const float dv = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 + (s / 8) * 2));
+    const float db = (dv * (0.5f + (float) (a >> 28))) * 0.5f;
+    float v[32];
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t word = (l < 2 ? q.x : q.y) >> (16 * (l & 1));
+        const uint32_t b1 = omph::quant::kIq3xxsGrid[word & 0xFFu];
+        const uint32_t b2 = omph::quant::kIq3xxsGrid[(word >> 8) & 0xFFu];
+        const uint32_t sgn = iq3xxs_group_signs(a, l);
+        put8(v, l, db, (sgn & kSignBits) | grid_pair_to_half2<0x04010400u>(b1),
+             ((sgn << 1) & kSignBits) | grid_pair_to_half2<0x04030402u>(b1),
+             ((sgn << 2) & kSignBits) | grid_pair_to_half2<0x04010400u>(b2),
+             ((sgn << 3) & kSignBits) | grid_pair_to_half2<0x04030402u>(b2));
+    }
+    store32(dst + out_row * n_sub * 32 + s * 32, v);
+}
+
+__global__ void rp_iq2xxs_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ d,
+                                 __half * __restrict__ dst, const long long row0,
+                                 const long long rows, const long long n_sub) {
+    long long row, s, out_row;
+    if (!rp_index(row0, rows, n_sub, row, s, out_row)) return;
+    const long long blocks = n_sub / 8;
+    const uint32_t * w = reinterpret_cast<const uint32_t *>(qs + row * blocks * 64 + s * 8);
+    const uint32_t aux0 = w[0];
+    const uint32_t aux1 = w[1];
+    const float dv = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 + (s / 8) * 2));
+    const float db = (dv * (0.5f + (float) (aux1 >> 28))) * 0.25f;
+    float v[32];
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint64_t g = omph::quant::kIq2xxsGrid[(aux0 >> (8 * l)) & 0xFFu];
+        const uint32_t g1 = (uint32_t) g;
+        const uint32_t g2 = (uint32_t) (g >> 32);
+        const uint32_t sgn = iq3xxs_group_signs(aux1, l);
+        put8(v, l, db, (sgn & kSignBits) | grid_pair_to_half2<0x04010400u>(g1),
+             ((sgn << 1) & kSignBits) | grid_pair_to_half2<0x04030402u>(g1),
+             ((sgn << 2) & kSignBits) | grid_pair_to_half2<0x04010400u>(g2),
+             ((sgn << 3) & kSignBits) | grid_pair_to_half2<0x04030402u>(g2));
+    }
+    store32(dst + out_row * n_sub * 32 + s * 32, v);
+}
+
+__global__ void rp_iq2xs_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ sc,
+                                const uint8_t * __restrict__ d, __half * __restrict__ dst,
+                                const long long row0, const long long rows, const long long n_sub) {
+    long long row, s, out_row;
+    if (!rp_index(row0, rows, n_sub, row, s, out_row)) return;
+    const long long blocks = n_sub / 8;
+    const long long blk = s / 8;
+    const uint16_t * e = reinterpret_cast<const uint16_t *>(qs + row * blocks * 64 + s * 8);
+    const uint32_t ent[2] = {(uint32_t) e[0] | ((uint32_t) e[1] << 16),
+                             (uint32_t) e[2] | ((uint32_t) e[3] << 16)};
+    const uint8_t scb = sc[row * blocks * 8 + blk * 8 + (s % 8)];
+    const float dv = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 + blk * 2));
+    const float dbl[2] = {(dv * (0.5f + (float) (scb & 0xF))) * 0.25f,
+                          (dv * (0.5f + (float) (scb >> 4))) * 0.25f};
+    float v[32];
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t en = (ent[l >> 1] >> (16 * (l & 1))) & 0xFFFFu;
+        const uint64_t g = omph::quant::kIq2xsGrid[en & 511u];
+        const uint32_t g1 = (uint32_t) g;
+        const uint32_t g2 = (uint32_t) (g >> 32);
+        const uint32_t f = en >> 9;
+        const uint32_t par = (uint32_t) __builtin_popcount(f) & 1u;
+        const uint32_t sgn = ((f & 0xFu) << 12) | ((f >> 4) << 29) | (par << 28);
+        put8(v, l, dbl[l >> 1], (sgn & kSignBits) | grid_pair_to_half2<0x04010400u>(g1),
+             ((sgn << 1) & kSignBits) | grid_pair_to_half2<0x04030402u>(g1),
+             ((sgn << 2) & kSignBits) | grid_pair_to_half2<0x04010400u>(g2),
+             ((sgn << 3) & kSignBits) | grid_pair_to_half2<0x04030402u>(g2));
+    }
+    store32(dst + out_row * n_sub * 32 + s * 32, v);
+}
+
+__global__ void rp_iq2s_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ sg,
+                               const uint8_t * __restrict__ qh, const uint8_t * __restrict__ sc,
+                               const uint8_t * __restrict__ d, __half * __restrict__ dst,
+                               const long long row0, const long long rows, const long long n_sub) {
+    long long row, s, out_row;
+    if (!rp_index(row0, rows, n_sub, row, s, out_row)) return;
+    const long long blocks = n_sub / 8;
+    const long long blk = s / 8;
+    const uint32_t qsw = *reinterpret_cast<const uint32_t *>(qs + row * blocks * 32 + s * 4);
+    const uint32_t sgw = *reinterpret_cast<const uint32_t *>(sg + row * blocks * 32 + s * 4);
+    const uint32_t qhb = qh[row * blocks * 8 + s];
+    const uint8_t scb = sc[row * blocks * 8 + blk * 8 + (s % 8)];
+    const float dv = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 + blk * 2));
+    const float dbl[2] = {(dv * (0.5f + (float) (scb & 0xF))) * 0.25f,
+                          (dv * (0.5f + (float) (scb >> 4))) * 0.25f};
+    float v[32];
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t lo = (qsw >> (8 * l)) & 0xFFu;
+        const uint32_t hi = ((qhb >> (2 * l)) & 3u) << 8;
+        const uint64_t g = omph::quant::kIq2sGrid[lo | hi];
+        const uint32_t g1 = (uint32_t) g;
+        const uint32_t g2 = (uint32_t) (g >> 32);
+        put8(v, l, dbl[l >> 1],
+             ((sgw << (4 * l)) & kSignBits) | grid_pair_to_half2<0x04010400u>(g1),
+             ((sgw << (4 * l + 1)) & kSignBits) | grid_pair_to_half2<0x04030402u>(g1),
+             ((sgw << (4 * l + 2)) & kSignBits) | grid_pair_to_half2<0x04010400u>(g2),
+             ((sgw << (4 * l + 3)) & kSignBits) | grid_pair_to_half2<0x04030402u>(g2));
+    }
+    store32(dst + out_row * n_sub * 32 + s * 32, v);
+}
+
+__global__ void rp_iq4_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ meta,
+                              __half * __restrict__ dst, const long long row0,
+                              const long long rows, const long long n_sub) {
+    long long row, s, out_row;
+    if (!rp_index(row0, rows, n_sub, row, s, out_row)) return;
+    const long long blocks = n_sub / 8;
+    const uint4 q = *reinterpret_cast<const uint4 *>(qs + row * blocks * 128 + s * 16);
+    const uint2 mt = *reinterpret_cast<const uint2 *>(meta + (row * blocks + s / 8) * 8);
+    const float dl = iq4_meta(mt, (int) (s % 8));
+    const uint32_t w[4] = {q.x, q.y, q.z, q.w};
+    float v[32];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const uint32_t byte = (w[i / 4] >> (8 * (i % 4))) & 0xFFu;
+        v[i] = dl * (float) omph::quant::kKvaluesIq4nl[byte & 0xFu];
+        v[16 + i] = dl * (float) omph::quant::kKvaluesIq4nl[byte >> 4];
+    }
+    store32(dst + out_row * n_sub * 32 + s * 32, v);
+}
+
+__global__ void rp_q4k_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ meta,
+                              __half * __restrict__ dst, const long long row0,
+                              const long long rows, const long long n_sub) {
+    long long row, s, out_row;
+    if (!rp_index(row0, rows, n_sub, row, s, out_row)) return;
+    const long long blocks = n_sub / 8;
+    const uint4 q = *reinterpret_cast<const uint4 *>(qs + row * blocks * 128 + s * 16);
+    float dl;
+    float ml;
+    q4k_meta(*reinterpret_cast<const uint4 *>(meta + (row * blocks + s / 8) * 16), (int) (s % 8),
+             dl, ml);
+    const uint32_t w[4] = {q.x, q.y, q.z, q.w};
+    float v[32];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const uint32_t byte = (w[i / 4] >> (8 * (i % 4))) & 0xFFu;
+        v[2 * i] = dl * (float) (byte & 0xFu) - ml;
+        v[2 * i + 1] = dl * (float) (byte >> 4) - ml;
+    }
+    store32(dst + out_row * n_sub * 32 + s * 32, v);
+}
+
+__global__ void rp_q2k_kernel(const uint8_t * __restrict__ sc, const uint8_t * __restrict__ qs,
+                              const uint8_t * __restrict__ d, const uint8_t * __restrict__ dmin,
+                              __half * __restrict__ dst, const long long row0,
+                              const long long rows, const long long n_sub) {
+    long long row, s, out_row;
+    if (!rp_index(row0, rows, n_sub, row, s, out_row)) return;
+    const long long blocks = n_sub / 8;
+    const long long g = s / 4;  // the 128-weight group
+    const long long blk = g >> 1;
+    const int half = (int) (g & 1);
+    const uint8_t * qrow = qs + row * blocks * 64 + g * 32;
+    const uint64_t scw =
+        *reinterpret_cast<const uint64_t *>(sc + row * blocks * 16 + blk * 16 + half * 8);
+    const float dv = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 + blk * 2));
+    const float mv = __half2float(*reinterpret_cast<const __half *>(dmin + row * blocks * 2 + blk * 2));
+    const uint4 qa = *reinterpret_cast<const uint4 *>(qrow);
+    const uint4 qb = *reinterpret_cast<const uint4 *>(qrow + 16);
+    const uint32_t wa[4] = {qa.x, qa.y, qa.z, qa.w};
+    const uint32_t wb[4] = {qb.x, qb.y, qb.z, qb.w};
+    float v[32];
+#pragma unroll
+    for (int uu = 0; uu < 2; ++uu) {
+        const int u = (int) (s % 4) * 2 + uu;  // 16-weight unit of the group
+        const int shift = (u >> 1) * 2;
+        const uint32_t scb = (uint32_t) (scw >> (8 * u)) & 0xFFu;
+        const float dl = dv * (float) (scb & 15);
+        const float ml = mv * (float) (scb >> 4);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const uint32_t word = (u & 1) ? wb[q] : wa[q];
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                v[uu * 16 + q * 4 + b] = dl * (float) ((word >> (8 * b + shift)) & 3u) - ml;
+            }
+        }
+    }
+    store32(dst + out_row * n_sub * 32 + s * 32, v);
+}
+
+__global__ void rp_q6k_kernel(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
+                              const uint8_t * __restrict__ sc, const uint8_t * __restrict__ d,
+                              __half * __restrict__ dst, const long long row0,
+                              const long long rows, const long long n_sub) {
+    long long row, s, out_row;
+    if (!rp_index(row0, rows, n_sub, row, s, out_row)) return;
+    const long long blocks = n_sub / 8;
+    const long long g = s / 4;  // the 128-weight half-block
+    const int j = (int) (s % 4); // this sub-block's quarter of it
+    const long long blk = g >> 1;
+    const int half = (int) (g & 1);
+    const uint32_t * pql = reinterpret_cast<const uint32_t *>(ql + row * blocks * 128 + blk * 128 + half * 64);
+    const uint32_t * pqh = reinterpret_cast<const uint32_t *>(qh + row * blocks * 64 + blk * 64 + half * 32);
+    const int8_t * psc = reinterpret_cast<const int8_t *>(sc + row * blocks * 16 + blk * 16 + half * 8);
+    const float dv = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 + blk * 2));
+    float v[32];
+#pragma unroll
+    for (int wi = 0; wi < 8; ++wi) {
+        const uint32_t lo = pql[wi];
+        const uint32_t hi = pql[wi + 8];
+        const uint32_t hb = pqh[wi];
+        const uint32_t c = j == 0   ? (lo & 0x0F0F0F0Fu) | ((hb & 0x03030303u) << 4)
+                           : j == 1 ? (hi & 0x0F0F0F0Fu) | ((hb & 0x0C0C0C0Cu) << 2)
+                           : j == 2 ? ((lo >> 4) & 0x0F0F0F0Fu) | (hb & 0x30303030u)
+                                    : ((hi >> 4) & 0x0F0F0F0Fu) | ((hb >> 2) & 0x30303030u);
+        const float sv = (float) psc[2 * j + (wi >> 2)];
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            v[wi * 4 + b] = dv * sv * (float) ((int) ((c >> (8 * b)) & 0xFFu) - 32);
+        }
+    }
+    store32(dst + out_row * n_sub * 32 + s * 32, v);
+}
+
+} // namespace
+
+bool dequant_repacked(const uint32_t type, const void * packed, void * dst_f16,
+                      const int64_t rows, const int64_t k, hipStream_t stream, int64_t row0,
+                      int64_t nrows) {
+    if (nrows < 0) {
+        nrows = rows - row0;
+    }
+    if (packed == nullptr || dst_f16 == nullptr || rows <= 0 || k <= 0 || k % 256 != 0 ||
+        row0 < 0 || nrows <= 0 || row0 + nrows > rows) {
+        return false;
+    }
+    const auto * base = static_cast<const uint8_t *>(packed);
+    auto * dst = static_cast<__half *>(dst_f16);
+    const int64_t n_blocks = rows * (k / 256);
+    const long long n_sub = k / 32;
+    const unsigned grid = (unsigned) ((nrows * n_sub + 255) / 256);
+    switch (type) {
+        case 21: {
+            const auto l = omph::format::iq3s_layout(n_blocks);
+            rp_iq3s_kernel<<<grid, 256, 0, stream>>>(base + l.qs_off, base + l.qh_off,
+                                                     base + l.signs_off, base + l.scales_off,
+                                                     base + l.d_off, dst, row0, nrows, n_sub);
+            break;
+        }
+        case 18: {
+            const auto l = omph::format::iq3_xxs_layout(n_blocks);
+            rp_iq3xxs_kernel<<<grid, 256, 0, stream>>>(base + l.qs_off, base + l.aux_off,
+                                                       base + l.d_off, dst, row0, nrows, n_sub);
+            break;
+        }
+        case 16: {
+            const auto l = omph::format::iq2_xxs_layout(n_blocks);
+            rp_iq2xxs_kernel<<<grid, 256, 0, stream>>>(base + l.qs_off, base + l.d_off, dst, row0, nrows,
+                                                       n_sub);
+            break;
+        }
+        case 17: {
+            const auto l = omph::format::iq2_xs_layout(n_blocks);
+            rp_iq2xs_kernel<<<grid, 256, 0, stream>>>(base + l.qs_off, base + l.sc_off,
+                                                      base + l.d_off, dst, row0, nrows, n_sub);
+            break;
+        }
+        case 22: {
+            const auto l = omph::format::iq2s_layout(n_blocks);
+            rp_iq2s_kernel<<<grid, 256, 0, stream>>>(base + l.qs_off, base + l.signs_off,
+                                                     base + l.qh_off, base + l.sc_off,
+                                                     base + l.d_off, dst, row0, nrows, n_sub);
+            break;
+        }
+        case 23: {
+            const auto l = omph::format::iq4_layout(n_blocks);
+            rp_iq4_kernel<<<grid, 256, 0, stream>>>(base + l.qs_off, base + l.meta_off, dst, row0, nrows,
+                                                    n_sub);
+            break;
+        }
+        case 12: {
+            const auto l = omph::format::q4k_layout(n_blocks);
+            rp_q4k_kernel<<<grid, 256, 0, stream>>>(base + l.qs_off, base + l.meta_off, dst, row0, nrows,
+                                                    n_sub);
+            break;
+        }
+        case 10: {
+            const auto l = omph::format::q2k_layout(n_blocks);
+            rp_q2k_kernel<<<grid, 256, 0, stream>>>(base + l.sc_off, base + l.qs_off,
+                                                    base + l.d_off, base + l.dmin_off, dst, row0, nrows,
+                                                    n_sub);
+            break;
+        }
+        case 14: {
+            const auto l = omph::format::q6k_layout(n_blocks);
+            rp_q6k_kernel<<<grid, 256, 0, stream>>>(base + l.ql_off, base + l.qh_off,
+                                                    base + l.sc_off, base + l.d_off, dst, row0, nrows,
+                                                    n_sub);
+            break;
+        }
+        default: return false;
+    }
+    return hipGetLastError() == hipSuccess;
+}
+
 } // namespace omph::kernels
