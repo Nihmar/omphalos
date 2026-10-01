@@ -82,7 +82,13 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
                    int64_t tokens, int64_t seq, int64_t nh, int64_t nkv, int64_t hd, float scale,
                    bool v_rotated, void * work, size_t work_bytes, hipStream_t stream,
                    void * out_f16 = nullptr,  // set: out is ignored, f16 written here
-                   bool allow_wmma = true);   // 16+ tokens: the WMMA prefill kernel (#97)
+                   bool allow_wmma = true,    // 16+ tokens: the WMMA prefill kernel (#97)
+                   int64_t key_chunk = 0);    // > 0: keys per split, fixed for the run (#136)
+
+// Keys per split for a run whose sequences reach max_seq (a multiple of 16).
+// With a fixed chunk every query sums its keys in the same order in any call
+// (a decode step or a speculative batch), so the two agree bit for bit.
+int64_t attention_key_chunk(int64_t max_seq);
 
 // Copies the FP16-ring slots of positions pos_first .. pos_first + count - 1
 // (slot = position % window) of every layer from (src_k, src_v) to
@@ -93,7 +99,9 @@ bool kv_ring_copy(const void * src_k, const void * src_v, void * dst_k, void * d
                   int64_t layers, int64_t window, int64_t row_bytes, int64_t pos_first,
                   int64_t count, hipStream_t stream);
 
-// Workspace for any call with up to `max_tokens` query tokens.
-size_t attention_gqa_work_bytes(int64_t max_tokens, int64_t nh, int64_t nkv, int64_t hd);
+// Workspace for any call with up to `max_tokens` query tokens (and, with a
+// key chunk, sequences up to max_seq).
+size_t attention_gqa_work_bytes(int64_t max_tokens, int64_t nh, int64_t nkv, int64_t hd,
+                                int64_t max_seq = 0, int64_t key_chunk = 0);
 
 } // namespace omph::kernels

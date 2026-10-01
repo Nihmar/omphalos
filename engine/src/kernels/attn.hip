@@ -189,7 +189,9 @@ constexpr int kGqaHd = 256;     // head_dim: one thread per dimension
 constexpr int kGqaKb = 16;      // keys per block: 256 threads = 16 keys x 16 chunks
 constexpr int kGqaGroup = 6;    // query heads per KV head (24 / 4): fixed for this model
 constexpr int kGqaTargetWgs = 128;  // split the keys until a launch has this many
-constexpr int kGqaMaxSplits = 64;
+constexpr int kGqaMaxSplits = 256;  // the merge kernel's LDS
+constexpr int64_t kDecTargetSplits = 64;   // key chunks at the context capacity (#136)
+constexpr int64_t kDecMinChunk = 16;       // keys per chunk at least (one block)
 
 struct KvArgs {
     const float * k_f32;
@@ -760,10 +762,11 @@ __global__ __launch_bounds__(kGqaHd) void attention_gqa_merge_kernel(
     }
 }
 
-// Query tokens per workgroup: a whole prefill chunk shares each K/V read four
-// ways; a decode step (or a few MTP tokens) keeps the six-row form.
+// Query tokens per workgroup: a decode step keeps the six-row form, a
+// verification of 2-4 tokens (or a longer run) shares each K/V read among
+// its tokens (#136). A row's arithmetic does not depend on the tile size.
 int gqa_tq(const int64_t tokens) {
-    return tokens >= 8 ? 4 : 1;
+    return tokens == 1 ? 1 : (tokens == 2 ? 2 : 4);
 }
 
 // Splits for a call: enough workgroups to fill the GPU, never more than the key
@@ -823,14 +826,25 @@ bool kv_ring_copy(const void * src_k, const void * src_v, void * dst_k, void * d
     return hipGetLastError() == hipSuccess;
 }
 
+int64_t attention_key_chunk(const int64_t max_seq) {
+    const int64_t per = (max_seq + kDecTargetSplits - 1) / kDecTargetSplits;
+    const int64_t chunk = (per + kGqaKb - 1) / kGqaKb * kGqaKb;
+    return chunk < kDecMinChunk ? kDecMinChunk : chunk;
+}
+
 size_t attention_gqa_work_bytes(const int64_t max_tokens, const int64_t nh, const int64_t nkv,
-                                const int64_t hd) {
-    // Worst case over the token counts a call can have, at any sequence length
-    // (the split count only grows with the sequence up to kGqaMaxSplits).
+                                const int64_t hd, const int64_t max_seq, const int64_t key_chunk) {
+    // Worst case over the token counts a call can have: up to the sequence
+    // capacity in key chunks (one split from kFaTokens tokens on, WMMA), or
+    // at any sequence length without chunks (the split count only grows with
+    // the sequence up to kGqaMaxSplits).
     size_t worst = 0;
     for (int64_t t = 1; t <= max_tokens; ++t) {
         long long bps = 0;
-        const size_t rows = (size_t) t * nh * gqa_splits(t, (int64_t) 1 << 40, nkv, bps);
+        const int64_t splits =
+            key_chunk > 0 ? (t >= kFaTokens ? 1 : (max_seq + key_chunk - 1) / key_chunk)
+                          : gqa_splits(t, (int64_t) 1 << 40, nkv, bps);
+        const size_t rows = (size_t) t * nh * splits;
         worst = rows > worst ? rows : worst;
     }
     return worst * (size_t) (hd + 2) * sizeof(float);
@@ -840,7 +854,7 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
                    const int64_t tokens, const int64_t seq, const int64_t nh, const int64_t nkv,
                    const int64_t hd, const float scale, const bool v_rotated, void * work,
                    const size_t work_bytes, hipStream_t stream, void * out_f16,
-                   const bool allow_wmma) {
+                   const bool allow_wmma, const int64_t key_chunk) {
     const bool q8 = kv.k_q8 != nullptr;
     if (q == nullptr || (out == nullptr && out_f16 == nullptr) || work == nullptr || tokens <= 0 || seq < tokens ||
         nh <= 0 || nkv <= 0 || nh / nkv != kGqaGroup || nh % nkv != 0 || hd != kGqaHd) {
@@ -853,7 +867,21 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
     }
     const bool fa = allow_wmma && tokens >= kFaTokens;
     long long bps = 0;
-    const int splits = fa ? 1 : gqa_splits(tokens, seq, nkv, bps);
+    int splits = 1;
+    if (!fa && key_chunk > 0 && tokens < kFaTokens) {
+        // fixed chunks of keys: a query's partition depends on its position only
+        if (key_chunk % kGqaKb != 0) {
+            return false;
+        }
+        bps = key_chunk / kGqaKb;
+        const long long kb_max = (seq + kGqaKb - 1) / kGqaKb;
+        splits = (int) ((kb_max + bps - 1) / bps);
+    } else if (!fa) {
+        splits = gqa_splits(tokens, seq, nkv, bps);
+    }
+    if (splits > kGqaMaxSplits) {
+        return false;
+    }
     if ((size_t) tokens * nh * splits * (hd + 2) * sizeof(float) > work_bytes) {
         return false;
     }
@@ -889,12 +917,16 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
     if (q8) {
         if (tq == 4) {
             OMPH_GQA_LAUNCH(true, 4);
+        } else if (tq == 2) {
+            OMPH_GQA_LAUNCH(true, 2);
         } else {
             OMPH_GQA_LAUNCH(true, 1);
         }
     } else {
         if (tq == 4) {
             OMPH_GQA_LAUNCH(false, 4);
+        } else if (tq == 2) {
+            OMPH_GQA_LAUNCH(false, 2);
         } else {
             OMPH_GQA_LAUNCH(false, 1);
         }
