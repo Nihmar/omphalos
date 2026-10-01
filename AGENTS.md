@@ -136,7 +136,8 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_KV_WINDOW=N` | KV | FP16 ring of the last N tokens (default 128, 0 = off) |
 | `OMPH_NO_OVERLAP` | A/B | no side stream for sibling GEMVs (#71). With it on, the runner times the overlap at load and drops a side stream that loses to running in order (#132; `OMPH_TIMING` prints the outcome) |
 | `OMPH_NO_B4` | A/B | no NT = 2..4-token GEMVs (verifications, short `--gemv` prefills): one launch per token |
-| `OMPH_GEMM_MIN=T` | A/B | `--gemv` runs of T+ tokens (prefill chunks) take the dequant + WMMA GEMM path (default 32, the measured crossover; #129, #132) |
+| `OMPH_GEMM_MIN=T` | A/B | `--gemv` runs of T+ tokens (prefill chunks) take the GEMM path (default 16, the measured crossover with the fused GEMM; #129, #141) |
+| `OMPH_NO_FUSED_GEMM` | A/B | dequantize each weight to f16, then the GEMM, instead of the fused dequant + WMMA GEMM (#141) |
 | `OMPH_STAGE_MIB=N` | A/B | f16 weights staged for the GEMM in row slices of ~N MiB (default 20, cache-resident; 0 = whole tensors; #129, #132) |
 | `OMPH_ATTN_SCALAR` | A/B | prefill attention on the scalar kernel instead of the WMMA one (#97) |
 | `OMPH_GDN_SERIAL` | A/B | a multi-token delta rule in one launch (one workgroup per head) instead of the token-parallel form (#96) |
