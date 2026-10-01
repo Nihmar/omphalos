@@ -20,6 +20,7 @@ struct EnvOptions {
     bool no_overlap = false;    // OMPH_NO_OVERLAP: no side stream for sibling GEMVs (#71)
     int stage_mib = 20;         // OMPH_STAGE_MIB=N: f16 weight slices of ~N MiB (0: whole)
     int gemm_min = 32;
+    bool attn_scalar = false;   // OMPH_ATTN_SCALAR: prefill attention without WMMA (#97)
     bool gdn_serial = false;    // OMPH_GDN_SERIAL: a chunk's delta rule in one launch (#96)
     bool no_b4 = false;         // OMPH_NO_B4: no NT-token GEMVs (verification, --gemv prefill)
     bool no_bf16_gemv = false;  // OMPH_NO_BF16_GEMV: BF16 weights through the f16 path

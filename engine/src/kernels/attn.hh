@@ -81,7 +81,8 @@ struct KvCache {
 bool attention_gqa(const float * q, const KvCache & kv, const float * gate, float * out,
                    int64_t tokens, int64_t seq, int64_t nh, int64_t nkv, int64_t hd, float scale,
                    bool v_rotated, void * work, size_t work_bytes, hipStream_t stream,
-                   void * out_f16 = nullptr);  // set: out is ignored, f16 written here
+                   void * out_f16 = nullptr,  // set: out is ignored, f16 written here
+                   bool allow_wmma = true);   // 16+ tokens: the WMMA prefill kernel (#97)
 
 // Copies the FP16-ring slots of positions pos_first .. pos_first + count - 1
 // (slot = position % window) of every layer from (src_k, src_v) to

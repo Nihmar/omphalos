@@ -1,0 +1,32 @@
+# M8: WMMA flash attention for prefill chunks (#97). Engine 03968e5 (on main ab9d5ef).
+# RX 9060 XT, wikitext prompts (wiki16k.txt, --tokens N), Q8/Q4 KV with the 128-token FP16
+# window, --gemv --last-logits --generate 1, OMPH_TIMING "prefill wall". OMPH_ATTN_SCALAR=1 = the
+# previous (scalar f32) kernel.
+#
+# 1. Prefill wall (ms, 3 runs):  scalar                     WMMA
+#    512 tokens                  729.4 729.1 727.7          703.4 702.3 703.4
+#    2048                        3215.9 3218.0 3223.4       2856.9 2871.9 2861.9
+#    8192                        18267.4 18290.6 18321.8    12196.8 12192.9 12192.5
+#    16384 (1 run)               51498.7                    26230.2
+#
+# 2. Attention kernel time at 8192 tokens (rocprofv3, 256 calls = 16 layers x 16 chunks):
+#    scalar 7395 ms (41 % of the prefill); WMMA 1221 -> 1055 (DPP row reductions instead of
+#    __shfl_xor's ds_bpermute, exp2) -> 1037 ms (branch-free softmax). Floor without any K/V load
+#    or dequant: 1146 ms at the first version, i.e. the staging is ~7 %. 16-key tiles: 1486 ms.
+#    The GEMMs are now ~62 % of an 8k prefill; attention ~8.5 %.
+#
+# 3. Accuracy (KL against the exact f32 KV with the scalar kernel, compare_logits.py):
+#                                         KL mean    p99        max       top-1
+#    512 tokens   scalar Q8/Q4            0.001282   0.013046   0.0589    96.68 %
+#                 WMMA   Q8/Q4            0.001278   0.015143   0.0368    96.68 %
+#                 WMMA   f32 cache        0.000000   0.000005   0.000013  100.00 %
+#    8192 (last 512) scalar Q8/Q4         0.000815   0.006295   0.0126    98.63 %
+#                 WMMA   Q8/Q4            0.000825   0.007073   0.0122    98.83 %
+#
+# 4. Found on the way (fixed, d262703): one-token attention tiles split the keys by batch size,
+#    so a verified token summed in another order than when decoded alone; with OMPH_KV_WINDOW=0 a
+#    near-tie at the 10th token made the oracle run differ (4 / 35 drafts). The partition now
+#    depends on the sequence only: speculative oracle runs identical in every KV mode and with
+#    OMPH_SPEC_CHECK=1. Cost: --draft-mtp 3 17.45 -> 17.50 ms/token; decode step 45.88 (unchanged).
+#
+# 5. check_gpu_* / decode --gemv / mtp: PASS. Peak VRAM unchanged (no new buffers).
