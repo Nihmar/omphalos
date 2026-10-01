@@ -486,11 +486,15 @@ int gqa_tq(const int64_t tokens) {
 }
 
 // Splits for a call: enough workgroups to fill the GPU, never more than the key
-// blocks of the longest tile.
+// blocks of the longest tile. With one-token tiles (decode steps and
+// speculative verifications) the partition depends on the sequence only: a
+// token verified in a batch then sums its keys in the same order as when it is
+// decoded alone, so speculative greedy equals plain greedy bit for bit (#97;
+// it had depended on the batch size, which a near-tie exposed).
 int gqa_splits(const int64_t tokens, const int64_t seq, const int64_t nkv,
                long long & blocks_per_split) {
     const long long tq = gqa_tq(tokens);
-    const long long tiles = (tokens + tq - 1) / tq;
+    const long long tiles = tq == 1 ? 1 : (tokens + tq - 1) / tq;
     const long long kb_max = (seq + kGqaKb - 1) / kGqaKb;
     long long splits = (kGqaTargetWgs + tiles * nkv - 1) / (tiles * nkv);
     splits = splits < 1 ? 1 : (splits > kGqaMaxSplits ? kGqaMaxSplits : splits);
