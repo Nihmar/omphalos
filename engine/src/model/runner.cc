@@ -253,8 +253,9 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                      hipEventCreateWithFlags(&ev_join_, hipEventDisableTiming) != hipSuccess)) {
         throw std::runtime_error("cannot create the side stream");
     }
+    key_chunk_ = omph::kernels::attention_key_chunk(max_seq_);
     attn_work_bytes_ = omph::kernels::attention_gqa_work_bytes(T, h_.n_head, h_.n_head_kv,
-                                                               h_.head_dim);
+                                                               h_.head_dim, max_seq_, key_chunk_);
     alloc(&attn_work_, attn_work_bytes_);
     // MTP (#124): the block's own cache (Q8/Q4, no ring) and its h buffers.
     if (mtp_) {

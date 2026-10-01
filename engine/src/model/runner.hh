@@ -361,6 +361,7 @@ private:
     size_t scratch_bytes_ = 0;    // the largest f16 weight slice (stage_rows)
     bool scratch_ready_ = false;  // allocated (at load without --gemv, else on first use)
     int64_t gemm_min_ = 0;        // tokens from which a --gemv runner uses the GEMM path
+    int64_t key_chunk_ = 0;       // attention keys per split, fixed for the run (#136)
 };
 
 } // namespace omph::model
