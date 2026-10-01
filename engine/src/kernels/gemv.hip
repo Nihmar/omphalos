@@ -111,16 +111,25 @@ __device__ inline float iq4_meta(const uint2 m, const int ib) {
 constexpr long long kQ4kChunkSub = 256;  // 8192 weights staged per LDS refill
 constexpr long long kQ4kRows = 4;        // output rows computed per warp
 
+// Staged position p of each 8-weight run holds weight kQ4kXOrder(p): the even
+// weights, then the odd ones. A word of nibbles gives the even weights in its
+// low nibbles and the odd ones in its high nibbles, so each half2 of codes
+// meets its activations as one aligned half2 (#94).
+__device__ inline long long q4k_x_order(const long long p) {
+    const long long j = p & 7;
+    return (p & ~7LL) + (j < 4 ? 2 * j : 2 * (j - 4) + 1);
+}
+
 __global__ void gemv_q4k_kernel(const uint8_t * __restrict__ qs,
                                 const uint8_t * __restrict__ meta, const __half * __restrict__ x,
                                 float * __restrict__ y, const long long rows,
                                 const long long n_sub) {
-    extern __shared__ __half xs[];  // activation chunk
+    extern __shared__ __half xs[];  // activation chunk, in q4k_x_order
 
     const int warp = (int) threadIdx.x / 32;
     const int lane = (int) threadIdx.x % 32;
     // kQ4kRows consecutive output rows per warp: one activation value feeds all
-    // of them and the accumulators give independent FMA chains.
+    // of them and the accumulators give independent chains.
     const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kQ4kRows;
     const long long blocks = n_sub / 8;
     const long long rlast = rows - 1;
@@ -129,7 +138,7 @@ __global__ void gemv_q4k_kernel(const uint8_t * __restrict__ qs,
     for (long long base = 0; base < n_sub; base += kQ4kChunkSub) {
         const long long len = n_sub - base < kQ4kChunkSub ? n_sub - base : kQ4kChunkSub;
         for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
-            xs[i] = x[base * 32 + i];
+            xs[i] = x[base * 32 + q4k_x_order(i)];
         }
         __syncthreads();
         if (row0 >= rows) {
@@ -139,7 +148,17 @@ __global__ void gemv_q4k_kernel(const uint8_t * __restrict__ qs,
         for (long long s = base + lane; s < base + len; s += 32) {
             const long long blk = s / 8;
             const int sub = (int) (s % 8);
-            const __half * xv = xs + (s - base) * 32;
+            const uint4 * xv = reinterpret_cast<const uint4 *>(xs + (s - base) * 32);
+            const uint4 xq[4] = {xv[0], xv[1], xv[2], xv[3]};
+            // (ds * q - ms) . x = ds * (q . x) - ms * sum(x): sum(x) is shared by
+            // the rows.
+            constexpr uint32_t kOnes = 0x3C003C00u;  // half2 (1, 1)
+            float xsum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                xsum = dot2(xq[i].x, kOnes, dot2(xq[i].y, kOnes, xsum));
+                xsum = dot2(xq[i].z, kOnes, dot2(xq[i].w, kOnes, xsum));
+            }
             uint4 q[kQ4kRows];
             float ds[kQ4kRows];
             float ms[kQ4kRows];
@@ -150,22 +169,21 @@ __global__ void gemv_q4k_kernel(const uint8_t * __restrict__ qs,
                 q4k_meta(*reinterpret_cast<const uint4 *>(meta + (row * blocks + blk) * 16), sub,
                          ds[r], ms[r]);
             }
-            float part[kQ4kRows] = {};
-#pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                // byte i: value 2i in the low nibble, 2i+1 in the high one
-                const float x0 = __half2float(xv[2 * i]);
-                const float x1 = __half2float(xv[2 * i + 1]);
-#pragma unroll
-                for (int r = 0; r < kQ4kRows; ++r) {
-                    const uint8_t b = reinterpret_cast<const uint8_t *>(&q[r])[i];
-                    part[r] = fmaf(fmaf(ds[r], (float) (b & 0xF), -ms[r]), x0, part[r]);
-                    part[r] = fmaf(fmaf(ds[r], (float) (b >> 4), -ms[r]), x1, part[r]);
-                }
-            }
 #pragma unroll
             for (int r = 0; r < kQ4kRows; ++r) {
-                acc[r] += part[r];
+                const uint32_t w[4] = {q[r].x, q[r].y, q[r].z, q[r].w};
+                float pe = 0.0f;  // even weights
+                float po = 0.0f;  // odd weights
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const uint32_t lo = w[i] & 0x0F0F0F0Fu;
+                    const uint32_t hi = (w[i] >> 4) & 0x0F0F0F0Fu;
+                    pe = dot2(grid_pair_to_half2<0x04010400u>(lo), xq[i].x, pe);
+                    po = dot2(grid_pair_to_half2<0x04010400u>(hi), xq[i].z, po);
+                    pe = dot2(grid_pair_to_half2<0x04030402u>(lo), xq[i].y, pe);
+                    po = dot2(grid_pair_to_half2<0x04030402u>(hi), xq[i].w, po);
+                }
+                acc[r] += fmaf(ds[r], pe + po, -ms[r] * xsum);
             }
         }
         __syncthreads();
@@ -186,31 +204,54 @@ __global__ void gemv_q4k_kernel(const uint8_t * __restrict__ qs,
 __device__ const int8_t kIq4Table[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
                                          1,    13,   25,  38,  53,  69,  89,  113};
 
+// The IQ4 codebook + 128 as bytes, in four words: entries 0-3, 4-7, 8-11,
+// 12-15 (kIq4Table).
+constexpr uint32_t kIq4B0 = 0x3F2D1801u;
+constexpr uint32_t kIq4B1 = 0x766A5D4Fu;
+constexpr uint32_t kIq4B2 = 0xA6998D81u;
+constexpr uint32_t kIq4B3 = 0xF1D9C5B5u;
+
+// Four 4-bit codes (one per byte) to their codebook values + 128, one per byte:
+// two byte permutes look the low three bits up in each half of the table and a
+// third picks the half by bit 3.
+__device__ inline uint32_t iq4_lookup(const uint32_t codes) {
+    const uint32_t idx = codes & 0x07070707u;
+    const uint32_t lo = __builtin_amdgcn_perm(kIq4B1, kIq4B0, idx);
+    const uint32_t hi = __builtin_amdgcn_perm(kIq4B3, kIq4B2, idx);
+    return __builtin_amdgcn_perm(hi, lo, 0x03020100u | ((codes & 0x08080808u) >> 1));
+}
+
+// Two biased codebook bytes (the bytes Sel picks) as a half2 of the values:
+// 1024 + (v + 128) from the byte permute, minus 1152 (exact, |v| <= 127).
+template <uint32_t Sel>
+__device__ inline uint32_t iq4_pair_to_half2(const uint32_t g) {
+    const uint32_t biased = __builtin_amdgcn_perm(0x64646464u, g, Sel);
+    const half2_v v =
+        __builtin_bit_cast(half2_v, biased) - half2_v{(_Float16) 1152, (_Float16) 1152};
+    return __builtin_bit_cast(uint32_t, v);
+}
+
 constexpr long long kIq4ChunkSub = 256;  // 8192 weights staged per LDS refill
 constexpr long long kIq4Rows = 4;        // output rows computed per warp
 
-__global__ void gemv_iq4_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ meta, const __half * __restrict__ x,
-                                float * __restrict__ y, const long long rows,
-                                const long long n_sub, const long long chunk_sub) {
-    extern __shared__ uint8_t smem[];
-    __half * xs = reinterpret_cast<__half *>(smem);  // activation chunk
-    float * table = reinterpret_cast<float *>(smem + chunk_sub * 64);
-    if (threadIdx.x < 16) {
-        table[threadIdx.x] = (float) kIq4Table[threadIdx.x];
-    }
+__global__ void gemv_iq4_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ meta,
+                                const __half * __restrict__ x, float * __restrict__ y,
+                                const long long rows, const long long n_sub,
+                                const long long chunk_sub) {
+    extern __shared__ __half xs[];  // activation chunk
 
     const int warp = (int) threadIdx.x / 32;
     const int lane = (int) threadIdx.x % 32;
     // Each warp owns kIq4Rows consecutive output rows: the activation value is
-    // loaded once and reused by all of them (outer product), and the four
-    // accumulators give independent FMA chains.
+    // loaded once and reused by all of them, and the accumulators give
+    // independent chains.
     const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kIq4Rows;
     const long long blocks = n_sub / 8;
     const long long rlast = rows - 1;
 
     float acc[kIq4Rows] = {};
-    for (long long base = 0; base < n_sub; base += kIq4ChunkSub) {
-        const long long len = n_sub - base < kIq4ChunkSub ? n_sub - base : kIq4ChunkSub;
+    for (long long base = 0; base < n_sub; base += chunk_sub) {
+        const long long len = n_sub - base < chunk_sub ? n_sub - base : chunk_sub;
         for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
             xs[i] = x[base * 32 + i];
         }
@@ -222,40 +263,38 @@ __global__ void gemv_iq4_kernel(const uint8_t * __restrict__ qs, const uint8_t *
         for (long long s = base + lane; s < base + len; s += 32) {
             const long long blk = s / 8;
             const int sub = (int) (s % 8);
-            const __half * xv = xs + (s - base) * 32;
+            const uint4 * xv = reinterpret_cast<const uint4 *>(xs + (s - base) * 32);
+            const uint4 xq[4] = {xv[0], xv[1], xv[2], xv[3]};
+            // the low nibbles of word i are weights 4i..4i+3, the high ones
+            // 16+4i..16+4i+3
+            const uint32_t xl[8] = {xq[0].x, xq[0].y, xq[0].z, xq[0].w,
+                                    xq[1].x, xq[1].y, xq[1].z, xq[1].w};
+            const uint32_t xh[8] = {xq[2].x, xq[2].y, xq[2].z, xq[2].w,
+                                    xq[3].x, xq[3].y, xq[3].z, xq[3].w};
             uint4 q[kIq4Rows];
-            float dl[kIq4Rows];
+            uint2 mt[kIq4Rows];
 #pragma unroll
             for (int r = 0; r < kIq4Rows; ++r) {
                 const long long row = row0 + r <= rlast ? row0 + r : rlast;  // clamped, never
                                                                              // used when masked
-                q[r] = *reinterpret_cast<const uint4 *>(
-                    qs + row * blocks * 128 + s * 16);
-                dl[r] = iq4_meta(*reinterpret_cast<const uint2 *>(meta + (row * blocks + blk) * 8),
-                                 sub);
-            }
-            float part[kIq4Rows] = {};
-#pragma unroll
-            for (int v = 0; v < 16; ++v) {
-                const float xval = __half2float(xv[v]);
-#pragma unroll
-                for (int r = 0; r < kIq4Rows; ++r) {
-                    const uint8_t code = reinterpret_cast<const uint8_t *>(&q[r])[v] & 0xF;
-                    part[r] = fmaf(table[code], xval, part[r]);
-                }
-            }
-#pragma unroll
-            for (int v = 0; v < 16; ++v) {
-                const float xval = __half2float(xv[v + 16]);
-#pragma unroll
-                for (int r = 0; r < kIq4Rows; ++r) {
-                    const uint8_t code = reinterpret_cast<const uint8_t *>(&q[r])[v] >> 4;
-                    part[r] = fmaf(table[code], xval, part[r]);
-                }
+                q[r] = *reinterpret_cast<const uint4 *>(qs + row * blocks * 128 + s * 16);
+                mt[r] = *reinterpret_cast<const uint2 *>(meta + (row * blocks + blk) * 8);
             }
 #pragma unroll
             for (int r = 0; r < kIq4Rows; ++r) {
-                acc[r] = fmaf(dl[r], part[r], acc[r]);
+                const uint32_t w[4] = {q[r].x, q[r].y, q[r].z, q[r].w};
+                float pl = 0.0f;
+                float ph = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const uint32_t vl = iq4_lookup(w[i] & 0x0F0F0F0Fu);
+                    const uint32_t vh = iq4_lookup((w[i] >> 4) & 0x0F0F0F0Fu);
+                    pl = dot2(iq4_pair_to_half2<0x04010400u>(vl), xl[2 * i], pl);
+                    ph = dot2(iq4_pair_to_half2<0x04010400u>(vh), xh[2 * i], ph);
+                    pl = dot2(iq4_pair_to_half2<0x04030402u>(vl), xl[2 * i + 1], pl);
+                    ph = dot2(iq4_pair_to_half2<0x04030402u>(vh), xh[2 * i + 1], ph);
+                }
+                acc[r] = fmaf(iq4_meta(mt[r], sub), pl + ph, acc[r]);
             }
         }
         __syncthreads();
@@ -1713,7 +1752,7 @@ bool gemv_iq4_xs(const void * packed, const void * x_f16, float * y, const int64
     const omph::format::Iq4Layout l = omph::format::iq4_layout(n_blocks);
     const int64_t n_sub = k / 32;
     const int64_t chunk = n_sub < kIq4ChunkSub ? n_sub : kIq4ChunkSub;
-    const size_t smem = (size_t) chunk * 64 + 16 * sizeof(float);
+    const size_t smem = (size_t) chunk * 64;
     if (smem > 64 * 1024) {
         return false;
     }
@@ -1730,7 +1769,7 @@ GemvOccupancy gemv_occupancy() {
     const void * kernels[4] = {(const void *) gemv_q4k_kernel, (const void *) gemv_iq4_kernel,
                                (const void *) gemv_iq3_kernel, (const void *) gemv_iq3s_kernel};
     o.smem_q4k = (size_t) kQ4kChunkSub * 64;
-    o.smem_iq4 = (size_t) kIq4ChunkSub * 64 + 16 * sizeof(float);
+    o.smem_iq4 = (size_t) kIq4ChunkSub * 64;
     o.smem_iq3 = (size_t) kIq3ChunkSub * kXPitch * 2 + 256 * 4;
     o.smem_iq3s = (size_t) kIq3sChunkSub * 64 + 512 * 4;
     int n = 0;
