@@ -20,6 +20,7 @@
 #include "kernels/elementwise.hh"
 #include "kernels/gdn.hh"
 #include "kernels/gemv.hh"
+#include "runtime/allocations.hh"
 #include "runtime/matmul.hh"
 #include "runtime/options.hh"
 
@@ -43,10 +44,10 @@ namespace {
 
 class Scratch {
 public:
-    bool init(const size_t bytes, const bool trace) {
+    void init(void * base, const size_t bytes, const bool trace) {
+        base_ = base;
         cap_ = bytes;
         trace_ = trace;
-        return hipMalloc(&base_, bytes) == hipSuccess;
     }
     void reset() { used_ = 0; }
     void * alloc(const size_t bytes) {
@@ -220,9 +221,7 @@ public:
                 // token needs (10 KB at IQ2_S) over PCIe, which keeps 388 MiB out
                 // of VRAM (#92).
                 if (t.name == "token_embd.weight") {
-                    if (hipHostMalloc(&embd_host_, (size_t) t.nbytes) != hipSuccess) {
-                        throw std::runtime_error("cannot allocate the host embedding");
-                    }
+                    embd_host_ = mem_.host((size_t) t.nbytes, "cannot allocate the host embedding");
                     std::memcpy(embd_host_, file_.tensor_data(t), (size_t) t.nbytes);
                     continue;
                 }
@@ -252,9 +251,7 @@ public:
                 total += ((size_t) t.nbytes + 255) & ~(size_t) 255;
                 places.push_back(p);
             }
-            if (hipMalloc(&dev_weights_, total) != hipSuccess) {
-                throw std::runtime_error("cannot allocate the weight image");
-            }
+            dev_weights_ = mem_.device(total, "cannot allocate the weight image");
             auto * base = static_cast<uint8_t *>(dev_weights_);
             for (const Place & p : places) {
                 const omph::gguf::TensorInfo * t = file_.tensor(p.name);
@@ -299,14 +296,9 @@ public:
                 scratch_bytes = std::max(scratch_bytes, kv.second);
             }
         }
-        if (!scratch_.init(scratch_bytes, env_.trace_alloc)) {
-            throw std::runtime_error("cannot allocate the weight scratch");
-        }
-        const auto alloc = [&](void ** p, const size_t bytes) {
-            if (hipMalloc(p, bytes) != hipSuccess) {
-                throw std::runtime_error("out of VRAM");
-            }
-        };
+        scratch_.init(mem_.device(scratch_bytes, "cannot allocate the weight scratch"),
+                      scratch_bytes, env_.trace_alloc);
+        const auto alloc = [&](void ** p, const size_t bytes) { *p = mem_.device(bytes); };
         alloc(&x_, T * ne * 4);
         alloc(&cur_, T * ne * 4);
         alloc(&resid_, T * ne * 4);
@@ -350,10 +342,8 @@ public:
             // (4.29 GB at 32k does not fit beside the weights), and one layer's
             // worth of it staged into VRAM before each attention.
             const size_t bytes = (size_t) n_kv * kvcap * attn_kv * 4;
-            if (hipHostMalloc(&kv_k_, bytes) != hipSuccess ||
-                hipHostMalloc(&kv_v_, bytes) != hipSuccess) {
-                throw std::runtime_error("cannot allocate the host KV cache");
-            }
+            kv_k_ = mem_.host(bytes, "cannot allocate the host KV cache");
+            kv_v_ = mem_.host(bytes, "cannot allocate the host KV cache");
             alloc(&kv_stage_k_, (size_t) kvcap * attn_kv * 4);
             alloc(&kv_stage_v_, (size_t) kvcap * attn_kv * 4);
         } else if (!kv_q8q4_) {
@@ -417,24 +407,16 @@ public:
         }
     }
 
+    // Memory is owned by mem_; the stream and the events are released here.
     ~Runner() {
-        if (kv_host_) {
-            (void) hipHostFree(kv_k_);
-            (void) hipHostFree(kv_v_);
-        }
-        for (void * p : f16_cache_owned_) {
-            (void) hipFree(p);
-        }
-        if (dev_weights_ != nullptr) {
-            (void) hipFree(dev_weights_);
-        }
-        if (embd_host_ != nullptr) {
-            (void) hipHostFree(embd_host_);
-        }
-        if (state_pool_ != nullptr) {
-            (void) hipFree(state_pool_);
+        if (side_ != nullptr) {
+            (void) hipStreamDestroy(side_);
+            (void) hipEventDestroy(ev_fork_);
+            (void) hipEventDestroy(ev_join_);
         }
     }
+    Runner(const Runner &) = delete;
+    Runner & operator=(const Runner &) = delete;
 
     // want_logits = false runs the layers only (a prefill chunk whose logits
     // nobody reads): no final norm, no lm_head.
@@ -1208,10 +1190,9 @@ private:
     }
 
     // Allocates *p on first use (the f16-path buffers, #86).
-    static void * lazy(void ** p, const size_t bytes) {
-        if (*p == nullptr && hipMalloc(p, bytes) != hipSuccess) {
-            (void) hipGetLastError();
-            throw std::runtime_error("out of VRAM (f16-path buffer)");
+    void * lazy(void ** p, const size_t bytes) {
+        if (*p == nullptr) {
+            *p = mem_.device(bytes, "out of VRAM (f16-path buffer)");
         }
         return *p;
     }
@@ -1291,12 +1272,12 @@ private:
         const int64_t n = numel(*t);
         void * dst = nullptr;
         if (cacheable) {
-            if (hipMalloc(&dst, (size_t) n * 2) != hipSuccess) {
-                // Long contexts fill VRAM: caching is an optimization, never a
-                // reason to fail. Fall back to the per-call staging buffer, and
-                // clear the out-of-memory error, which the next kernel wrapper's
-                // hipGetLastError() would otherwise report as its own failure.
-                (void) hipGetLastError();
+            // Long contexts fill VRAM: caching is an optimization, never a
+            // reason to fail. Fall back to the per-call staging buffer
+            // (try_device clears the out-of-memory error, which the next kernel
+            // wrapper's hipGetLastError() would otherwise report as its own).
+            dst = mem_.try_device((size_t) n * 2);
+            if (dst == nullptr) {
                 cacheable = false;
                 dst = scratch_.alloc((size_t) n * 2);
             }
@@ -1316,7 +1297,6 @@ private:
         timer_stage_.stop(t_stage_);
         if (cacheable) {
             f16_cache_[name] = dst;
-            f16_cache_owned_.push_back(dst);
         }
         return dst;
     }
@@ -1340,6 +1320,7 @@ private:
     };
 
     const omph::runtime::EnvOptions env_;  // first: the other members' setup reads it
+    omph::runtime::Allocations mem_;       // every device / pinned buffer below
     omph::gguf::File file_;
     HParams h_;
     bool use_gemv_ = false;
@@ -1412,8 +1393,7 @@ private:
     void * raw_stage_ = nullptr;
     size_t tmp_logits_bytes_ = 0;
     size_t head16_bytes_ = 0;
-    std::map<std::string, void *> f16_cache_;
-    std::vector<void *> f16_cache_owned_;
+    std::map<std::string, void *> f16_cache_;  // into mem_
 };
 
 } // namespace

@@ -190,70 +190,76 @@ File::File(const std::string & path) {
         fail("mmap failed for " + path);
     }
     base_ = static_cast<const uint8_t *>(map);
+    // The destructor does not run when the constructor throws: unmap here.
+    try {
+        Cursor c{base_, base_ + size_};
+        if (c.u32() != kMagic) {
+            fail("bad magic (not a GGUF file)");
+        }
+        version_ = c.u32();
+        if (version_ != 3) {
+            fail("unsupported GGUF version " + std::to_string(version_));
+        }
+        const uint64_t tensor_count = c.u64();
+        const uint64_t kv_count = c.u64();
 
-    Cursor c{base_, base_ + size_};
-    if (c.u32() != kMagic) {
-        fail("bad magic (not a GGUF file)");
-    }
-    version_ = c.u32();
-    if (version_ != 3) {
-        fail("unsupported GGUF version " + std::to_string(version_));
-    }
-    const uint64_t tensor_count = c.u64();
-    const uint64_t kv_count = c.u64();
+        kv_.reserve(std::min<uint64_t>(kv_count, 4096));
+        for (uint64_t i = 0; i < kv_count; ++i) {
+            std::string key = c.str();
+            const ValueType t = (ValueType) c.u32();
+            kv_index_.emplace(key, kv_.size());
+            kv_.emplace_back(std::move(key), read_value(c, t));
+        }
 
-    kv_.reserve(std::min<uint64_t>(kv_count, 4096));
-    for (uint64_t i = 0; i < kv_count; ++i) {
-        std::string key = c.str();
-        const ValueType t = (ValueType) c.u32();
-        kv_index_.emplace(key, kv_.size());
-        kv_.emplace_back(std::move(key), read_value(c, t));
-    }
+        tensors_.reserve(std::min<uint64_t>(tensor_count, 4096));
+        for (uint64_t i = 0; i < tensor_count; ++i) {
+            TensorInfo ti;
+            ti.name = c.str();
+            const uint32_t n_dims = c.u32();
+            if (n_dims == 0 || n_dims > 4) {
+                fail("bad dimension count for tensor " + ti.name);
+            }
+            ti.ne.resize(n_dims);
+            for (uint32_t d = 0; d < n_dims; ++d) {
+                ti.ne[d] = c.u64();
+            }
+            ti.type = c.u32();
+            ti.offset = c.u64();
+            ti.nbytes = type_nbytes(ti.type, ti.ne);
+            tensor_index_.emplace(ti.name, tensors_.size());
+            tensors_.push_back(std::move(ti));
+        }
 
-    tensors_.reserve(std::min<uint64_t>(tensor_count, 4096));
-    for (uint64_t i = 0; i < tensor_count; ++i) {
-        TensorInfo ti;
-        ti.name = c.str();
-        const uint32_t n_dims = c.u32();
-        if (n_dims == 0 || n_dims > 4) {
-            fail("bad dimension count for tensor " + ti.name);
+        uint64_t alignment = 32;  // ggml default
+        if (const Value * a = find("general.alignment")) {
+            uint64_t v = 0;
+            if (a->as_u64(v) && v > 0) {
+                alignment = v;
+            }
         }
-        ti.ne.resize(n_dims);
-        for (uint32_t d = 0; d < n_dims; ++d) {
-            ti.ne[d] = c.u64();
+        const uint64_t offset = (uint64_t) (c.p - base_);
+        data_offset_ = (offset + alignment - 1) / alignment * alignment;
+        if (data_offset_ > size_) {
+            fail("data section starts beyond the end of the file");
         }
-        ti.type = c.u32();
-        ti.offset = c.u64();
-        ti.nbytes = type_nbytes(ti.type, ti.ne);
-        tensor_index_.emplace(ti.name, tensors_.size());
-        tensors_.push_back(std::move(ti));
-    }
-
-    uint64_t alignment = 32;  // ggml default
-    if (const Value * a = find("general.alignment")) {
-        uint64_t v = 0;
-        if (a->as_u64(v) && v > 0) {
-            alignment = v;
+        // Every tensor must have a known type and lie inside the mapping: a
+        // truncated file would otherwise fault at upload instead of failing here.
+        const uint64_t data_bytes = size_ - data_offset_;
+        for (const TensorInfo & t : tensors_) {
+            if (type_info(t.type) == nullptr) {
+                fail("unknown type " + std::to_string(t.type) + " for tensor " + t.name);
+            }
+            if (t.nbytes == 0) {
+                fail("row size is not a whole number of blocks for tensor " + t.name);
+            }
+            if (t.offset > data_bytes || t.nbytes > data_bytes - t.offset) {
+                fail("data of tensor " + t.name + " extends beyond the end of the file");
+            }
         }
-    }
-    const uint64_t offset = (uint64_t) (c.p - base_);
-    data_offset_ = (offset + alignment - 1) / alignment * alignment;
-    if (data_offset_ > size_) {
-        fail("data section starts beyond the end of the file");
-    }
-    // Every tensor must have a known type and lie inside the mapping: a
-    // truncated file would otherwise fault at upload instead of failing here.
-    const uint64_t data_bytes = size_ - data_offset_;
-    for (const TensorInfo & t : tensors_) {
-        if (type_info(t.type) == nullptr) {
-            fail("unknown type " + std::to_string(t.type) + " for tensor " + t.name);
-        }
-        if (t.nbytes == 0) {
-            fail("row size is not a whole number of blocks for tensor " + t.name);
-        }
-        if (t.offset > data_bytes || t.nbytes > data_bytes - t.offset) {
-            fail("data of tensor " + t.name + " extends beyond the end of the file");
-        }
+    } catch (...) {
+        ::munmap(map, size_);
+        base_ = nullptr;
+        throw;
     }
 }
 
