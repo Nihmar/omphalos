@@ -38,7 +38,6 @@ class Runner {
         int64_t rows = 0;
         int64_t k = 0;
         uint32_t type = 0;
-        bool has_b4 = false;  // a small-batch kernel exists for this type
     };
 
     // A weight matrix resolved once at load (#100): the hot path looks nothing
@@ -204,11 +203,6 @@ private:
     static bool gemv_one(const int type, const void * w, const void * x, float * y,
                          const int64_t n_out, const int64_t k, hipStream_t st);
 
-    // Small-batch GEMV: one weight read per four tokens. Only the types that have
-    // this form answer true; the others stay on the f16 path.
-    static bool gemv_batch4(const int type, const void * w, const void * x, float * y,
-                            const int64_t n_out, const int64_t k, hipStream_t st);
-
     // One matmul: the fused GEMV for single-token steps when it is available for
     // this tensor, the small-batch GEMV for a few tokens, otherwise the f16
     // dequant + hipBLASLt path.
@@ -299,6 +293,9 @@ private:
     bool verifying_ = false;
     int64_t verify_tokens_ = 0;
     int64_t verify_pos0_ = 0;
+    std::vector<int32_t> * verify_argmax_ = nullptr;  // verify(): rows' tokens from lm_head
+    void * spec_keys_ = nullptr;                      // their packed argmax keys (device)
+    static constexpr int64_t kVerifyRowsMax = 32;
     void * replay_pool_ = nullptr;
     void * conv_hist_pool_ = nullptr;
     void * ring_backup_k_ = nullptr;

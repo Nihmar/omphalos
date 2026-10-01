@@ -232,16 +232,54 @@ bool Runner::lm_head(const int64_t T, std::vector<float> & logits, int32_t * gre
     // Small-batch head: for a Q4_K head with 2+ tokens, run four tokens per
     // weight read instead of materializing f16 (PLAN.md §10.1's N = 1..5),
     // kHeadRows (a multiple of 4) rows at a time into logits_, then out.
+    // A verification (#122, #126): every row's greedy token on the device, 8
+    // bytes per row back instead of 1 MB of logits.
+    if (verifying_ && verify_argmax_ != nullptr && use_gemv_ && T <= kVerifyRowsMax &&
+        head_.gemv != nullptr && head_.gemv->type == 12) {
+        for (int64_t t0 = 0; t0 < T;) {
+            const int64_t n = std::min<int64_t>(4, T - t0);
+            const uint8_t * x = static_cast<const uint8_t *>(h16_) + t0 * ne * 2;
+            float * y = static_cast<float *>(logits_) + t0 * h_.n_vocab;
+            const bool ok = n > 1 ? omph::kernels::gemv_multi(12, head_.dev, x, y, h_.n_vocab, ne,
+                                                              (int) n, nullptr)
+                                  : omph::kernels::gemv_q4k(head_.dev, x, y, h_.n_vocab, ne,
+                                                            nullptr);
+            if (!ok) {
+                return fail("lm_head (verify) failed");
+            }
+            t0 += n;
+        }
+        auto * keys = static_cast<unsigned long long *>(spec_keys_);
+        for (int64_t t = 0; t < T; ++t) {
+            if (!omph::kernels::argmax_f32(static_cast<const float *>(logits_) + t * h_.n_vocab,
+                                           h_.n_vocab, keys + t, nullptr)) {
+                return fail("verify argmax failed");
+            }
+        }
+        std::vector<unsigned long long> host((size_t) T);
+        if (hipMemcpy(host.data(), keys, (size_t) T * 8, hipMemcpyDeviceToHost) != hipSuccess) {
+            return fail("verify argmax copy failed");
+        }
+        verify_argmax_->resize((size_t) T);
+        for (int64_t t = 0; t < T; ++t) {
+            (*verify_argmax_)[(size_t) t] = omph::kernels::argmax_key_index(host[(size_t) t]);
+        }
+        logits.clear();
+        return true;
+    }
     if (use_gemv_ && T > 1 && head_.gemv != nullptr && head_.gemv->type == 12) {
         for (int64_t r0 = 0; r0 < T; r0 += kHeadRows) {
             const int64_t rows = std::min<int64_t>(kHeadRows, T - r0);
-            for (int64_t t0 = 0; t0 < rows; t0 += t0 + 4 <= rows ? 4 : 1) {
+            for (int64_t t0 = 0; t0 < rows;) {
+                const int64_t n = std::min<int64_t>(4, rows - t0);
                 const uint8_t * x = static_cast<const uint8_t *>(h16_) + (r0 + t0) * ne * 2;
                 float * y = static_cast<float *>(logits_) + t0 * h_.n_vocab;
+                // up to four tokens per read of the 682 MB head (#126)
                 const bool ok =
-                    t0 + 4 <= rows
-                        ? omph::kernels::gemv_q4k_b4(head_.dev, x, y, h_.n_vocab, ne, nullptr)
-                        : omph::kernels::gemv_q4k(head_.dev, x, y, h_.n_vocab, ne, nullptr);
+                    n > 1 ? omph::kernels::gemv_multi(12, head_.dev, x, y, h_.n_vocab, ne, (int) n,
+                                                      nullptr)
+                          : omph::kernels::gemv_q4k(head_.dev, x, y, h_.n_vocab, ne, nullptr);
+                t0 += n;
                 if (!ok) {
                     return fail("lm_head batch4 failed");
                 }

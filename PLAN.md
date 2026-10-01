@@ -699,6 +699,7 @@ Details:
 ### 12.5 Drafting
 
 - `k` drafts per step by chaining the MTP layer on its own output **[verify]** exactly which hidden state is fed back (pre- or post-norm) in the reference.
+- **Measured and not done (#126):** a frequency-truncated draft head. The top 32k / 64k tokens of a wikitext + C++ corpus cover 94.9 % / 97.5 % of generated tokens, so the ~2 ms a draft saves is about what the lost acceptance costs, and the ranking is corpus-dependent (other languages fall outside it). Adaptive k: k = 3 is best or tied on every prompt measured (`bench/results/m6-speculative.txt`).
 - **Truncated-vocab draft head:** score only the top ~32k most frequent tokens = first rows of the frequency-sorted `lm_head` (§8.3). Build the frequency table from a corpus representative of the real workload (for code-heavy use, a code corpus including the languages you actually use), tokenized with the model's tokenizer (`uv run` + `tokenizers`).
 - **Adaptive k:** track acceptance over the last few steps and pick k ∈ {1, 2, 3, 4} dynamically.
 - Tree drafting (several candidates per position) is attractive for memory-bound verification, but the DeltaNet recurrence needs a separate state per branch → not worth it initially.
@@ -934,6 +935,8 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 | 8 | Fast prefill | Dequant→WMMA GEMM, chunked DeltaNet; target ~900+ t/s |
 | 9 | Offline converter + final format | Layouts frozen, bit-exact verification in the converter |
 | 10 | Polish | C ABI, OpenAI-compatible server, prompt-prefix cache in host RAM, breadcrumbs |
+
+Status: **M0-M5 are complete; M6 is functionally complete (#121).** Greedy speculative decoding with the model's MTP head (`--draft-mtp 3`): output identical to plain greedy; 18.9 ms/token on wikitext, 19.4 on prose, 24-25 on code / repetitive text, against 45.5 ms plain (1.8-2.4x). Rollback is bit-exact (A/B delta-net states + rank-1 replay, FP16-ring restore, #122), the MTP KV fill costs +1.1-1.5 % of a `--gemv` prefill, verifications run on NT-token GEMVs (#126). Not done: truncated-vocab drafts (measured, not worth it), adaptive k (k = 3 always best or tied), sampling (temperature > 0). Measurements: `bench/results/m6-speculative.txt`.
 
 Status: **M0-M5 are complete.** M5 (quantized KV, issues #43, #58-#61): K Q8 + V Q4
 with the Hadamard rotation and a 128-token FP16 window, 4.92x less KV VRAM (4.29 GB ->

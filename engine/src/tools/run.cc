@@ -210,6 +210,7 @@ int main(int argc, char ** argv) {
                                                                 : n_toks);
         std::vector<float> logits;
         std::vector<float> part_logits;
+        const double prefill_t0 = omph::runtime::now_ms();
         for (int64_t off = 0; off < n_toks; off += act_chunk) {
             const int64_t n = std::min<int64_t>(act_chunk, n_toks - off);
             const std::vector<int32_t> part(toks.begin() + (size_t) off,
@@ -226,6 +227,11 @@ int main(int argc, char ** argv) {
                 logits.insert(logits.end(), part_logits.begin() + (size_t) (first * h.n_vocab),
                               part_logits.end());
             }
+        }
+        if (env.timing) {
+            (void) hipDeviceSynchronize();
+            std::fprintf(stderr, "prefill wall %.1f ms (%lld tokens)\n",
+                         omph::runtime::now_ms() - prefill_t0, (long long) n_toks);
         }
         write_f32(logits_path, logits);
         const auto argmax = [&](const float * row) {
@@ -281,6 +287,7 @@ int main(int argc, char ** argv) {
                         break;
                     }
                     std::vector<int32_t> batch{next};
+                    const double c0 = omph::runtime::now_ms();
                     if (draft_mtp) {
                         std::vector<int32_t> drafts;
                         if (!runner.mtp_draft(next, pos, draft_k, drafts)) {
@@ -302,15 +309,24 @@ int main(int argc, char ** argv) {
                         batch.push_back(d);
                     }
                     std::vector<int32_t> am;
+                    const double c1 = omph::runtime::now_ms();
                     if (!runner.verify(batch, pos, am)) {
                         return 1;
                     }
+                    const double c2 = omph::runtime::now_ms();
                     int64_t a = 0;
                     while (a + 1 < (int64_t) batch.size() && batch[(size_t) a + 1] == am[(size_t) a]) {
                         ++a;
                     }
                     if (!runner.commit(a + 1)) {
                         return 1;
+                    }
+                    if (timing) {
+                        (void) hipDeviceSynchronize();
+                        std::fprintf(stderr, "spec cycle: draft %.2f verify %.2f commit %.2f ms "
+                                             "(T %zu, kept %lld)\n",
+                                     c1 - c0, c2 - c1, omph::runtime::now_ms() - c2, batch.size(),
+                                     (long long) a + 1);
                     }
                     ++n_steps;
                     n_accepted += a;

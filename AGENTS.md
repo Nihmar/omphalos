@@ -112,7 +112,7 @@ tools/native/build.sh <llama.cpp-dir> && tools/native/dump_tensors ...
 | `--last-logits` / `--logits-tail N` | write only the last row / the last N rows of logits (long prompts) |
 | `--tokens N` | use only the first N prompt tokens |
 | `--trace-dir DIR` | dump every layer's output (one-chunk prompts only) |
-| `--draft-mtp K` | speculative greedy decode with K MTP drafts per step (#124); output identical to plain greedy |
+| `--draft-mtp K` | speculative greedy decode with K MTP drafts per step (#124, #126); output identical to plain greedy. K = 3 is the measured best (1.8-2.4x the plain decode); costs +0.5 GB VRAM (MTP block + alternate delta-net state) |
 | `--mtp` / `--mtp-out FILE` | load the MTP block (needs `--gemv --generate`) / write two chained drafts' logits after the prompt (validation) |
 | `--draft-oracle FILE [--draft-k K] [--draft-corrupt N]` | speculative greedy decode with drafts from a token file (a plain greedy run's `--gen-out`), every N-th draft corrupted: validates the verification + rollback (#122); the output must equal the plain greedy run |
 
@@ -129,7 +129,7 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_KV_K4` | KV | K in V's Q4 format too (#81, experiment) |
 | `OMPH_KV_WINDOW=N` | KV | FP16 ring of the last N tokens (default 128, 0 = off) |
 | `OMPH_NO_OVERLAP` | A/B | no side stream for sibling GEMVs (#71) |
-| `OMPH_NO_B4` | A/B | no four-token GEMVs in a `--gemv` prefill |
+| `OMPH_NO_B4` | A/B | no NT = 2..4-token GEMVs (verifications, `--gemv` prefill): one launch per token |
 | `OMPH_NO_BF16_GEMV` | A/B | BF16 weights through the f16 path |
 | `OMPH_NO_F16_CACHE` | A/B | re-convert f16-path weights on every call |
 | `OMPH_HOST_ARGMAX` | A/B | greedy argmax on the host instead of the device (#102) |

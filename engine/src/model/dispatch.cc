@@ -40,19 +40,6 @@ bool Runner::gemv_one(const int type, const void * w, const void * x, float * y,
     }
 }
 
-// Small-batch GEMV: one weight read per four tokens. Only the types that have
-// this form answer true; the others stay on the f16 path.
-bool Runner::gemv_batch4(const int type, const void * w, const void * x, float * y,
-                        const int64_t n_out, const int64_t k, hipStream_t st) {
-    switch (type) {
-        case 12: return omph::kernels::gemv_q4k_b4(w, x, y, n_out, k, st);
-        case 21: return omph::kernels::gemv_iq3s_b4(w, x, y, n_out, k, st);
-        case 23: return omph::kernels::gemv_iq4_xs_b4(w, x, y, n_out, k, st);
-        case 18: return omph::kernels::gemv_iq3_xxs_b4(w, x, y, n_out, k, st);
-        default: return false;
-    }
-}
-
 // One matmul: the fused GEMV for single-token steps when it is available for
 // this tensor, the small-batch GEMV for a few tokens, otherwise the f16
 // dequant + hipBLASLt path.
@@ -104,32 +91,46 @@ bool Runner::matmul(const Mat & m, const void * x16, float * y, const int64_t n_
         }
     }
     if (use_gemv_ && T > 1 && g != nullptr && g->rows == n_out && g->k == k) {
+        // the ablations of the single-token path apply here too
+        if (env_.skip_gemv ||
+            (env_.skip_gemv_type >= 0 && (uint32_t) env_.skip_gemv_type == g->type)) {
+            return true;
+        }
         const auto * w = static_cast<const uint8_t *>(m.dev);
         const auto * xb = static_cast<const uint8_t *>(x16);
-        if (!g->has_b4 && has_gemv_type(g->type)) {
-            // Types with a single-token kernel but no small-batch form: run one
-            // per token. No staging, so a long prefill stays inside VRAM — it
-            // just does not amortize the weight read (the b4 port is the fix).
+        // NT-token kernels (#126): groups of up to four tokens per weight read,
+        // a remainder of 2 or 3 included; a type without them falls through.
+        if (!env_.no_b4) {
             timer_gemv_.start(gemv_stream_);
             bool ok = true;
-            for (int64_t t0 = 0; t0 < T && ok; ++t0) {
-                ok = gemv_one(g->type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
-                              gemv_stream_);
+            bool supported = true;
+            for (int64_t t0 = 0; t0 < T && ok; ) {
+                const int64_t n = std::min<int64_t>(4, T - t0);
+                if (n == 1) {
+                    ok = gemv_one(g->type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
+                                  gemv_stream_);
+                } else {
+                    ok = omph::kernels::gemv_multi(g->type, w, xb + t0 * k * 2, y + t0 * n_out,
+                                                   n_out, k, (int) n, gemv_stream_);
+                    if (!ok && t0 == 0) {
+                        supported = false;  // nothing issued yet: fall through
+                        (void) hipGetLastError();
+                        break;
+                    }
+                }
+                t0 += n;
             }
             timer_gemv_.stop(t_gemv_, gemv_stream_);
-            if (ok) {
+            if (supported && ok) {
                 return true;
             }
         }
-        if (g->has_b4) {
+        if (has_gemv_type(g->type)) {
+            // Types with a single-token kernel but no NT form (IQ1_M, Q6_K): one
+            // launch per token. No staging, so a long prefill stays inside VRAM.
             timer_gemv_.start(gemv_stream_);
             bool ok = true;
-            int64_t t0 = 0;
-            for (; t0 + 4 <= T && ok; t0 += 4) {
-                ok = gemv_batch4(g->type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
-                                 gemv_stream_);
-            }
-            for (; t0 < T && ok; ++t0) {
+            for (int64_t t0 = 0; t0 < T && ok; ++t0) {
                 ok = gemv_one(g->type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
                               gemv_stream_);
             }
