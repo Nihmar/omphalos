@@ -1,0 +1,19 @@
+# Decode-step KL at long context against the exact f32 KV (#138, for #136). Engine 2d8888b + the
+# --gen-logits / --gen-force options ("new") vs 4bc9a42 (before #136, "old"), RX 9060 XT.
+# wiki16k.txt --tokens N, --gemv; the reference decodes 64 greedy tokens with OMPH_KV_F32=1 on the
+# old build; every other run is forced to those tokens (--gen-force) and writes its 63 decode
+# steps' logits (--gen-logits). compare_logits.py, all 63 rows:
+#
+#                      KL mean    median     p99        max        top-1
+# 8192 context
+#   old Q8/Q4          0.000156   0.000048   0.001692   0.002547   100.00 %
+#   new Q8/Q4          0.000155   0.000046   0.001659   0.002554   100.00 %
+#   new f32 KV         0.000000   0.000000   0.000002   0.000003   100.00 %
+# 16384 context
+#   old Q8/Q4          0.000714   0.000296   0.007259   0.013325   100.00 %
+#   new Q8/Q4          0.000711   0.000296   0.007170   0.013076   100.00 %
+#   new f32 KV         0.000000   0.000000   0.000001   0.000001   100.00 %
+#
+# -> #136's summation order (fixed key chunks, DPP trees, exp2) leaves the decode accuracy
+#    unchanged; on its own (f32 KV) it moves the logits by <= 3e-6 nats.
+# Command: /var/tmp/omphalos-scripts/decode_kl.sh (outputs kept in /var/tmp/omphalos-scratch/gl/).
