@@ -82,4 +82,12 @@ bool conv_silu_split_fused(const float * qkv, const float * w, const float * sta
                            int64_t channels, int64_t kernel, int64_t q_dims, int64_t kv_dims,
                            int64_t v_dims, hipStream_t stream);
 
+// conv_silu_split_fused plus the per-head L2 normalization of q and k
+// (y = x / sqrt(mean(x^2) + eps) * scale over each head_dim-wide head) in one
+// launch (#78). head_dim must be 128 and every part a multiple of it.
+bool conv_silu_split_l2(const float * qkv, const float * w, const float * state, float * new_state,
+                        float * q, float * k, float * v, int64_t tokens, int64_t channels,
+                        int64_t kernel, int64_t q_dims, int64_t kv_dims, int64_t v_dims,
+                        int64_t head_dim, float eps, float scale, hipStream_t stream);
+
 } // namespace omph::kernels

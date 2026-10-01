@@ -313,6 +313,60 @@ __global__ void conv_silu_split_kernel(const float * __restrict__ qkv,
 }
 
 
+// conv1d + silu + q/k/v split + the L2 normalization of q and k per head, in
+// one launch (#78; formerly conv_silu_split + two rms_norm launches). grid:
+// (tokens, q heads + k heads + v channels / 128); 128 threads, one channel
+// each. A q or k workgroup is exactly one head, so its norm is a block
+// reduction: y = x / sqrt(mean(x^2) + eps) * scale, as rms_norm computed it.
+// The workgroups of token 0 also shift the conv state for their channels.
+constexpr int kConvHead = 128;
+
+__global__ __launch_bounds__(kConvHead) void conv_silu_split_l2_kernel(
+    const float * __restrict__ qkv, const float * __restrict__ w,
+    const float * __restrict__ state, float * __restrict__ new_state, float * __restrict__ q,
+    float * __restrict__ k, float * __restrict__ v, const long long tokens,
+    const long long channels, const long long kernel, const long long q_dims,
+    const long long kv_dims, const long long v_dims, const float eps, const float scale) {
+    __shared__ float wsum[kConvHead / 32];
+    const long long t = blockIdx.x;
+    const long long c = (long long) blockIdx.y * kConvHead + threadIdx.x;
+    const long long rows = kernel - 1;
+    float acc = 0.0f;
+    for (long long j = 0; j < kernel; ++j) {
+        const long long r = t + j;
+        const float xv = (r < rows) ? state[r * channels + c] : qkv[(r - rows) * channels + c];
+        acc = fmaf(w[c * kernel + j], xv, acc);
+    }
+    float y = acc / (1.0f + expf(-acc));  // silu
+    if (t == 0) {
+        for (long long r = 0; r < rows; ++r) {
+            const long long src = tokens + r;
+            new_state[r * channels + c] =
+                (src < rows) ? state[src * channels + c] : qkv[(src - rows) * channels + c];
+        }
+    }
+    if (c < q_dims + kv_dims) {  // a whole q or k head: normalize it
+        float ss = y * y;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            ss += __shfl_xor(ss, off);
+        }
+        if ((threadIdx.x & 31) == 0) {
+            wsum[threadIdx.x >> 5] = ss;
+        }
+        __syncthreads();
+        const float tot = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+        y = y * (1.0f / sqrtf(tot / (float) kConvHead + eps)) * scale;
+    }
+    if (c < q_dims) {
+        q[t * q_dims + c] = y;
+    } else if (c < q_dims + kv_dims) {
+        k[t * kv_dims + (c - q_dims)] = y;
+    } else {
+        v[t * v_dims + (c - q_dims - kv_dims)] = y;
+    }
+}
+
 unsigned grid_for(const long long n) {
     return (unsigned) ((n + kBlock - 1) / kBlock);
 }
@@ -489,6 +543,25 @@ bool conv_silu_split_fused(const float * qkv, const float * w, const float * sta
     conv_silu_split_kernel<<<grid_for(n), kBlock, 0, stream>>>(
         qkv, w, state, new_state, q, k, v, (long long) tokens, (long long) channels,
         (long long) kernel, (long long) q_dims, (long long) kv_dims, (long long) v_dims);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool conv_silu_split_l2(const float * qkv, const float * w, const float * state, float * new_state,
+                        float * q, float * k, float * v, const int64_t tokens,
+                        const int64_t channels, const int64_t kernel, const int64_t q_dims,
+                        const int64_t kv_dims, const int64_t v_dims, const int64_t head_dim,
+                        const float eps, const float scale, hipStream_t stream) {
+    if (qkv == nullptr || w == nullptr || state == nullptr || new_state == nullptr ||
+        q == nullptr || k == nullptr || v == nullptr || tokens <= 0 || kernel <= 1 ||
+        head_dim != kConvHead || q_dims % kConvHead != 0 || kv_dims % kConvHead != 0 ||
+        v_dims % kConvHead != 0 || channels != q_dims + kv_dims + v_dims) {
+        return false;
+    }
+    const dim3 grid((unsigned) tokens, (unsigned) (channels / kConvHead));
+    conv_silu_split_l2_kernel<<<grid, kConvHead, 0, stream>>>(
+        qkv, w, state, new_state, q, k, v, (long long) tokens, (long long) channels,
+        (long long) kernel, (long long) q_dims, (long long) kv_dims, (long long) v_dims, eps,
+        scale);
     return hipGetLastError() == hipSuccess;
 }
 

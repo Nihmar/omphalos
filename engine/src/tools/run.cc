@@ -803,16 +803,12 @@ private:
         if (!proj_ok) {
             return fail("gdn projection failed");
         }
-        if (!omph::kernels::conv_silu_split_fused(
+        // conv + silu + split + L2 norm of q and k: rms_norm(x, eps/s) / sqrt(s)
+        if (!omph::kernels::conv_silu_split_l2(
                 static_cast<const float *>(fused_), conv_w, conv_cur, conv_new,
                 static_cast<float *>(q_), static_cast<float *>(k_), static_cast<float *>(v_), T,
-                channels, h_.ssm_conv_k, q_dims, k_dims, v_dims, nullptr) ||
-            !omph::kernels::rms_norm(static_cast<const float *>(q_), nullptr,
-                                     static_cast<float *>(q_), T * n_kh, s,
-                                     (float) (h_.eps / (double) s), l2_scale, nullptr) ||
-            !omph::kernels::rms_norm(static_cast<const float *>(k_), nullptr,
-                                     static_cast<float *>(k_), T * n_kh, s,
-                                     (float) (h_.eps / (double) s), l2_scale, nullptr)) {
+                channels, h_.ssm_conv_k, q_dims, k_dims, v_dims, s, (float) (h_.eps / (double) s),
+                l2_scale, nullptr)) {
             return fail("gdn preprocessing failed");
         }
         for (int64_t t = 0; t < T; ++t) {
