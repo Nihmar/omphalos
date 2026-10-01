@@ -7,35 +7,15 @@ usage: uv run python validate_reference.py [--max-layers N] [--tol X]
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 import numpy as np
 
+from omphalos_tools.golden import load, load_index, rel_diff
 from omphalos_tools.model import Model
 from omphalos_tools.reference import Captures, Reference
 
 COMPARE = ("attn_norm", "attn_residual", "attn_post_norm", "ffn_out", "l_out")
-
-
-def load_index(dump: Path) -> dict[str, dict]:
-    idx: dict[str, dict] = {}
-    for line in (dump / "index.jsonl").read_text().splitlines():
-        entry = json.loads(line)
-        idx[entry["name"]] = entry  # last wins
-    return idx
-
-
-def load(dump: Path, entry: dict) -> np.ndarray:
-    dtype = {"f32": np.float32, "f16": np.float16}[entry["type"]]
-    flat = np.fromfile(dump / entry["file"], dtype=dtype).astype(np.float32)
-    return flat.reshape(tuple(reversed(entry["ne"])))  # (tokens, ...)
-
-
-def rel_diff(mine: np.ndarray, ref: np.ndarray) -> float:
-    d = np.abs(mine - ref)
-    scale = max(float(np.abs(ref).max()), 1e-12)
-    return float(d.max()) / scale
 
 
 def main() -> None:

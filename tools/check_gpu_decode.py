@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Greedy decode: engine vs NumPy reference (milestone 2 exit criterion).
 
-usage: uv run python check_gpu_decode.py [--generate N] [--tol 0.15] [--refresh]
+usage: uv run python check_gpu_decode.py [--gemv] [--generate N] [--tol 0.15] [--refresh]
+
+--gemv runs the engine's fast decode path (fused GEMVs on repacked weights).
 
 The NumPy reference costs ~4 minutes per generated token, so its result is
 cached next to the dump (decode-ref-g<N>.npz) and reused while the model file,
@@ -12,20 +14,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import tempfile
 import time
 from pathlib import Path
 
 import numpy as np
 
+from omphalos_tools.golden import rel_diff, run_tool
 from omphalos_tools.model import Model
 from omphalos_tools.reference import Reference
-
-
-def rel_diff(mine: np.ndarray, ref: np.ndarray) -> float:
-    scale = max(float(np.abs(ref).max()), 1e-12)
-    return float(np.abs(mine - ref).max()) / scale
 
 
 def main() -> None:
@@ -90,7 +87,7 @@ def main() -> None:
                "--generate", str(args.generate), "--gen-out", str(gen_path)]
         if args.gemv:
             cmd.append("--gemv")
-        out = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        out = run_tool(cmd, text=True)
         print(f"engine: {time.time() - t0:.1f}s", flush=True)
         print(out.stdout.strip(), flush=True)
         gen_gpu = [int(v) for v in gen_path.read_text().split()]

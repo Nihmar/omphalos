@@ -12,38 +12,18 @@ carried across calls).
 from __future__ import annotations
 
 import argparse
-import json
-import subprocess
 import tempfile
 from pathlib import Path
 
 import numpy as np
+
+from omphalos_tools.golden import load, load_index, rel_diff, run_tool
 
 PAIRS = (
     ("qkv", "linear_attn_qkv_mixed"),
     ("z", "z"),
     ("final", "final_output"),
 )
-
-
-def load_index(dump: Path) -> dict[str, dict]:
-    idx: dict[str, dict] = {}
-    for line in (dump / "index.jsonl").read_text().splitlines():
-        entry = json.loads(line)
-        idx[entry["name"]] = entry
-    return idx
-
-
-def load(dump: Path, entry: dict) -> np.ndarray:
-    dtype = {"f32": np.float32, "f16": np.float16}[entry["type"]]
-    flat = np.fromfile(dump / entry["file"], dtype=dtype).astype(np.float32)
-    return flat.reshape(tuple(reversed(entry["ne"])))
-
-
-def rel_diff(mine: np.ndarray, ref: np.ndarray) -> float:
-    d = np.abs(mine - ref)
-    scale = max(float(np.abs(ref).max()), 1e-12)
-    return float(d.max()) / scale
 
 
 def main() -> None:
@@ -68,8 +48,8 @@ def main() -> None:
         in_path = Path(tmp) / "in.f32"
         prefix = str(Path(tmp) / "t")
         np.ascontiguousarray(x, dtype=np.float32).tofile(in_path)
-        subprocess.run([args.tool, args.model, str(il), str(in_path), prefix, str(tokens),
-                        "--trace", "--chunk", str(args.chunk)], check=True, capture_output=True)
+        run_tool([args.tool, args.model, str(il), str(in_path), prefix, str(tokens),
+                        "--trace", "--chunk", str(args.chunk)])
         got = {name: np.fromfile(f"{prefix}-{name}.f32", dtype=np.float32) for name, _ in PAIRS}
         out = np.fromfile(f"{prefix}.out.f32", dtype=np.float32)
 

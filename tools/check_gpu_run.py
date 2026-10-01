@@ -1,37 +1,19 @@
 #!/usr/bin/env python3
 """Compare omph-run (full 64-layer forward pass) against the golden dump.
 
-usage: uv run python check_gpu_run.py <model.gguf> [--dump DIR] [--layers] [--tol 0.3]
+usage: uv run python check_gpu_run.py <model.gguf> [--dump DIR] [--layers] [--tol 0.15]
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 import tempfile
 from pathlib import Path
 
 import numpy as np
 
-
-def load_index(dump: Path) -> dict[str, dict]:
-    idx: dict[str, dict] = {}
-    for line in (dump / "index.jsonl").read_text().splitlines():
-        entry = json.loads(line)
-        idx[entry["name"]] = entry
-    return idx
-
-
-def load(dump: Path, entry: dict) -> np.ndarray:
-    dtype = {"f32": np.float32, "f16": np.float16}[entry["type"]]
-    flat = np.fromfile(dump / entry["file"], dtype=dtype).astype(np.float32)
-    return flat.reshape(tuple(reversed(entry["ne"])))
-
-
-def rel_diff(mine: np.ndarray, ref: np.ndarray) -> float:
-    scale = max(float(np.abs(ref).max()), 1e-12)
-    return float(np.abs(mine - ref).max()) / scale
+from omphalos_tools.golden import load, load_index, rel_diff
 
 
 def main() -> None:

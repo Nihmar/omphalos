@@ -8,6 +8,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -36,8 +37,21 @@ int main(int argc, char ** argv) {
             width = std::atoll(argv[++i]);
         } else if (std::strcmp(argv[i], "--reps") == 0 && i + 1 < argc) {
             reps = std::atoi(argv[++i]);
+        } else {
+            std::fprintf(stderr, "usage: %s [--kernels N] [--width N] [--reps N]\n", argv[0]);
+            return 2;
         }
     }
+    if (n_kernels <= 0 || width <= 0 || reps <= 0) {
+        std::fprintf(stderr, "--kernels, --width and --reps must be positive\n");
+        return 2;
+    }
+    // PLAN.md §17: the median of the repetitions, not the best one
+    const auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        const size_t n = v.size();
+        return n % 2 == 1 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+    };
 
     float * x = nullptr;
     float * zero = nullptr;
@@ -66,15 +80,15 @@ int main(int argc, char ** argv) {
     chain(nullptr);
     (void) hipDeviceSynchronize();
 
-    double best_free = 1e30;
+    std::vector<double> t_free;
     for (int r = 0; r < reps; ++r) {
         (void) hipEventRecord(a, nullptr);
         chain(nullptr);
         (void) hipEventRecord(b, nullptr);
         (void) hipDeviceSynchronize();
-        const double ms = ms_between(a, b);
-        best_free = ms < best_free ? ms : best_free;
+        t_free.push_back(ms_between(a, b));
     }
+    const double med_free = median(t_free);
 
     // the same chain, captured
     hipStream_t cap = nullptr;
@@ -98,23 +112,24 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    double best_graph = 1e30;
+    std::vector<double> t_graph;
     for (int r = 0; r < reps; ++r) {
         (void) hipEventRecord(a, nullptr);
         (void) hipGraphLaunch(exec, nullptr);
         (void) hipEventRecord(b, nullptr);
         (void) hipDeviceSynchronize();
-        const double ms = ms_between(a, b);
-        best_graph = ms < best_graph ? ms : best_graph;
+        t_graph.push_back(ms_between(a, b));
     }
+    const double med_graph = median(t_graph);
 
-    std::printf("chain of %lld tiny dependent kernels\n", (long long) n_kernels);
-    std::printf("  launched one by one : %8.3f ms  (%.2f us per kernel)\n", best_free,
-                1000.0 * best_free / (double) n_kernels);
-    std::printf("  replayed as a graph : %8.3f ms  (%.2f us per kernel)\n", best_graph,
-                1000.0 * best_graph / (double) n_kernels);
-    std::printf("  saved               : %8.3f ms  (%.1f%%)\n", best_free - best_graph,
-                100.0 * (best_free - best_graph) / best_free);
+    std::printf("chain of %lld tiny dependent kernels, median of %d\n", (long long) n_kernels,
+                reps);
+    std::printf("  launched one by one : %8.3f ms  (%.2f us per kernel)\n", med_free,
+                1000.0 * med_free / (double) n_kernels);
+    std::printf("  replayed as a graph : %8.3f ms  (%.2f us per kernel)\n", med_graph,
+                1000.0 * med_graph / (double) n_kernels);
+    std::printf("  saved               : %8.3f ms  (%.1f%%)\n", med_free - med_graph,
+                100.0 * (med_free - med_graph) / med_free);
 
     (void) hipGraphExecDestroy(exec);
     (void) hipGraphDestroy(graph);

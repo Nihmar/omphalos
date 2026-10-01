@@ -27,6 +27,7 @@ ts="$(date +%Y%m%d-%H%M%S)"
 csv="$outdir/m0-llama-bench-$label-$ts.csv"
 log="$outdir/m0-llama-bench-$label-$ts.log"
 tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
 
 {
   echo "# omphalos M0 llama.cpp baselines"

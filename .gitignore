@@ -33,3 +33,11 @@ tools/native/isa_probe
 
 # rocprofv3 output
 .rocprofv3/
+
+# Tool outputs the AGENTS.md commands write into the working directory
+# (logits, dequant dumps, llama.cpp KL bases, cached references). None are
+# tracked; a fixture that must be would need an explicit `!path` here.
+*.f32
+*.raw
+*.kld
+*.npz

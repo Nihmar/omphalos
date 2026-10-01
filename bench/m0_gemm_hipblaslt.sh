@@ -16,7 +16,7 @@ mkdir -p "$outdir"
 bin="$root/bench/build/hipblaslt_gemm_bench"
 if [[ ! -x "$bin" ]]; then
   echo "missing $bin — build it with:" >&2
-  echo "  hipcc -O3 --offload-arch=gfx1200 bench/hipblaslt_gemm_bench.hip -o bench/build/hipblaslt_gemm_bench -L/opt/rocm/lib -lhipblaslt -Wl,-rpath,/opt/rocm/lib" >&2
+  echo "  mkdir -p bench/build && hipcc -O3 --offload-arch=gfx1200 bench/hipblaslt_gemm_bench.hip -o bench/build/hipblaslt_gemm_bench -L/opt/rocm/lib -lhipblaslt -Wl,-rpath,/opt/rocm/lib" >&2
   exit 1
 fi
 
