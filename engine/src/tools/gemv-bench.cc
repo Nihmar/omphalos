@@ -109,24 +109,49 @@ bool prepare(const omph::gguf::File & file, const omph::gguf::TensorInfo * t, Ca
 
 double time_ms(const std::vector<Case> & cases, const void * x, float * y, const int iters,
                hipStream_t stream) {
+    // Launches alternate over `streams` non-blocking streams (OMPH_BENCH_STREAMS,
+    // default 1): with 2 they overlap as the decode's sibling GEMVs do (#71), so
+    // the figure is the kernel's own rate rather than the launch-gap-bound one.
+    int ns = 1;
+    if (const char * e = std::getenv("OMPH_BENCH_STREAMS")) {
+        ns = std::atoi(e) > 0 ? std::atoi(e) : 1;
+    }
+    std::vector<hipStream_t> st((size_t) ns, stream);
+    for (int k = 1; k < ns; ++k) {
+        (void) hipStreamCreateWithFlags(&st[(size_t) k], hipStreamNonBlocking);
+    }
+    size_t n = 0;
     for (int i = 0; i < 3; ++i) {
         for (const Case & c : cases) {
-            (void) launch(c, x, y, stream);
+            (void) launch(c, x, y, st[n++ % st.size()]);
         }
     }
+    (void) hipDeviceSynchronize();
     hipEvent_t e0, e1;
     (void) hipEventCreate(&e0);
     (void) hipEventCreate(&e1);
-    (void) hipEventRecord(e0, stream);
+    (void) hipEventRecord(e0, st[0]);
+    for (int k = 1; k < ns; ++k) {
+        (void) hipStreamWaitEvent(st[(size_t) k], e0, 0);
+    }
     for (int i = 0; i < iters; ++i) {
         for (const Case & c : cases) {
-            (void) launch(c, x, y, stream);
+            (void) launch(c, x, y, st[n++ % st.size()]);
         }
     }
-    (void) hipEventRecord(e1, stream);
+    for (int k = 1; k < ns; ++k) {
+        hipEvent_t done;
+        (void) hipEventCreate(&done);
+        (void) hipEventRecord(done, st[(size_t) k]);
+        (void) hipStreamWaitEvent(st[0], done, 0);
+    }
+    (void) hipEventRecord(e1, st[0]);
     (void) hipDeviceSynchronize();
     float ms = 0.0f;
     (void) hipEventElapsedTime(&ms, e0, e1);
+    for (int k = 1; k < ns; ++k) {
+        (void) hipStreamDestroy(st[(size_t) k]);
+    }
     return (double) ms / iters;
 }
 

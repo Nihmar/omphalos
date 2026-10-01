@@ -209,7 +209,8 @@ void unrepack_iq2_xxs(const void * src, int64_t n_blocks, void * dst);
 // 32-weight sub-block followed by 4 sign bytes per sub-block, 8 bytes of 2-bit
 // index extensions (the grid has 1024 entries) and 8 bytes of 4-bit scales.
 // The two halves of the index/sign area are split into their own streams; size
-// unchanged, and the signs are already masks so no table is needed.
+// unchanged. Each sub-block's 32 sign bits are pair-ordered as for IQ3_S
+// (weight 2p at bit 15 - p, 2p + 1 at bit 31 - p; #73), losslessly.
 //   [ qs 32 ] [ signs 32 ] [ qh 8 ] [ sc 8 ] [ d 2 ]
 struct Iq2sLayout {
     int64_t n_blocks = 0;

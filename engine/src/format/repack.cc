@@ -694,7 +694,12 @@ void repack_iq2_s(const void * src, const int64_t n_blocks, void * dst) {
     uint8_t * out = static_cast<uint8_t *>(dst);
     for (int64_t b = 0; b < n_blocks; ++b) {
         std::memcpy(out + l.qs_off + b * 32, in[b].qs, 32);
-        std::memcpy(out + l.signs_off + b * 32, in[b].qs + 32, 32);
+        for (int sub = 0; sub < 8; ++sub) {  // same sign order as IQ3_S (#73)
+            uint32_t sg = 0;
+            std::memcpy(&sg, in[b].qs + 32 + 4 * sub, 4);
+            sg = iq3s_signs_to_pairs(sg);
+            std::memcpy(out + l.signs_off + b * 32 + 4 * sub, &sg, 4);
+        }
         std::memcpy(out + l.qh_off + b * 8, in[b].qh, 8);
         std::memcpy(out + l.sc_off + b * 8, in[b].scales, 8);
         std::memcpy(out + l.d_off + 2 * b, &in[b].d, 2);
@@ -707,7 +712,12 @@ void unrepack_iq2_s(const void * src, const int64_t n_blocks, void * dst) {
     auto * out = static_cast<BlockIq2S *>(dst);
     for (int64_t b = 0; b < n_blocks; ++b) {
         std::memcpy(out[b].qs, in + l.qs_off + b * 32, 32);
-        std::memcpy(out[b].qs + 32, in + l.signs_off + b * 32, 32);
+        for (int sub = 0; sub < 8; ++sub) {
+            uint32_t sg = 0;
+            std::memcpy(&sg, in + l.signs_off + b * 32 + 4 * sub, 4);
+            sg = iq3s_pairs_to_signs(sg);
+            std::memcpy(out[b].qs + 32 + 4 * sub, &sg, 4);
+        }
         std::memcpy(out[b].qh, in + l.qh_off + b * 8, 8);
         std::memcpy(out[b].scales, in + l.sc_off + b * 8, 8);
         std::memcpy(&out[b].d, in + l.d_off + 2 * b, 2);

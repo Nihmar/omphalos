@@ -928,33 +928,27 @@ __global__ void gemv_iq2s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
                 dbl[r][0] = dv * (0.5f + (float) (scb & 0xF)) * 0.25f;
                 dbl[r][1] = dv * (0.5f + (float) (scb >> 4)) * 0.25f;
             }
+            // Same scheme as IQ3_S: codebook byte pairs -> half2, pair-ordered
+            // signs OR-ed in, v_dot2; one u64 codebook entry per 8 weights.
             float sub[kIq2sRows][2] = {};
+            const uint4 * xq4 = reinterpret_cast<const uint4 *>(xv);
 #pragma unroll
             for (int l = 0; l < 4; ++l) {
+                const uint4 xq = xq4[l];
 #pragma unroll
                 for (int r = 0; r < kIq2sRows; ++r) {
-                    const uint32_t lo = (qsw[r] >> (8 * l)) & 0xFF;
-                    const uint32_t hi = ((qhb[r] >> (2 * l)) & 3) << 8;
-                    const uint32_t sg = (sgw[r] >> (8 * l)) & 0xFF;
-                    uint32_t smk[8];
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        smk[j] = ((sg >> j) & 1u) ? 0x80000000u : 0u;
-                    }
+                    const uint32_t lo = (qsw[r] >> (8 * l)) & 0xFFu;
+                    const uint32_t hi = ((qhb[r] >> (2 * l)) & 3u) << 8;
                     const uint64_t g = grid[lo | hi];
-                    const uint32_t glo = (uint32_t) g;
-                    const uint32_t ghi = (uint32_t) (g >> 32);
-                    float gf[8];
-                    grid4(glo, gf);
-                    grid4(ghi, gf + 4);
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        float v = gf[j];
-                        if (sg & (1u << j)) {
-                            v = -v;
-                        }
-                        sub[r][l >> 1] = fmaf(v, __half2float(xv[8 * l + j]), sub[r][l >> 1]);
-                    }
+                    const uint32_t g1 = (uint32_t) g;
+                    const uint32_t g2 = (uint32_t) (g >> 32);
+                    constexpr uint32_t kSign2 = 0x80008000u;
+                    // two independent dot2 chains, so they do not stall on each other
+                    float pa = dot2(((sgw[r] << (4 * l)) & kSign2) | grid_pair_to_half2<0x04010400u>(g1), xq.x, 0.0f);
+                    float pb = dot2(((sgw[r] << (4 * l + 2)) & kSign2) | grid_pair_to_half2<0x04010400u>(g2), xq.z, 0.0f);
+                    pa = dot2(((sgw[r] << (4 * l + 1)) & kSign2) | grid_pair_to_half2<0x04030402u>(g1), xq.y, pa);
+                    pb = dot2(((sgw[r] << (4 * l + 3)) & kSign2) | grid_pair_to_half2<0x04030402u>(g2), xq.w, pb);
+                    sub[r][l >> 1] += pa + pb;
                 }
             }
 #pragma unroll
