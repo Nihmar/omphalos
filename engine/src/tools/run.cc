@@ -1103,7 +1103,7 @@ private:
             // BF16 weights: bf16 is the top half of an f32, so a direct dot
             // product beats converting to f16 and running a tiny M = 1 GEMM.
             const omph::gguf::TensorInfo * ti = file_.tensor(name);
-            if (ti != nullptr && ti->type == 30 && ti->ne[1] == n_out && ti->ne[0] == k &&
+            if (ti != nullptr && ti->type == 30 && (int64_t) ti->ne[1] == n_out && (int64_t) ti->ne[0] == k &&
                 std::getenv("OMPH_NO_BF16_GEMV") == nullptr) {
                 const void * w = static_cast<const uint8_t *>(dev_weights_) + off_.at(name);
                 timer_gemv_.start();
