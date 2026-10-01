@@ -175,11 +175,9 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         const int64_t rows = stage_rows((int64_t) t.ne[1], (int64_t) t.ne[0]);
         scratch_bytes = std::max(scratch_bytes, (((size_t) rows * t.ne[0] * 2) + 255) & ~(size_t) 255);
     }
+    // Allocated on first use: with the fused GEMM (#141) only a weight of a
+    // type without a decoder ever needs it.
     scratch_bytes_ = scratch_bytes;
-    if (!use_gemv_) {
-        scratch_.init(mem_.device(scratch_bytes, "cannot allocate the weight scratch"),
-                      scratch_bytes, env_.trace_alloc);
-    }
     const auto alloc = [&](void ** p, const size_t bytes) { *p = mem_.device(bytes); };
     alloc(&x_, T * ne * 4);
     alloc(&cur_, T * ne * 4);
@@ -304,7 +302,6 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
             }
         }
     }
-    scratch_ready_ = !use_gemv_;
     gemm_min_ = env_.gemm_min;
     if (overlap_) {
         calibrate_overlap();

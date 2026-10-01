@@ -1,0 +1,33 @@
+# M8: fused dequant + WMMA GEMM (#141). Engine 9e86b4f vs main cb8b97a, same session.
+# RX 9060 XT, --gemv --last-logits --generate 1, OMPH_TIMING "prefill wall", median of 5 unless noted.
+#
+# 1. Prefill (ms):             main                                 fused
+#    512 tokens                723.5 726.7 721.4 720.6 720.1         595.3 594.4 597.7 599.0 594.1
+#    128 tokens                400.1 401.7 398.3 395.4 403.7         231.3 231.4 230.8 230.7 231.0
+#    f16 path, 512 tokens      874.8 877.4 877.2 875.5 873.9         643.1 645.4 645.5 646.7 648.7
+#    2048 (1 run)              2881.6                                2376.7
+#    8192 (1 run)              12285.2                               10160.3
+#    16384 (1 run)             26278.7                               22009.8
+#    (this session ran ~2.5 % slower than earlier ones: main measured 705 ms at 512 before)
+#
+# 2. Steps, 512 tokens (same session as each pair):
+#    dequant to f16 + gemm_f16 (main)                          705 ms
+#    fused, 128-token tiles                                    623 ms
+#    + codebooks copied to LDS                                 641 ms (dropped)
+#    + 256-token tiles past 256 tokens                         577 ms
+#    Short runs: 128-token tiles win up to 256 tokens (T=32 187 vs 253, T=128 225 vs 287,
+#    T=256 327 vs 335 ms).
+#    Per type at 512 tokens (rocprofv3): IQ3_S 52, IQ4_XS 56.5, IQ3_XXS 55.6 TFLOPS (gemm_f16 on
+#    f16: ~60), with no dequant pass (it was ~95 ms of kernels + launch gaps).
+#
+# 3. GEMV vs GEMM crossover (--gemv prefill, ms): T=8 97 vs 182, T=12 140 vs 183, T=16 183 vs 185,
+#    T=24 266 vs 187, T=32 352 vs 192 -> OMPH_GEMM_MIN 32 -> 16.
+#
+# 4. Peak VRAM over idle: --gemv 11459 -> 11433 MiB, f16 path 11828 -> 11802 MiB (no staging
+#    scratch: every repacked type, IQ1_M included, has a decoder).
+#
+# 5. Correctness: every output bit-identical to main (f16 prefill 512 and 1000-token tail, --gemv
+#    prefill + greedy tokens, f32 KV); the shared decoders: omph-gemv-bench --dequant, 0
+#    mismatches on all 399 tensors of the eight types. Speculative oracle runs identical in every
+#    KV mode (15 / 15); check_gpu_* / run --layers / decode --gemv / mtp: PASS. Decode 45.7 ms and
+#    --draft-mtp 3 17.44 ms/token: unchanged.
