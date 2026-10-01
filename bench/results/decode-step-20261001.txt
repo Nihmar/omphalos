@@ -18,3 +18,15 @@ prompt                 KV     main (ms)   now (ms)
 # 10-token prompt: 51.67 ms; 8k prompt: 54.35 ms
 # omph-gemv-bench --all-of-type, launches alternated over 1 / 2 non-blocking streams:
 # IQ3_S 79.4 / 96.0 %, IQ4_XS 84.5 / 96.7 %, IQ3_XXS 70.9 / 83.8 %
+
+# #75/#76 low-bit GEMVs, then #78/#79 kernel-chain fusion. Decode step, 512 tokens,
+# default Q8/Q4 KV, --last-logits --gemv --generate 16, median of 15 steps, A/B runs
+# alternated with a fixed baseline binary in the same session (5 runs each):
+# main before #76 (#74 merged):      50.83 50.86 50.87 50.85 50.94  | #76: 50.15-50.19
+# baseline #76 (463157c):            50.14 50.13 50.13 50.14 50.16
+# + delta gates in the delta kernel: 49.70 49.71 49.72 49.74 49.74
+# + gated norm writes f16:           49.60 49.57 49.62 49.60 49.60
+# + conv + L2 norm fused:            49.23 49.22 49.23 49.23 49.24
+# + attention prep fused, f16 merge: 48.63 48.64 48.61 48.61 48.65
+# rocprofv3 kernel trace before #78 (profiled step 57.6 ms): busy 51.6 ms, idle 6.0 ms
+# over 1130 inter-kernel gaps (median 4.0 us, p90 8.9 us).
