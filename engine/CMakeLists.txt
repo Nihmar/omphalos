@@ -17,7 +17,6 @@ add_compile_definitions(HIP_API_PER_THREAD_DEFAULT_STREAM=1)
 add_compile_options($<$<COMPILE_LANGUAGE:HIP>:-fgpu-default-stream=per-thread>)
 
 find_package(hip REQUIRED)
-find_package(hipblaslt REQUIRED)
 
 # Warnings for every target, the library and the tools alike (#100).
 add_library(omph_warnings INTERFACE)
@@ -41,13 +40,14 @@ add_library(omphalos SHARED
     src/kernels/attn.hip
     src/kernels/gdn.hip
     src/kernels/gemv.hip
+    src/kernels/gemm.hip
 )
 target_include_directories(omphalos
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_compile_options(omphalos PRIVATE -O3)
-target_link_libraries(omphalos PRIVATE roc::hipblaslt hip::host omph_warnings)
+target_link_libraries(omphalos PRIVATE hip::host omph_warnings)
 
 add_executable(omph-gguf-info src/tools/gguf_info.cc)
 target_include_directories(omph-gguf-info PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -62,15 +62,15 @@ target_link_libraries(omph-dequant PRIVATE omphalos hip::host omph_warnings)
 
 add_executable(omph-linear src/tools/linear.cc)
 target_include_directories(omph-linear PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(omph-linear PRIVATE omphalos hip::host roc::hipblaslt omph_warnings)
+target_link_libraries(omph-linear PRIVATE omphalos hip::host omph_warnings)
 
 add_executable(omph-attn src/tools/attn.cc)
 target_include_directories(omph-attn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(omph-attn PRIVATE omphalos hip::host roc::hipblaslt omph_warnings)
+target_link_libraries(omph-attn PRIVATE omphalos hip::host omph_warnings)
 
 add_executable(omph-gdn src/tools/gdn.cc)
 target_include_directories(omph-gdn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(omph-gdn PRIVATE omphalos hip::host roc::hipblaslt omph_warnings)
+target_link_libraries(omph-gdn PRIVATE omphalos hip::host omph_warnings)
 
 add_executable(omph-graph-probe src/tools/graph_probe.cc)
 target_include_directories(omph-graph-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -78,8 +78,8 @@ target_link_libraries(omph-graph-probe PRIVATE omphalos hip::host omph_warnings)
 
 add_executable(omph-run src/tools/run.cc)
 target_include_directories(omph-run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(omph-run PRIVATE omphalos hip::host roc::hipblaslt omph_warnings)
+target_link_libraries(omph-run PRIVATE omphalos hip::host omph_warnings)
 
 add_executable(omph-gemv-bench src/tools/gemv-bench.cc)
 target_include_directories(omph-gemv-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(omph-gemv-bench PRIVATE omphalos hip::host roc::hipblaslt omph_warnings)
+target_link_libraries(omph-gemv-bench PRIVATE omphalos hip::host omph_warnings)

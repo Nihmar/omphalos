@@ -450,7 +450,7 @@ int main(int argc, char ** argv) {
                     total_bytes / (1024 * 1024), gbs, 100.0 * gbs / kMeasuredBandwidthGBs,
                     kMeasuredBandwidthGBs);
 
-        // ---- accuracy against the f16 dequant + hipBLASLt path
+        // ---- accuracy against the f16 dequant + GEMM path
         const Case & c = cases.front();
         const omph::gguf::TensorInfo * t = c.t;
         void * quantized = nullptr;

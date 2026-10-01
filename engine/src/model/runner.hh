@@ -127,7 +127,7 @@ private:
     // The first `rows` rows of logits_ to the host (synchronous).
     bool copy_logits(float * dst, const int64_t rows);
 
-    // lm head in vocab chunks, through the f16 dequant + hipBLASLt path: the
+    // lm head in vocab chunks, through the f16 dequant + GEMM path: the
     // whole f16 head (248k x 5120, 2.5 GB) would not fit. Writes (T, n_vocab)
     // to `out` on the host, one vocab chunk at a time.
     bool head_chunked(const void * x16, const int64_t T, float * out);
@@ -205,7 +205,7 @@ private:
 
     // One matmul: the fused GEMV for single-token steps when it is available for
     // this tensor, the small-batch GEMV for a few tokens, otherwise the f16
-    // dequant + hipBLASLt path.
+    // dequant + GEMM path.
     bool matmul(const Mat & m, const void * x16, float * y, const int64_t n_out,
                 const int64_t k, const int64_t T);
 
@@ -240,7 +240,7 @@ private:
     omph::gguf::File file_;
     HParams h_;
     bool use_gemv_ = false;
-    omph::runtime::Linear linear_;  // one hipBLASLt handle for the whole run
+    omph::runtime::Linear linear_;  // the f16 WMMA GEMM (#132)
     PhaseTimer timer_stage_;
     PhaseTimer timer_gemm_;
     PhaseTimer timer_gemv_;

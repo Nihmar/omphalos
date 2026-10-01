@@ -33,7 +33,7 @@ struct EnvOptions {
     bool skip_blocks = false;   // OMPH_SKIP_BLOCKS: no attention / delta-net / FFN at all
     bool skip_gemv = false;     // OMPH_SKIP_GEMV: no fused GEMVs
     int skip_gemv_type = -1;    // OMPH_SKIP_GEMV_TYPE=T: no GEMVs of GGUF type T (#63)
-    bool skip_stage = false;    // OMPH_SKIP_STAGE: no f16 staging + hipBLASLt matmuls
+    bool skip_stage = false;    // OMPH_SKIP_STAGE: no f16 staging + GEMMs
 
     // --- diagnostics
     bool timing = false;        // OMPH_TIMING: VRAM after load, per-step GPU and wall times
