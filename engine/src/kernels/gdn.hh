@@ -63,7 +63,8 @@ bool gated_norm(const float * o, const float * w, const float * z, float * out, 
 // (PLAN.md §10.2; #78, #83): per value head, the conv1d + silu of its q / k
 // (key head h % n_kh) and v from the qkv projection and the conv state, the L2
 // norm of q and k, the gates (beta = sigmoid(beta_raw), decay =
-// exp(softplus(alpha_raw + dt_bias) * ssm_a)), the delta rule on the head's
+// exp(softplus(alpha_raw + dt_bias) * ssm_a), the raw gates being this head's
+// rows of the BF16 beta / alpha projections dotted with x16), the delta rule on the head's
 // state (decay, sk = S^T k, d = (v - sk) * beta, S += k (x) d, o = l2_scale *
 // S^T q) and the gated RMSNorm (o / sqrt(mean(o^2) + eps_norm) * norm_w *
 // silu(z)) written as f16. State size s = 128; one 256-thread workgroup per
@@ -75,8 +76,10 @@ struct GdnStep {
     const float * conv_w = nullptr;    // (channels, conv_k)
     const float * conv_cur = nullptr;  // (conv_k - 1, channels)
     float * conv_new = nullptr;        // (conv_k - 1, channels)
-    const float * beta = nullptr;      // (heads) raw, token t
-    const float * alpha = nullptr;     // (heads) raw, token t
+    const __half * x16 = nullptr;      // (k_in) the normed layer input, token t
+    const uint16_t * w_beta = nullptr;   // (heads, k_in) BF16 beta projection
+    const uint16_t * w_alpha = nullptr;  // (heads, k_in) BF16 alpha projection
+    long long k_in = 0;
     const float * dt_bias = nullptr;   // (heads)
     const float * ssm_a = nullptr;     // (heads)
     const float * z = nullptr;         // (heads, 128), token t
