@@ -74,15 +74,7 @@ bool delta_step_fused(float * state, const float * q, const float * k, const flo
                       const float * ssm_a, float * o, int64_t heads, int64_t n_kh, int64_t s,
                       float scale, hipStream_t stream);
 
-// Delta-net front end in one launch: the depthwise causal conv over
-// [state; qkv], silu, the q/k/v split and the state shift. The grid covers
-// tokens*channels conv elements plus (kernel-1)*channels state elements.
-bool conv_silu_split_fused(const float * qkv, const float * w, const float * state,
-                           float * new_state, float * q, float * k, float * v, int64_t tokens,
-                           int64_t channels, int64_t kernel, int64_t q_dims, int64_t kv_dims,
-                           int64_t v_dims, hipStream_t stream);
-
-// conv_silu_split_fused plus the per-head L2 normalization of q and k
+// conv1d + silu + q/k/v split plus the per-head L2 normalization of q and k
 // (y = x / sqrt(mean(x^2) + eps) * scale over each head_dim-wide head) in one
 // launch (#78). head_dim must be 128 and every part a multiple of it.
 bool conv_silu_split_l2(const float * qkv, const float * w, const float * state, float * new_state,

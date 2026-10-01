@@ -25,20 +25,6 @@ bool rope_neox(float * x, int64_t tokens, int64_t heads, int64_t head_dim, int64
 // per token: K is 272 B per head (256 + 16 of scales) and V is 144 B, against
 // 1024 B each in f32.
 
-// Fast Walsh-Hadamard along n (a power of two), applied to q and k after RoPE.
-// H is orthogonal, so (Hq)·(Hk) = q·k and the scores are unchanged while the
-// outliers get spread across the channels, which is what makes Q4 viable.
-bool hadamard_f32(float * x, const int64_t rows, const int64_t n, hipStream_t stream);
-
-// Quantizes the T token rows of k/v (f32, T * nkv * hd each) into the cache at
-// `pos`, computing one scale per 32-element block.
-// `k16`/`v16` (may be null) hold an exact f16 copy of the most recent `window`
-// tokens in a ring: the FP16 window of PLAN §13.4, in the same rotated basis.
-bool kv_quant(const float * k_src, const float * v_src, uint8_t * k_q8, void * k_scales,
-              uint8_t * v_q4, void * v_scales, void * k16, void * v16, const int64_t pos,
-              const int64_t tokens, const int64_t nkv, const int64_t hd, const int64_t window,
-              hipStream_t stream);
-
 // --- fused attention prep (#79) -------------------------------------------
 //
 // One launch for what split_qg, rms_norm (q, k), rope_neox (q, k),
@@ -76,7 +62,7 @@ bool attn_prep(const AttnPrep & a, hipStream_t stream);
 // --- GQA-grouped flash attention (issue #59) -------------------------------
 //
 // One layer's KV cache, in either storage: f32 (k_f32/v_f32, (seq, nkv, hd)) or
-// K Q8 / V Q4 with the optional FP16 window (the fields of kv_quant).
+// K Q8 / V Q4 with the optional FP16 window (the cache attn_prep writes).
 struct KvCache {
     const float * k_f32 = nullptr;
     const float * v_f32 = nullptr;
