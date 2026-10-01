@@ -5,7 +5,7 @@
 // against the NumPy port, which is itself bit-exact vs ggml).
 #include "kernels/dequant.hh"
 
-#include "kernels/quant_tables.hh"
+#include "kernels/iq_tables.hh"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>

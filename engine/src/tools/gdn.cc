@@ -1,7 +1,13 @@
-// omph-gdn — run one gated-delta-net layer through the naive GPU path.
+// omph-gdn — run one gated-delta-net layer through the kernel the engine runs
+// (gdn_step, #99).
 //
 // usage: omph-gdn <model.gguf> <layer> <in.f32> <out-prefix> <tokens> [--trace]
+//                 [--chunk N]
 //   in.f32: tokens x n_embd, row-major float32 (the layer's attn_norm input)
+//   --chunk: tokens per call, the conv state carried across calls as omph-run
+//            does (1 = the decode path); all of them by default.
+//   writes <out-prefix>.out.f32 and, with --trace, the projections and the
+//   gated-norm output.
 #include "format/gguf.hh"
 #include "kernels/dequant.hh"
 #include "kernels/elementwise.hh"
@@ -10,10 +16,12 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -56,7 +64,9 @@ void write_f32(const std::string & path, const std::vector<float> & data) {
 
 void read_back(std::vector<float> & host, const void * dev, const size_t n) {
     host.resize(n);
-    (void) hipMemcpy(host.data(), dev, n * 4, hipMemcpyDeviceToHost);
+    if (hipMemcpy(host.data(), dev, n * 4, hipMemcpyDeviceToHost) != hipSuccess) {
+        throw std::runtime_error("read-back failed");
+    }
 }
 
 } // namespace
@@ -64,7 +74,8 @@ void read_back(std::vector<float> & host, const void * dev, const size_t n) {
 int main(int argc, char ** argv) {
     if (argc < 6) {
         std::fprintf(stderr,
-                     "usage: %s <model.gguf> <layer> <in.f32> <out-prefix> <tokens> [--trace]\n",
+                     "usage: %s <model.gguf> <layer> <in.f32> <out-prefix> <tokens> [--trace] "
+                     "[--chunk N]\n",
                      argv[0]);
         return 2;
     }
@@ -73,9 +84,29 @@ int main(int argc, char ** argv) {
     const char * in_path = argv[3];
     const std::string prefix = argv[4];
     const int64_t tokens = std::atoll(argv[5]);
-    const bool trace = argc > 6 && std::strcmp(argv[6], "--trace") == 0;
+    bool trace = false;
+    int64_t chunk = 0;
+    for (int i = 6; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--trace") == 0) {
+            trace = true;
+        } else if (std::strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
+            chunk = std::atoll(argv[++i]);
+        } else {
+            std::fprintf(stderr, "unknown option: %s\n", argv[i]);
+            return 2;
+        }
+    }
+    if (tokens <= 0 || chunk < 0) {
+        return fail("bad token count or chunk");
+    }
+    if (chunk == 0 || chunk > tokens) {
+        chunk = tokens;
+    }
 
     try {
+        if (omph::kernels::kernel_wave_size() != 32) {
+            return fail("kernels not built for wave32");
+        }
         omph::gguf::File file(model_path);
         int64_t n_kh = 0;
         int64_t n_vh = 0;
@@ -90,17 +121,23 @@ int main(int argc, char ** argv) {
         meta_int(file, "qwen35.ssm.conv_kernel", conv_k);
         meta_int(file, "qwen35.embedding_length", n_embd);
         const double eps = meta_float(file, "qwen35.attention.layer_norm_rms_epsilon", 1e-6);
-        if (n_kh <= 0 || n_vh <= 0 || s <= 0 || inner <= 0 || conv_k <= 1 || n_embd <= 0) {
-            return fail("missing hyperparameters");
+        if (n_kh <= 0 || n_vh <= 0 || s != 128 || inner <= 0 || conv_k <= 1 || n_embd <= 0) {
+            return fail("missing or unsupported hyperparameters");
         }
         const int64_t v_dim = inner / n_vh;
         const int64_t q_dims = n_kh * s;
         const int64_t k_dims = n_kh * s;
         const int64_t v_dims = n_vh * v_dim;
         const int64_t channels = q_dims + k_dims + v_dims;
-        const float l2_scale = 1.0f / std::sqrt((float) s);
 
         const std::string p = "blk." + std::to_string(layer) + ".";
+        if (file.tensor(p + "ssm_a") == nullptr) {
+            return fail("not a delta-net layer");
+        }
+        bool ok = true;
+        const auto dev_alloc = [&](void ** dst, const size_t bytes) {
+            ok = ok && hipMalloc(dst, bytes) == hipSuccess && hipMemset(*dst, 0, bytes) == hipSuccess;
+        };
         const auto dequant_to = [&](const char * name, void ** dev) -> bool {
             const omph::gguf::TensorInfo * t = file.tensor(p + name);
             if (t == nullptr) {
@@ -112,57 +149,42 @@ int main(int argc, char ** argv) {
             }
             void * q = nullptr;
             if (hipMalloc(&q, t->nbytes) != hipSuccess ||
-                hipMalloc(dev, (size_t) elems * 2) != hipSuccess) {
+                hipMalloc(dev, (size_t) elems * 2) != hipSuccess ||
+                hipMemcpy(q, file.tensor_data(*t), t->nbytes, hipMemcpyHostToDevice) != hipSuccess) {
                 return false;
             }
-            if (hipMemcpy(q, file.tensor_data(*t), t->nbytes, hipMemcpyHostToDevice) != hipSuccess) {
-                return false;
-            }
-            const bool ok = omph::kernels::dequantize(t->type, q, *dev, elems, true, nullptr);
+            const bool done = omph::kernels::dequantize(t->type, q, *dev, elems, true, nullptr);
             (void) hipFree(q);
-            return ok;
+            return done;
+        };
+        // Raw bytes: the f32 vectors, and the BF16 beta / alpha rows gdn_step
+        // dots itself.
+        const auto upload = [&](const char * name, const uint32_t type, void ** dev) -> bool {
+            const omph::gguf::TensorInfo * t = file.tensor(p + name);
+            if (t == nullptr || t->type != type) {
+                return false;
+            }
+            return hipMalloc(dev, t->nbytes) == hipSuccess &&
+                   hipMemcpy(*dev, file.tensor_data(*t), t->nbytes, hipMemcpyHostToDevice) ==
+                       hipSuccess;
         };
 
         void * wqkv = nullptr;
         void * wz = nullptr;
+        void * wout = nullptr;
         void * wbeta = nullptr;
         void * walpha = nullptr;
-        void * wout = nullptr;
+        void * dt = nullptr;
+        void * ssm_a = nullptr;
+        void * norm_w = nullptr;
+        void * conv_w = nullptr;
         if (!dequant_to("attn_qkv.weight", &wqkv) || !dequant_to("attn_gate.weight", &wz) ||
-            !dequant_to("ssm_beta.weight", &wbeta) || !dequant_to("ssm_alpha.weight", &walpha) ||
-            !dequant_to("ssm_out.weight", &wout)) {
-            return fail("failed to dequantize weights");
+            !dequant_to("ssm_out.weight", &wout) || !upload("ssm_beta.weight", 30, &wbeta) ||
+            !upload("ssm_alpha.weight", 30, &walpha) || !upload("ssm_dt.bias", 0, &dt) ||
+            !upload("ssm_a", 0, &ssm_a) || !upload("ssm_norm.weight", 0, &norm_w) ||
+            !upload("ssm_conv1d.weight", 0, &conv_w)) {
+            return fail("failed to load the layer's weights (beta / alpha must be BF16)");
         }
-
-        const auto vec_host = [&](const char * name) {
-            const omph::gguf::TensorInfo * t = file.tensor(p + name);
-            const float * src = reinterpret_cast<const float *>(file.tensor_data(*t));
-            return std::vector<float>(src, src + t->ne[0]);
-        };
-        const std::vector<float> dt_bias = vec_host("ssm_dt.bias");
-        const std::vector<float> ssm_a = vec_host("ssm_a");
-        const std::vector<float> ssm_norm_w = vec_host("ssm_norm.weight");
-        // conv1d.weight is (kernel, channels) — flat layout w[c*kernel + j]
-        const omph::gguf::TensorInfo * cw = file.tensor(p + "ssm_conv1d.weight");
-        int64_t cw_n = 1;
-        for (const uint64_t d : cw->ne) {
-            cw_n *= (int64_t) d;
-        }
-        const float * cw_src = reinterpret_cast<const float *>(file.tensor_data(*cw));
-        const std::vector<float> conv_w(cw_src, cw_src + cw_n);
-
-        void * dev_dt = nullptr;
-        void * dev_a = nullptr;
-        void * dev_norm = nullptr;
-        void * dev_convw = nullptr;
-        (void) hipMalloc(&dev_dt, dt_bias.size() * 4);
-        (void) hipMalloc(&dev_a, ssm_a.size() * 4);
-        (void) hipMalloc(&dev_norm, ssm_norm_w.size() * 4);
-        (void) hipMalloc(&dev_convw, conv_w.size() * 4);
-        (void) hipMemcpy(dev_dt, dt_bias.data(), dt_bias.size() * 4, hipMemcpyHostToDevice);
-        (void) hipMemcpy(dev_a, ssm_a.data(), ssm_a.size() * 4, hipMemcpyHostToDevice);
-        (void) hipMemcpy(dev_norm, ssm_norm_w.data(), ssm_norm_w.size() * 4, hipMemcpyHostToDevice);
-        (void) hipMemcpy(dev_convw, conv_w.data(), conv_w.size() * 4, hipMemcpyHostToDevice);
 
         // input
         std::vector<float> host_in((size_t) tokens * n_embd);
@@ -177,174 +199,102 @@ int main(int argc, char ** argv) {
         }
         void * ex32 = nullptr;
         void * ex16 = nullptr;
-        (void) hipMalloc(&ex32, host_in.size() * 4);
-        (void) hipMalloc(&ex16, host_in.size() * 2);
-        (void) hipMemcpy(ex32, host_in.data(), host_in.size() * 4, hipMemcpyHostToDevice);
-        (void) omph::kernels::cast_f32_to_f16((const float *) ex32, ex16, (int64_t) host_in.size(),
-                                              nullptr);
-
-        omph::runtime::Linear linear;
         void * qkv = nullptr;
         void * z = nullptr;
-        void * beta = nullptr;
-        void * alpha = nullptr;
-        void * conv_raw = nullptr;
-        void * q = nullptr;
-        void * k = nullptr;
-        void * v = nullptr;
-        void * sk = nullptr;
-        void * dvec = nullptr;
-        void * o = nullptr;
-        void * final = nullptr;
-        void * out = nullptr;
-        void * conv_state = nullptr;
-        void * state = nullptr;
         void * final16 = nullptr;
-        (void) hipMalloc(&qkv, (size_t) tokens * channels * 4);
-        (void) hipMalloc(&z, (size_t) tokens * v_dims * 4);
-        (void) hipMalloc(&beta, (size_t) tokens * n_vh * 4);
-        (void) hipMalloc(&alpha, (size_t) tokens * n_vh * 4);
-        (void) hipMalloc(&conv_raw, (size_t) tokens * channels * 4);
-        (void) hipMalloc(&q, (size_t) tokens * q_dims * 4);
-        (void) hipMalloc(&k, (size_t) tokens * k_dims * 4);
-        (void) hipMalloc(&v, (size_t) tokens * v_dims * 4);
-        (void) hipMalloc(&sk, (size_t) n_vh * s * 4);
-        (void) hipMalloc(&dvec, (size_t) n_vh * s * 4);
-        (void) hipMalloc(&o, (size_t) tokens * v_dims * 4);
-        (void) hipMalloc(&final, (size_t) tokens * v_dims * 4);
-        (void) hipMalloc(&out, (size_t) tokens * n_embd * 4);
-        (void) hipMalloc(&conv_state, (size_t)(conv_k - 1) * channels * 4);
-        (void) hipMalloc(&state, (size_t) n_vh * s * s * 4);
-        (void) hipMalloc(&final16, (size_t) tokens * v_dims * 2);
-        (void) hipMemset(conv_state, 0, (size_t)(conv_k - 1) * channels * 4);
-        (void) hipMemset(state, 0, (size_t) n_vh * s * s * 4);
+        void * out = nullptr;
+        void * conv_a = nullptr;
+        void * conv_b = nullptr;
+        void * state = nullptr;
+        dev_alloc(&ex32, host_in.size() * 4);
+        dev_alloc(&ex16, host_in.size() * 2);
+        dev_alloc(&qkv, (size_t) tokens * channels * 4);
+        dev_alloc(&z, (size_t) tokens * v_dims * 4);
+        dev_alloc(&final16, (size_t) tokens * v_dims * 2);
+        dev_alloc(&out, (size_t) tokens * n_embd * 4);
+        dev_alloc(&conv_a, (size_t) (conv_k - 1) * channels * 4);
+        dev_alloc(&conv_b, (size_t) (conv_k - 1) * channels * 4);
+        dev_alloc(&state, (size_t) n_vh * s * s * 4);
+        if (!ok) {
+            return fail("out of VRAM");
+        }
+        if (hipMemcpy(ex32, host_in.data(), host_in.size() * 4, hipMemcpyHostToDevice) !=
+                hipSuccess ||
+            !omph::kernels::cast_f32_to_f16((const float *) ex32, ex16, (int64_t) host_in.size(),
+                                            nullptr)) {
+            return fail("input upload failed");
+        }
 
+        // projections (hipBLASLt, all tokens: not what this tool checks)
+        omph::runtime::Linear linear;
         if (!linear.run(wqkv, ex16, (float *) qkv, channels, n_embd, tokens) ||
-            !linear.run(wz, ex16, (float *) z, v_dims, n_embd, tokens) ||
-            !linear.run(wbeta, ex16, (float *) beta, n_vh, n_embd, tokens) ||
-            !linear.run(walpha, ex16, (float *) alpha, n_vh, n_embd, tokens)) {
+            !linear.run(wz, ex16, (float *) z, v_dims, n_embd, tokens)) {
             return fail("projection failed");
         }
-        if (!omph::kernels::sigmoid_inplace((float *) beta, tokens * n_vh, nullptr)) {
-            return fail("sigmoid failed");
+
+        // gdn_step, one launch per token, `chunk` tokens per call: the conv
+        // state flips between its two buffers after each call, as in omph-run
+        omph::kernels::GdnStep step;
+        step.state = static_cast<float *>(state);
+        step.conv_w = static_cast<const float *>(conv_w);
+        step.w_beta = static_cast<const uint16_t *>(wbeta);
+        step.w_alpha = static_cast<const uint16_t *>(walpha);
+        step.k_in = n_embd;
+        step.dt_bias = static_cast<const float *>(dt);
+        step.ssm_a = static_cast<const float *>(ssm_a);
+        step.norm_w = static_cast<const float *>(norm_w);
+        step.channels = channels;
+        step.q_dims = q_dims;
+        step.kv_dims = k_dims;
+        step.conv_k = conv_k;
+        step.n_kh = n_kh;
+        step.eps_l2 = (float) (eps / (double) s);
+        step.l2_scale = 1.0f / std::sqrt((float) s);
+        step.eps_norm = (float) eps;
+        bool flip = false;
+        for (int64_t t0 = 0; t0 < tokens; t0 += chunk) {
+            const int64_t n = std::min(chunk, tokens - t0);
+            step.qkv = static_cast<const float *>(qkv) + t0 * channels;
+            step.conv_cur = static_cast<const float *>(flip ? conv_b : conv_a);
+            step.conv_new = static_cast<float *>(flip ? conv_a : conv_b);
+            step.tokens = n;
+            for (int64_t t = 0; t < n; ++t) {
+                step.t = t;
+                step.x16 = static_cast<const __half *>(ex16) + (t0 + t) * n_embd;
+                step.z = static_cast<const float *>(z) + (t0 + t) * v_dims;
+                step.out16 = static_cast<__half *>(final16) + (t0 + t) * v_dims;
+                if (!omph::kernels::gdn_step(step, n_vh, nullptr)) {
+                    return fail("gdn_step failed");
+                }
+            }
+            flip = !flip;
         }
+        if (!linear.run(wout, final16, (float *) out, n_embd, v_dims, tokens) ||
+            hipDeviceSynchronize() != hipSuccess) {
+            return fail("output projection failed");
+        }
+
+        std::vector<float> host_out;
+        read_back(host_out, out, (size_t) tokens * n_embd);
+        write_f32(prefix + ".out.f32", host_out);
         if (trace) {
             std::vector<float> t1;
             read_back(t1, qkv, (size_t) tokens * channels);
             write_f32(prefix + "-qkv.f32", t1);
             read_back(t1, z, (size_t) tokens * v_dims);
             write_f32(prefix + "-z.f32", t1);
-            read_back(t1, beta, (size_t) tokens * n_vh);
-            write_f32(prefix + "-beta.f32", t1);
-            read_back(t1, alpha, (size_t) tokens * n_vh);
-            write_f32(prefix + "-alpha.f32", t1);
-        }
-        if (!omph::kernels::softplus_bias_inplace((float *) alpha, (const float *) dev_dt, tokens,
-                                                  n_vh, nullptr)) {
-            return fail("softplus failed");
-        }
-        if (trace) {
-            std::vector<float> t1;
-            read_back(t1, alpha, (size_t) tokens * n_vh);
-            write_f32(prefix + "-a_softplus.f32", t1);
-        }
-        if (!omph::kernels::mul_row_inplace((float *) alpha, (const float *) dev_a, tokens, n_vh,
-                                            nullptr)) {
-            return fail("gate mul failed");
-        }
-        if (trace) {
-            std::vector<float> t1;
-            read_back(t1, alpha, (size_t) tokens * n_vh);
-            write_f32(prefix + "-gate.f32", t1);
-        }
-
-        // conv1d + silu, then split q/k/v
-        if (!omph::kernels::conv1d_state((const float *) qkv, (const float *) dev_convw,
-                                         (const float *) conv_state, (float *) conv_raw, tokens,
-                                         channels, conv_k, nullptr)) {
-            return fail("conv failed");
-        }
-        if (trace) {
-            std::vector<float> t1;
-            read_back(t1, conv_raw, (size_t) tokens * channels);
-            write_f32(prefix + "-conv_raw.f32", t1);
-        }
-        if (!omph::kernels::silu_inplace((float *) conv_raw, tokens * channels, nullptr)) {
-            return fail("silu failed");
-        }
-        if (trace) {
-            std::vector<float> t1;
-            read_back(t1, conv_raw, (size_t) tokens * channels);
-            write_f32(prefix + "-conv_silu.f32", t1);
-        }
-        if (!omph::kernels::split_qkv((const float *) conv_raw, (float *) q, (float *) k,
-                                      (float *) v, tokens, q_dims, k_dims, v_dims, nullptr)) {
-            return fail("split failed");
-        }
-        // L2 normalization of q and k (per head): rms_norm(x, eps/n) * 1/sqrt(n)
-        if (!omph::kernels::rms_norm((const float *) q, nullptr, (float *) q, tokens * n_kh, s,
-                                     (float) (eps / (double) s), l2_scale, nullptr) ||
-            !omph::kernels::rms_norm((const float *) k, nullptr, (float *) k, tokens * n_kh, s,
-                                     (float) (eps / (double) s), l2_scale, nullptr)) {
-            return fail("l2 norm failed");
-        }
-        if (trace) {
-            std::vector<float> t1;
-            read_back(t1, q, (size_t) tokens * q_dims);
-            write_f32(prefix + "-q_l2.f32", t1);
-            read_back(t1, k, (size_t) tokens * k_dims);
-            write_f32(prefix + "-k_l2.f32", t1);
-            read_back(t1, v, (size_t) tokens * v_dims);
-            write_f32(prefix + "-v.f32", t1);
-        }
-
-        // delta rule, one token at a time
-        for (int64_t t = 0; t < tokens; ++t) {
-            if (!omph::kernels::delta_decay((float *) state, (const float *) alpha + t * n_vh, n_vh,
-                                            s, nullptr) ||
-                !omph::kernels::delta_sk((const float *) state, (const float *) k + t * k_dims, (float *) sk,
-                                         n_vh, n_kh, s, nullptr) ||
-                !omph::kernels::delta_d((const float *) v + t * v_dims, (const float *) sk,
-                                        (const float *) beta + t * n_vh, (float *) dvec, n_vh, s,
-                                        nullptr) ||
-                !omph::kernels::delta_update((float *) state, (const float *) k + t * k_dims,
-                                             (const float *) dvec, n_vh, n_kh, s, nullptr) ||
-                !omph::kernels::delta_o((const float *) state, (const float *) q + t * q_dims,
-                                        (float *) o + t * v_dims, n_vh, n_kh, s, l2_scale,
-                                        nullptr)) {
-                return fail("delta rule failed");
+            std::vector<__half> h((size_t) tokens * v_dims);
+            if (hipMemcpy(h.data(), final16, h.size() * 2, hipMemcpyDeviceToHost) != hipSuccess) {
+                return fail("read-back failed");
             }
-        }
-        if (trace) {
-            std::vector<float> t1;
-            read_back(t1, o, (size_t) tokens * v_dims);
-            write_f32(prefix + "-attn_output.f32", t1);
-        }
-
-        if (!omph::kernels::gated_norm((const float *) o, (const float *) dev_norm, (const float *) z,
-                                       (float *) final, tokens * n_vh, v_dim, (float) eps,
-                                       nullptr)) {
-            return fail("gated norm failed");
-        }
-        if (trace) {
-            std::vector<float> t1;
-            read_back(t1, final, (size_t) tokens * v_dims);
+            t1.resize(h.size());
+            for (size_t i = 0; i < h.size(); ++i) {
+                t1[i] = __half2float(h[i]);
+            }
             write_f32(prefix + "-final.f32", t1);
         }
-        if (!omph::kernels::cast_f32_to_f16((const float *) final, final16, tokens * v_dims,
-                                            nullptr) ||
-            !linear.run(wout, final16, (float *) out, n_embd, v_dims, tokens)) {
-            return fail("output projection failed");
-        }
-        if (hipDeviceSynchronize() != hipSuccess) {
-            return fail("kernel failed");
-        }
-
-        std::vector<float> host_out;
-        read_back(host_out, out, (size_t) tokens * n_embd);
-        write_f32(prefix + ".out.f32", host_out);
-        std::printf("gdn layer %d: %lld tokens -> %s.out.f32\n", layer, (long long) tokens,
-                    prefix.c_str());
+        std::printf("gdn layer %d (chunk %lld): %lld tokens -> %s.out.f32\n", layer,
+                    (long long) chunk, (long long) tokens, prefix.c_str());
     } catch (const std::exception & exc) {
         std::fprintf(stderr, "error: %s\n", exc.what());
         return 1;

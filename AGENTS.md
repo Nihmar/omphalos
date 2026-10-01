@@ -73,8 +73,10 @@ cd tools
 ../engine/build/omph-dequant <model> <tensor> /tmp/dq.raw
 uv run python validate_gpu_dequant.py <model> <tensor> /tmp/dq.raw  # dequant kernel, bit-exact
 uv run python check_gpu_linear.py <model> <tensor>  # matmul path
-uv run python check_gpu_attn.py <model> <layer>   # attention layers 3 / 7 / 63
-uv run python check_gpu_gdn.py  <model> <layer>   # delta-net layers 0 / 1 / 20
+uv run python check_gpu_attn.py <model> <layer>   # attention layers 3 / 7 / 63 (attn_prep +
+    # attention_gqa); [--kv q8q4|q4q4 --window 0] the quantized cache, [--chunk 1] the decode path
+uv run python check_gpu_gdn.py  <model> <layer>   # delta-net layers 0 / 1 / 20 (gdn_step);
+    # [--chunk 1|3] the decode path / the conv state carried across calls
 uv run python check_gpu_run.py  <model> --layers  # 64-layer stack vs the dump
 uv run python check_gpu_decode.py [--gemv]        # greedy decode vs the NumPy reference
                                                   # (cached in models/golden/cpu; --refresh)

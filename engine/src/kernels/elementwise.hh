@@ -14,8 +14,7 @@ bool cast_f32_to_f16(const float * src, void * dst, int64_t n, hipStream_t strea
 bool rms_norm(const float * x, const float * w, float * y, int64_t rows, int64_t n, float eps,
               float scale, hipStream_t stream);
 
-// x[i] *= y[i] and x[i] += y[i], in place; out[i] = x[i] + y[i].
-bool mul_inplace(float * x, const float * y, int64_t n, hipStream_t stream);
+// x[i] += y[i], in place; out[i] = x[i] + y[i].
 bool add_inplace(float * x, const float * y, int64_t n, hipStream_t stream);
 bool add_out(const float * x, const float * y, float * out, int64_t n, hipStream_t stream);
 
@@ -23,6 +22,14 @@ bool add_out(const float * x, const float * y, float * out, int64_t n, hipStream
 // sum_out (f32) receives a + b, the residual stream. n % 4 == 0, n <= 8192.
 bool add_rms_norm_f16(const float * a, const float * b, float * sum_out, const float * w,
                       void * y_f16, int64_t rows, int64_t n, float eps, hipStream_t stream);
+
+// The wave size the kernels were compiled for, or 0 if the probe fails. Every
+// kernel assumes 32 (gfx1200's default): five-step shuffle reductions, `lane =
+// tid & 31`, one wave per 32-element quantization block. A -mwavefrontsize64
+// build would reduce over half a wave and be silently wrong, so the tools
+// refuse to run unless this is 32 (#99). One translation unit stands for all:
+// they share the target's flags.
+int kernel_wave_size();
 
 // out[i] = silu(x[i]) * y[i], written as f16 — the SwiGLU epilogue feeding the
 // down projection.

@@ -1,10 +1,13 @@
-// Fused dequant+dot GEMV for the repacked Q4_K layout.
+// Fused dequant + dot GEMVs for the decode (PLAN.md §10.1), one kernel per
+// GGUF type on the repacked layouts of format/repack.hh (and the GGUF bytes for
+// IQ1_M / BF16).
 //
-// One warp per output row (8 warps per workgroup). The activation vector is
-// staged in LDS as f16; each lane walks 32-weight sub-blocks in strides of 32
-// and loads 16 contiguous, aligned bytes per sub-block. Weights are dequantized
-// in registers, so quantized bytes are read exactly once and nothing else
-// touches memory.
+// A warp computes a few consecutive output rows (8 warps per workgroup). The
+// activation vector is staged in LDS as f16; each lane walks the row's
+// sub-blocks in strides of 32 with aligned 16-byte weight loads, decodes the
+// codes in registers into half2 and accumulates with v_dot2_f32_f16, so the
+// quantized bytes are read exactly once. The *_b4 kernels do four tokens per
+// weight read (prefill head, MTP verification).
 #include "kernels/gemv.hh"
 
 #include "format/repack.hh"
@@ -201,15 +204,22 @@ __global__ void gemv_q4k_kernel(const uint8_t * __restrict__ qs,
     }
 }
 
-__device__ const int8_t kIq4Table[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
-                                         1,    13,   25,  38,  53,  69,  89,  113};
-
-// The IQ4 codebook + 128 as bytes, in four words: entries 0-3, 4-7, 8-11,
-// 12-15 (kIq4Table).
+// The IQ4_NL codebook (omph::quant::kKvaluesIq4nl) + 128 as bytes, in four
+// words: entries 0-3, 4-7, 8-11, 12-15.
 constexpr uint32_t kIq4B0 = 0x3F2D1801u;
 constexpr uint32_t kIq4B1 = 0x766A5D4Fu;
 constexpr uint32_t kIq4B2 = 0xA6998D81u;
 constexpr uint32_t kIq4B3 = 0xF1D9C5B5u;
+constexpr uint32_t iq4_biased_word(const int w) {
+    uint32_t v = 0;
+    for (int j = 0; j < 4; ++j) {
+        v |= (uint32_t) (uint8_t) (omph::quant::kKvaluesIq4nl[4 * w + j] + 128) << (8 * j);
+    }
+    return v;
+}
+static_assert(kIq4B0 == iq4_biased_word(0) && kIq4B1 == iq4_biased_word(1) &&
+                  kIq4B2 == iq4_biased_word(2) && kIq4B3 == iq4_biased_word(3),
+              "kIq4B* must be the IQ4_NL codebook + 128");
 
 // Four 4-bit codes (one per byte) to their codebook values + 128, one per byte:
 // two byte permutes look the low three bits up in each half of the table and a
@@ -1037,9 +1047,9 @@ __global__ void gemv_iq2s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
 }
 
 // Q4_K, four tokens at once: the weight bytes and scales are read once and used
-// for four dot products. Two output rows per warp keeps the accumulators (8) and
-// the weight registers in budget; the activation chunk holds the four token
-// vectors side by side in LDS.
+// for four dot products. kB4Rows rows per warp (16 accumulators); the four
+// token vectors are read straight from global memory (L1/L2 resident), not
+// staged.
 constexpr long long kB4Rows = 4;
 constexpr long long kB4Nt = 4;
 constexpr long long kB4ChunkSub = 128;  // 4096 weights per token staged
@@ -1064,7 +1074,6 @@ __global__ void gemv_q4k_b4_kernel(const uint8_t * __restrict__ qs,
         for (long long s = base + lane; s < base + len; s += 32) {
             const long long blk = s / 8;
             const int sub = (int) (s % 8);
-            (void) 0;  // activations are read straight from global (L1/L2 resident)
             uint4 q[kB4Rows];
             float ds[kB4Rows];
             float ms[kB4Rows];
@@ -1229,7 +1238,7 @@ __global__ void gemv_iq4_b4_kernel(const uint8_t * __restrict__ qs,
                                    const long long n_sub, const long long k) {
     extern __shared__ float table[];
     if (threadIdx.x < 16) {
-        table[threadIdx.x] = (float) kIq4Table[threadIdx.x];
+        table[threadIdx.x] = (float) omph::quant::kKvaluesIq4nl[threadIdx.x];
     }
     __syncthreads();
 

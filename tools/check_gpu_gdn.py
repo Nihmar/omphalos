@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""Compare omph-gdn (GPU gated delta net block) against the golden dump.
+"""Compare omph-gdn (GPU gated delta net block, the engine's gdn_step) against the golden dump.
 
-usage: uv run python check_gpu_gdn.py <model.gguf> <layer>
+usage: uv run python check_gpu_gdn.py <model.gguf> <layer> [--chunk N]
+
+gdn_step fuses the conv, the L2 norms, the gates, the delta rule and the gated
+norm, so the check sees the projections, the gated-norm output and the block
+output. --chunk 1 runs the decode path (one token per call, the conv state
+carried across calls).
 """
 
 from __future__ import annotations
@@ -17,16 +22,6 @@ import numpy as np
 PAIRS = (
     ("qkv", "linear_attn_qkv_mixed"),
     ("z", "z"),
-    ("beta", "beta_sigmoid"),
-    ("alpha", "alpha"),
-    ("a_softplus", "a_softplus"),
-    ("gate", "gate"),
-    ("conv_raw", "conv_output_raw"),
-    ("conv_silu", "conv_output_silu"),
-    ("q_l2", "q_conv_predelta"),
-    ("k_l2", "k_conv_predelta"),
-    ("v", "v_conv_predelta"),
-    ("attn_output", "attn_output"),
     ("final", "final_output"),
 )
 
@@ -57,8 +52,8 @@ def main() -> None:
     ap.add_argument("layer", type=int)
     ap.add_argument("--dump", default="../models/golden/cpu")
     ap.add_argument("--tool", default="../engine/build/omph-gdn")
-    ap.add_argument("--tol", type=float, default=0.15,
-                    help="relative; q_l2/k_l2 can amplify (L2 norm of near-zero heads)")
+    ap.add_argument("--tol", type=float, default=0.15, help="relative")
+    ap.add_argument("--chunk", type=int, default=0)
     args = ap.parse_args()
 
     dump = Path(args.dump)
@@ -74,10 +69,11 @@ def main() -> None:
         prefix = str(Path(tmp) / "t")
         np.ascontiguousarray(x, dtype=np.float32).tofile(in_path)
         subprocess.run([args.tool, args.model, str(il), str(in_path), prefix, str(tokens),
-                        "--trace"], check=True, capture_output=True)
+                        "--trace", "--chunk", str(args.chunk)], check=True, capture_output=True)
         got = {name: np.fromfile(f"{prefix}-{name}.f32", dtype=np.float32) for name, _ in PAIRS}
         out = np.fromfile(f"{prefix}.out.f32", dtype=np.float32)
 
+    print(f"chunk {args.chunk or tokens}, {tokens} tokens")
     worst = (0.0, "")
     for name, dump_name in PAIRS:
         entry = idx.get(f"{dump_name}-{il}")

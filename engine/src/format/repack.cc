@@ -92,9 +92,6 @@ void unrepack_q4k(const void * src, const int64_t n_blocks, void * dst) {
 
 // ------------------------------------------------------------------ IQ4_XS
 
-const int8_t kIq4Codebook[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
-                                 1,    13,   25,  38,  53,  69,  89,  113};
-
 Iq4Layout iq4_layout(const int64_t n_blocks) {
     Iq4Layout l;
     l.n_blocks = n_blocks;
@@ -376,7 +373,7 @@ void unrepack_q2k(const void * src, const int64_t n_blocks, void * dst) {
 
 int64_t quant_block_bytes(const uint32_t type) {
     switch (type) {
-        case 10: return 84;    // Q2_K   (layout only, no kernel yet)
+        case 10: return 84;    // Q2_K
         case 29: return 56;    // IQ1_M  (identity layout: the GGUF bytes)
         case 12: return 144;   // Q4_K
         case 14: return 210;   // Q6_K

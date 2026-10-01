@@ -8,30 +8,21 @@
 
 namespace omph::kernels {
 
-// Splits the fused Q projection (ggml: 2*head_dim per head = [q | gate]) into
-// contiguous q and gate tensors of shape (tokens, heads, head_dim).
-bool split_qg(const float * q_full, float * q, float * gate, int64_t tokens, int64_t heads,
-              int64_t head_dim, hipStream_t stream);
-
-// Partial NeoX RoPE in place: rotates pairs (i, i + n_rot/2) of the first n_rot
-// head dims; theta_i = position / freq_base^(2i/n_rot).
-bool rope_neox(float * x, int64_t tokens, int64_t heads, int64_t head_dim, int64_t n_rot,
-               float freq_base, int64_t pos_offset, hipStream_t stream);
-
 // --- quantized KV (PLAN.md §13) -------------------------------------------
 //
-// K is stored as Q8 and V as Q4, in 32-element blocks along head_dim with the
-// scales in a separate stream. head_dim is 256, so there are 8 blocks per head
-// per token: K is 272 B per head (256 + 16 of scales) and V is 144 B, against
-// 1024 B each in f32.
+// By default K is stored as Q8 and V as Q4, in 32-element blocks along head_dim
+// (Hadamard-rotated) with f16 scales in a separate stream. head_dim is 256, so
+// there are 8 blocks per head per token: K is 272 B per head (256 + 16 of
+// scales) and V is 144 B, against 1024 B each in f32. With k_q4 (OMPH_KV_K4,
+// #81) K uses V's Q4 format too. The last `window` tokens are also kept exactly
+// in an FP16 ring.
 
 // --- fused attention prep (#79) -------------------------------------------
 //
-// One launch for what split_qg, rms_norm (q, k), rope_neox (q, k),
-// hadamard_f32 (q, k, v) and kv_quant did: q and gate from the fused
-// projection, q / k normalized and rotated, k / v rotated in place and, when
-// k_q8 is set, quantized into the cache at pos0 (+ the FP16 ring). head_dim
-// must be 256.
+// One launch for the Q/gate split, the QK RMSNorm, the partial NeoX RoPE on q
+// and k, the Hadamard rotation of q, k and v (when `rotate`) and, when k_q8 is
+// set, the quantized cache write at pos0 (+ the FP16 ring). head_dim must be
+// 256.
 struct AttnPrep {
     const float * qg = nullptr;      // (tokens, nh, 2 * hd): q | gate per head
     float * q = nullptr;             // (tokens, nh, hd)

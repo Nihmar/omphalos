@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""Compare omph-attn (GPU attention block) against the golden dump.
+"""Compare omph-attn (GPU attention block, the engine's kernels) against the golden dump.
 
-usage: uv run python check_gpu_attn.py <model.gguf> <layer> [--tokens-from-dump]
+usage: uv run python check_gpu_attn.py <model.gguf> <layer> [--kv f32|q8q4|q4q4]
+                                       [--window N] [--chunk N]
+
+--kv f32 (default) checks every intermediate; with a quantized cache q and k are
+Hadamard-rotated, so only the gate, the attention output and the block output
+are compared. --window 0 sends every key through the quantized blocks;
+--chunk 1 runs the decode path (one token per call, split-K attention).
 """
 
 from __future__ import annotations
@@ -16,13 +22,12 @@ import numpy as np
 
 PAIRS = (
     ("q_full", "Qcur_full"),
-    ("q_normed", "Qcur_normed"),
-    ("k_normed", "Kcur_normed"),
     ("q", "Qcur"),
     ("k", "Kcur"),
     ("gate", "gate_reshaped"),
     ("attn_gated", "attn_gated"),
 )
+ROTATED = {"q", "k"}  # in the Hadamard basis with a quantized cache
 
 
 def load_index(dump: Path) -> dict[str, dict]:
@@ -51,8 +56,17 @@ def main() -> None:
     ap.add_argument("layer", type=int)
     ap.add_argument("--dump", default="../models/golden/cpu")
     ap.add_argument("--tool", default="../engine/build/omph-attn")
-    ap.add_argument("--tol", type=float, default=8e-2, help="relative (llama.cpp's own path is at ~2e-2)")
+    ap.add_argument("--tol", type=float, default=None,
+                    help="relative; default 0.08 for f32 (llama.cpp's own path is at ~2e-2), "
+                         "0.15 with a quantized cache (its end-to-end KL is validated "
+                         "separately, #58 / #61)")
+    ap.add_argument("--kv", choices=("f32", "q8q4", "q4q4"), default="f32")
+    ap.add_argument("--window", type=int, default=128)
+    ap.add_argument("--chunk", type=int, default=0)
     args = ap.parse_args()
+    pairs = [p for p in PAIRS if args.kv == "f32" or p[0] not in ROTATED]
+    if args.tol is None:
+        args.tol = 8e-2 if args.kv == "f32" else 0.15
 
     dump = Path(args.dump)
     idx = load_index(dump)
@@ -68,14 +82,16 @@ def main() -> None:
         prefix = str(Path(tmp) / "t")
         np.ascontiguousarray(x, dtype=np.float32).tofile(in_path)
         subprocess.run([args.tool, args.model, str(il), str(in_path), prefix, str(tokens),
-                        "--trace"], check=True, capture_output=True)
+                        "--trace", "--kv", args.kv, "--window", str(args.window),
+                        "--chunk", str(args.chunk)], check=True, capture_output=True)
         got = {}
-        for name, _ in PAIRS:
+        for name, _ in pairs:
             got[name] = np.fromfile(f"{prefix}-{name}.f32", dtype=np.float32)
         out = np.fromfile(f"{prefix}.out.f32", dtype=np.float32)
 
+    print(f"kv {args.kv}, window {args.window}, chunk {args.chunk or tokens}, {tokens} tokens")
     worst = (0.0, "")
-    for name, dump_name in PAIRS:
+    for name, dump_name in pairs:
         entry = idx.get(f"{dump_name}-{il}")
         if entry is None:
             print(f"  {name:12} -> {dump_name}-{il}: (not in dump)")

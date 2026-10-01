@@ -168,6 +168,10 @@ public:
     explicit Runner(const std::string & path, const int64_t max_tokens, const bool use_gemv,
                     const bool last_logits_only = false, const int64_t kv_capacity = 0)
         : file_(path), h_(read_hparams(file_)), use_gemv_(use_gemv) {
+        if (const int w = omph::kernels::kernel_wave_size(); w != 32) {
+            throw std::runtime_error("kernels built for wave size " + std::to_string(w) +
+                                     "; they need wave32");
+        }
         const int64_t ne = h_.n_embd;
         const int64_t T = max_tokens;
         max_tokens_ = max_tokens;
@@ -1226,10 +1230,11 @@ private:
         if (t == nullptr) {
             throw std::runtime_error("missing tensor " + name);
         }
-        // Small tensors that never got a quantized kernel (IQ1_M) were being
-        // converted to f16 on every call — 1.6 ms of every decode step for one
-        // 18.6 MiB tensor. Convert once, keep it: at most 64 MiB, which keeps the
-        // big repacked weights (whose f16 form would not fit VRAM) out.
+        // Tensors of a type without a fused GEMV were converted to f16 on every
+        // call (1.6 ms of every decode step for the 18.6 MiB IQ1_M tensor before
+        // it got one). Convert once and keep it, up to 256 MiB of f16 per
+        // tensor; the big GEMV types (whose f16 form would not fit VRAM) never
+        // take this path.
         const int64_t n_elems = numel(*t);
         bool cacheable = std::getenv("OMPH_NO_F16_CACHE") == nullptr &&
                          !has_gemv_type(t->type) && n_elems * 2 <= (256 << 20);
