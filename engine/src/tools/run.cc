@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <map>
 #include <stdexcept>
@@ -113,6 +114,14 @@ int64_t numel(const omph::gguf::TensorInfo & t) {
         n *= (int64_t) d;
     }
     return n;
+}
+
+// Monotonic wall clock in ms (<chrono> pulls in <format>, which this
+// clang + libstdc++ pair does not compile).
+double now_ms() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double) ts.tv_sec * 1e3 + (double) ts.tv_nsec * 1e-6;
 }
 
 void write_f32(const std::string & path, const std::vector<float> & data) {
@@ -309,6 +318,7 @@ public:
         // of f32 logits would be T x 248320 x 4 = 508 MB at T = 512 (#93).
         alloc(&logits_, (size_t) (last_logits_only ? 1 : std::min<int64_t>(T, kHeadRows)) *
                              h_.n_vocab * 4);
+        alloc(&argmax_key_, sizeof(unsigned long long));
         // tmp_logits_, head16_ (the vocab-chunked f16 lm_head) and raw_stage_ (raw
         // bytes of a repacked tensor for the f16 path) are allocated on first
         // use: the GEMV decode never touches them (#86).
@@ -423,10 +433,16 @@ public:
 
     // want_logits = false runs the layers only (a prefill chunk whose logits
     // nobody reads): no final norm, no lm_head.
+    // greedy (decode, --gemv): set to the argmax token computed on the device,
+    // and the logits stay there (#102); -1 when this path did not run, and the
+    // caller takes the argmax of `logits`.
     bool forward(const std::vector<int32_t> & toks, std::vector<float> & logits,
                  const std::string & trace_dir, const int64_t start_pos = 0,
-                 const bool want_logits = true) {
+                 const bool want_logits = true, int32_t * greedy = nullptr) {
         const int64_t T = (int64_t) toks.size();
+        if (greedy != nullptr) {
+            *greedy = -1;
+        }
         // The activations hold max_tokens_ rows and the KV cache max_seq_
         // positions: anything past either is an out-of-bounds write.
         if (T <= 0 || T > max_tokens_ || start_pos < 0 || start_pos + T > max_seq_) {
@@ -567,12 +583,28 @@ public:
             return fail("output_norm failed");
         }
         if (use_gemv_ && T == 1 && gems_.count("output.weight") != 0) {
-            if (!matmul("output.weight", h16_, static_cast<float *>(logits_), h_.n_vocab, ne, T) ||
-                hipDeviceSynchronize() != hipSuccess) {
+            if (!matmul("output.weight", h16_, static_cast<float *>(logits_), h_.n_vocab, ne, T)) {
                 return fail("lm_head (gemv) failed");
             }
-            logits.resize((size_t) T * h_.n_vocab);
-            (void) hipMemcpy(logits.data(), logits_, logits.size() * 4, hipMemcpyDeviceToHost);
+            if (greedy != nullptr) {
+                // 8 bytes back instead of 1 MB of logits and a host argmax
+                unsigned long long key = 0;
+                if (!omph::kernels::argmax_f32(static_cast<const float *>(logits_), h_.n_vocab,
+                                               static_cast<unsigned long long *>(argmax_key_),
+                                               nullptr) ||
+                    hipMemcpy(&key, argmax_key_, sizeof(key), hipMemcpyDeviceToHost) !=
+                        hipSuccess) {
+                    return fail("argmax failed");
+                }
+                *greedy = omph::kernels::argmax_key_index(key);
+            } else {
+                if (hipDeviceSynchronize() != hipSuccess) {
+                    return fail("lm_head (gemv) failed");
+                }
+                logits.resize((size_t) T * h_.n_vocab);
+                (void) hipMemcpy(logits.data(), logits_, logits.size() * 4,
+                                 hipMemcpyDeviceToHost);
+            }
             report_phases();
             if (time_step) {
                 step_event(step_a, step_b);
@@ -1369,6 +1401,7 @@ private:
     void * ffn2_ = nullptr;
     void * ffn16_ = nullptr;
     void * logits_ = nullptr;
+    void * argmax_key_ = nullptr;  // 8 bytes: the greedy decode's packed argmax (#102)
     void * tmp_logits_ = nullptr;
     void * head16_ = nullptr;
     void * raw_stage_ = nullptr;
@@ -1526,6 +1559,11 @@ int main(int argc, char ** argv) {
         if (generate > 0) {
             // greedy decode: one token per step, reusing the KV cache, the conv
             // state and the delta-net state
+            const bool timing = std::getenv("OMPH_TIMING") != nullptr;
+            std::vector<float> step_logits;  // `logits` keeps the file's rows for the report
+            // OMPH_HOST_ARGMAX=1: copy the logits back and take the argmax on the
+            // host, as before #102 (A/B and validation).
+            const bool host_argmax = std::getenv("OMPH_HOST_ARGMAX") != nullptr;
             std::vector<int32_t> gen;
             int32_t next = argmax(logits.data() + (logits.size() - h.n_vocab));
             for (int64_t i = 0; i < generate; ++i) {
@@ -1533,11 +1571,17 @@ int main(int argc, char ** argv) {
                 if (i + 1 == generate) {
                     break;
                 }
+                const double w0 = now_ms();
                 const std::vector<int32_t> one{next};
-                if (!runner.forward(one, logits, std::string(), (int64_t) toks.size() + i)) {
+                int32_t on_device = -1;
+                if (!runner.forward(one, step_logits, std::string(), (int64_t) toks.size() + i,
+                                    true, host_argmax ? nullptr : &on_device)) {
                     return 1;
                 }
-                next = argmax(logits.data());
+                next = on_device >= 0 ? on_device : argmax(step_logits.data());
+                if (timing) {
+                    std::fprintf(stderr, "step wall %.2f ms\n", now_ms() - w0);
+                }
             }
             FILE * f = std::fopen(gen_path.c_str(), "w");
             bool ok = f != nullptr;
