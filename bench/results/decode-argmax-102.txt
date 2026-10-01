@@ -1,0 +1,13 @@
+# Greedy decode, device vs host argmax (#102). Engine commit 10ce445, RX 9060 XT, --gemv,
+# Q8/Q4 KV, wikitext 512-token prompt, 64 generated tokens per run; medians over the
+# 64 steps of "step gpu" (event pair around the step) and "step wall" (host clock
+# around forward + argmax). 5 runs alternating OMPH_HOST_ARGMAX=1 (host) and default (dev).
+run  host gpu  host wall  dev gpu  dev wall
+1    47.89     48.00      47.83    47.84
+2    47.87     47.99      47.81    47.83
+3    47.88     47.99      47.81    47.83
+4    47.88     48.00      47.81    47.84
+5    47.87     47.99      47.82    47.85
+# median wall: host 47.99, dev 47.84 (-0.15 ms/token); generated tokens identical.
+# HIP graph estimate (omph-graph-probe, 1861-kernel chain, 3 runs): 0.47 us saved per
+# kernel (12-14 %), i.e. ~0.37 ms on the 789-kernel step -> graphs not pursued.
