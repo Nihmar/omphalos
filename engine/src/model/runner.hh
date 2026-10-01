@@ -293,6 +293,9 @@ private:
     bool verifying_ = false;
     int64_t verify_tokens_ = 0;
     int64_t verify_pos0_ = 0;
+    std::vector<int32_t> * verify_argmax_ = nullptr;  // verify(): rows' tokens from lm_head
+    void * spec_keys_ = nullptr;                      // their packed argmax keys (device)
+    static constexpr int64_t kVerifyRowsMax = 32;
     void * replay_pool_ = nullptr;
     void * conv_hist_pool_ = nullptr;
     void * ring_backup_k_ = nullptr;

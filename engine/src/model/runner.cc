@@ -586,6 +586,7 @@ void Runner::enable_speculation(const int64_t max_tokens) {
         ring_backup_k_ = mem_.device(ring);
         ring_backup_v_ = mem_.device(ring);
     }
+    spec_keys_ = mem_.device((size_t) std::max<int64_t>(max_tokens, 1) * 8);
     // A verification brings every row back, also with --last-logits.
     if (last_logits_only_ || max_tokens > kHeadRows) {
         logits_ = mem_.device((size_t) std::max<int64_t>(max_tokens, kHeadRows) * h_.n_vocab * 4);
@@ -618,11 +619,17 @@ bool Runner::verify(const std::vector<int32_t> & toks, const int64_t pos0,
     verifying_ = true;
     verify_tokens_ = T;
     verify_pos0_ = pos0;
+    argmax.clear();
+    verify_argmax_ = &argmax;
     std::vector<float> logits;
     const bool ok = forward(toks, logits, std::string(), pos0, true, nullptr);
     verifying_ = false;
+    verify_argmax_ = nullptr;
     if (!ok) {
         return false;
+    }
+    if ((int64_t) argmax.size() == T) {
+        return true;  // the device argmax ran (the GEMV Q4_K head)
     }
     argmax.resize((size_t) T);
     for (int64_t t = 0; t < T; ++t) {
