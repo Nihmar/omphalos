@@ -212,7 +212,8 @@ constexpr int kDeltaRows = kDeltaS / 2;   // rows per thread
 __global__ __launch_bounds__(256) void delta_step_kernel(
     float * __restrict__ state, const float * __restrict__ q, const float * __restrict__ k,
     const float * __restrict__ v, const float * __restrict__ beta,
-    const float * __restrict__ gate, float * __restrict__ o, const long long n_kh,
+    const float * __restrict__ alpha, const float * __restrict__ dt_bias,
+    const float * __restrict__ ssm_a, float * __restrict__ o, const long long n_kh,
     const long long s, const float scale) {
     __shared__ float part[2 * kDeltaS];
     __shared__ float dd[kDeltaS];
@@ -224,8 +225,11 @@ __global__ __launch_bounds__(256) void delta_step_kernel(
     const int half = tid >> 7;
     const int lo = half * kDeltaRows;
     kq[tid] = tid < kDeltaS ? k[(h % n_kh) * kDeltaS + tid] : q[(h % n_kh) * kDeltaS + tid - kDeltaS];
-    const float decay = expf(gate[h]);
-    const float b = beta[h];
+    // The gates from the raw projections (formerly three kernels, #78):
+    // b = sigmoid(beta), decay = exp(softplus(alpha + dt_bias) * A).
+    const float b = 1.0f / (1.0f + expf(-beta[h]));
+    const float ar = alpha[h] + dt_bias[h];
+    const float decay = expf((log1pf(expf(-fabsf(ar))) + fmaxf(ar, 0.0f)) * ssm_a[h]);
 
     float st[kDeltaRows];
 #pragma unroll
@@ -447,15 +451,16 @@ bool gated_norm(const float * o, const float * w, const float * z, float * out, 
 }
 
 bool delta_step_fused(float * state, const float * q, const float * k, const float * v,
-                      const float * beta, const float * gate, float * o, const int64_t heads,
-                      const int64_t n_kh, const int64_t s, const float scale,
-                      hipStream_t stream) {
+                      const float * beta, const float * alpha, const float * dt_bias,
+                      const float * ssm_a, float * o, const int64_t heads, const int64_t n_kh,
+                      const int64_t s, const float scale, hipStream_t stream) {
     if (state == nullptr || q == nullptr || k == nullptr || v == nullptr || beta == nullptr ||
-        gate == nullptr || o == nullptr || heads <= 0 || n_kh <= 0 || s != 128) {
+        alpha == nullptr || dt_bias == nullptr || ssm_a == nullptr || o == nullptr ||
+        heads <= 0 || n_kh <= 0 || s != 128) {
         return false;  // the kernel's thread mapping is written for s == 128
     }
-    delta_step_kernel<<<(unsigned) heads, 256, 0, stream>>>(state, q, k, v, beta, gate, o, n_kh,
-                                                            s, scale);
+    delta_step_kernel<<<(unsigned) heads, 256, 0, stream>>>(state, q, k, v, beta, alpha, dt_bias,
+                                                            ssm_a, o, n_kh, s, scale);
     return hipGetLastError() == hipSuccess;
 }
 

@@ -803,12 +803,7 @@ private:
         if (!proj_ok) {
             return fail("gdn projection failed");
         }
-        if (!omph::kernels::sigmoid_inplace(static_cast<float *>(beta_), T * n_vh, nullptr) ||
-            !omph::kernels::softplus_bias_inplace(static_cast<float *>(alpha_), dt_bias, T, n_vh,
-                                                  nullptr) ||
-            !omph::kernels::mul_row_inplace(static_cast<float *>(alpha_), ssm_a, T, n_vh,
-                                            nullptr) ||
-            !omph::kernels::conv_silu_split_fused(
+        if (!omph::kernels::conv_silu_split_fused(
                 static_cast<const float *>(fused_), conv_w, conv_cur, conv_new,
                 static_cast<float *>(q_), static_cast<float *>(k_), static_cast<float *>(v_), T,
                 channels, h_.ssm_conv_k, q_dims, k_dims, v_dims, nullptr) ||
@@ -826,7 +821,7 @@ private:
                     static_cast<const float *>(k_) + t * k_dims,
                     static_cast<const float *>(v_) + t * v_dims,
                     static_cast<const float *>(beta_) + t * n_vh,
-                    static_cast<const float *>(alpha_) + t * n_vh,
+                    static_cast<const float *>(alpha_) + t * n_vh, dt_bias, ssm_a,
                     static_cast<float *>(o_) + t * v_dims, n_vh, n_kh, s, l2_scale, nullptr)) {
                 return fail("delta rule failed");
             }

@@ -59,12 +59,16 @@ bool gated_norm(const float * o, const float * w, const float * z, float * out, 
                 int64_t n, float eps, hipStream_t stream);
 
 // One-token delta rule in a single launch (PLAN.md §10.2): decay, sk = S^T k,
-// d = (v - sk) * beta, S += k (x) d and o = scale * S^T q for every head.
-//   state: (heads, s, s); q/k: (n_kh, s); v/o: (heads, s); gate: (heads,)
-//   beta: (heads,); one workgroup per head, 256 threads; s must be 128.
+// d = (v - sk) * beta, S += k (x) d and o = scale * S^T q for every head. The
+// gates come raw from the projections and are resolved in the kernel (#78):
+// beta = sigmoid(beta_raw), decay = exp(softplus(alpha_raw + dt_bias) * ssm_a).
+//   state: (heads, s, s); q/k: (n_kh, s); v/o: (heads, s);
+//   beta/alpha/dt_bias/ssm_a: (heads,); one workgroup per head, 256 threads;
+//   s must be 128.
 bool delta_step_fused(float * state, const float * q, const float * k, const float * v,
-                      const float * beta, const float * gate, float * o, int64_t heads,
-                      int64_t n_kh, int64_t s, float scale, hipStream_t stream);
+                      const float * beta, const float * alpha, const float * dt_bias,
+                      const float * ssm_a, float * o, int64_t heads, int64_t n_kh, int64_t s,
+                      float scale, hipStream_t stream);
 
 // Delta-net front end in one launch: the depthwise causal conv over
 // [state; qkv], silu, the q/k/v split and the state shift. The grid covers
