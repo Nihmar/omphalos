@@ -48,6 +48,9 @@ bool launch(const Case & c, const void * x, float * y, hipStream_t stream) {
     if (c.t->type == 12) {
         return omph::kernels::gemv_q4k(c.dev, x, y, c.rows, c.k, stream);
     }
+    if (c.t->type == 29) {
+        return omph::kernels::gemv_iq1_m(c.dev, x, y, c.rows, c.k, stream);
+    }
     if (c.t->type == 23) {
         return omph::kernels::gemv_iq4_xs(c.dev, x, y, c.rows, c.k, stream);
     }
@@ -98,7 +101,9 @@ bool prepare(const omph::gguf::File & file, const omph::gguf::TensorInfo * t, Ca
     c.t = t;
     c.k = k;
     c.rows = rows;
-    c.bytes = rows * (k / 2 + (k / 256) * 8 + (k / 256) * 2);  // qs + scales + d
+    // Every byte of the repacked tensor is read once (the Q4_K formula used here
+    // before overstated the low-bit types, e.g. IQ2_S by 1.7x; #63).
+    c.bytes = (int64_t) host.size();
     return true;
 }
 

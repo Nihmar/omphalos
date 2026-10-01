@@ -199,60 +199,67 @@ __global__ void gated_norm_kernel(const float * __restrict__ o, const float * __
 }
 
 // Fused one-token delta rule: one workgroup per head, 256 threads (two per
-// column, each covering half of the rows). The state stays in global memory but
-// is touched twice instead of five times, and the whole rule is one launch.
+// column, each covering half of the rows). Each thread keeps its 64 state
+// elements in registers, so the state is read once and written once (the
+// earlier form walked it five times: decay + S^T k, update, S^T q, #66).
 //
 //   tid = 0..255; col = tid & (s-1); half = tid >> 7 -> rows [half*s/2, ...)
-//   decay and the S^T k partial touch the same elements, so no barrier is needed
-//   between them; then d, the update, and the S^T q partial.
-__global__ void delta_step_kernel(float * __restrict__ state, const float * __restrict__ q,
-                                  const float * __restrict__ k, const float * __restrict__ v,
-                                  const float * __restrict__ beta, const float * __restrict__ gate,
-                                  float * __restrict__ o, const long long n_kh,
-                                  const long long s, const float scale) {
-    extern __shared__ float sh[];
-    float * part = sh;        // 2 * s partial sums
-    float * dd = sh + 2 * s;  // s, the delta vector
+//   decay, then the S^T k partials (combined across the halves in LDS), d,
+//   the rank-1 update, and the S^T q partials.
+constexpr int kDeltaS = 128;              // state size; the wrapper checks it
+constexpr int kDeltaRows = kDeltaS / 2;   // rows per thread
+
+__global__ __launch_bounds__(256) void delta_step_kernel(
+    float * __restrict__ state, const float * __restrict__ q, const float * __restrict__ k,
+    const float * __restrict__ v, const float * __restrict__ beta,
+    const float * __restrict__ gate, float * __restrict__ o, const long long n_kh,
+    const long long s, const float scale) {
+    __shared__ float part[2 * kDeltaS];
+    __shared__ float dd[kDeltaS];
+    __shared__ float kq[2 * kDeltaS];  // k then q of this head's key group
     const long long h = blockIdx.x;
-    float * S = state + h * s * s;
-    const float * kr = k + (h % n_kh) * s;
-    const float * qr = q + (h % n_kh) * s;
+    float * S = state + h * kDeltaS * kDeltaS;
     const int tid = (int) threadIdx.x;
-    const int col = tid & (int) (s - 1);
+    const int col = tid & (kDeltaS - 1);
     const int half = tid >> 7;
-    const long long lo = (long long) half * (s / 2);
-    const long long rows = s / 2;
+    const int lo = half * kDeltaRows;
+    kq[tid] = tid < kDeltaS ? k[(h % n_kh) * kDeltaS + tid] : q[(h % n_kh) * kDeltaS + tid - kDeltaS];
     const float decay = expf(gate[h]);
     const float b = beta[h];
 
+    float st[kDeltaRows];
+#pragma unroll
+    for (int r = 0; r < kDeltaRows; ++r) {
+        st[r] = S[(lo + r) * kDeltaS + col];
+    }
+    __syncthreads();  // kq
     float acc = 0.0f;
-    for (long long r = 0; r < rows; ++r) {
-        const long long i = lo + r;
-        float * e = S + i * s + col;
-        *e *= decay;
-        acc += *e * kr[i];
+#pragma unroll
+    for (int r = 0; r < kDeltaRows; ++r) {
+        st[r] *= decay;
+        acc = fmaf(st[r], kq[lo + r], acc);
     }
-    part[half * s + col] = acc;
+    part[half * kDeltaS + col] = acc;
     __syncthreads();
     if (half == 0) {
-        const float sk = part[col] + part[s + col];
-        dd[col] = (v[h * s + col] - sk) * b;
+        dd[col] = (v[h * kDeltaS + col] - (part[col] + part[kDeltaS + col])) * b;
     }
     __syncthreads();
-    for (long long r = 0; r < rows; ++r) {
-        const long long i = lo + r;
-        S[i * s + col] += kr[i] * dd[col];
-    }
-    __syncthreads();
+    const float dc = dd[col];
     float acc2 = 0.0f;
-    for (long long r = 0; r < rows; ++r) {
-        acc2 += S[(lo + r) * s + col] * qr[lo + r];
+#pragma unroll
+    for (int r = 0; r < kDeltaRows; ++r) {
+        st[r] = fmaf(kq[lo + r], dc, st[r]);
+        acc2 = fmaf(st[r], kq[kDeltaS + lo + r], acc2);
+        S[(lo + r) * kDeltaS + col] = st[r];
     }
-    part[half * s + col] = acc2;
+    __syncthreads();  // part is reused
+    part[half * kDeltaS + col] = acc2;
     __syncthreads();
     if (half == 0) {
-        o[h * s + col] = scale * (part[col] + part[s + col]);
+        o[h * kDeltaS + col] = scale * (part[col] + part[kDeltaS + col]);
     }
+    (void) s;
 }
 
 
@@ -447,9 +454,8 @@ bool delta_step_fused(float * state, const float * q, const float * k, const flo
         gate == nullptr || o == nullptr || heads <= 0 || n_kh <= 0 || s != 128) {
         return false;  // the kernel's thread mapping is written for s == 128
     }
-    const size_t smem = (size_t) 3 * s * sizeof(float);
-    delta_step_kernel<<<(unsigned) heads, 256, smem, stream>>>(state, q, k, v, beta, gate, o,
-                                                               n_kh, s, scale);
+    delta_step_kernel<<<(unsigned) heads, 256, 0, stream>>>(state, q, k, v, beta, gate, o, n_kh,
+                                                            s, scale);
     return hipGetLastError() == hipSuccess;
 }
 

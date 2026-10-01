@@ -934,6 +934,15 @@ every length — the budget chosen in #58 (`bench/results/m5-kv-kl-long.txt`). T
 GQA-grouped flash attention (#59) makes the decode nearly flat in context: 58.4 ms at
 512, 61.7 ms at 8k, 65.0 ms at 16k with the quantized KV (was 99.0 ms at 8k). Left to
 decide: whether Q8/Q4 becomes the engine's default KV (today opt-in, `OMPH_KV_Q8Q4=1`).
+
+Decode after M5 (#63, #66; `bench/results/decode-step-20261001.txt`): **55.2 ms/token** at
+a 10-token prompt (58.0 on main measured the same day), 54.8 ms at 512 and 58.2 ms at 8k
+with the quantized KV. Measured by ablation (`OMPH_SKIP_GEMV_TYPE`), the GEMVs run at
+~78 % of the bandwidth in the model and take ~47 ms; everything else is 3.9 ms of kernel
+time. `rocprofv3` per-kernel times inflate some GEMVs by up to 40 % and the `OMPH_TIMING`
+phase totals were wrong before #64 — use the ablation. Per-kernel GEMV tuning measured
+at diminishing returns (#63); the next decode lever is MTP (M6). The gap to llama.cpp
+(48.5 ms) is GEMV efficiency.
 Before that, M4's status: the decode was at
 73.3 % of the ceiling (57 ms/token) when M3 closed, and the two defects above put it at
 ~75.6 % (55.2 ms/token) — at the milestone's criterion. What is left of the criterion is

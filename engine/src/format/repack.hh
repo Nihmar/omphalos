@@ -72,12 +72,16 @@ extern const int8_t kIq4Codebook[16];
 //
 // GGUF IQ3_XXS: 98-byte blocks — f16 `d`, 64 bytes of 4-byte grid indices
 // (iq3xxs_grid) and 32 bytes of packed words holding a 4-bit scale plus four
-// 7-bit sign indices each. The repack only splits the fields into aligned
-// streams; the kernel resolves the sign indices with the 128-byte table from
-// kernels/iq_tables.hh, so the block keeps its 98 bytes:
+// 7-bit sign indices each. The repack splits the fields into aligned streams
+// and permutes the sign bits of each aux word (below), so the block keeps its
+// 98 bytes:
 //
 //   [ qs  ] 64 B/block : grid indices, as in the source
-//   [ aux ] 32 B/block : the scale/sign words, as in the source
+//   [ aux ] 32 B/block : the scale/sign words, sign bits permuted (#63): per
+//                        group l of 8 weights, weights 0/2/4/6 reversed in bits
+//                        [4l, 4l + 4) and 1/3/5 reversed in [16 + 3l, 16 + 3l + 3);
+//                        the scale stays in [28, 32). Weight 7's sign is the
+//                        parity of the other seven, as in the GGUF.
 //   [ d   ]  2 B/block : f16
 struct Iq3XxsLayout {
     int64_t n_blocks = 0;
@@ -100,9 +104,15 @@ void unrepack_iq3_xxs(const void * src, int64_t n_blocks, void * dst);
 //
 //   [ qs     ] 64 B/block
 //   [ qh     ]  8 B/block
-//   [ signs  ] 32 B/block
+//   [ signs  ] 32 B/block, one u32 per 32-weight sub-block, bits permuted (below)
 //   [ scales ]  4 B/block
 //   [ d      ]  2 B/block
+//
+// Sign bits (#63): in the GGUF, bit w of a sub-block's four sign bytes is the
+// sign of weight w. Here the sign of weight 2p sits at bit 15 - p and that of
+// weight 2p + 1 at bit 31 - p, so the kernel gets the f16 sign bits of the
+// weight pair p (bits 15 and 31 of a packed half2) as (S << p) & 0x80008000.
+// A lossless permutation: unrepack restores the GGUF order.
 struct Iq3sLayout {
     int64_t n_blocks = 0;
     int64_t qs_off = 0;

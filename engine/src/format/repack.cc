@@ -221,6 +221,45 @@ Iq3XxsLayout iq3_xxs_layout(const int64_t n_blocks) {
     return l;
 }
 
+namespace {
+
+// GGUF IQ3_XXS aux word: four 7-bit sign indices s_l at bits [7l, 7l + 7) and a
+// 4-bit scale at [28, 32). Repacked: for group l, the even-weight sign bits
+// (s_l bits 0, 2, 4, 6 = weights 0, 2, 4, 6) reversed in [4l, 4l + 4) and the
+// odd ones (bits 1, 3, 5) reversed in [16 + 3l, 16 + 3l + 3); scale unchanged.
+// The kernel then shifts each field straight into the pair-ordered sign word
+// of repack.hh (weight 7's sign, the parity, it computes). Lossless.
+uint32_t iq3xxs_aux_to_pairs(const uint32_t a) {
+    uint32_t t = a & 0xF0000000u;
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t sl = (a >> (7 * l)) & 127u;
+        for (int k = 0; k < 4; ++k) {
+            t |= ((sl >> (2 * k)) & 1u) << (4 * l + 3 - k);
+        }
+        for (int k = 0; k < 3; ++k) {
+            t |= ((sl >> (2 * k + 1)) & 1u) << (16 + 3 * l + 2 - k);
+        }
+    }
+    return t;
+}
+
+uint32_t iq3xxs_pairs_to_aux(const uint32_t t) {
+    uint32_t a = t & 0xF0000000u;
+    for (int l = 0; l < 4; ++l) {
+        uint32_t sl = 0;
+        for (int k = 0; k < 4; ++k) {
+            sl |= ((t >> (4 * l + 3 - k)) & 1u) << (2 * k);
+        }
+        for (int k = 0; k < 3; ++k) {
+            sl |= ((t >> (16 + 3 * l + 2 - k)) & 1u) << (2 * k + 1);
+        }
+        a |= sl << (7 * l);
+    }
+    return a;
+}
+
+} // namespace
+
 void repack_iq3_xxs(const void * src, const int64_t n_blocks, void * dst) {
     const Iq3XxsLayout l = iq3_xxs_layout(n_blocks);
     const auto * in = static_cast<const BlockIq3Xxs *>(src);
@@ -232,7 +271,12 @@ void repack_iq3_xxs(const void * src, const int64_t n_blocks, void * dst) {
     for (int64_t b = 0; b < n_blocks; ++b) {
         std::memcpy(d + 2 * b, &in[b].d, 2);
         std::memcpy(qs + b * 64, in[b].qs, 64);
-        std::memcpy(aux + b * 32, in[b].qs + 64, 32);
+        for (int sub = 0; sub < 8; ++sub) {
+            uint32_t a = 0;
+            std::memcpy(&a, in[b].qs + 64 + 4 * sub, 4);
+            a = iq3xxs_aux_to_pairs(a);
+            std::memcpy(aux + b * 32 + 4 * sub, &a, 4);
+        }
     }
 }
 
@@ -247,7 +291,12 @@ void unrepack_iq3_xxs(const void * src, const int64_t n_blocks, void * dst) {
     for (int64_t b = 0; b < n_blocks; ++b) {
         std::memcpy(&out[b].d, d + 2 * b, 2);
         std::memcpy(out[b].qs, qs + b * 64, 64);
-        std::memcpy(out[b].qs + 64, aux + b * 32, 32);
+        for (int sub = 0; sub < 8; ++sub) {
+            uint32_t t = 0;
+            std::memcpy(&t, aux + b * 32 + 4 * sub, 4);
+            t = iq3xxs_pairs_to_aux(t);
+            std::memcpy(out[b].qs + 64 + 4 * sub, &t, 4);
+        }
     }
 }
 
@@ -281,6 +330,30 @@ Iq3sLayout iq3s_layout(const int64_t n_blocks) {
     return l;
 }
 
+namespace {
+
+// GGUF sign order (bit w = weight w) <-> the pair order of the repacked IQ3_S
+// signs (weight 2p at bit 15 - p, weight 2p + 1 at bit 31 - p).
+uint32_t iq3s_signs_to_pairs(const uint32_t s) {
+    uint32_t t = 0;
+    for (int w = 0; w < 32; ++w) {
+        const int pos = (w & 1) ? 31 - w / 2 : 15 - w / 2;
+        t |= ((s >> w) & 1u) << pos;
+    }
+    return t;
+}
+
+uint32_t iq3s_pairs_to_signs(const uint32_t t) {
+    uint32_t s = 0;
+    for (int w = 0; w < 32; ++w) {
+        const int pos = (w & 1) ? 31 - w / 2 : 15 - w / 2;
+        s |= ((t >> pos) & 1u) << w;
+    }
+    return s;
+}
+
+} // namespace
+
 void repack_iq3_s(const void * src, const int64_t n_blocks, void * dst) {
     const Iq3sLayout l = iq3s_layout(n_blocks);
     const auto * in = static_cast<const BlockIq3S *>(src);
@@ -289,7 +362,12 @@ void repack_iq3_s(const void * src, const int64_t n_blocks, void * dst) {
         std::memcpy(out + l.d_off + 2 * b, &in[b].d, 2);
         std::memcpy(out + l.qs_off + b * 64, in[b].qs, 64);
         std::memcpy(out + l.qh_off + b * 8, in[b].qh, 8);
-        std::memcpy(out + l.signs_off + b * 32, in[b].signs, 32);
+        for (int sub = 0; sub < 8; ++sub) {
+            uint32_t sg = 0;
+            std::memcpy(&sg, in[b].signs + 4 * sub, 4);
+            sg = iq3s_signs_to_pairs(sg);
+            std::memcpy(out + l.signs_off + b * 32 + 4 * sub, &sg, 4);
+        }
         std::memcpy(out + l.scales_off + b * 4, in[b].scales, 4);
     }
 }
@@ -302,7 +380,12 @@ void unrepack_iq3_s(const void * src, const int64_t n_blocks, void * dst) {
         std::memcpy(&out[b].d, in + l.d_off + 2 * b, 2);
         std::memcpy(out[b].qs, in + l.qs_off + b * 64, 64);
         std::memcpy(out[b].qh, in + l.qh_off + b * 8, 8);
-        std::memcpy(out[b].signs, in + l.signs_off + b * 32, 32);
+        for (int sub = 0; sub < 8; ++sub) {
+            uint32_t sg = 0;
+            std::memcpy(&sg, in + l.signs_off + b * 32 + 4 * sub, 4);
+            sg = iq3s_pairs_to_signs(sg);
+            std::memcpy(out[b].signs + 4 * sub, &sg, 4);
+        }
         std::memcpy(out[b].scales, in + l.scales_off + b * 4, 4);
     }
 }
@@ -362,6 +445,7 @@ void unrepack_q2k(const void * src, const int64_t n_blocks, void * dst) {
 int64_t quant_block_bytes(const uint32_t type) {
     switch (type) {
         case 10: return 84;    // Q2_K   (layout only, no kernel yet)
+        case 29: return 56;    // IQ1_M  (identity layout: the GGUF bytes)
         case 12: return 144;   // Q4_K
         case 14: return 210;   // Q6_K
         case 16: return 66;    // IQ2_XXS
@@ -385,6 +469,7 @@ int64_t repacked_bytes(const uint32_t type, const int64_t n_blocks) {
         case 21: return iq3s_layout(n_blocks).total;
         case 22: return iq2s_layout(n_blocks).total;
         case 23: return iq4_layout(n_blocks).total;
+        case 29: return n_blocks * 56;  // IQ1_M: kept as in the GGUF
         default: return 0;
     }
 }
@@ -418,6 +503,11 @@ bool repack_any(const uint32_t type, const void * src, const int64_t n_blocks,
     } else if (type == 10) {
         dst.resize((size_t) q2k_layout(n_blocks).total);
         repack_q2k(src, n_blocks, dst.data());
+    } else if (type == 29) {
+        // IQ1_M: one small tensor in this model; its GEMV reads the GGUF blocks
+        // as they are (56-byte blocks, 8-byte aligned fields).
+        dst.resize((size_t) n_blocks * 56);
+        std::memcpy(dst.data(), src, dst.size());
     } else {
         return false;
     }
@@ -435,6 +525,7 @@ bool unrepack_any(const uint32_t type, const void * src, const int64_t n_blocks,
     else if (type == 22) unrepack_iq2_s(src, n_blocks, dst.data());
     else if (type == 16) unrepack_iq2_xxs(src, n_blocks, dst.data());
     else if (type == 10) unrepack_q2k(src, n_blocks, dst.data());
+    else if (type == 29) std::memcpy(dst.data(), src, (size_t) n_blocks * 56);
     else return false;
     return true;
 }
