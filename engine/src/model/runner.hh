@@ -209,6 +209,9 @@ private:
     bool matmul(const Mat & m, const void * x16, float * y, const int64_t n_out,
                 const int64_t k, const int64_t T);
 
+    // Keeps the side stream only if overlapping beats running in order (#132).
+    void calibrate_overlap();
+
     // Allocates *p on first use (the f16-path buffers, #86).
     void * lazy(void ** p, const size_t bytes);
 
