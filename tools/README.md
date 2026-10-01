@@ -25,6 +25,8 @@ from this directory). The package `omphalos_tools` (`src/`) holds:
 | `check_gpu_decode.py` | greedy decode vs the NumPy reference (cached) |
 | `compare_logits.py` | KL / top-1 between two `omph-run` logits files |
 | `extract_quant_tables.py` | regenerates the ggml tables (Python and C++) |
+| `check_doc_math.py` | Markdown math that GitHub would mangle (CI) |
+| `tests/` (pytest) | the NumPy decoders vs gguf-py, bit for bit (CI) |
 
 The exact commands and the layers each check uses are in
 [AGENTS.md](../AGENTS.md) ("Entry points"). The golden dump lives in

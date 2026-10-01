@@ -92,6 +92,12 @@ OMPH_KV_HOST=1 engine/build/omph-run <model> <tokens.txt> ref.f32 --logits-tail 
 engine/build/omph-run <model> <tokens.txt> q8.f32 --logits-tail 512   # default: Q8/Q4 KV
 bench/m5_llama_kv_kl.sh <llama.cpp-bin-dir> <ctx>   # llama.cpp's own KV-quant KL (budget)
 
+# CPU-only tests (no GPU, no ROCm; what CI runs, .github/workflows/ci.yml)
+cmake -S engine/tests -B engine/build-tests && cmake --build engine/build-tests -j
+ctest --test-dir engine/build-tests --output-on-failure   # repack round trip, GGUF parser
+cd tools && uv run ruff check . && uv run python -m pytest tests -q   # decoders vs gguf-py
+uv run python check_doc_math.py ../docs/*.md ../PLAN.md        # math GitHub would mangle
+
 # regenerating the golden dump (CPU backend, needs a llama.cpp build)
 tools/native/build.sh <llama.cpp-dir> && tools/native/dump_tensors ...
 ```
@@ -131,5 +137,5 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 
 - PLAN.md is the source of truth for architecture; deviations are proposed in an issue first.
 - Every performance claim comes with a measurement following PLAN.md §17 (fixed conditions, median of ≥5 runs, results in `bench/`).
-- "Done" means: tree builds, relevant tests pass (once tests exist), results reported as measured — never claimed untested.
+- "Done" means: tree builds, the CPU tests and CI pass, the relevant GPU checks of "Entry points" pass, results reported as measured — never claimed untested.
 - Keep each change scoped to its issue; keep refactors separate from features.

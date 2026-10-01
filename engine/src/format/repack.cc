@@ -54,7 +54,9 @@ void repack_q4k(const void * src, const int64_t n_blocks, void * dst) {
         std::memcpy(meta + 16 * b + 14, &in[b].dmin, 2);
         // ggml group j (32 bytes) holds the low nibbles for sub-block 2j and the
         // high nibbles for sub-block 2j+1; here every sub-block gets 16 bytes.
+        // The nibbles are ORed in: clear the block first, whatever dst held.
         uint8_t * sub = qs + b * 128;
+        std::memset(sub, 0, 128);
         for (int j = 0; j < 4; ++j) {
             const uint8_t * g = in[b].qs + j * 32;
             for (int i = 0; i < 32; ++i) {

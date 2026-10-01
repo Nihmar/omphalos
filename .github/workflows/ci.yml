@@ -1,0 +1,41 @@
+# What runs without the GPU (#105): the format layer's C++ tests (no ROCm), the
+# Python tooling (lint, the NumPy decoders against gguf-py) and the docs' math.
+# The GPU checks in AGENTS.md ("Entry points") stay manual: no gfx1200 runner.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (format/ + tests, LANGUAGES CXX)
+        run: cmake -S engine/tests -B build-tests -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build-tests -j
+      - name: Test
+        run: ctest --test-dir build-tests --output-on-failure
+
+  python:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: tools
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Sync (locked)
+        run: uv sync --locked
+      - name: Lint
+        run: uv run ruff check .
+      - name: Decoders vs gguf-py
+        run: uv run python -m pytest tests -q
+      - name: Docs math renders on GitHub
+        run: uv run python check_doc_math.py ../docs/*.md ../PLAN.md ../README.md ../AGENTS.md

@@ -10,7 +10,6 @@ usage: uv run python validate_gpu_dequant.py <model.gguf> <tensor> <dump.raw> [-
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 import numpy as np
 
