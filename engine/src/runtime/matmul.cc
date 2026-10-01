@@ -77,7 +77,7 @@ bool Linear::run(const void * w, const void * x, float * y, const int64_t out_fe
         const float alpha = 1.0f;
         const float beta = 0.0f;
         ok = check(hipblasLtMatmul(handle_, op, &alpha, w, a, x, b, &beta, y, c, y, d, &heur.algo,
-                                   workspace_, workspace_size_, nullptr), "matmul");
+                                   workspace_, workspace_size_, hipStreamPerThread), "matmul");
     }
 
     if (pref != nullptr) (void) hipblasLtMatmulPreferenceDestroy(pref);

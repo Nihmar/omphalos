@@ -6,12 +6,15 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 
 namespace omph::gguf {
 namespace {
 
 constexpr uint32_t kMagic = 0x46554747u;  // "GGUF" little-endian
+// The cursor reads the file's little-endian fields with plain loads.
+static_assert(std::endian::native == std::endian::little, "little-endian host required");
 
 [[noreturn]] void fail(const std::string & msg) {
     throw std::runtime_error("gguf: " + msg);
@@ -105,6 +108,9 @@ Value read_value(Cursor & c, ValueType t) {
             v.truncated = n > kKeep;
             break;
         }
+        default:
+            // An unknown type has an unknown size: parsing on would desync.
+            fail("unknown value type " + std::to_string((uint32_t) t));
     }
     return v;
 }
