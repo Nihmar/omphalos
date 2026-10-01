@@ -80,6 +80,13 @@ __device__ inline uint32_t iq3xxs_group_signs(const uint32_t a, const int l) {
     return (even << 12) | (odd << 29) | (par << 28);
 }
 
+// Staged x for the compute-bound lane-per-sub-block kernels (IQ2_S, IQ2_XS,
+// IQ3_XXS): 40 halves per 32-weight sub-block. With the natural 32 (16 words)
+// the lanes' 16-byte loads hit the LDS banks 8 ways; 20 words leaves the
+// unavoidable 2. Measured per type (#75): the memory-bound kernels gain nothing
+// and IQ3_S loses occupancy to the bigger chunk, so they keep 32.
+constexpr long long kXPitch = 40;
+
 constexpr long long kQ4kChunkSub = 256;  // 8192 weights staged per LDS refill
 constexpr long long kQ4kRows = 4;        // output rows computed per warp
 
@@ -266,7 +273,7 @@ __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t *
                                 const long long n_sub, const long long chunk_sub) {
     extern __shared__ uint8_t smem[];
     __half * xs = reinterpret_cast<__half *>(smem);  // activation chunk
-    uint32_t * grid = reinterpret_cast<uint32_t *>(smem + chunk_sub * 64);
+    uint32_t * grid = reinterpret_cast<uint32_t *>(smem + chunk_sub * kXPitch * 2);
     for (int i = threadIdx.x; i < 256; i += blockDim.x) {
         grid[i] = omph::quant::kIq3xxsGrid[i];
     }
@@ -281,7 +288,7 @@ __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t *
     for (long long base = 0; base < n_sub; base += kIq3ChunkSub) {
         const long long len = n_sub - base < kIq3ChunkSub ? n_sub - base : kIq3ChunkSub;
         for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
-            xs[i] = x[base * 32 + i];
+            xs[(i / 32) * kXPitch + (i % 32)] = x[base * 32 + i];
         }
         __syncthreads();
         if (row0 >= rows) {
@@ -289,7 +296,7 @@ __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t *
             continue;
         }
         for (long long s = base + lane; s < base + len; s += 32) {
-            const uint4 * xv = reinterpret_cast<const uint4 *>(xs + (s - base) * 32);
+            const uint4 * xv = reinterpret_cast<const uint4 *>(xs + (s - base) * kXPitch);
             uint2 q[kIq3Rows];
             uint32_t a[kIq3Rows];
             float db[kIq3Rows];
@@ -456,6 +463,7 @@ __global__ void gemv_iq3s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
 // on how the compiler treats an array) and eight sub-block scales.
 constexpr long long kQ2kChunkSub = 256;
 constexpr long long kQ2kRows = 4;
+constexpr long long kQ2kXPitch = 132;  // halves per staged 128-weight group
 
 __global__ void gemv_q2k_kernel(const uint8_t * __restrict__ sc, const uint8_t * __restrict__ qs,
                                 const uint8_t * __restrict__ d, const uint8_t * __restrict__ dmin,
@@ -473,8 +481,11 @@ __global__ void gemv_q2k_kernel(const uint8_t * __restrict__ sc, const uint8_t *
     float acc[kQ2kRows] = {};
     for (long long base = 0; base < n_sub; base += chunk_sub) {
         const long long len = n_sub - base < chunk_sub ? n_sub - base : chunk_sub;
+        // Each lane reads its own 128-weight group: a 132-half pitch puts the
+        // lanes' rows of x on different LDS banks (a 128-half pitch put them
+        // all on one, #75).
         for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
-            xs[i] = x[base * 32 + i];
+            xs[(i / 128) * kQ2kXPitch + (i % 128)] = x[base * 32 + i];
         }
         __syncthreads();
         if (row0 >= rows) {
@@ -486,13 +497,31 @@ __global__ void gemv_q2k_kernel(const uint8_t * __restrict__ sc, const uint8_t *
         for (long long g = g_first + lane; g < g_last; g += 32) {
             const long long blk = g >> 1;
             const int half = (int) (g & 1);
-            const long long xoff = (g * 4 - base) * 32;
+            const long long xoff = (g - base / 4) * kQ2kXPitch;
+            // sum (dl * c - ml) * x = dl * sum c * x - ml * sum x per group of 16:
+            // the 8 sums of x are shared by the rows; four 2-bit codes come out of
+            // one word as bytes ((w >> shift) & 0x03030303), become two half2
+            // (v_perm + packed add) and go through v_dot2 (#75).
+            const uint2 * xh = reinterpret_cast<const uint2 *>(xs + xoff);  // 4 halves each
+            constexpr uint32_t kOnes = 0x3C003C00u;  // half2 (1, 1)
+            float xsum[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                float t = 0.0f;
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const uint2 xv2 = xh[u * 4 + q];
+                    t = dot2(xv2.x, kOnes, dot2(xv2.y, kOnes, t));
+                }
+                xsum[u] = t;
+            }
             float part[kQ2kRows] = {};
 #pragma unroll
             for (int r = 0; r < kQ2kRows; ++r) {
                 const long long row = row0 + r <= rlast ? row0 + r : rlast;
                 const uint8_t * qrow = qs + row * blocks * 64 + g * 32;
-                const uint8_t * srow = sc + row * blocks * 16 + blk * 16 + half * 8;
+                const uint64_t scw =
+                    *reinterpret_cast<const uint64_t *>(sc + row * blocks * 16 + blk * 16 + half * 8);
                 const float dv =
                     __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 + blk * 2));
                 const float mv = __half2float(
@@ -501,20 +530,28 @@ __global__ void gemv_q2k_kernel(const uint8_t * __restrict__ sc, const uint8_t *
                 const uint4 qb = *reinterpret_cast<const uint4 *>(qrow + 16);
                 const uint32_t wa[4] = {qa.x, qa.y, qa.z, qa.w};
                 const uint32_t wb[4] = {qb.x, qb.y, qb.z, qb.w};
+                float pr = 0.0f;
 #pragma unroll
                 for (int u = 0; u < 8; ++u) {
                     const int shift = (u >> 1) * 2;
-                    const uint8_t scb = srow[u];
-                    const float dl = dv * (float) (scb & 0xF);
-                    const float ml = mv * (float) (scb >> 4);
+                    const uint32_t scb = (uint32_t) (scw >> (8 * u)) & 0xFFu;
+                    float ca = 0.0f;
+                    float cb = 0.0f;
 #pragma unroll
-                    for (int i = 0; i < 16; ++i) {
-                        const uint32_t word = ((u & 1) ? wb : wa)[i >> 2];
-                        const int code = (int) ((word >> (8 * (i & 3))) >> shift) & 3;
-                        const float xa = __half2float(xs[xoff + u * 16 + i]);
-                        part[r] = fmaf(fmaf(dl, (float) code, -ml), xa, part[r]);
+                    for (int q = 0; q < 4; q += 2) {
+                        const uint32_t c0 = (((u & 1) ? wb : wa)[q] >> shift) & 0x03030303u;
+                        const uint32_t c1 = (((u & 1) ? wb : wa)[q + 1] >> shift) & 0x03030303u;
+                        const uint2 x0 = xh[u * 4 + q];
+                        const uint2 x1 = xh[u * 4 + q + 1];
+                        ca = dot2(grid_pair_to_half2<0x04010400u>(c0), x0.x, ca);
+                        cb = dot2(grid_pair_to_half2<0x04010400u>(c1), x1.x, cb);
+                        ca = dot2(grid_pair_to_half2<0x04030402u>(c0), x0.y, ca);
+                        cb = dot2(grid_pair_to_half2<0x04030402u>(c1), x1.y, cb);
                     }
+                    pr = fmaf(dv * (float) (scb & 0xFu), ca + cb, pr);
+                    pr = fmaf(-mv * (float) (scb >> 4), xsum[u], pr);
                 }
+                part[r] = pr;
             }
 #pragma unroll
             for (int r = 0; r < kQ2kRows; ++r) {
@@ -680,13 +717,9 @@ __global__ void gemv_iq2xs_kernel(const uint8_t * __restrict__ qs, const uint8_t
                                   const long long n_sub, const long long chunk_sub) {
     extern __shared__ uint8_t smem[];
     __half * xs = reinterpret_cast<__half *>(smem);
-    uint64_t * grid = reinterpret_cast<uint64_t *>(smem + chunk_sub * 64);
-    uint8_t * stab = reinterpret_cast<uint8_t *>(grid + 512);
+    uint64_t * grid = reinterpret_cast<uint64_t *>(smem + chunk_sub * kXPitch * 2);
     for (int i = threadIdx.x; i < 512; i += blockDim.x) {
         grid[i] = omph::quant::kIq2xsGrid[i];
-    }
-    if (threadIdx.x < 128) {
-        stab[threadIdx.x] = omph::quant::kKsignsIq2xs[threadIdx.x];
     }
 
     const int warp = (int) threadIdx.x / 32;
@@ -699,7 +732,7 @@ __global__ void gemv_iq2xs_kernel(const uint8_t * __restrict__ qs, const uint8_t
     for (long long base = 0; base < n_sub; base += chunk_sub) {
         const long long len = n_sub - base < chunk_sub ? n_sub - base : chunk_sub;
         for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
-            xs[i] = x[base * 32 + i];
+            xs[(i / 32) * kXPitch + (i % 32)] = x[base * 32 + i];
         }
         __syncthreads();
         if (row0 >= rows) {
@@ -707,7 +740,7 @@ __global__ void gemv_iq2xs_kernel(const uint8_t * __restrict__ qs, const uint8_t
             continue;
         }
         for (long long s = base + lane; s < base + len; s += 32) {
-            const __half * xv = xs + (s - base) * 32;
+            const __half * xv = xs + (s - base) * kXPitch;
             const long long blk = s / 8;
             const int ib = (int) (s % 8);
             uint32_t ent[kIq2Rows][2];
@@ -725,30 +758,30 @@ __global__ void gemv_iq2xs_kernel(const uint8_t * __restrict__ qs, const uint8_t
                 dbl[r][0] = dv * (0.5f + (float) (scb & 0xF)) * 0.25f;
                 dbl[r][1] = dv * (0.5f + (float) (scb >> 4)) * 0.25f;
             }
+            // Same scheme as IQ2_S / IQ3_XXS (#75): codebook bytes -> half2,
+            // the pair-ordered sign word from the permuted entry (repack.cc:
+            // evens reversed in bits 9-12, odds in 13-15; weight 7's sign is
+            // the parity), two independent dot2 chains.
             float sub[kIq2Rows][2] = {};
+            const uint4 * xq4 = reinterpret_cast<const uint4 *>(xv);
 #pragma unroll
             for (int l = 0; l < 4; ++l) {
+                const uint4 xq = xq4[l];
 #pragma unroll
                 for (int r = 0; r < kIq2Rows; ++r) {
-                    const uint32_t e = ent[r][l >> 1] >> (16 * (l & 1));
-                    const uint8_t sg = stab[(e >> 9) & 127];
-                    uint32_t smk[8];
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        smk[j] = ((sg >> j) & 1u) ? 0x80000000u : 0u;
-                    }
-                    const uint64_t g = grid[e & 511];
-                    const uint32_t glo = (uint32_t) g;
-                    const uint32_t ghi = (uint32_t) (g >> 32);
-                    float gf[8];
-                    grid4(glo, gf);
-                    grid4(ghi, gf + 4);
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        float v = __uint_as_float(__float_as_uint(gf[j]) ^ smk[j]);
-                        sub[r][l >> 1] =
-                            fmaf(v, __half2float(xv[8 * l + j]), sub[r][l >> 1]);
-                    }
+                    const uint32_t e = (ent[r][l >> 1] >> (16 * (l & 1))) & 0xFFFFu;
+                    const uint64_t g = grid[e & 511u];
+                    const uint32_t g1 = (uint32_t) g;
+                    const uint32_t g2 = (uint32_t) (g >> 32);
+                    const uint32_t f = e >> 9;
+                    const uint32_t par = (uint32_t) __builtin_popcount(f) & 1u;
+                    const uint32_t sgn = ((f & 0xFu) << 12) | ((f >> 4) << 29) | (par << 28);
+                    constexpr uint32_t kSign2 = 0x80008000u;
+                    float pa = dot2((sgn & kSign2) | grid_pair_to_half2<0x04010400u>(g1), xq.x, 0.0f);
+                    float pb = dot2(((sgn << 2) & kSign2) | grid_pair_to_half2<0x04010400u>(g2), xq.z, 0.0f);
+                    pa = dot2(((sgn << 1) & kSign2) | grid_pair_to_half2<0x04030402u>(g1), xq.y, pa);
+                    pb = dot2(((sgn << 3) & kSign2) | grid_pair_to_half2<0x04030402u>(g2), xq.w, pb);
+                    sub[r][l >> 1] += pa + pb;
                 }
             }
 #pragma unroll
@@ -782,12 +815,8 @@ __global__ void gemv_iq2xxs_kernel(const uint8_t * __restrict__ qs,
     extern __shared__ uint8_t smem[];
     __half * xs = reinterpret_cast<__half *>(smem);
     uint64_t * grid = reinterpret_cast<uint64_t *>(smem + chunk_sub * 64);
-    uint8_t * stab = reinterpret_cast<uint8_t *>(grid + 256);
     for (int i = threadIdx.x; i < 256; i += blockDim.x) {
         grid[i] = omph::quant::kIq2xxsGrid[i];
-    }
-    if (threadIdx.x < 128) {
-        stab[threadIdx.x] = omph::quant::kKsignsIq2xs[threadIdx.x];
     }
 
     const int warp = (int) threadIdx.x / 32;
@@ -824,32 +853,25 @@ __global__ void gemv_iq2xxs_kernel(const uint8_t * __restrict__ qs,
                     __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 + blk * 2));
                 db[r] = dv * (0.5f + (float) (aux1[r] >> 28)) * 0.25f;
             }
+            // Same scheme as IQ3_XXS (#75): codebook bytes -> half2, the
+            // pair-ordered sign word from the permuted aux, two dot2 chains.
             float part[kIq2Rows] = {};
+            const uint4 * xq4 = reinterpret_cast<const uint4 *>(xv);
 #pragma unroll
             for (int l = 0; l < 4; ++l) {
+                const uint4 xq = xq4[l];
 #pragma unroll
                 for (int r = 0; r < kIq2Rows; ++r) {
-                    const uint32_t idx_byte = (aux0[r] >> (8 * l)) & 0xFF;
-                    const uint8_t sg = stab[(aux1[r] >> (7 * l)) & 127];
-                    uint32_t smk[8];
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        smk[j] = ((sg >> j) & 1u) ? 0x80000000u : 0u;
-                    }
-                    const uint64_t g = grid[idx_byte];
-                    const uint32_t glo = (uint32_t) g;
-                    const uint32_t ghi = (uint32_t) (g >> 32);
-                    float gf[8];
-                    grid4(glo, gf);
-                    grid4(ghi, gf + 4);
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        float v = gf[j];
-                        if (sg & (1u << j)) {
-                            v = -v;
-                        }
-                        part[r] = fmaf(v, __half2float(xv[8 * l + j]), part[r]);
-                    }
+                    const uint64_t g = grid[(aux0[r] >> (8 * l)) & 0xFFu];
+                    const uint32_t g1 = (uint32_t) g;
+                    const uint32_t g2 = (uint32_t) (g >> 32);
+                    const uint32_t sgn = iq3xxs_group_signs(aux1[r], l);
+                    constexpr uint32_t kSign2 = 0x80008000u;
+                    float pa = dot2((sgn & kSign2) | grid_pair_to_half2<0x04010400u>(g1), xq.x, 0.0f);
+                    float pb = dot2(((sgn << 2) & kSign2) | grid_pair_to_half2<0x04010400u>(g2), xq.z, 0.0f);
+                    pa = dot2(((sgn << 1) & kSign2) | grid_pair_to_half2<0x04030402u>(g1), xq.y, pa);
+                    pb = dot2(((sgn << 3) & kSign2) | grid_pair_to_half2<0x04030402u>(g2), xq.w, pb);
+                    part[r] += pa + pb;
                 }
             }
 #pragma unroll
@@ -886,7 +908,7 @@ __global__ void gemv_iq2s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
                                  const long long n_sub, const long long chunk_sub) {
     extern __shared__ uint8_t smem[];
     __half * xs = reinterpret_cast<__half *>(smem);
-    uint64_t * grid = reinterpret_cast<uint64_t *>(smem + chunk_sub * 64);
+    uint64_t * grid = reinterpret_cast<uint64_t *>(smem + chunk_sub * kXPitch * 2);
     for (int i = threadIdx.x; i < 1024; i += blockDim.x) {
         grid[i] = omph::quant::kIq2sGrid[i];
     }
@@ -901,7 +923,7 @@ __global__ void gemv_iq2s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
     for (long long base = 0; base < n_sub; base += chunk_sub) {
         const long long len = n_sub - base < chunk_sub ? n_sub - base : chunk_sub;
         for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
-            xs[i] = x[base * 32 + i];
+            xs[(i / 32) * kXPitch + (i % 32)] = x[base * 32 + i];
         }
         __syncthreads();
         if (row0 >= rows) {
@@ -909,7 +931,7 @@ __global__ void gemv_iq2s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
             continue;
         }
         for (long long s = base + lane; s < base + len; s += 32) {
-            const __half * xv = xs + (s - base) * 32;
+            const __half * xv = xs + (s - base) * kXPitch;
             const long long blk = s / 8;
             const int ib = (int) (s % 8);
             uint32_t qsw[kIq2sRows];
@@ -1557,7 +1579,7 @@ bool gemv_iq2_s(const void * packed, const void * x_f16, float * y, const int64_
     const omph::format::Iq2sLayout l = omph::format::iq2s_layout(n_blocks);
     const int64_t n_sub = k / 32;
     const int64_t chunk = n_sub < kIq2sChunkSub ? n_sub : kIq2sChunkSub;
-    const size_t smem = (size_t) chunk * 64 + 1024 * 8;
+    const size_t smem = (size_t) chunk * kXPitch * 2 + 1024 * 8;
     const auto * base = static_cast<const uint8_t *>(packed);
     const dim3 grid((unsigned) ((rows + 8 * kIq2sRows - 1) / (8 * kIq2sRows)));
     gemv_iq2s_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.signs_off,
@@ -1577,7 +1599,7 @@ bool gemv_iq2_xs(const void * packed, const void * x_f16, float * y, const int64
     const omph::format::Iq2Layout l = omph::format::iq2_xs_layout(n_blocks);
     const int64_t n_sub = k / 32;
     const int64_t chunk = n_sub < kIq2ChunkSub ? n_sub : kIq2ChunkSub;
-    const size_t smem = (size_t) chunk * 64 + 512 * 8 + 128;
+    const size_t smem = (size_t) chunk * kXPitch * 2 + 512 * 8;
     const auto * base = static_cast<const uint8_t *>(packed);
     const dim3 grid((unsigned) ((rows + 8 * kIq2Rows - 1) / (8 * kIq2Rows)));
     gemv_iq2xs_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.sc_off,
@@ -1597,7 +1619,7 @@ bool gemv_iq2_xxs(const void * packed, const void * x_f16, float * y, const int6
     const omph::format::Iq2Layout l = omph::format::iq2_xxs_layout(n_blocks);
     const int64_t n_sub = k / 32;
     const int64_t chunk = n_sub < kIq2ChunkSub ? n_sub : kIq2ChunkSub;
-    const size_t smem = (size_t) chunk * 64 + 256 * 8 + 128;
+    const size_t smem = (size_t) chunk * 64 + 256 * 8;
     const auto * base = static_cast<const uint8_t *>(packed);
     const dim3 grid((unsigned) ((rows + 8 * kIq2Rows - 1) / (8 * kIq2Rows)));
     gemv_iq2xxs_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.d_off,
@@ -1636,7 +1658,7 @@ bool gemv_q2k(const void * packed, const void * x_f16, float * y, const int64_t 
     const omph::format::Q2kLayout l = omph::format::q2k_layout(n_blocks);
     const int64_t n_sub = k / 32;
     const int64_t chunk = n_sub < kQ2kChunkSub ? n_sub : kQ2kChunkSub;
-    const size_t smem = (size_t) chunk * 64;
+    const size_t smem = (size_t) (chunk / 4) * kQ2kXPitch * 2;  // padded groups
     const auto * base = static_cast<const uint8_t *>(packed);
     const dim3 grid((unsigned) ((rows + 8 * kQ2kRows - 1) / (8 * kQ2kRows)));
     gemv_q2k_kernel<<<grid, 256, smem, stream>>>(base + l.sc_off, base + l.qs_off,
@@ -1677,7 +1699,7 @@ bool gemv_iq3_xxs(const void * packed, const void * x_f16, float * y, const int6
     const omph::format::Iq3XxsLayout l = omph::format::iq3_xxs_layout(n_blocks);
     const int64_t n_sub = k / 32;
     const int64_t chunk = n_sub < kIq3ChunkSub ? n_sub : kIq3ChunkSub;
-    const size_t smem = (size_t) chunk * 64 + 256 * 4;
+    const size_t smem = (size_t) chunk * kXPitch * 2 + 256 * 4;
     const auto * base = static_cast<const uint8_t *>(packed);
     const dim3 grid((unsigned) ((rows + 8 * kIq3Rows - 1) / (8 * kIq3Rows)));
     gemv_iq3_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.aux_off,
@@ -1715,7 +1737,7 @@ GemvOccupancy gemv_occupancy() {
                                (const void *) gemv_iq3_kernel, (const void *) gemv_iq3s_kernel};
     o.smem_q4k = 0;
     o.smem_iq4 = (size_t) kIq4ChunkSub * 64 + 16 * sizeof(float);
-    o.smem_iq3 = (size_t) kIq3ChunkSub * 64 + 256 * 4;
+    o.smem_iq3 = (size_t) kIq3ChunkSub * kXPitch * 2 + 256 * 4;
     o.smem_iq3s = (size_t) kIq3sChunkSub * 64 + 512 * 4;
     int n = 0;
     const size_t smems[4] = {o.smem_q4k, o.smem_iq4, o.smem_iq3, o.smem_iq3s};

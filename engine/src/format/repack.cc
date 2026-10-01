@@ -610,12 +610,46 @@ Iq2Layout iq2_xs_layout(const int64_t n_blocks) {
     return l;
 }
 
+namespace {
+
+// IQ2_XS entry: 9-bit grid index (bits 0-8) and a 7-bit sign index (9-15).
+// Repacked, the sign bits are permuted as for IQ3_XXS (#75): weights 0/2/4/6
+// reversed in bits 9-12, weights 1/3/5 reversed in bits 13-15. Lossless.
+uint16_t iq2xs_entry_to_pairs(const uint16_t e) {
+    const uint32_t s = (uint32_t) e >> 9;
+    uint32_t t = 0;
+    for (int k = 0; k < 4; ++k) {
+        t |= ((s >> (2 * k)) & 1u) << (3 - k);
+    }
+    for (int k = 0; k < 3; ++k) {
+        t |= ((s >> (2 * k + 1)) & 1u) << (4 + 2 - k);
+    }
+    return (uint16_t) ((e & 0x1FFu) | (t << 9));
+}
+
+uint16_t iq2xs_pairs_to_entry(const uint16_t e) {
+    const uint32_t t = (uint32_t) e >> 9;
+    uint32_t s = 0;
+    for (int k = 0; k < 4; ++k) {
+        s |= ((t >> (3 - k)) & 1u) << (2 * k);
+    }
+    for (int k = 0; k < 3; ++k) {
+        s |= ((t >> (4 + 2 - k)) & 1u) << (2 * k + 1);
+    }
+    return (uint16_t) ((e & 0x1FFu) | (s << 9));
+}
+
+} // namespace
+
 void repack_iq2_xs(const void * src, const int64_t n_blocks, void * dst) {
     const Iq2Layout l = iq2_xs_layout(n_blocks);
     const auto * in = static_cast<const BlockIq2Xs *>(src);
     uint8_t * out = static_cast<uint8_t *>(dst);
     for (int64_t b = 0; b < n_blocks; ++b) {
-        std::memcpy(out + l.qs_off + b * 64, in[b].qs, 64);
+        for (int e = 0; e < 32; ++e) {
+            const uint16_t v = iq2xs_entry_to_pairs(in[b].qs[e]);
+            std::memcpy(out + l.qs_off + b * 64 + 2 * e, &v, 2);
+        }
         std::memcpy(out + l.sc_off + b * 8, in[b].scales, 8);
         std::memcpy(out + l.d_off + 2 * b, &in[b].d, 2);
     }
@@ -626,7 +660,11 @@ void unrepack_iq2_xs(const void * src, const int64_t n_blocks, void * dst) {
     const uint8_t * in = static_cast<const uint8_t *>(src);
     auto * out = static_cast<BlockIq2Xs *>(dst);
     for (int64_t b = 0; b < n_blocks; ++b) {
-        std::memcpy(out[b].qs, in + l.qs_off + b * 64, 64);
+        for (int e = 0; e < 32; ++e) {
+            uint16_t v = 0;
+            std::memcpy(&v, in + l.qs_off + b * 64 + 2 * e, 2);
+            out[b].qs[e] = iq2xs_pairs_to_entry(v);
+        }
         std::memcpy(out[b].scales, in + l.sc_off + b * 8, 8);
         std::memcpy(&out[b].d, in + l.d_off + 2 * b, 2);
     }
@@ -648,6 +686,14 @@ void repack_iq2_xxs(const void * src, const int64_t n_blocks, void * dst) {
     uint8_t * out = static_cast<uint8_t *>(dst);
     for (int64_t b = 0; b < n_blocks; ++b) {
         std::memcpy(out + l.qs_off + b * 64, in[b].qs, 64);
+        // Each sub-block's second word (four 7-bit sign indices + scale) gets
+        // the IQ3_XXS sign permutation (#75); lossless, unrepack inverts it.
+        for (int sub = 0; sub < 8; ++sub) {
+            uint32_t a = 0;
+            std::memcpy(&a, out + l.qs_off + b * 64 + 8 * sub + 4, 4);
+            a = iq3xxs_aux_to_pairs(a);
+            std::memcpy(out + l.qs_off + b * 64 + 8 * sub + 4, &a, 4);
+        }
         std::memcpy(out + l.d_off + 2 * b, &in[b].d, 2);
     }
 }
@@ -658,6 +704,12 @@ void unrepack_iq2_xxs(const void * src, const int64_t n_blocks, void * dst) {
     auto * out = static_cast<BlockIq2Xxs *>(dst);
     for (int64_t b = 0; b < n_blocks; ++b) {
         std::memcpy(out[b].qs, in + l.qs_off + b * 64, 64);
+        for (int sub = 0; sub < 8; ++sub) {
+            uint32_t t = 0;
+            std::memcpy(&t, reinterpret_cast<const uint8_t *>(out[b].qs) + 8 * sub + 4, 4);
+            t = iq3xxs_pairs_to_aux(t);
+            std::memcpy(reinterpret_cast<uint8_t *>(out[b].qs) + 8 * sub + 4, &t, 4);
+        }
         std::memcpy(&out[b].d, in + l.d_off + 2 * b, 2);
     }
 }
