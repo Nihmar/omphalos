@@ -198,6 +198,12 @@ bool Runner::gdn_layer(const int64_t il, const LayerWeights & L, const int64_t T
         step.x16 = static_cast<const __half *>(h16_);
         step.z = static_cast<const float *>(z_);
         step.out16 = static_cast<__half *>(ffn16_);
+        // the token-parallel form (#96), its scratch in ffn1_, which the FFN
+        // fills only later; OMPH_GDN_SERIAL=1 keeps the single launch (A/B)
+        if (!env_.gdn_serial &&
+            omph::kernels::gdn_work_floats(T, n_vh, n_kh) <= T * h_.n_ff) {
+            step.work = static_cast<float *>(ffn1_);
+        }
         if (!omph::kernels::gdn_chunk(step, n_vh, nullptr)) {
             return fail("delta rule (chunk) failed");
         }

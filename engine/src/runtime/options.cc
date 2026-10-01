@@ -27,6 +27,7 @@ EnvOptions EnvOptions::from_env() {
             o.gemm_min = std::atoi(g);
         }
     }
+    o.gdn_serial = flag("OMPH_GDN_SERIAL");
     o.no_b4 = flag("OMPH_NO_B4");
     o.no_bf16_gemv = flag("OMPH_NO_BF16_GEMV");
     o.no_f16_cache = flag("OMPH_NO_F16_CACHE");

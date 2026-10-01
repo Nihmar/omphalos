@@ -50,6 +50,9 @@ struct GdnStep {
                                        // t * that, the token's rank-1 factors (decay, k, d)
     float * conv_hist = nullptr;       // at t = 0: [conv_cur; qkv] rows, (conv_k - 1 + tokens)
                                        // x channels, to rebuild the tail of a shorter prefix
+    // gdn_chunk only: gdn_work_floats(tokens, heads, n_kh) floats of scratch, which
+    // selects the token-parallel form (#96).
+    float * work = nullptr;
 };
 bool gdn_step(const GdnStep & a, int64_t heads, hipStream_t stream);
 
@@ -58,7 +61,18 @@ bool gdn_step(const GdnStep & a, int64_t heads, hipStream_t stream);
 // ignored. The state is read from `state` once and written to `state_out` (or
 // `state`) once; replay / conv_hist record every token as gdn_step would. The
 // result equals `tokens` gdn_step launches bit for bit.
+// With a.work set, the chunk runs as four launches, still bit for bit: the
+// token-parallel parts first (conv + L2 norms, the gates, for every token and
+// head), then the recurrence alone, whose 128 value columns are independent
+// and so spread over many waves with no barrier per token, then the gated norms.
 bool gdn_chunk(const GdnStep & a, int64_t heads, hipStream_t stream);
+
+// Scratch floats of the token-parallel gdn_chunk: per token, the conv output
+// of every channel (q | k | v: n_kh * 256 + heads * 128), the delta rule's
+// output (heads * 128) and (beta, decay) per head.
+inline int64_t gdn_work_floats(const int64_t tokens, const int64_t heads, const int64_t n_kh) {
+    return tokens * (n_kh * 256 + heads * 256 + heads * 2);
+}
 
 // Floats of one token's replay record: decay (heads), k (n_kh x 128), d (heads x 128).
 inline int64_t gdn_replay_floats(const int64_t heads, const int64_t n_kh) {
