@@ -67,8 +67,10 @@ int main(int argc, char ** argv) {
         if (out == nullptr) {
             return fail("cannot open output file");
         }
-        std::fwrite(host.data(), 1, out_bytes, out);
-        std::fclose(out);
+        const bool written = std::fwrite(host.data(), 1, out_bytes, out) == out_bytes;
+        if (std::fclose(out) != 0 || !written) {
+            return fail("cannot write the output file");
+        }
 
         const omph::gguf::TypeInfo * info = omph::gguf::type_info(tensor->type);
         std::printf("dequantized %s (%s, %lld elements) -> %s (%zu bytes, %s)\n", argv[2],

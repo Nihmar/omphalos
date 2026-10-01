@@ -26,10 +26,12 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -116,6 +118,10 @@ int64_t numel(const omph::gguf::TensorInfo & t) {
 void write_f32(const std::string & path, const std::vector<float> & data) {
     std::ofstream out(path, std::ios::binary);
     out.write(reinterpret_cast<const char *>(data.data()), (std::streamsize) (data.size() * 4));
+    out.close();
+    if (!out) {
+        throw std::runtime_error("cannot write " + path);
+    }
 }
 
 // Phase timing: record a fresh event pair per call, resolve them all after the
@@ -649,10 +655,10 @@ public:
             return fail("output.weight missing");
         }
         const int64_t head_row_bytes = (int64_t) (head->nbytes / head->ne[1]);
-        if (gems_.count(head->name) != 0) {
-            (void) hipMemcpy(lazy(&raw_stage_, (size_t) 768 * 1024 * 1024),
-                             file_.tensor_data(*head), (size_t) head->nbytes,
-                             hipMemcpyHostToDevice);
+        if (gems_.count(head->name) != 0 &&
+            hipMemcpy(lazy(&raw_stage_, raw_stage_bytes()), file_.tensor_data(*head),
+                      (size_t) head->nbytes, hipMemcpyHostToDevice) != hipSuccess) {
+            return fail("cannot stage the lm_head");
         }
         void * head16 = lazy(&head16_, head16_bytes_);
         void * tmp_logits = lazy(&tmp_logits_, tmp_logits_bytes_);
@@ -760,8 +766,17 @@ private:
             --h.n_layer;
         }
         if (h.n_embd <= 0 || h.n_layer <= 0 || h.n_vocab <= 0 || h.n_head <= 0 ||
-            h.head_dim <= 0 || h.n_ff <= 0) {
+            h.n_head_kv <= 0 || h.head_dim <= 0 || h.n_rot <= 0 || h.n_ff <= 0 ||
+            h.ssm_n_kh <= 0 || h.ssm_n_vh <= 0 || h.ssm_s <= 0 || h.ssm_inner <= 0 ||
+            h.ssm_conv_k <= 1) {
             throw std::runtime_error("incomplete hyperparameters");
+        }
+        // What the kernels hard-code for this model (single-model engine).
+        const omph::gguf::TensorInfo * out = f.tensor("output.weight");
+        if (h.head_dim != 256 || h.n_rot > h.head_dim || h.n_head % h.n_head_kv != 0 ||
+            h.ssm_s != 128 || h.ssm_inner % h.ssm_n_vh != 0 || h.ssm_n_vh % h.ssm_n_kh != 0 ||
+            out == nullptr || out->ne.size() < 2 || (int64_t) out->ne[1] != h.n_vocab) {
+            throw std::runtime_error("hyperparameters outside what the kernels support");
         }
         return h;
     }
@@ -1160,6 +1175,15 @@ private:
         return *p;
     }
 
+    // raw_stage_ holds the original bytes of any one repacked tensor.
+    size_t raw_stage_bytes() const {
+        size_t n = 0;
+        for (const auto & kv : gems_) {
+            n = std::max(n, (size_t) file_.tensor(kv.first)->nbytes);
+        }
+        return n;
+    }
+
     // Device pointer to the original GGUF bytes: they live in the image unless
     // the tensor was repacked, in which case they are staged from the file.
     const void * raw_bytes(const std::string & name) {
@@ -1168,7 +1192,7 @@ private:
             return static_cast<const uint8_t *>(dev_weights_) + off_.at(name);
         }
         const omph::gguf::TensorInfo * t = file_.tensor(name);
-        if (hipMemcpy(lazy(&raw_stage_, (size_t) 768 * 1024 * 1024), file_.tensor_data(*t),
+        if (hipMemcpy(lazy(&raw_stage_, raw_stage_bytes()), file_.tensor_data(*t),
                       (size_t) t->nbytes,
                       hipMemcpyHostToDevice) != hipSuccess) {
             throw std::runtime_error("cannot stage " + name);
@@ -1350,12 +1374,15 @@ private:
 } // namespace
 
 int main(int argc, char ** argv) {
-    if (argc < 4) {
+    const auto usage = [&]() {
         std::fprintf(stderr, "usage: %s <model.gguf> <tokens.txt> <out-logits.f32> "
                              "[--trace-dir DIR] [--tokens N] [--last-logits | --logits-tail N] "
                              "[--generate N --gen-out FILE] [--gemv]\n",
                      argv[0]);
         return 2;
+    };
+    if (argc < 4) {
+        return usage();
     }
     const std::string model = argv[1];
     const std::string tok_path = argv[2];
@@ -1367,22 +1394,37 @@ int main(int argc, char ** argv) {
     int64_t logits_tail = 0;
     int64_t generate = 0;
     bool use_gemv = false;
+    // A flag's numeric value: a whole non-negative number or nothing.
+    const auto count = [](const char * s, int64_t & out) {
+        char * end = nullptr;
+        const long long v = std::strtoll(s, &end, 10);
+        out = v;
+        return end != s && *end == '\0' && v >= 0;
+    };
     for (int i = 4; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--trace-dir") == 0 && i + 1 < argc) {
+        const bool has_value = i + 1 < argc;
+        if (std::strcmp(argv[i], "--trace-dir") == 0 && has_value) {
             trace_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--last-logits") == 0) {
             last_logits = true;
-        } else if (std::strcmp(argv[i], "--logits-tail") == 0 && i + 1 < argc) {
-            logits_tail = std::atoll(argv[++i]);
-        } else if (std::strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
-            max_tokens = std::atoll(argv[++i]);
-        } else if (std::strcmp(argv[i], "--generate") == 0 && i + 1 < argc) {
-            generate = std::atoll(argv[++i]);
+        } else if (std::strcmp(argv[i], "--logits-tail") == 0 && has_value) {
+            if (!count(argv[++i], logits_tail)) return usage();
+        } else if (std::strcmp(argv[i], "--tokens") == 0 && has_value) {
+            if (!count(argv[++i], max_tokens)) return usage();
+        } else if (std::strcmp(argv[i], "--generate") == 0 && has_value) {
+            if (!count(argv[++i], generate)) return usage();
         } else if (std::strcmp(argv[i], "--gemv") == 0) {
             use_gemv = true;
-        } else if (std::strcmp(argv[i], "--gen-out") == 0 && i + 1 < argc) {
+        } else if (std::strcmp(argv[i], "--gen-out") == 0 && has_value) {
             gen_path = argv[++i];
+        } else {
+            std::fprintf(stderr, "unknown option or missing value: %s\n", argv[i]);
+            return usage();
         }
+    }
+    if (use_gemv && generate == 0) {
+        std::fprintf(stderr, "note: --gemv only applies with --generate; prefill-only runs "
+                             "use the f16 path\n");
     }
     try {
         std::vector<int32_t> toks;
@@ -1390,7 +1432,16 @@ int main(int argc, char ** argv) {
             std::ifstream in(tok_path);
             int64_t v = 0;
             while (in >> v) {
+                if (v < 0 || v > INT32_MAX) {
+                    std::fprintf(stderr, "token id %lld out of range in %s\n", (long long) v,
+                                 tok_path.c_str());
+                    return 1;
+                }
                 toks.push_back((int32_t) v);
+            }
+            if (!in.eof()) {
+                std::fprintf(stderr, "%s: not a list of token ids\n", tok_path.c_str());
+                return 1;
             }
         }
         if (toks.empty()) {
@@ -1423,6 +1474,13 @@ int main(int argc, char ** argv) {
         }
         Runner runner(model, act_chunk, use_gemv && generate > 0, last_logits, total_len);
         const HParams & h = runner.hparams();
+        // An id past the vocabulary would index the embedding out of bounds.
+        for (const int32_t t : toks) {
+            if (t >= h.n_vocab) {
+                std::fprintf(stderr, "token id %d >= n_vocab %lld\n", t, (long long) h.n_vocab);
+                return 1;
+            }
+        }
         // Every chunk's rows are kept, so the file is the whole prompt's logits;
         // with --last-logits only the last row, with --logits-tail N the last N.
         // Chunks that do not reach the rows being kept skip the lm_head.
@@ -1474,11 +1532,14 @@ int main(int argc, char ** argv) {
                 }
                 next = argmax(logits.data());
             }
-            if (FILE * f = std::fopen(gen_path.c_str(), "w")) {
-                for (const int32_t t : gen) {
-                    std::fprintf(f, "%d\n", t);
-                }
-                std::fclose(f);
+            FILE * f = std::fopen(gen_path.c_str(), "w");
+            bool ok = f != nullptr;
+            for (const int32_t t : gen) {
+                ok = ok && std::fprintf(f, "%d\n", t) > 0;
+            }
+            if (f == nullptr || std::fclose(f) != 0 || !ok) {
+                std::fprintf(stderr, "cannot write %s\n", gen_path.c_str());
+                return 1;
             }
             std::printf("generated:");
             for (const int32_t t : gen) {

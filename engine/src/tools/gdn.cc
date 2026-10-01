@@ -47,9 +47,10 @@ double meta_float(const omph::gguf::File & f, const char * key, double fallback)
 }
 
 void write_f32(const std::string & path, const std::vector<float> & data) {
-    if (FILE * f = std::fopen(path.c_str(), "wb")) {
-        std::fwrite(data.data(), 4, data.size(), f);
-        std::fclose(f);
+    FILE * f = std::fopen(path.c_str(), "wb");
+    const bool ok = f != nullptr && std::fwrite(data.data(), 4, data.size(), f) == data.size();
+    if (f == nullptr || std::fclose(f) != 0 || !ok) {
+        throw std::runtime_error("cannot write " + path);
     }
 }
 

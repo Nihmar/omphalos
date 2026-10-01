@@ -111,8 +111,10 @@ int main(int argc, char ** argv) {
         (void) hipFree(dev_y32);
 
         if (FILE * fo = std::fopen(out_path, "wb")) {
-            std::fwrite(host_out.data(), 4, y_elems, fo);
-            std::fclose(fo);
+            const bool written = std::fwrite(host_out.data(), 4, y_elems, fo) == (size_t) y_elems;
+            if (std::fclose(fo) != 0 || !written) {
+                return fail("cannot write the output file");
+            }
         } else {
             return fail("cannot open the output file");
         }
