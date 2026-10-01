@@ -212,7 +212,7 @@ __global__ __launch_bounds__(kPrepHd) void attn_prep_kernel(const AttnPrep a) {
     for (int s = 16; s > 0; s >>= 1) {
         amax = fmaxf(amax, __shfl_xor(amax, s));
     }
-    if (is_k) {
+    if (is_k && !a.k_q4) {
         const float sc = amax / 127.0f;
         const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
         if (lane == 0) {
@@ -224,7 +224,7 @@ __global__ __launch_bounds__(kPrepHd) void attn_prep_kernel(const AttnPrep a) {
         const float vsc = amax / 7.0f;
         const float vinv = amax > 0.0f ? 7.0f / amax : 0.0f;
         if (lane == 0) {
-            a.v_scales[sdst + b] = __float2half(vsc);
+            (is_k ? a.k_scales : a.v_scales)[sdst + b] = __float2half(vsc);
         }
         const float x_hi = __shfl(x, (lane + 16) & 31);  // value lane + 16 of the block
         if (lane < (int) kKvBlock / 2) {
@@ -232,7 +232,7 @@ __global__ __launch_bounds__(kPrepHd) void attn_prep_kernel(const AttnPrep a) {
             const int q1 = (int) rintf(x_hi * vinv);
             const int c0 = q0 > 7 ? 7 : (q0 < -8 ? -8 : q0);
             const int c1 = q1 > 7 ? 7 : (q1 < -8 ? -8 : q1);
-            a.v_q4[dst / 2 + b * (kKvBlock / 2) + lane] =
+            (is_k ? a.k_q8 : a.v_q4)[dst / 2 + b * (kKvBlock / 2) + lane] =
                 (uint8_t) (((c0 + 8) & 0xF) | (((c1 + 8) & 0xF) << 4));
         }
     }
@@ -274,6 +274,7 @@ struct KvArgs {
     const __half * k16;
     const __half * v16;
     long long window;
+    bool k_q4;
 };
 
 // Dimensions [16c, 16c + 16) of the K row of position p for KV head kvh, as one
@@ -295,9 +296,22 @@ __device__ inline void gqa_load_k16(const KvArgs & kv, const long long p, const 
             }
             return;
         }
+        const float sc = __half2float(kv.k_scales[row * (kGqaHd / kKvBlock) + c / 2]);
+        if (kv.k_q4) {
+            // V's Q4 format: byte j of the block holds element j (low nibble) and
+            // j + 16 (high); chunk c is the low or high half of block c / 2.
+            const uint4 b4 = *reinterpret_cast<const uint4 *>(kv.k_q8 + row * (kGqaHd / 2) +
+                                                              (c / 2) * (kKvBlock / 2));
+            const uint8_t * bv4 = reinterpret_cast<const uint8_t *>(&b4);
+            const int sh = (c & 1) ? 4 : 0;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                k[i] = (float) ((int) ((bv4[i] >> sh) & 0xF) - 8) * sc;
+            }
+            return;
+        }
         const uint4 b = *reinterpret_cast<const uint4 *>(kv.k_q8 + row * kGqaHd + c * 16);
         const int8_t * bv = reinterpret_cast<const int8_t *>(&b);
-        const float sc = __half2float(kv.k_scales[row * (kGqaHd / kKvBlock) + c / 2]);
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
             k[i] = (float) bv[i] * sc;
@@ -600,7 +614,8 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
                       static_cast<const __half *>(kv.v_scales),
                       static_cast<const __half *>(kv.k16),
                       static_cast<const __half *>(kv.v16),
-                      kv.window > 0 ? kv.window : 1};
+                      kv.window > 0 ? kv.window : 1,
+                      kv.k_q4};
     const int tq = gqa_tq(tokens);
     const dim3 grid((unsigned) ((tokens + tq - 1) / tq), (unsigned) nkv, (unsigned) splits);
     auto * w = static_cast<float *>(work);

@@ -18,7 +18,7 @@ common=(-m "$MODEL" -f "$TEXT" -c "$CTX" -b 512 -ub 512 --chunks 1 -ngl 99 -fa o
 
 "$BIN/llama-perplexity" "${common[@]}" -ctk f16 -ctv f16 \
     --kl-divergence-base "$WORK/base-$CTX.kld" > "$WORK/base-$CTX.log" 2>&1
-for kv in "q8_0 q4_0" "q8_0 q8_0"; do
+for kv in "q8_0 q4_0" "q8_0 q8_0" "q4_0 q4_0"; do
     set -- $kv
     "$BIN/llama-perplexity" "${common[@]}" -ctk "$1" -ctv "$2" \
         --kl-divergence-base "$WORK/base-$CTX.kld" --kl-divergence \
