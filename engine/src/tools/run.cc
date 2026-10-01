@@ -180,6 +180,44 @@ private:
 };
 
 class Runner {
+    // A tensor repacked for a fused GEMV (PLAN.md §8.3).
+    struct GemvEntry {
+        size_t off = 0;
+        size_t bytes = 0;
+        int64_t rows = 0;
+        int64_t k = 0;
+        uint32_t type = 0;
+        bool has_b4 = false;  // a small-batch kernel exists for this type
+    };
+
+    // A weight matrix resolved once at load (#100): the hot path looks nothing
+    // up by name.
+    struct Mat {
+        std::string name;
+        const omph::gguf::TensorInfo * t = nullptr;  // null: not in the file
+        const GemvEntry * gemv = nullptr;            // repacked for a fused GEMV
+        const void * dev = nullptr;                  // its bytes in the weight image
+    };
+    struct LayerWeights {
+        bool recurrent = false;
+        const float * attn_norm = nullptr;
+        const float * post_norm = nullptr;
+        // full attention
+        const float * q_norm = nullptr;
+        const float * k_norm = nullptr;
+        Mat attn_q, attn_k, attn_v, attn_output;
+        // gated delta net
+        const float * dt_bias = nullptr;
+        const float * ssm_a = nullptr;
+        const float * ssm_norm = nullptr;
+        const float * conv_w = nullptr;
+        const uint16_t * w_beta = nullptr;   // BF16 rows, dotted inside gdn_step
+        const uint16_t * w_alpha = nullptr;
+        Mat attn_qkv, attn_gate, ssm_out;
+        // FFN
+        Mat ffn_up, ffn_gate, ffn_down;
+    };
+
 public:
     explicit Runner(const std::string & path, const int64_t max_tokens, const bool use_gemv,
                     const omph::runtime::EnvOptions & env, const bool last_logits_only = false,
@@ -279,6 +317,8 @@ public:
             }
         }
 
+        resolve_layers();
+
         // The f16 staging scratch holds one layer's weights on the dequant +
         // hipBLASLt path, so it is sized to the largest per-layer sum of the
         // tensors that can take it: every 2D weight of a block (~770 MiB, #93),
@@ -331,8 +371,7 @@ public:
         max_seq_ = kvcap;
         int64_t n_kv = 0;
         for (int64_t il = 0; il < h_.n_layer; ++il) {
-            const bool recurrent = file_.tensor("blk." + std::to_string(il) + ".ssm_a") != nullptr;
-            kv_index_.push_back(recurrent ? -1 : n_kv++);
+            kv_index_.push_back(layers_[(size_t) il].recurrent ? -1 : n_kv++);
         }
         // The KV cache is sized by the whole sequence, the activations by the
         // chunk: that is what lets a long prompt run in pieces.
@@ -449,39 +488,25 @@ public:
 
         // token embeddings, one row at a time (the table is quantized and lives
         // in pinned host memory: the kernel reads the row over PCIe)
-        const omph::gguf::TensorInfo * te = file_.tensor("token_embd.weight");
-        if (te == nullptr || embd_host_ == nullptr) return fail("token_embd.weight missing");
-        const int64_t row_bytes = (int64_t) (te->nbytes / te->ne[1]);
         for (int64_t t = 0; t < T; ++t) {
             const uint8_t * src =
-                static_cast<const uint8_t *>(embd_host_) + (size_t) toks[t] * row_bytes;
-            if (!omph::kernels::dequantize(te->type, src,
+                static_cast<const uint8_t *>(embd_host_) + (size_t) toks[t] * embd_row_bytes_;
+            if (!omph::kernels::dequantize(embd_type_, src,
                                            static_cast<uint8_t *>(x_) + t * ne * 4, ne, false,
                                            nullptr)) {
                 return fail("embedding dequant failed");
             }
         }
 
-        const auto vec = [&](const std::string & name) -> const float * {
-            const omph::gguf::TensorInfo * t = file_.tensor(name);
-            return t == nullptr ? nullptr : reinterpret_cast<const float *>(
-                                                static_cast<const uint8_t *>(dev_weights_) +
-                                                off_.at(t->name));
-        };
-
         // Set when the previous layer's final residual add already wrote this
         // layer's attn_norm(x) into h16_ (one fused launch instead of two).
         bool h16_normed = false;
         for (int64_t il = 0; il < h_.n_layer; ++il) {
-            const std::string p = "blk." + std::to_string(il) + ".";
-            const bool recurrent = file_.tensor(p + "ssm_a") != nullptr;
-            const bool skip_attn = !recurrent && env_.skip_attn;
+            const LayerWeights & L = layers_[(size_t) il];
+            const bool skip_attn = !L.recurrent && env_.skip_attn;
             const bool skip_ffn = env_.skip_ffn;
-            const float * attn_norm = vec(p + "attn_norm.weight");
-            const float * post_norm = vec(p + "post_attention_norm.weight");
-            if (attn_norm == nullptr || post_norm == nullptr) {
-                return fail("missing layer norms");
-            }
+            const float * attn_norm = L.attn_norm;
+            const float * post_norm = L.post_norm;
             if (!h16_normed &&
                 !omph::kernels::add_rms_norm_f16(static_cast<const float *>(x_), nullptr, nullptr,
                                                  attn_norm, h16_, T, ne, (float) h_.eps,
@@ -494,10 +519,10 @@ public:
                 continue;  // ablation only: the layer output is the normed input
             }
             timer_block_.start();
-            if (recurrent) {
-                if (!gdn_layer(il, p, T)) return false;
+            if (L.recurrent) {
+                if (!gdn_layer(il, L, T)) return false;
             } else if (!skip_attn) {
-                if (!attn_layer(il, p, T, start_pos)) return false;
+                if (!attn_layer(il, L, T, start_pos)) return false;
             }
             timer_block_.stop(t_block_);
             if (skip_ffn) {
@@ -513,25 +538,22 @@ public:
             const bool gate_up_ok = fork_join(
                 T,
                 [&] {
-                    return matmul(p + "ffn_up.weight", h16_, static_cast<float *>(ffn2_), h_.n_ff,
-                                  ne, T);
+                    return matmul(L.ffn_up, h16_, static_cast<float *>(ffn2_), h_.n_ff, ne, T);
                 },
                 [&] {
-                    return matmul(p + "ffn_gate.weight", h16_, static_cast<float *>(ffn1_),
-                                  h_.n_ff, ne, T);
+                    return matmul(L.ffn_gate, h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T);
                 });
             if (!gate_up_ok ||
                 !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
                                            static_cast<const float *>(ffn2_), ffn16_, T * h_.n_ff,
                                            nullptr) ||
-                !matmul(p + "ffn_down.weight", ffn16_, static_cast<float *>(cur_), ne, h_.n_ff, T)) {
+                !matmul(L.ffn_down, ffn16_, static_cast<float *>(cur_), ne, h_.n_ff, T)) {
                 return fail("ffn failed");
             }
             // x = ffn + resid; for all but the last layer, the same launch also
             // writes the next layer's attn_norm(x) into h16_.
             const float * next_norm =
-                il + 1 < h_.n_layer ? vec("blk." + std::to_string(il + 1) + ".attn_norm.weight")
-                                    : nullptr;
+                il + 1 < h_.n_layer ? layers_[(size_t) il + 1].attn_norm : nullptr;
             if (next_norm != nullptr) {
                 if (!omph::kernels::add_rms_norm_f16(static_cast<const float *>(cur_),
                                                      static_cast<const float *>(resid_),
@@ -563,17 +585,15 @@ public:
             }
             return true;
         }
-        const float * out_norm = vec("output_norm.weight");
-        if (out_norm == nullptr ||
-            !omph::kernels::rms_norm(static_cast<const float *>(x_), out_norm,
+        if (!omph::kernels::rms_norm(static_cast<const float *>(x_), out_norm_,
                                      static_cast<float *>(cur_), T, ne, (float) h_.eps, 1.0f,
                                      nullptr) ||
             !omph::kernels::cast_f32_to_f16(static_cast<const float *>(cur_), h16_, T * ne,
                                             nullptr)) {
             return fail("output_norm failed");
         }
-        if (use_gemv_ && T == 1 && gems_.count("output.weight") != 0) {
-            if (!matmul("output.weight", h16_, static_cast<float *>(logits_), h_.n_vocab, ne, T)) {
+        if (use_gemv_ && T == 1 && head_.gemv != nullptr) {
+            if (!matmul(head_, h16_, static_cast<float *>(logits_), h_.n_vocab, ne, T)) {
                 return fail("lm_head (gemv) failed");
             }
             if (greedy != nullptr) {
@@ -605,14 +625,8 @@ public:
         // 33 GB, and the long-context KV validation only needs the final row.
         if (last_logits_only_) {
             const uint8_t * xlast = static_cast<const uint8_t *>(h16_) + (T - 1) * ne * 2;
-            const omph::gguf::TensorInfo * ht = file_.tensor("output.weight");
-            if (ht == nullptr) {
-                return fail("output.weight missing");
-            }
-            if (use_gemv_ && gems_.count("output.weight") != 0) {
-                const auto & e = gems_.at("output.weight");
-                const void * w = static_cast<const uint8_t *>(dev_weights_) + e.off;
-                if (!gemv_one(e.type, w, xlast, static_cast<float *>(logits_), h_.n_vocab, ne, nullptr)) {
+            if (use_gemv_ && head_.gemv != nullptr) {
+                if (!gemv_one(head_.gemv->type, head_.dev, xlast, static_cast<float *>(logits_), h_.n_vocab, ne, nullptr)) {
                     return fail("lm_head gemv failed");
                 }
                 if (hipDeviceSynchronize() != hipSuccess) {
@@ -635,10 +649,8 @@ public:
         }
         // Small-batch head: for a Q4_K head with 2+ tokens, run four tokens per
         // weight read instead of materializing f16 (PLAN.md §10.1's N = 1..5).
-        if (use_gemv_ && T > 1 && gems_.count("output.weight") != 0 &&
-            gems_.at("output.weight").type == 12) {
-            const auto & e = gems_.at("output.weight");
-            const void * w = static_cast<const uint8_t *>(dev_weights_) + e.off;
+        if (use_gemv_ && T > 1 && head_.gemv != nullptr && head_.gemv->type == 12) {
+            const void * w = head_.dev;
             logits.resize((size_t) T * h_.n_vocab);
             // kHeadRows (a multiple of 4) rows at a time into logits_, then out
             for (int64_t r0 = 0; r0 < T; r0 += kHeadRows) {
@@ -678,22 +690,17 @@ public:
     // to `out` on the host, one vocab chunk at a time.
     bool head_chunked(const void * x16, const int64_t T, float * out) {
         const int64_t ne = h_.n_embd;
-        const omph::gguf::TensorInfo * head = file_.tensor("output.weight");
-        if (head == nullptr) {
-            return fail("output.weight missing");
-        }
+        const omph::gguf::TensorInfo * head = head_.t;
         const int64_t head_row_bytes = (int64_t) (head->nbytes / head->ne[1]);
-        if (gems_.count(head->name) != 0 &&
+        if (head_.gemv != nullptr &&
             hipMemcpy(lazy(&raw_stage_, raw_stage_bytes()), file_.tensor_data(*head),
                       (size_t) head->nbytes, hipMemcpyHostToDevice) != hipSuccess) {
             return fail("cannot stage the lm_head");
         }
         void * head16 = lazy(&head16_, head16_bytes_);
         void * tmp_logits = lazy(&tmp_logits_, tmp_logits_bytes_);
-        const uint8_t * head_src = gems_.count(head->name) != 0
-                                       ? static_cast<const uint8_t *>(raw_stage_)
-                                       : static_cast<const uint8_t *>(dev_weights_) +
-                                             off_.at(head->name);
+        const uint8_t * head_src = head_.gemv != nullptr ? static_cast<const uint8_t *>(raw_stage_)
+                                                         : static_cast<const uint8_t *>(head_.dev);
         const int64_t chunk = std::min<int64_t>(h_.n_vocab, 32768);
         for (int64_t v0 = 0; v0 < h_.n_vocab; v0 += chunk) {
             const int64_t rows = std::min(chunk, h_.n_vocab - v0);
@@ -811,7 +818,7 @@ private:
         return h;
     }
 
-    bool attn_layer(const int64_t il, const std::string & p, const int64_t T,
+    bool attn_layer(const int64_t il, const LayerWeights & L, const int64_t T,
                     const int64_t pos0) {
         const int64_t ne = h_.n_embd;
         const int64_t q_out = h_.n_head * 2 * h_.head_dim;
@@ -823,18 +830,17 @@ private:
         float * v_cache = kv_v_ == nullptr
                               ? nullptr
                               : static_cast<float *>(kv_v_) + kv_index_[il] * max_seq_ * kv_out;
-        const float * q_norm = f32_ref(p + "attn_q_norm.weight");
-        const float * k_norm = f32_ref(p + "attn_k_norm.weight");
+        const float * q_norm = L.q_norm;
+        const float * k_norm = L.k_norm;
 
         const bool proj_ok = fork_join(
             T,
             [&] {
-                return matmul(p + "attn_k.weight", h16_, static_cast<float *>(k_), kv_out, ne, T) &&
-                       matmul(p + "attn_v.weight", h16_, static_cast<float *>(v_), kv_out, ne, T);
+                return matmul(L.attn_k, h16_, static_cast<float *>(k_), kv_out, ne, T) &&
+                       matmul(L.attn_v, h16_, static_cast<float *>(v_), kv_out, ne, T);
             },
             [&] {
-                return matmul(p + "attn_q.weight", h16_, static_cast<float *>(fused_), q_out, ne,
-                              T);
+                return matmul(L.attn_q, h16_, static_cast<float *>(fused_), q_out, ne, T);
             });
         // split, QK-norm, RoPE, the Hadamard rotation and (quantized cache)
         // the KV write, in one launch (#79).
@@ -868,14 +874,14 @@ private:
         }
         if (!proj_ok || !omph::kernels::attn_prep(prep, nullptr) ||
             !attn_impl(il, k_cache, v_cache, pos0, T) ||
-            !matmul(p + "attn_output.weight", ffn16_, static_cast<float *>(blk_), ne,
+            !matmul(L.attn_output, ffn16_, static_cast<float *>(blk_), ne,
                     h_.n_head * h_.head_dim, T)) {
             return fail("attention layer failed");
         }
         return true;
     }
 
-    bool gdn_layer(const int64_t il, const std::string & p, const int64_t T) {
+    bool gdn_layer(const int64_t il, const LayerWeights & L, const int64_t T) {
         const int64_t ne = h_.n_embd;
         const int64_t n_kh = h_.ssm_n_kh;
         const int64_t n_vh = h_.ssm_n_vh;
@@ -887,10 +893,10 @@ private:
         const int64_t channels = q_dims + k_dims + v_dims;
         const float l2_scale = 1.0f / std::sqrt((float) s);
 
-        const float * dt_bias = f32_ref(p + "ssm_dt.bias");
-        const float * ssm_a = f32_ref(p + "ssm_a");
-        const float * ssm_norm = f32_ref(p + "ssm_norm.weight");
-        const float * conv_w = f32_ref(p + "ssm_conv1d.weight");
+        const float * dt_bias = L.dt_bias;
+        const float * ssm_a = L.ssm_a;
+        const float * ssm_norm = L.ssm_norm;
+        const float * conv_w = L.conv_w;
         uint8_t * st = static_cast<uint8_t *>(states_[il]);
         const int64_t n_conv_f = (h_.ssm_conv_k - 1) * channels;
         float * conv_a = reinterpret_cast<float *>(st);
@@ -904,12 +910,10 @@ private:
             T,
             [&] {
                 // beta / alpha (BF16, 48 rows each) are dotted inside gdn_step (#88)
-                return matmul(p + "attn_gate.weight", h16_, static_cast<float *>(z_), v_dims, ne,
-                              T);
+                return matmul(L.attn_gate, h16_, static_cast<float *>(z_), v_dims, ne, T);
             },
             [&] {
-                return matmul(p + "attn_qkv.weight", h16_, static_cast<float *>(fused_), channels,
-                              ne, T);
+                return matmul(L.attn_qkv, h16_, static_cast<float *>(fused_), channels, ne, T);
             });
         if (!proj_ok) {
             return fail("gdn projection failed");
@@ -922,15 +926,8 @@ private:
         step.conv_w = conv_w;
         step.conv_cur = conv_cur;
         step.conv_new = conv_new;
-        const omph::gguf::TensorInfo * wb = file_.tensor(p + "ssm_beta.weight");
-        const omph::gguf::TensorInfo * wa = file_.tensor(p + "ssm_alpha.weight");
-        if (wb == nullptr || wa == nullptr || wb->type != 30 || wa->type != 30) {
-            return fail("gdn: ssm_beta / ssm_alpha must be BF16");
-        }
-        step.w_beta = reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(dev_weights_) +
-                                                         off_.at(wb->name));
-        step.w_alpha = reinterpret_cast<const uint16_t *>(
-            static_cast<const uint8_t *>(dev_weights_) + off_.at(wa->name));
+        step.w_beta = L.w_beta;
+        step.w_alpha = L.w_alpha;
         step.k_in = ne;
         step.dt_bias = dt_bias;
         step.ssm_a = ssm_a;
@@ -954,7 +951,7 @@ private:
                 return fail("delta rule failed");
             }
         }
-        if (!matmul(p + "ssm_out.weight", ffn16_, static_cast<float *>(blk_), ne, v_dims, T)) {
+        if (!matmul(L.ssm_out, ffn16_, static_cast<float *>(blk_), ne, v_dims, T)) {
             return fail("gdn output failed");
         }
         conv_flip_[il] ^= 1;
@@ -1090,17 +1087,19 @@ private:
     // One matmul: the fused GEMV for single-token steps when it is available for
     // this tensor, the small-batch GEMV for a few tokens, otherwise the f16
     // dequant + hipBLASLt path.
-    bool matmul(const std::string & name, const void * x16, float * y, const int64_t n_out,
+    bool matmul(const Mat & m, const void * x16, float * y, const int64_t n_out,
                 const int64_t k, const int64_t T) {
+        if (m.t == nullptr) {
+            throw std::runtime_error("missing tensor " + m.name);
+        }
+        const GemvEntry * g = m.gemv;
         if (T == 1) {
             // BF16 weights: bf16 is the top half of an f32, so a direct dot
             // product beats converting to f16 and running a tiny M = 1 GEMM.
-            const omph::gguf::TensorInfo * ti = file_.tensor(name);
-            if (ti != nullptr && ti->type == 30 && (int64_t) ti->ne[1] == n_out && (int64_t) ti->ne[0] == k &&
+            if (m.t->type == 30 && (int64_t) m.t->ne[1] == n_out && (int64_t) m.t->ne[0] == k &&
                 !env_.no_bf16_gemv) {
-                const void * w = static_cast<const uint8_t *>(dev_weights_) + off_.at(name);
                 timer_gemv_.start(gemv_stream_);
-                const bool ok = omph::kernels::gemv_bf16(w, x16, y, n_out, k, gemv_stream_);
+                const bool ok = omph::kernels::gemv_bf16(m.dev, x16, y, n_out, k, gemv_stream_);
                 timer_gemv_.stop(t_gemv_, gemv_stream_);
                 if (ok) {
                     return true;
@@ -1108,55 +1107,44 @@ private:
             }
         }
         if (use_gemv_ && T == 1) {
-            const auto it = gems_.find(name);
-            if (it != gems_.end() && it->second.rows == n_out && it->second.k == k) {
-                const void * w = static_cast<const uint8_t *>(dev_weights_) + it->second.off;
+            if (g != nullptr && g->rows == n_out && g->k == k) {
                 if (env_.skip_gemv) {
                     return true;  // ablation only: wrong results, valid timing
                 }
                 // Ablation only: skip the GEMVs of one GGUF type. The step time
                 // difference is that type's real cost; rocprofv3's per-kernel
                 // times inflate some kernels by up to 40 % (#63).
-                if (env_.skip_gemv_type >= 0 &&
-                    (uint32_t) env_.skip_gemv_type == it->second.type) {
+                if (env_.skip_gemv_type >= 0 && (uint32_t) env_.skip_gemv_type == g->type) {
                     return true;
                 }
                 timer_gemv_.start(gemv_stream_);
-                const bool gemv_ok = gemv_one(it->second.type, w, x16, y, n_out, k, gemv_stream_);
+                const bool gemv_ok = gemv_one(g->type, m.dev, x16, y, n_out, k, gemv_stream_);
                 timer_gemv_.stop(t_gemv_, gemv_stream_);
                 if (gemv_ok) {
                     return true;
                 }
                 if (env_.trace_f16) {
-                    const omph::gguf::TensorInfo * ti = file_.tensor(name);
                     std::fprintf(stderr,
-                                 "f16 path: %s (entry %s, type %u, ne %lld x %lld, %lld B)\n",
-                                 name.c_str(), it != gems_.end() ? "yes" : "no",
-                                 ti != nullptr ? (unsigned) ti->type : 0u,
-                                 ti != nullptr ? (long long) ti->ne[0] : 0,
-                                 ti != nullptr ? (long long) ti->ne[1] : 0,
-                                 ti != nullptr ? (long long) ti->nbytes : 0);
+                                 "f16 path: %s (entry yes, type %u, ne %lld x %lld, %lld B)\n",
+                                 m.name.c_str(), (unsigned) m.t->type, (long long) m.t->ne[0],
+                                 (long long) m.t->ne[1], (long long) m.t->nbytes);
                 }
             } else if (env_.trace_f16) {
-                const omph::gguf::TensorInfo * ti = file_.tensor(name);
                 std::fprintf(stderr, "f16 path: %s (not a gemv tensor, type %u, %lld B)\n",
-                             name.c_str(), ti != nullptr ? (unsigned) ti->type : 0u,
-                             ti != nullptr ? (long long) ti->nbytes : 0);
+                             m.name.c_str(), (unsigned) m.t->type, (long long) m.t->nbytes);
             }
         }
-        if (use_gemv_ && T > 1) {
-            const auto it = gems_.find(name);
-            if (it != gems_.end() && it->second.rows == n_out && it->second.k == k &&
-                !it->second.has_b4 && has_gemv_type(it->second.type)) {
+        if (use_gemv_ && T > 1 && g != nullptr && g->rows == n_out && g->k == k) {
+            const auto * w = static_cast<const uint8_t *>(m.dev);
+            const auto * xb = static_cast<const uint8_t *>(x16);
+            if (!g->has_b4 && has_gemv_type(g->type)) {
                 // Types with a single-token kernel but no small-batch form: run one
                 // per token. No staging, so a long prefill stays inside VRAM — it
                 // just does not amortize the weight read (the b4 port is the fix).
-                const uint8_t * w = static_cast<const uint8_t *>(dev_weights_) + it->second.off;
-                const auto * xb = static_cast<const uint8_t *>(x16);
                 timer_gemv_.start(gemv_stream_);
                 bool ok = true;
                 for (int64_t t0 = 0; t0 < T && ok; ++t0) {
-                    ok = gemv_one(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
+                    ok = gemv_one(g->type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
                                   gemv_stream_);
                 }
                 timer_gemv_.stop(t_gemv_, gemv_stream_);
@@ -1164,19 +1152,16 @@ private:
                     return true;
                 }
             }
-            if (it != gems_.end() && it->second.rows == n_out && it->second.k == k &&
-                it->second.has_b4) {
-                const uint8_t * w = static_cast<const uint8_t *>(dev_weights_) + it->second.off;
-                const auto * xb = static_cast<const uint8_t *>(x16);
+            if (g->has_b4) {
                 timer_gemv_.start(gemv_stream_);
                 bool ok = true;
                 int64_t t0 = 0;
                 for (; t0 + 4 <= T && ok; t0 += 4) {
-                    ok = gemv_batch4(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
+                    ok = gemv_batch4(g->type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
                                      gemv_stream_);
                 }
                 for (; t0 < T && ok; ++t0) {
-                    ok = gemv_one(it->second.type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
+                    ok = gemv_one(g->type, w, xb + t0 * k * 2, y + t0 * n_out, n_out, k,
                                   gemv_stream_);
                 }
                 timer_gemv_.stop(t_gemv_, gemv_stream_);
@@ -1188,7 +1173,7 @@ private:
         if (env_.skip_stage) {
             return true;  // ablation only
         }
-        void * w = stage_w(name);
+        void * w = stage_w(m.name);
         timer_gemm_.start();
         const bool ok = linear_.run(w, x16, y, n_out, k, T);
         timer_gemm_.stop(t_gemm_);
@@ -1307,23 +1292,79 @@ private:
         return dst;
     }
 
-    const float * f32_ref(const std::string & name) {
-        const omph::gguf::TensorInfo * t = file_.tensor(name);
-        if (t == nullptr) {
-            throw std::runtime_error("missing tensor " + name);
+    Mat resolve(const std::string & name) const {
+        Mat m;
+        m.name = name;
+        m.t = file_.tensor(name);
+        const auto off = off_.find(name);
+        if (m.t != nullptr && off != off_.end()) {
+            m.dev = static_cast<const uint8_t *>(dev_weights_) + off->second;
         }
-        return reinterpret_cast<const float *>(static_cast<const uint8_t *>(dev_weights_) +
-                                               off_.at(name));
+        const auto g = gems_.find(name);
+        if (g != gems_.end()) {
+            m.gemv = &g->second;
+        }
+        return m;
     }
 
-    struct GemvEntry {
-        size_t off = 0;
-        size_t bytes = 0;
-        int64_t rows = 0;
-        int64_t k = 0;
-        uint32_t type = 0;
-        bool has_b4 = false;  // a small-batch kernel exists for this type
-    };
+    // An f32 vector in the image, or null when the file does not have it.
+    const float * resolve_f32(const std::string & name) const {
+        return static_cast<const float *>(resolve(name).dev);
+    }
+
+    void resolve_layers() {
+        layers_.resize((size_t) h_.n_layer);
+        for (int64_t il = 0; il < h_.n_layer; ++il) {
+            const std::string p = "blk." + std::to_string(il) + ".";
+            LayerWeights & L = layers_[(size_t) il];
+            L.recurrent = file_.tensor(p + "ssm_a") != nullptr;
+            L.attn_norm = resolve_f32(p + "attn_norm.weight");
+            L.post_norm = resolve_f32(p + "post_attention_norm.weight");
+            if (L.attn_norm == nullptr || L.post_norm == nullptr) {
+                throw std::runtime_error("missing layer norms in " + p);
+            }
+            L.ffn_up = resolve(p + "ffn_up.weight");
+            L.ffn_gate = resolve(p + "ffn_gate.weight");
+            L.ffn_down = resolve(p + "ffn_down.weight");
+            if (L.recurrent) {
+                L.dt_bias = resolve_f32(p + "ssm_dt.bias");
+                L.ssm_a = resolve_f32(p + "ssm_a");
+                L.ssm_norm = resolve_f32(p + "ssm_norm.weight");
+                L.conv_w = resolve_f32(p + "ssm_conv1d.weight");
+                const Mat wb = resolve(p + "ssm_beta.weight");
+                const Mat wa = resolve(p + "ssm_alpha.weight");
+                if (L.dt_bias == nullptr || L.ssm_a == nullptr || L.ssm_norm == nullptr ||
+                    L.conv_w == nullptr || wb.t == nullptr || wa.t == nullptr ||
+                    wb.t->type != 30 || wa.t->type != 30) {
+                    throw std::runtime_error("delta-net tensors missing in " + p +
+                                             " (ssm_beta / ssm_alpha must be BF16)");
+                }
+                L.w_beta = static_cast<const uint16_t *>(wb.dev);
+                L.w_alpha = static_cast<const uint16_t *>(wa.dev);
+                L.attn_qkv = resolve(p + "attn_qkv.weight");
+                L.attn_gate = resolve(p + "attn_gate.weight");
+                L.ssm_out = resolve(p + "ssm_out.weight");
+            } else {
+                L.q_norm = resolve_f32(p + "attn_q_norm.weight");
+                L.k_norm = resolve_f32(p + "attn_k_norm.weight");
+                if (L.q_norm == nullptr || L.k_norm == nullptr) {
+                    throw std::runtime_error("QK norms missing in " + p);
+                }
+                L.attn_q = resolve(p + "attn_q.weight");
+                L.attn_k = resolve(p + "attn_k.weight");
+                L.attn_v = resolve(p + "attn_v.weight");
+                L.attn_output = resolve(p + "attn_output.weight");
+            }
+        }
+        head_ = resolve("output.weight");
+        out_norm_ = resolve_f32("output_norm.weight");
+        const omph::gguf::TensorInfo * te = file_.tensor("token_embd.weight");
+        if (head_.t == nullptr || out_norm_ == nullptr || te == nullptr || embd_host_ == nullptr) {
+            throw std::runtime_error("output.weight / output_norm / token_embd missing");
+        }
+        embd_type_ = te->type;
+        embd_row_bytes_ = (int64_t) (te->nbytes / te->ne[1]);
+    }
 
     const omph::runtime::EnvOptions env_;  // first: the other members' setup reads it
     omph::runtime::Allocations mem_;       // every device / pinned buffer below
@@ -1341,6 +1382,11 @@ private:
     std::vector<std::pair<hipEvent_t, hipEvent_t>> t_block_;
     std::unordered_map<std::string, size_t> off_;
     std::unordered_map<std::string, GemvEntry> gems_;
+    std::vector<LayerWeights> layers_;  // resolved at load, by resolve_layers()
+    Mat head_;
+    const float * out_norm_ = nullptr;
+    uint32_t embd_type_ = 0;
+    int64_t embd_row_bytes_ = 0;
     Scratch scratch_;
     std::vector<void *> states_;  // per layer, into state_pool_; null for attention
     void * state_pool_ = nullptr;
