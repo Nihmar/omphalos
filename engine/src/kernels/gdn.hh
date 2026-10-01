@@ -53,6 +53,13 @@ struct GdnStep {
 };
 bool gdn_step(const GdnStep & a, int64_t heads, hipStream_t stream);
 
+// All `tokens` tokens of a chunk in one launch (#96): x16, z and out16 point
+// at the chunk's first token (strides k_in, heads * 128, heads * 128); t is
+// ignored. The state is read from `state` once and written to `state_out` (or
+// `state`) once; replay / conv_hist record every token as gdn_step would. The
+// result equals `tokens` gdn_step launches bit for bit.
+bool gdn_chunk(const GdnStep & a, int64_t heads, hipStream_t stream);
+
 // Floats of one token's replay record: decay (heads), k (n_kh x 128), d (heads x 128).
 inline int64_t gdn_replay_floats(const int64_t heads, const int64_t n_kh) {
     return heads + n_kh * 128 + heads * 128;
