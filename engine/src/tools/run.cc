@@ -826,11 +826,9 @@ private:
                 return fail("delta rule failed");
             }
         }
-        if (!omph::kernels::gated_norm(static_cast<const float *>(o_), ssm_norm,
-                                       static_cast<const float *>(z_), static_cast<float *>(o_),
-                                       T * n_vh, v_dim, (float) h_.eps, nullptr) ||
-            !omph::kernels::cast_f32_to_f16(static_cast<const float *>(o_), ffn16_, T * v_dims,
-                                            nullptr) ||
+        if (!omph::kernels::gated_norm_f16(static_cast<const float *>(o_), ssm_norm,
+                                           static_cast<const float *>(z_), ffn16_, T * n_vh,
+                                           v_dim, (float) h_.eps, nullptr) ||
             !matmul(p + "ssm_out.weight", ffn16_, static_cast<float *>(blk_), ne, v_dims, T)) {
             return fail("gdn output failed");
         }

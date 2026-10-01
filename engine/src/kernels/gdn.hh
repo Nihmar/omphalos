@@ -58,6 +58,10 @@ bool delta_o(const float * state, const float * q, float * o, int64_t heads, int
 bool gated_norm(const float * o, const float * w, const float * z, float * out, int64_t rows,
                 int64_t n, float eps, hipStream_t stream);
 
+// Same, written as f16: the input of the ssm_out GEMV, without a cast kernel (#78).
+bool gated_norm_f16(const float * o, const float * w, const float * z, void * out_f16,
+                    int64_t rows, int64_t n, float eps, hipStream_t stream);
+
 // One-token delta rule in a single launch (PLAN.md §10.2): decay, sk = S^T k,
 // d = (v - sk) * beta, S += k (x) d and o = scale * S^T q for every head. The
 // gates come raw from the projections and are resolved in the kernel (#78):

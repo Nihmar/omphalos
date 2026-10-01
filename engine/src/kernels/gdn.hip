@@ -1,6 +1,7 @@
 // Gated delta net kernels (PLAN.md §10.2, autoregressive path).
 #include "kernels/gdn.hh"
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 namespace omph::kernels {
@@ -170,14 +171,15 @@ __global__ void delta_o_kernel(const float * __restrict__ state, const float * _
     o[i] = acc * scale;
 }
 
+template <typename OutT>
 __global__ void gated_norm_kernel(const float * __restrict__ o, const float * __restrict__ w,
-                                  const float * __restrict__ z, float * __restrict__ out,
+                                  const float * __restrict__ z, OutT * __restrict__ out,
                                   const long long n, const float eps) {
     extern __shared__ float sdata[];
     const long long row = blockIdx.x;
     const float * orow = o + row * n;
     const float * zrow = z + row * n;
-    float * yrow = out + row * n;
+    OutT * yrow = out + row * n;
 
     float acc = 0.0f;
     for (long long i = threadIdx.x; i < n; i += blockDim.x) {
@@ -194,7 +196,7 @@ __global__ void gated_norm_kernel(const float * __restrict__ o, const float * __
     const float scale = 1.0f / sqrtf(sdata[0] / (float) n + eps);
     for (long long i = threadIdx.x; i < n; i += blockDim.x) {
         const float zn = zrow[i];
-        yrow[i] = orow[i] * scale * (w != nullptr ? w[i] : 1.0f) * (zn / (1.0f + expf(-zn)));
+        yrow[i] = (OutT) (orow[i] * scale * (w != nullptr ? w[i] : 1.0f) * (zn / (1.0f + expf(-zn))));
     }
 }
 
@@ -444,9 +446,19 @@ bool gated_norm(const float * o, const float * w, const float * z, float * out, 
     if (o == nullptr || z == nullptr || out == nullptr || rows <= 0 || n <= 0) {
         return false;
     }
-    gated_norm_kernel<<<(unsigned) rows, kBlock, kBlock * sizeof(float), stream>>>(o, w, z, out,
+    gated_norm_kernel<float><<<(unsigned) rows, kBlock, kBlock * sizeof(float), stream>>>(o, w, z, out,
                                                                                    (long long) n,
                                                                                    eps);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool gated_norm_f16(const float * o, const float * w, const float * z, void * out_f16,
+                    const int64_t rows, const int64_t n, const float eps, hipStream_t stream) {
+    if (o == nullptr || z == nullptr || out_f16 == nullptr || rows <= 0 || n <= 0) {
+        return false;
+    }
+    gated_norm_kernel<__half><<<(unsigned) rows, kBlock, kBlock * sizeof(float), stream>>>(
+        o, w, z, static_cast<__half *>(out_f16), (long long) n, eps);
     return hipGetLastError() == hipSuccess;
 }
 
