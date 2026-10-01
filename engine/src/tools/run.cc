@@ -257,7 +257,6 @@ public:
         alloc(&fused_, T * fused * 4);
         alloc(&conv_out_, T * fused * 4);
         alloc(&z_, T * ssm_v * 4);
-        alloc(&o_, T * ssm_v * 4);
         alloc(&q_, T * attn_q * 4);
         alloc(&gate_, T * attn_q * 4);
         alloc(&k_, T * std::max(ssm_q, attn_kv) * 4);
@@ -823,15 +822,14 @@ private:
                     static_cast<const float *>(k_) + t * k_dims,
                     static_cast<const float *>(v_) + t * v_dims,
                     static_cast<const float *>(beta_) + t * n_vh,
-                    static_cast<const float *>(alpha_) + t * n_vh, dt_bias, ssm_a,
-                    static_cast<float *>(o_) + t * v_dims, n_vh, n_kh, s, l2_scale, nullptr)) {
+                    static_cast<const float *>(alpha_) + t * n_vh, dt_bias, ssm_a, nullptr,
+                    n_vh, n_kh, s, l2_scale, nullptr, static_cast<const float *>(z_) + t * v_dims,
+                    ssm_norm, (float) h_.eps,
+                    static_cast<uint8_t *>(ffn16_) + t * v_dims * 2)) {  // gated norm fused (#83)
                 return fail("delta rule failed");
             }
         }
-        if (!omph::kernels::gated_norm_f16(static_cast<const float *>(o_), ssm_norm,
-                                           static_cast<const float *>(z_), ffn16_, T * n_vh,
-                                           v_dim, (float) h_.eps, nullptr) ||
-            !matmul(p + "ssm_out.weight", ffn16_, static_cast<float *>(blk_), ne, v_dims, T)) {
+        if (!matmul(p + "ssm_out.weight", ffn16_, static_cast<float *>(blk_), ne, v_dims, T)) {
             return fail("gdn output failed");
         }
         conv_flip_[il] ^= 1;
@@ -1241,7 +1239,6 @@ private:
     void * fused_ = nullptr;
     void * conv_out_ = nullptr;
     void * z_ = nullptr;
-    void * o_ = nullptr;
     void * q_ = nullptr;
     void * gate_ = nullptr;
     void * k_ = nullptr;
