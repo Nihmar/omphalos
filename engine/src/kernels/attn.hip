@@ -1,5 +1,6 @@
-// Attention block kernels: fused Q/gate split, partial NeoX RoPE, naive causal
-// attention with a KV cache (PLAN.md §10.4).
+// Attention block kernels: fused Q/gate split, partial NeoX RoPE, the quantized
+// KV writer and the GQA-grouped flash attention over either cache (PLAN.md §10.4,
+// §13).
 #include "kernels/attn.hh"
 
 #include <hip/hip_fp16.h>
@@ -48,73 +49,6 @@ __global__ void rope_neox_kernel(float * __restrict__ x, const long long tokens,
     row[i + half] = x0 * s + x1 * c;
 }
 
-// Flash-style attention: one workgroup per (query token, head) with one thread
-// per head dimension. Each cache row's score is computed once and staged in LDS,
-// instead of being recomputed for every (row, dimension) pair three times over
-// (which is what the first, naive kernel did). The cache is walked in blocks of
-// hd rows with online softmax rescaling.
-__global__ void attention_flash_kernel(const float * __restrict__ q,
-                                       const float * __restrict__ k_cache,
-                                       const float * __restrict__ v_cache,
-                                       const float * __restrict__ gate, float * __restrict__ out,
-                                       const long long tokens, const long long seq,
-                                       const long long nh, const long long nkv, const long long hd,
-                                       const float scale, const long long head_ratio) {
-    extern __shared__ float sh[];
-    float * sc = sh;  // hd scores, then the weights
-    const long long h = blockIdx.y;
-    const long long t = blockIdx.x;
-    const int d = (int) threadIdx.x;
-    const long long kvh = h / head_ratio;
-    const long long q_row = seq - tokens + t;
-    const float * qr = q + (t * nh + h) * hd;
-
-    float m = -INFINITY;
-    float l = 0.0f;
-    float acc = 0.0f;
-    for (long long s0 = 0; s0 <= q_row; s0 += hd) {
-        const long long bs = q_row - s0 + 1 < hd ? q_row - s0 + 1 : hd;
-        if (d < bs) {
-            const float * ks = k_cache + ((s0 + d) * nkv + kvh) * hd;
-            float dot = 0.0f;
-            for (long long i = 0; i < hd; ++i) {
-                dot += qr[i] * ks[i];
-            }
-            sc[d] = dot * scale;
-        }
-        __syncthreads();
-        float bm = -INFINITY;
-        for (long long j = 0; j < bs; ++j) {
-            bm = fmaxf(bm, sc[j]);
-        }
-        const float m_new = fmaxf(m, bm);
-        const float corr = expf(m - m_new);
-        // Every thread must finish scanning the scores before any of them is
-        // replaced by its weight, or threads disagree on the block max.
-        __syncthreads();
-        if (d < bs) {
-            sc[d] = expf(sc[d] - m_new);
-        }
-        __syncthreads();
-        float lsum = 0.0f;
-        float a = 0.0f;
-        for (long long j = 0; j < bs; ++j) {
-            const float wj = sc[j];
-            lsum += wj;
-            a += wj * v_cache[((s0 + j) * nkv + kvh) * hd + d];
-        }
-        l = l * corr + lsum;
-        acc = acc * corr + a;
-        m = m_new;
-        __syncthreads();
-    }
-    float val = acc / l;
-    if (gate != nullptr) {
-        val *= 1.0f / (1.0f + expf(-gate[(t * nh + h) * hd + d]));
-    }
-    out[(t * nh + h) * hd + d] = val;
-}
-
 } // namespace
 
 bool split_qg(const float * q_full, float * q, float * gate, const int64_t tokens,
@@ -142,24 +76,6 @@ bool rope_neox(float * x, const int64_t tokens, const int64_t heads, const int64
     rope_neox_kernel<<<grid, kBlock, 0, stream>>>(x, (long long) tokens, (long long) heads,
                                                   (long long) head_dim, (int) n_rot, freq_base,
                                                   (long long) pos_offset);
-    return hipGetLastError() == hipSuccess;
-}
-
-bool attention(const float * q, const float * k_cache, const float * v_cache, const float * gate,
-               float * out, const int64_t tokens, const int64_t seq, const int64_t nh,
-               const int64_t nkv, const int64_t hd, const float scale, hipStream_t stream) {
-    if (q == nullptr || k_cache == nullptr || v_cache == nullptr || out == nullptr || tokens <= 0 ||
-        seq < tokens || nh <= 0 || nkv <= 0 || hd <= 0 || nh % nkv != 0) {
-        return false;
-    }
-    if (hd > 1024) {
-        return false;  // the flash layout needs one thread per head dimension
-    }
-    const dim3 grid((unsigned) tokens, (unsigned) nh);
-    const size_t smem = (size_t) hd * sizeof(float);
-    attention_flash_kernel<<<grid, (unsigned) hd, smem, stream>>>(
-        q, k_cache, v_cache, gate, out, (long long) tokens, (long long) seq, (long long) nh,
-        (long long) nkv, (long long) hd, scale, (long long) (nh / nkv));
     return hipGetLastError() == hipSuccess;
 }
 
@@ -280,117 +196,6 @@ __global__ void kv_quant_kernel(const float * __restrict__ k_src, const float * 
     }
 }
 
-__global__ void attention_flash_q8q4_kernel(
-    const float * __restrict__ q, const uint8_t * __restrict__ k_q8,
-    const __half * __restrict__ k_scales, const uint8_t * __restrict__ v_q4,
-    const __half * __restrict__ v_scales, const __half * __restrict__ k16,
-    const __half * __restrict__ v16, const float * __restrict__ gate,
-    float * __restrict__ out, const long long tokens, const long long seq, const long long nh,
-    const long long nkv, const long long hd, const float scale, const long long head_ratio,
-    const long long window) {
-    extern __shared__ float sh[];
-    float * sc = sh;
-    const long long h = blockIdx.y;
-    const long long t = blockIdx.x;
-    const int d = (int) threadIdx.x;
-    const long long kvh = h / head_ratio;
-    const long long q_row = seq - tokens + t;
-    const float * qr = q + (t * nh + h) * hd;
-    const long long nb = hd / kKvBlock;
-
-    float m = -INFINITY;
-    float l = 0.0f;
-    float acc = 0.0f;
-    for (long long s0 = 0; s0 <= q_row; s0 += hd) {
-        const long long bs = q_row - s0 + 1 < hd ? q_row - s0 + 1 : hd;
-        if (d < bs) {
-            const long long p = s0 + d;
-            float dot = 0.0f;
-            // The ring holds positions [seq - window, seq): relative to the
-            // sequence, not to this query, since later tokens of the same
-            // chunk have already replaced the slots of earlier ones.
-            if (k16 != nullptr && p + window >= seq) {
-                const __half * kw = k16 + ((p % window) * nkv + kvh) * hd;
-                for (long long i = 0; i < hd; ++i) {
-                    dot = fmaf(qr[i], __half2float(kw[i]), dot);
-                }
-            } else {
-                const long long kv = p * nkv + kvh;
-                const uint8_t * kq = k_q8 + kv * hd;
-                const __half * ksc = k_scales + kv * nb;
-                for (long long b = 0; b < nb; ++b) {
-                    const float ks = __half2float(ksc[b]);
-                    for (int i = 0; i < kKvBlock; ++i) {
-                        const float k = (float) (int8_t) kq[b * kKvBlock + i];
-                        dot = fmaf(qr[b * kKvBlock + i], k * ks, dot);
-                    }
-                }
-            }
-            sc[d] = dot * scale;
-        }
-        __syncthreads();
-        float bm = -INFINITY;
-        for (long long j = 0; j < bs; ++j) {
-            bm = fmaxf(bm, sc[j]);
-        }
-        const float m_new = fmaxf(m, bm);
-        const float corr = expf(m - m_new);
-        // Every thread must finish scanning the scores before any of them is
-        // replaced by its weight, or threads disagree on the block max.
-        __syncthreads();
-        if (d < bs) {
-            sc[d] = expf(sc[d] - m_new);
-        }
-        __syncthreads();
-        float lsum = 0.0f;
-        float a = 0.0f;
-        for (long long j = 0; j < bs; ++j) {
-            const float wj = sc[j];
-            const long long p = s0 + j;
-            float vval;
-            if (v16 != nullptr && p + window >= seq) {
-                vval = __half2float(v16[((p % window) * nkv + kvh) * hd + d]);
-            } else {
-                const long long kv = p * nkv + kvh;
-                const uint8_t * vq = v_q4 + kv * hd / 2;
-                const float vs = __half2float(v_scales[kv * nb + d / kKvBlock]);
-                const uint8_t byte = vq[(d / kKvBlock) * (kKvBlock / 2) + (d & 15)];
-                const int nib = (d & 16) ? (byte >> 4) : (byte & 0xF);
-                vval = (float) (nib - 8) * vs;
-            }
-            lsum += wj;
-            a = fmaf(wj, vval, a);
-        }
-        l = l * corr + lsum;
-        acc = acc * corr + a;
-        m = m_new;
-        __syncthreads();
-    }
-    float val = acc / l;
-    // V is stored rotated (see the writer): undo it here, before the gate, because
-    // H is symmetric and the gate is elementwise. The workgroup is exactly one
-    // head, so the butterfly is an LDS pass.
-    sc[d] = val;
-    __syncthreads();
-    for (int len = 1; len < (int) hd; len <<= 1) {
-        for (int i = d; i < (int) hd / 2; i += blockDim.x) {
-            const int a = (i / len) * 2 * len + (i % len);
-            const int b = a + len;
-            const float u = sc[a];
-            const float v = sc[b];
-            sc[a] = u + v;
-            sc[b] = u - v;
-        }
-        __syncthreads();
-    }
-    val = sc[d] * rsqrtf((float) hd);
-    float outv = val;
-    if (gate != nullptr) {
-        outv *= 1.0f / (1.0f + expf(-gate[(t * nh + h) * hd + d]));
-    }
-    out[(t * nh + h) * hd + d] = outv;
-}
-
 } // namespace
 
 bool hadamard_f32(float * x, const int64_t rows, const int64_t n, hipStream_t stream) {
@@ -420,28 +225,371 @@ bool kv_quant(const float * k_src, const float * v_src, uint8_t * k_q8, void * k
     return hipGetLastError() == hipSuccess;
 }
 
-bool attention_flash_q8q4(const float * q, const uint8_t * k_q8, const void * k_scales,
-                          const uint8_t * v_q4, const void * v_scales, const void * k16,
-                          const void * v16, const float * gate, float * out, const int64_t tokens,
-                          const int64_t seq, const int64_t nh, const int64_t nkv, const int64_t hd,
-                          const float scale, const int64_t head_ratio, const int64_t window,
-                          hipStream_t stream) {
-    // One thread per head dimension (<= 1024), 32-element quant blocks, and a
-    // butterfly un-rotation in the epilogue (power of two). The FP16 window
-    // needs both rings or neither.
-    if (q == nullptr || k_q8 == nullptr || k_scales == nullptr || v_q4 == nullptr ||
-        v_scales == nullptr || out == nullptr || tokens <= 0 || seq < tokens || nh <= 0 ||
-        nkv <= 0 || nh % nkv != 0 || head_ratio != nh / nkv || hd <= 0 || hd > 1024 ||
-        (hd & (hd - 1)) != 0 || hd % kKvBlock != 0 || (k16 == nullptr) != (v16 == nullptr) ||
-        (k16 != nullptr && window <= 0)) {
+// ------------------------------------------------- GQA-grouped flash attention
+
+namespace {
+
+constexpr int kGqaHd = 256;     // head_dim: one thread per dimension
+constexpr int kGqaKb = 16;      // keys per block: 256 threads = 16 keys x 16 chunks
+constexpr int kGqaGroup = 6;    // query heads per KV head (24 / 4): fixed for this model
+constexpr int kGqaTargetWgs = 128;  // split the keys until a launch has this many
+constexpr int kGqaMaxSplits = 64;
+
+struct KvArgs {
+    const float * k_f32;
+    const float * v_f32;
+    const uint8_t * k_q8;
+    const __half * k_scales;
+    const uint8_t * v_q4;
+    const __half * v_scales;
+    const __half * k16;
+    const __half * v16;
+    long long window;
+};
+
+// Dimensions [16c, 16c + 16) of the K row of position p for KV head kvh, as one
+// 16-byte load for Q8 (dequantized; inside the FP16 window: the exact copy).
+template <bool Q8>
+__device__ inline void gqa_load_k16(const KvArgs & kv, const long long p, const long long kvh,
+                                    const long long nkv, const int c, const long long seq,
+                                    float * k) {
+    const long long row = p * nkv + kvh;
+    if constexpr (Q8) {
+        if (kv.k16 != nullptr && p + kv.window >= seq) {
+            const uint4 * src = reinterpret_cast<const uint4 *>(
+                kv.k16 + ((p % kv.window) * nkv + kvh) * kGqaHd + c * 16);
+            uint4 h[2] = {src[0], src[1]};
+            const __half * hv = reinterpret_cast<const __half *>(h);
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                k[i] = __half2float(hv[i]);
+            }
+            return;
+        }
+        const uint4 b = *reinterpret_cast<const uint4 *>(kv.k_q8 + row * kGqaHd + c * 16);
+        const int8_t * bv = reinterpret_cast<const int8_t *>(&b);
+        const float sc = __half2float(kv.k_scales[row * (kGqaHd / kKvBlock) + c / 2]);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            k[i] = (float) bv[i] * sc;
+        }
+    } else {
+        const float4 * src = reinterpret_cast<const float4 *>(kv.k_f32 + row * kGqaHd + c * 16);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float4 f = src[i];
+            k[4 * i] = f.x;
+            k[4 * i + 1] = f.y;
+            k[4 * i + 2] = f.z;
+            k[4 * i + 3] = f.w;
+        }
+    }
+}
+
+template <bool Q8>
+__device__ inline float gqa_load_v(const KvArgs & kv, const long long p, const long long kvh,
+                                   const long long nkv, const int d, const long long seq) {
+    if constexpr (Q8) {
+        if (kv.v16 != nullptr && p + kv.window >= seq) {
+            return __half2float(kv.v16[((p % kv.window) * nkv + kvh) * kGqaHd + d]);
+        }
+        const long long row = p * nkv + kvh;
+        const uint8_t byte = kv.v_q4[row * (kGqaHd / 2) + (d / kKvBlock) * (kKvBlock / 2) + (d & 15)];
+        const int nib = (d & 16) ? (byte >> 4) : (byte & 0xF);
+        return (float) (nib - 8) *
+               __half2float(kv.v_scales[row * (kGqaHd / kKvBlock) + d / kKvBlock]);
+    } else {
+        return kv.v_f32[(p * nkv + kvh) * kGqaHd + d];
+    }
+}
+
+// grid: (query tiles of TQ tokens, nkv, splits); 256 threads. Row r of the tile
+// is query token t0 + r / G, query head kvh * G + r % G; the row count is a
+// compile-time constant so the accumulators stay in registers (TQ = 1 for a
+// decode step, 4 for a prefill chunk). Rows past the last token are computed on
+// zero queries and not stored. Writes one partial (m, l, acc) per (token, head,
+// split) to `work`.
+template <bool Q8, int TQ>
+__global__ __launch_bounds__(kGqaHd) void attention_gqa_kernel(
+    const float * __restrict__ q, const KvArgs kv, float * __restrict__ work,
+    const long long tokens, const long long seq, const int nh, const int nkv,
+    const float scale, const int splits, const long long blocks_per_split) {
+    constexpr int G = kGqaGroup;
+    constexpr int kRows = TQ * G;
+    // Q rows in 16-dimension chunks padded to 17: the 16 lanes of a key read
+    // different chunks, and the padding puts them on different banks.
+    __shared__ float qs[kRows][16 * 17];
+    __shared__ float sc[kRows][kGqaKb];
+    __shared__ float corr[kRows];
+
+    const int d = (int) threadIdx.x;
+    const long long t0 = (long long) blockIdx.x * TQ;
+    const int kvh = (int) blockIdx.y;
+    const int split = (int) blockIdx.z;
+    const int nt = (int) (tokens - t0 < TQ ? tokens - t0 : TQ);
+    const int R = nt * G;
+    const long long qpos0 = seq - tokens + t0;  // cache position of the tile's first query
+
+    for (int r = 0; r < kRows; ++r) {
+        const long long h = (long long) kvh * G + r % G;
+        qs[r][(d / 16) * 17 + d % 16] =
+            r < R ? q[((t0 + r / G) * nh + h) * kGqaHd + d] * scale : 0.0f;
+    }
+
+    // Keys up to the tile's last query; this split's share of their blocks.
+    const long long n_keys = qpos0 + nt;
+    const long long kb_total = (n_keys + kGqaKb - 1) / kGqaKb;
+    const long long kb0 = (long long) split * blocks_per_split;
+    const long long kb1 = kb0 + blocks_per_split < kb_total ? kb0 + blocks_per_split : kb_total;
+
+    float acc[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+        acc[r] = 0.0f;
+    }
+    float m_row = -INFINITY;  // thread r < kRows owns row r's running max and sum
+    float l_row = 0.0f;
+    __syncthreads();
+
+    for (long long kb = kb0; kb < kb1; ++kb) {
+        const long long s0 = kb * kGqaKb;
+        const int bs = (int) (n_keys - s0 < kGqaKb ? n_keys - s0 : kGqaKb);
+        // This block's V for dimension d, issued now with the K loads below so
+        // that the 32 accesses overlap instead of each waiting on the last.
+        float vv[kGqaKb];
+#pragma unroll
+        for (int j = 0; j < kGqaKb; ++j) {
+            vv[j] = j < bs ? gqa_load_v<Q8>(kv, s0 + j, kvh, nkv, d, seq) : 0.0f;
+        }
+        // Scores: thread (key jj, chunk c) dots its 16 dimensions of K, read once
+        // straight from memory, with the matching chunk of every row; the 16
+        // lanes of a key then reduce with shuffles.
+        {
+            const int jj = d / 16;
+            const int c = d % 16;
+            float kc[16];
+            if (jj < bs) {
+                gqa_load_k16<Q8>(kv, s0 + jj, kvh, nkv, c, seq, kc);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    kc[i] = 0.0f;
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                float part = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    part = fmaf(qs[r][c * 17 + i], kc[i], part);
+                }
+#pragma unroll
+                for (int m = 8; m > 0; m >>= 1) {
+                    part += __shfl_xor(part, m, 16);
+                }
+                if (c == 0) {
+                    sc[r][jj] = (jj < bs && s0 + jj <= qpos0 + r / G) ? part : -INFINITY;
+                }
+            }
+        }
+        __syncthreads();
+        // Online softmax, one thread per row; scores become weights in place.
+        if (d < kRows) {
+            float bm = -INFINITY;
+            for (int j = 0; j < kGqaKb; ++j) {
+                bm = fmaxf(bm, sc[d][j]);
+            }
+            const float m_new = fmaxf(m_row, bm);
+            float c = 1.0f;
+            float lsum = 0.0f;
+            if (m_new != -INFINITY) {
+                c = expf(m_row - m_new);  // 0 when this is the row's first key
+                for (int j = 0; j < kGqaKb; ++j) {
+                    const float w = sc[d][j] == -INFINITY ? 0.0f : expf(sc[d][j] - m_new);
+                    sc[d][j] = w;
+                    lsum += w;
+                }
+            } else {
+                for (int j = 0; j < kGqaKb; ++j) {
+                    sc[d][j] = 0.0f;
+                }
+            }
+            l_row = l_row * c + lsum;
+            m_row = m_new;
+            corr[d] = c;
+        }
+        __syncthreads();
+        // Each V value is read once and applied to every row of the tile.
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            acc[r] *= corr[r];
+        }
+#pragma unroll
+        for (int j = 0; j < kGqaKb; ++j) {  // weights past bs are 0, vv too
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                acc[r] = fmaf(sc[r][j], vv[j], acc[r]);
+            }
+        }
+        __syncthreads();  // sc and corr are rewritten by the next block
+    }
+
+    // Partial layout: [((token * nh + head) * splits + split) * (hd + 2)] = m, l, acc[hd]
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+        if (r < R) {
+            const long long h = (long long) kvh * G + r % G;
+            float * dst = work + (((t0 + r / G) * nh + h) * splits + split) * (kGqaHd + 2);
+            dst[2 + d] = acc[r];
+        }
+    }
+    if (d < R) {
+        const long long h = (long long) kvh * G + d % G;
+        float * dst = work + (((t0 + d / G) * nh + h) * splits + split) * (kGqaHd + 2);
+        dst[0] = m_row;
+        dst[1] = l_row;
+    }
+}
+
+// grid: (tokens, nh); 256 threads. Merges the splits in order, then un-rotates V
+// (Q8/Q4 cache: stored rotated, H symmetric, before the elementwise gate) and
+// applies the gate.
+__global__ __launch_bounds__(kGqaHd) void attention_gqa_merge_kernel(
+    const float * __restrict__ work, const float * __restrict__ gate, float * __restrict__ out,
+    const int nh, const int splits, const bool v_rotated) {
+    __shared__ float row[kGqaHd];
+    __shared__ float ms[kGqaMaxSplits];
+    __shared__ float ls[kGqaMaxSplits];
+    const long long t = blockIdx.x;
+    const int h = (int) blockIdx.y;
+    const int d = (int) threadIdx.x;
+    const float * part = work + ((t * nh + h) * splits) * (kGqaHd + 2);
+    // One thread per split loads its (m, l): all in flight at once.
+    if (d < splits) {
+        ms[d] = part[d * (kGqaHd + 2)];
+        ls[d] = part[d * (kGqaHd + 2) + 1];
+    }
+    __syncthreads();
+    float m = -INFINITY;
+    for (int s = 0; s < splits; ++s) {
+        m = fmaxf(m, ms[s]);
+    }
+    float l = 0.0f;
+    float o = 0.0f;
+    for (int s = 0; s < splits; ++s) {
+        // A split that held no key for this query has m = -inf, l = acc = 0.
+        const float f = ms[s] == -INFINITY ? 0.0f : expf(ms[s] - m);
+        l = fmaf(ls[s], f, l);
+        o = fmaf(part[s * (kGqaHd + 2) + 2 + d], f, o);
+    }
+    float val = o / l;
+    if (v_rotated) {
+        row[d] = val;
+        __syncthreads();
+        for (int len = 1; len < kGqaHd; len <<= 1) {
+            if (d < kGqaHd / 2) {
+                const int a = (d / len) * 2 * len + (d % len);
+                const int b = a + len;
+                const float u = row[a];
+                const float v = row[b];
+                row[a] = u + v;
+                row[b] = u - v;
+            }
+            __syncthreads();
+        }
+        val = row[d] * rsqrtf((float) kGqaHd);
+    }
+    if (gate != nullptr) {
+        val *= 1.0f / (1.0f + expf(-gate[(t * nh + h) * kGqaHd + d]));
+    }
+    out[(t * nh + h) * kGqaHd + d] = val;
+}
+
+// Splits for a call: enough workgroups to fill the GPU, never more than the key
+// blocks of the longest tile.
+// Query tokens per workgroup: a whole prefill chunk shares each K/V read four
+// ways; a decode step (or a few MTP tokens) keeps the six-row form.
+int gqa_tq(const int64_t tokens) {
+    return tokens >= 8 ? 4 : 1;
+}
+
+int gqa_splits(const int64_t tokens, const int64_t seq, const int64_t nkv,
+               long long & blocks_per_split) {
+    const long long tq = gqa_tq(tokens);
+    const long long tiles = (tokens + tq - 1) / tq;
+    const long long kb_max = (seq + kGqaKb - 1) / kGqaKb;
+    long long splits = (kGqaTargetWgs + tiles * nkv - 1) / (tiles * nkv);
+    splits = splits < 1 ? 1 : (splits > kGqaMaxSplits ? kGqaMaxSplits : splits);
+    splits = splits > kb_max ? kb_max : splits;
+    blocks_per_split = (kb_max + splits - 1) / splits;
+    return (int) ((kb_max + blocks_per_split - 1) / blocks_per_split);
+}
+
+} // namespace
+
+size_t attention_gqa_work_bytes(const int64_t max_tokens, const int64_t nh, const int64_t nkv,
+                                const int64_t hd) {
+    // Worst case over the token counts a call can have, at any sequence length
+    // (the split count only grows with the sequence up to kGqaMaxSplits).
+    size_t worst = 0;
+    for (int64_t t = 1; t <= max_tokens; ++t) {
+        long long bps = 0;
+        const size_t rows = (size_t) t * nh * gqa_splits(t, (int64_t) 1 << 40, nkv, bps);
+        worst = rows > worst ? rows : worst;
+    }
+    return worst * (size_t) (hd + 2) * sizeof(float);
+}
+
+bool attention_gqa(const float * q, const KvCache & kv, const float * gate, float * out,
+                   const int64_t tokens, const int64_t seq, const int64_t nh, const int64_t nkv,
+                   const int64_t hd, const float scale, const bool v_rotated, void * work,
+                   const size_t work_bytes, hipStream_t stream) {
+    const bool q8 = kv.k_q8 != nullptr;
+    if (q == nullptr || out == nullptr || work == nullptr || tokens <= 0 || seq < tokens ||
+        nh <= 0 || nkv <= 0 || nh / nkv != kGqaGroup || nh % nkv != 0 || hd != kGqaHd) {
         return false;
     }
-    const dim3 grid((unsigned) tokens, (unsigned) nh);
-    attention_flash_q8q4_kernel<<<grid, (unsigned) hd, (size_t) hd * sizeof(float), stream>>>(
-        q, k_q8, static_cast<const __half *>(k_scales), v_q4,
-        static_cast<const __half *>(v_scales), static_cast<const __half *>(k16),
-        static_cast<const __half *>(v16), gate, out, tokens, seq, nh, nkv, hd, scale, head_ratio,
-        window > 0 ? window : 1);
+    if (q8 ? (kv.k_scales == nullptr || kv.v_q4 == nullptr || kv.v_scales == nullptr ||
+              (kv.k16 == nullptr) != (kv.v16 == nullptr) || (kv.k16 != nullptr && kv.window <= 0))
+           : (kv.k_f32 == nullptr || kv.v_f32 == nullptr)) {
+        return false;
+    }
+    long long bps = 0;
+    const int splits = gqa_splits(tokens, seq, nkv, bps);
+    if ((size_t) tokens * nh * splits * (hd + 2) * sizeof(float) > work_bytes) {
+        return false;
+    }
+    const KvArgs args{kv.k_f32,
+                      kv.v_f32,
+                      kv.k_q8,
+                      static_cast<const __half *>(kv.k_scales),
+                      kv.v_q4,
+                      static_cast<const __half *>(kv.v_scales),
+                      static_cast<const __half *>(kv.k16),
+                      static_cast<const __half *>(kv.v16),
+                      kv.window > 0 ? kv.window : 1};
+    const int tq = gqa_tq(tokens);
+    const dim3 grid((unsigned) ((tokens + tq - 1) / tq), (unsigned) nkv, (unsigned) splits);
+    auto * w = static_cast<float *>(work);
+#define OMPH_GQA_LAUNCH(Q8, TQ)                                                              \
+    attention_gqa_kernel<Q8, TQ><<<grid, kGqaHd, 0, stream>>>(q, args, w, tokens, seq, (int) nh, \
+                                                              (int) nkv, scale, splits, bps)
+    if (q8) {
+        if (tq == 4) {
+            OMPH_GQA_LAUNCH(true, 4);
+        } else {
+            OMPH_GQA_LAUNCH(true, 1);
+        }
+    } else {
+        if (tq == 4) {
+            OMPH_GQA_LAUNCH(false, 4);
+        } else {
+            OMPH_GQA_LAUNCH(false, 1);
+        }
+    }
+#undef OMPH_GQA_LAUNCH
+    attention_gqa_merge_kernel<<<dim3((unsigned) tokens, (unsigned) nh), kGqaHd, 0, stream>>>(
+        w, gate, out, (int) nh, splits, v_rotated);
     return hipGetLastError() == hipSuccess;
 }
 

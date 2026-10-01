@@ -3,8 +3,11 @@
 // usage: omph-run <model.gguf> <tokens.txt> <out-logits.f32> [--trace-dir DIR]
 //   tokens.txt: token ids separated by whitespace.
 //   Logits are written as tokens x n_vocab f32 for the whole prompt (one row
-//   with --last-logits); with --trace-dir the per-layer outputs are dumped as
-//   l_out-<layer>.f32 (single-chunk prompts only).
+//   with --last-logits, the last N with --logits-tail N); with --trace-dir the
+//   per-layer outputs are dumped as l_out-<layer>.f32 (single-chunk prompts only).
+//   OMPH_KV_Q8Q4=1 quantizes the KV (FP16 ring of the last 128 tokens;
+//   OMPH_KV_WINDOW=N changes it, 0 disables it);
+//   OMPH_KV_HOST=1 keeps the exact f32 KV in host RAM (long-context reference).
 //
 // The whole quantized tensor block lives in VRAM; the weights of the current
 // layer are dequantized to f16 into a reusable scratch buffer, and every op is
@@ -279,7 +282,19 @@ public:
         // The KV cache is sized by the whole sequence, the activations by the
         // chunk: that is what lets a long prompt run in pieces.
         kv_q8q4_ = std::getenv("OMPH_KV_Q8Q4") != nullptr;
-        if (!kv_q8q4_) {
+        kv_host_ = !kv_q8q4_ && std::getenv("OMPH_KV_HOST") != nullptr;
+        if (kv_host_) {
+            // Validation reference only: the exact f32 cache in pinned host RAM
+            // (4.29 GB at 32k does not fit beside the weights), and one layer's
+            // worth of it staged into VRAM before each attention.
+            const size_t bytes = (size_t) n_kv * kvcap * attn_kv * 4;
+            if (hipHostMalloc(&kv_k_, bytes) != hipSuccess ||
+                hipHostMalloc(&kv_v_, bytes) != hipSuccess) {
+                throw std::runtime_error("cannot allocate the host KV cache");
+            }
+            alloc(&kv_stage_k_, (size_t) kvcap * attn_kv * 4);
+            alloc(&kv_stage_v_, (size_t) kvcap * attn_kv * 4);
+        } else if (!kv_q8q4_) {
             alloc(&kv_k_, (size_t) n_kv * kvcap * attn_kv * 4);
             alloc(&kv_v_, (size_t) n_kv * kvcap * attn_kv * 4);
         } else {
@@ -291,13 +306,19 @@ public:
             alloc(&kv_vq_, (size_t) n_kv * kvcap * attn_kv / 2);
             alloc(&kv_vs_, (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2);
             // FP16 window: the last `kv_window_` tokens exactly, in the same
-            // rotated basis, in a ring (PLAN §13.4).
+            // rotated basis, in a ring (PLAN §13.4). 128 by default: it keeps the
+            // KL under llama.cpp's q8_0/q4_0 up to 32k for 8.4 MB (#61);
+            // OMPH_KV_WINDOW=0 turns it off.
+            kv_window_ = 128;
             if (const char * w = std::getenv("OMPH_KV_WINDOW")) {
                 kv_window_ = std::atoll(w);
             }
             alloc(&kv_k16_, (size_t) n_kv * kv_window_ * attn_kv * 2);
             alloc(&kv_v16_, (size_t) n_kv * kv_window_ * attn_kv * 2);
         }
+        attn_work_bytes_ = omph::kernels::attention_gqa_work_bytes(T, h_.n_head, h_.n_head_kv,
+                                                                   h_.head_dim);
+        alloc(&attn_work_, attn_work_bytes_);
         conv_flip_.assign((size_t) h_.n_layer, 0);
         for (int64_t il = 0; il < h_.n_layer; ++il) {
             void * st = nullptr;
@@ -312,6 +333,10 @@ public:
     }
 
     ~Runner() {
+        if (kv_host_) {
+            (void) hipHostFree(kv_k_);
+            (void) hipHostFree(kv_v_);
+        }
         for (void * p : f16_cache_owned_) {
             (void) hipFree(p);
         }
@@ -320,8 +345,11 @@ public:
         }
     }
 
+    // want_logits = false runs the layers only (a prefill chunk whose logits
+    // nobody reads): no final norm, no lm_head.
     bool forward(const std::vector<int32_t> & toks, std::vector<float> & logits,
-                 const std::string & trace_dir, const int64_t start_pos = 0) {
+                 const std::string & trace_dir, const int64_t start_pos = 0,
+                 const bool want_logits = true) {
         const int64_t T = (int64_t) toks.size();
         // The activations hold max_tokens_ rows and the KV cache max_seq_
         // positions: anything past either is an out-of-bounds write.
@@ -412,6 +440,17 @@ public:
             }
         }
 
+        if (!want_logits) {
+            logits.clear();
+            if (hipDeviceSynchronize() != hipSuccess) {
+                return fail("forward failed");
+            }
+            report_phases();
+            if (time_step) {
+                step_event(step_a, step_b);
+            }
+            return true;
+        }
         const float * out_norm = vec("output_norm.weight");
         if (out_norm == nullptr ||
             !omph::kernels::rms_norm(static_cast<const float *>(x_), out_norm,
@@ -580,7 +619,10 @@ public:
 private:
     // Returns false: every caller is a bool function that reports failure.
     static bool fail(const char * msg) {
-        std::fprintf(stderr, "%s\n", msg);
+        // The pending HIP error (if any) is usually the actual cause.
+        const hipError_t err = hipGetLastError();
+        std::fprintf(stderr, "%s%s%s\n", msg, err != hipSuccess ? ": " : "",
+                     err != hipSuccess ? hipGetErrorString(err) : "");
         return false;
     }
 
@@ -740,8 +782,8 @@ private:
         return true;
     }
 
-    // KV write + attention, on either the f32 cache (memcpy + flash attention) or
-    // the Q8/Q4 one (quantize, then flash attention that dequantizes on the fly).
+    // KV write + attention, on either the f32 cache (memcpy) or the Q8/Q4 one
+    // (quantize); attention_gqa then reads either, dequantizing on the fly.
     bool attn_impl(const int64_t il, float * k_cache, float * v_cache, const int64_t pos0,
                    const int64_t T) {
         const int64_t kv_out = h_.n_head_kv * h_.head_dim;
@@ -763,25 +805,47 @@ private:
                                          nullptr)) {
                 return false;
             }
-            return omph::kernels::attention_flash_q8q4(
-                static_cast<const float *>(q_), kq, ksc, vq, vsc, k16, v16,
-                static_cast<const float *>(gate_), static_cast<float *>(attn_), T, pos0 + T,
-                h_.n_head, h_.n_head_kv, h_.head_dim, scale, h_.n_head / h_.n_head_kv,
-                kv_window_, nullptr);
+            omph::kernels::KvCache kv;
+            kv.k_q8 = kq;
+            kv.k_scales = ksc;
+            kv.v_q4 = vq;
+            kv.v_scales = vsc;
+            kv.k16 = kv_window_ > 0 ? k16 : nullptr;
+            kv.v16 = kv_window_ > 0 ? v16 : nullptr;
+            kv.window = kv_window_;
+            return omph::kernels::attention_gqa(
+                static_cast<const float *>(q_), kv, static_cast<const float *>(gate_),
+                static_cast<float *>(attn_), T, pos0 + T, h_.n_head, h_.n_head_kv, h_.head_dim,
+                scale, true, attn_work_, attn_work_bytes_, nullptr);
         }
         if (k_cache == nullptr || v_cache == nullptr) {
             return false;
         }
-        if (hipMemcpy(k_cache + pos0 * kv_out, k_, (size_t) T * kv_out * 4,
-                      hipMemcpyDeviceToDevice) != hipSuccess ||
-            hipMemcpy(v_cache + pos0 * kv_out, v_, (size_t) T * kv_out * 4,
-                      hipMemcpyDeviceToDevice) != hipSuccess) {
+        // hipMemcpyDefault: the cache is device memory, or pinned host memory
+        // with OMPH_KV_HOST.
+        if (hipMemcpy(k_cache + pos0 * kv_out, k_, (size_t) T * kv_out * 4, hipMemcpyDefault) !=
+                hipSuccess ||
+            hipMemcpy(v_cache + pos0 * kv_out, v_, (size_t) T * kv_out * 4, hipMemcpyDefault) !=
+                hipSuccess) {
             return false;
         }
-        return omph::kernels::attention(static_cast<const float *>(q_), k_cache, v_cache,
-                                        static_cast<const float *>(gate_),
-                                        static_cast<float *>(attn_), T, pos0 + T, h_.n_head,
-                                        h_.n_head_kv, h_.head_dim, scale, nullptr);
+        if (kv_host_) {
+            const size_t bytes = (size_t) (pos0 + T) * kv_out * 4;
+            if (hipMemcpy(kv_stage_k_, k_cache, bytes, hipMemcpyHostToDevice) != hipSuccess ||
+                hipMemcpy(kv_stage_v_, v_cache, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+                return false;
+            }
+            k_cache = static_cast<float *>(kv_stage_k_);
+            v_cache = static_cast<float *>(kv_stage_v_);
+        }
+        omph::kernels::KvCache kv;
+        kv.k_f32 = k_cache;
+        kv.v_f32 = v_cache;
+        return omph::kernels::attention_gqa(static_cast<const float *>(q_), kv,
+                                            static_cast<const float *>(gate_),
+                                            static_cast<float *>(attn_), T, pos0 + T, h_.n_head,
+                                            h_.n_head_kv, h_.head_dim, scale, false, attn_work_,
+                                            attn_work_bytes_, nullptr);
     }
 
     // One fused GEMV launch for a single token, dispatched on the GGUF type.
@@ -977,7 +1041,10 @@ private:
         if (cacheable) {
             if (hipMalloc(&dst, (size_t) n * 2) != hipSuccess) {
                 // Long contexts fill VRAM: caching is an optimization, never a
-                // reason to fail. Fall back to the per-call staging buffer.
+                // reason to fail. Fall back to the per-call staging buffer, and
+                // clear the out-of-memory error, which the next kernel wrapper's
+                // hipGetLastError() would otherwise report as its own failure.
+                (void) hipGetLastError();
                 cacheable = false;
                 dst = scratch_.alloc((size_t) n * 2);
             }
@@ -1049,8 +1116,13 @@ private:
     void * kv_vs_ = nullptr;
     void * kv_k16_ = nullptr;
     void * kv_v16_ = nullptr;
-    int64_t kv_window_ = 0;  // off by default: measured neutral at 512 tokens (M5)
+    int64_t kv_window_ = 0;  // Q8/Q4 mode: 128 unless OMPH_KV_WINDOW says otherwise
     bool kv_q8q4_ = false;
+    bool kv_host_ = false;  // f32 KV in pinned host RAM (validation reference)
+    void * kv_stage_k_ = nullptr;
+    void * attn_work_ = nullptr;  // split-K partials of attention_gqa
+    size_t attn_work_bytes_ = 0;
+    void * kv_stage_v_ = nullptr;
     void * dev_weights_ = nullptr;
     void * x_ = nullptr;
     void * cur_ = nullptr;
@@ -1086,7 +1158,8 @@ private:
 int main(int argc, char ** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: %s <model.gguf> <tokens.txt> <out-logits.f32> "
-                             "[--trace-dir DIR] [--tokens N] [--generate N --gen-out FILE]\n",
+                             "[--trace-dir DIR] [--tokens N] [--last-logits | --logits-tail N] "
+                             "[--generate N --gen-out FILE] [--gemv]\n",
                      argv[0]);
         return 2;
     }
@@ -1097,6 +1170,7 @@ int main(int argc, char ** argv) {
     std::string gen_path;
     int64_t max_tokens = 0;
     bool last_logits = false;
+    int64_t logits_tail = 0;
     int64_t generate = 0;
     bool use_gemv = false;
     for (int i = 4; i < argc; ++i) {
@@ -1104,6 +1178,8 @@ int main(int argc, char ** argv) {
             trace_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--last-logits") == 0) {
             last_logits = true;
+        } else if (std::strcmp(argv[i], "--logits-tail") == 0 && i + 1 < argc) {
+            logits_tail = std::atoll(argv[++i]);
         } else if (std::strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
             max_tokens = std::atoll(argv[++i]);
         } else if (std::strcmp(argv[i], "--generate") == 0 && i + 1 < argc) {
@@ -1154,20 +1230,28 @@ int main(int argc, char ** argv) {
         Runner runner(model, act_chunk, use_gemv && generate > 0, last_logits, total_len);
         const HParams & h = runner.hparams();
         // Every chunk's rows are kept, so the file is the whole prompt's logits;
-        // with --last-logits each forward returns one row and the last one wins.
+        // with --last-logits only the last row, with --logits-tail N the last N.
+        // Chunks that do not reach the rows being kept skip the lm_head.
+        const int64_t n_toks = (int64_t) toks.size();
+        const int64_t keep = last_logits ? 1 : (logits_tail > 0 ? std::min(logits_tail, n_toks)
+                                                                : n_toks);
         std::vector<float> logits;
         std::vector<float> part_logits;
-        for (int64_t off = 0; off < (int64_t) toks.size(); off += act_chunk) {
-            const int64_t n = std::min<int64_t>(act_chunk, (int64_t) toks.size() - off);
+        for (int64_t off = 0; off < n_toks; off += act_chunk) {
+            const int64_t n = std::min<int64_t>(act_chunk, n_toks - off);
             const std::vector<int32_t> part(toks.begin() + (size_t) off,
                                             toks.begin() + (size_t) (off + n));
-            if (!runner.forward(part, part_logits, trace_dir, off)) {
+            const bool want = off + n > n_toks - keep;
+            if (!runner.forward(part, part_logits, trace_dir, off, want)) {
                 return 1;
             }
             if (last_logits) {
                 logits.swap(part_logits);
-            } else {
-                logits.insert(logits.end(), part_logits.begin(), part_logits.end());
+            } else if (want) {
+                // rows of this chunk inside the tail
+                const int64_t first = std::max<int64_t>(0, (n_toks - keep) - off);
+                logits.insert(logits.end(), part_logits.begin() + (size_t) (first * h.n_vocab),
+                              part_logits.end());
             }
         }
         write_f32(logits_path, logits);

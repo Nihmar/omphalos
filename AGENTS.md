@@ -81,6 +81,11 @@ uv run python check_gpu_decode.py [--gemv]        # greedy decode vs the NumPy r
 uv run python compare_logits.py ref.f32 test.f32  # KL + top-1 agreement over every
                                                   # position (e.g. f32 KV vs OMPH_KV_Q8Q4=1)
 
+# long-context KV validation (exact f32 KV kept in host RAM as the reference)
+OMPH_KV_HOST=1 engine/build/omph-run <model> <tokens.txt> ref.f32 --logits-tail 512
+OMPH_KV_Q8Q4=1 engine/build/omph-run <model> <tokens.txt> q8.f32 --logits-tail 512
+bench/m5_llama_kv_kl.sh <llama.cpp-bin-dir> <ctx>   # llama.cpp's own KV-quant KL (budget)
+
 # regenerating the golden dump (CPU backend, needs a llama.cpp build)
 tools/native/build.sh <llama.cpp-dir> && tools/native/dump_tensors ...
 ```

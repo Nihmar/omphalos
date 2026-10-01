@@ -1,0 +1,18 @@
+# M5 long-context quality of the quantized KV (issues #58, #61)
+# omphalos: KL(f32 KV || test) over the LAST 512 positions of a wikitext-2 test
+#   prompt of the given length; reference = exact f32 KV in host RAM
+#   (OMPH_KV_HOST=1); tools/compare_logits.py; engine at #60 (attention_gqa).
+# llama.cpp: bench/m5_llama_kv_kl.sh (build-hip, -fa on, one chunk of CTX
+#   tokens, llama-perplexity scores its second half), KL vs its own f16 KV.
+# The position sets differ (512 vs CTX/2 positions): read as the same order of
+# magnitude, not as a paired comparison.
+
+context  omphalos Q8/Q4           +FP16 window 128         llama q8_0/q4_0          llama q8_0/q8_0
+         KL mean  p99    top-1    KL mean  p99    top-1    KL mean  p99    top-1    KL mean  p99    top-1
+8k       0.00106  0.0087 98.63%   0.00084  0.0069 99.02%   0.00162  0.0149 98.05%   0.00066  0.0069 98.73%
+16k      0.00174  0.0142 99.02%   0.00090  0.0081 99.41%   0.00149  0.0147 98.40%   0.00061  0.0062 99.07%
+32k      0.00090  0.0056 98.44%   0.00071  0.0066 98.63%   0.00135  0.0090 98.04%   0.00057  0.0039 98.70%
+
+# max KL: omphalos Q8/Q4 16k 0.271 nats (one position); with the window 0.051
+# wall time (omphalos, prefill + 512-row tail): ref 8k 34 s / 16k 78 s / 32k 203 s;
+#   Q8/Q4 37 / 93 / 305 s (at 32k the f16 weight cache no longer fits and restages)
