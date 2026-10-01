@@ -99,8 +99,15 @@ t_{\min} = \frac{W}{B} = 35.7\ \text{ms} \quad (\approx 28\ \text{tokens/s}).
 ```
 
 The achieved fraction $\eta = t_{\min}/t_{\text{step}}$ is the figure of merit. The step
-today is 48.35 ms, $\eta = 0.738$; llama.cpp on the same card decodes in 48.5 ms
-($\eta \approx 0.735$). §6 explains where the remaining quarter goes.
+today is **45.5 ms**, $\eta = 0.785$ (about 22 tokens/s); llama.cpp on the same card decodes in 48.5 ms
+($\eta \approx 0.735$). §6 explains where the remaining fifth goes.
+
+> **Measurement note (#100).** Every "step gpu" figure in this report before #100 was taken
+> with `OMPH_TIMING`, which also recorded a pair of events around every phase: ~460 per step.
+> Those events cost ~2.6 ms per step (48.08 vs 45.49 ms, same binary, #100). Phase timing
+> is now a separate switch (`OMPH_PHASES`). The A/B deltas quoted below are unaffected,
+> since both sides carried the same events, but the absolute steps before #100 are ~2.5 ms
+> high.
 
 Everything that is not a weight read is, for decode, overhead: the activations are a few
 kilobytes, the DeltaNet states are $48 \times 48 \times 128^2 \times 4$ B = 151 MB

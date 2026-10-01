@@ -1,0 +1,230 @@
+// Runner: the full-attention and gated-delta-net blocks and the KV cache.
+#include "model/runner.hh"
+
+#include "format/repack.hh"
+#include "kernels/attn.hh"
+#include "kernels/dequant.hh"
+#include "kernels/elementwise.hh"
+#include "kernels/gdn.hh"
+#include "kernels/gemv.hh"
+
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace omph::model {
+
+bool Runner::attn_layer(const int64_t il, const LayerWeights & L, const int64_t T,
+                const int64_t pos0) {
+    const int64_t ne = h_.n_embd;
+    const int64_t q_out = h_.n_head * 2 * h_.head_dim;
+    const int64_t kv_out = h_.n_head_kv * h_.head_dim;
+    // Null in the quantized-KV mode, where the f32 cache is never allocated.
+    float * k_cache = kv_k_ == nullptr
+                          ? nullptr
+                          : static_cast<float *>(kv_k_) + kv_index_[il] * max_seq_ * kv_out;
+    float * v_cache = kv_v_ == nullptr
+                          ? nullptr
+                          : static_cast<float *>(kv_v_) + kv_index_[il] * max_seq_ * kv_out;
+    const float * q_norm = L.q_norm;
+    const float * k_norm = L.k_norm;
+
+    const bool proj_ok = fork_join(
+        T,
+        [&] {
+            return matmul(L.attn_k, h16_, static_cast<float *>(k_), kv_out, ne, T) &&
+                   matmul(L.attn_v, h16_, static_cast<float *>(v_), kv_out, ne, T);
+        },
+        [&] {
+            return matmul(L.attn_q, h16_, static_cast<float *>(fused_), q_out, ne, T);
+        });
+    // split, QK-norm, RoPE, the Hadamard rotation and (quantized cache)
+    // the KV write, in one launch (#79).
+    omph::kernels::AttnPrep prep;
+    prep.qg = static_cast<const float *>(fused_);
+    prep.q = static_cast<float *>(q_);
+    prep.gate = static_cast<float *>(gate_);
+    prep.k = static_cast<float *>(k_);
+    prep.v = static_cast<float *>(v_);
+    prep.q_norm = q_norm;
+    prep.k_norm = k_norm;
+    prep.tokens = T;
+    prep.pos0 = pos0;
+    prep.nh = h_.n_head;
+    prep.nkv = h_.n_head_kv;
+    prep.hd = h_.head_dim;
+    prep.n_rot = (int) h_.n_rot;
+    prep.freq_base = (float) h_.freq_base;
+    prep.eps = (float) h_.eps;
+    prep.rotate = kv_q8q4_;
+    if (kv_q8q4_) {
+        const QuantKv c = quant_kv(il);
+        prep.k_q8 = c.kq;
+        prep.k_scales = reinterpret_cast<__half *>(c.ksc);
+        prep.v_q4 = c.vq;
+        prep.v_scales = reinterpret_cast<__half *>(c.vsc);
+        prep.k16 = kv_window_ > 0 ? reinterpret_cast<__half *>(c.k16) : nullptr;
+        prep.v16 = kv_window_ > 0 ? reinterpret_cast<__half *>(c.v16) : nullptr;
+        prep.window = kv_window_;
+        prep.k_q4 = kv_k4_;
+    }
+    if (!proj_ok || !omph::kernels::attn_prep(prep, nullptr) ||
+        !attn_impl(il, k_cache, v_cache, pos0, T) ||
+        !matmul(L.attn_output, ffn16_, static_cast<float *>(blk_), ne,
+                h_.n_head * h_.head_dim, T)) {
+        return fail("attention layer failed");
+    }
+    return true;
+}
+
+bool Runner::gdn_layer(const int64_t il, const LayerWeights & L, const int64_t T) {
+    const int64_t ne = h_.n_embd;
+    const int64_t n_kh = h_.ssm_n_kh;
+    const int64_t n_vh = h_.ssm_n_vh;
+    const int64_t s = h_.ssm_s;
+    const int64_t v_dim = h_.ssm_inner / n_vh;
+    const int64_t q_dims = n_kh * s;
+    const int64_t k_dims = n_kh * s;
+    const int64_t v_dims = n_vh * v_dim;
+    const int64_t channels = q_dims + k_dims + v_dims;
+    const float l2_scale = 1.0f / std::sqrt((float) s);
+
+    const float * dt_bias = L.dt_bias;
+    const float * ssm_a = L.ssm_a;
+    const float * ssm_norm = L.ssm_norm;
+    const float * conv_w = L.conv_w;
+    uint8_t * st = static_cast<uint8_t *>(states_[il]);
+    const int64_t n_conv_f = (h_.ssm_conv_k - 1) * channels;
+    float * conv_a = reinterpret_cast<float *>(st);
+    float * conv_b = conv_a + n_conv_f;
+    float * conv_cur = conv_flip_[il] ? conv_b : conv_a;
+    float * conv_new = conv_flip_[il] ? conv_a : conv_b;
+    float * seq_state = reinterpret_cast<float *>(st + 2 * n_conv_f * 4);
+
+
+    const bool proj_ok = fork_join(
+        T,
+        [&] {
+            // beta / alpha (BF16, 48 rows each) are dotted inside gdn_step (#88)
+            return matmul(L.attn_gate, h16_, static_cast<float *>(z_), v_dims, ne, T);
+        },
+        [&] {
+            return matmul(L.attn_qkv, h16_, static_cast<float *>(fused_), channels, ne, T);
+        });
+    if (!proj_ok) {
+        return fail("gdn projection failed");
+    }
+    // conv, L2 norms, gates, delta rule and gated norm: one launch per token
+    // (#78, #83). The L2 norm is rms_norm(x, eps/s) / sqrt(s).
+    omph::kernels::GdnStep step;
+    step.state = seq_state;
+    step.qkv = static_cast<const float *>(fused_);
+    step.conv_w = conv_w;
+    step.conv_cur = conv_cur;
+    step.conv_new = conv_new;
+    step.w_beta = L.w_beta;
+    step.w_alpha = L.w_alpha;
+    step.k_in = ne;
+    step.dt_bias = dt_bias;
+    step.ssm_a = ssm_a;
+    step.norm_w = ssm_norm;
+    step.tokens = T;
+    step.channels = channels;
+    step.q_dims = q_dims;
+    step.kv_dims = k_dims;
+    step.conv_k = h_.ssm_conv_k;
+    step.n_kh = n_kh;
+    step.eps_l2 = (float) (h_.eps / (double) s);
+    step.l2_scale = l2_scale;
+    step.eps_norm = (float) h_.eps;
+    for (int64_t t = 0; t < T; ++t) {
+        step.t = t;
+        step.x16 = reinterpret_cast<const __half *>(static_cast<const uint8_t *>(h16_) +
+                                                    t * ne * 2);
+        step.z = static_cast<const float *>(z_) + t * v_dims;
+        step.out16 = reinterpret_cast<__half *>(static_cast<uint8_t *>(ffn16_) + t * v_dims * 2);
+        if (!omph::kernels::gdn_step(step, n_vh, nullptr)) {
+            return fail("delta rule failed");
+        }
+    }
+    if (!matmul(L.ssm_out, ffn16_, static_cast<float *>(blk_), ne, v_dims, T)) {
+        return fail("gdn output failed");
+    }
+    conv_flip_[il] ^= 1;
+    return true;
+}
+
+Runner::QuantKv Runner::quant_kv(const int64_t il) const {
+    const int64_t kv_out = h_.n_head_kv * h_.head_dim;
+    const int64_t nblk = h_.head_dim / 32;
+    const int64_t kvl = kv_index_[il];
+    return {static_cast<uint8_t *>(kv_kq_) + kvl * max_seq_ * kv_out / (kv_k4_ ? 2 : 1),
+            static_cast<uint8_t *>(kv_ks_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2,
+            static_cast<uint8_t *>(kv_vq_) + kvl * max_seq_ * kv_out / 2,
+            static_cast<uint8_t *>(kv_vs_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2,
+            static_cast<uint8_t *>(kv_k16_) + kvl * kv_window_ * kv_out * 2,
+            static_cast<uint8_t *>(kv_v16_) + kvl * kv_window_ * kv_out * 2};
+}
+
+// KV write + attention, on either the f32 cache (memcpy) or the Q8/Q4 one
+// (quantize); attention_gqa then reads either, dequantizing on the fly.
+bool Runner::attn_impl(const int64_t il, float * k_cache, float * v_cache, const int64_t pos0,
+               const int64_t T) {
+    const int64_t kv_out = h_.n_head_kv * h_.head_dim;
+    const float scale = 1.0f / std::sqrt((float) h_.head_dim);
+    if (kv_q8q4_) {
+        // The rows were quantized into the cache by attn_prep.
+        const QuantKv c = quant_kv(il);
+        omph::kernels::KvCache kv;
+        kv.k_q8 = c.kq;
+        kv.k_scales = c.ksc;
+        kv.v_q4 = c.vq;
+        kv.v_scales = c.vsc;
+        kv.k16 = kv_window_ > 0 ? c.k16 : nullptr;
+        kv.v16 = kv_window_ > 0 ? c.v16 : nullptr;
+        kv.window = kv_window_;
+        kv.k_q4 = kv_k4_;
+        return omph::kernels::attention_gqa(
+            static_cast<const float *>(q_), kv, static_cast<const float *>(gate_),
+            nullptr, T, pos0 + T, h_.n_head, h_.n_head_kv, h_.head_dim, scale, true,
+            attn_work_, attn_work_bytes_, nullptr, ffn16_);
+    }
+    if (k_cache == nullptr || v_cache == nullptr) {
+        return false;
+    }
+    // hipMemcpyDefault: the cache is device memory, or pinned host memory
+    // with OMPH_KV_HOST.
+    if (hipMemcpy(k_cache + pos0 * kv_out, k_, (size_t) T * kv_out * 4, hipMemcpyDefault) !=
+            hipSuccess ||
+        hipMemcpy(v_cache + pos0 * kv_out, v_, (size_t) T * kv_out * 4, hipMemcpyDefault) !=
+            hipSuccess) {
+        return false;
+    }
+    if (kv_host_) {
+        const size_t bytes = (size_t) (pos0 + T) * kv_out * 4;
+        if (hipMemcpy(kv_stage_k_, k_cache, bytes, hipMemcpyHostToDevice) != hipSuccess ||
+            hipMemcpy(kv_stage_v_, v_cache, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+            return false;
+        }
+        k_cache = static_cast<float *>(kv_stage_k_);
+        v_cache = static_cast<float *>(kv_stage_v_);
+    }
+    omph::kernels::KvCache kv;
+    kv.k_f32 = k_cache;
+    kv.v_f32 = v_cache;
+    return omph::kernels::attention_gqa(static_cast<const float *>(q_), kv,
+                                        static_cast<const float *>(gate_),
+                                        nullptr, T, pos0 + T, h_.n_head, h_.n_head_kv,
+                                        h_.head_dim, scale, false, attn_work_,
+                                        attn_work_bytes_, nullptr, ffn16_);
+}
+
+} // namespace omph::model

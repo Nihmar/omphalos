@@ -64,9 +64,13 @@ Model path used below: `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (local, git-i
 cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release
 cmake --build engine/build -j
 
-# full forward pass: prefill + greedy decode (GPU, naive path)
+# full forward pass: prefill + greedy decode (options in the table below)
 engine/build/omph-run <model.gguf> models/golden/cpu/tokens.txt <out-logits.f32> \
-    --generate 3 --gen-out /tmp/gen.txt [--trace-dir DIR] [--tokens N]
+    --gemv --generate 3 --gen-out /tmp/gen.txt [--trace-dir DIR] [--tokens N]
+
+# decode speed (PLAN.md §17): "step gpu" / "step wall" per token
+OMPH_TIMING=1 engine/build/omph-run <model> <tokens.txt> /tmp/x.f32 --last-logits \
+    --gemv --generate 65 --gen-out /tmp/gen.txt
 
 # per-block checks against the golden dump (models/golden/cpu, local)
 cd tools
@@ -91,6 +95,37 @@ bench/m5_llama_kv_kl.sh <llama.cpp-bin-dir> <ctx>   # llama.cpp's own KV-quant K
 # regenerating the golden dump (CPU backend, needs a llama.cpp build)
 tools/native/build.sh <llama.cpp-dir> && tools/native/dump_tensors ...
 ```
+
+### `omph-run` options and environment switches
+
+| option | effect |
+|---|---|
+| `--gemv` | decode with the fused GEMVs on repacked weights: the fast path. Only effective with `--generate`; a prefill-only run stays on the f16 + hipBLASLt path |
+| `--generate N --gen-out FILE` | greedy-decode N tokens after the prompt, ids to FILE |
+| `--last-logits` / `--logits-tail N` | write only the last row / the last N rows of logits (long prompts) |
+| `--tokens N` | use only the first N prompt tokens |
+| `--trace-dir DIR` | dump every layer's output (one-chunk prompts only) |
+
+The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (the authoritative list). Defaults are what the engine runs; ablations give wrong results with valid timings.
+
+| variable | kind | effect |
+|---|---|---|
+| `OMPH_TIMING` | diagnostics | VRAM after load, per-step `step gpu` / `step wall` |
+| `OMPH_PHASES` | diagnostics | per-phase GPU totals; its ~460 events per step add ~2.6 ms, so never measure the step with it (#100) |
+| `OMPH_TRACE_ALLOC` / `OMPH_TRACE_F16` / `OMPH_TRACE_STAGE` | diagnostics | f16-scratch allocations / matmuls falling back to the f16 path / f16 staging and cache hits |
+| `OMPH_KV_F32` | KV | exact f32 cache in VRAM (reference) |
+| `OMPH_KV_HOST` | KV | exact f32 cache in pinned host RAM (long-context reference) |
+| `OMPH_KV_K4` | KV | K in V's Q4 format too (#81, experiment) |
+| `OMPH_KV_WINDOW=N` | KV | FP16 ring of the last N tokens (default 128, 0 = off) |
+| `OMPH_NO_OVERLAP` | A/B | no side stream for sibling GEMVs (#71) |
+| `OMPH_NO_B4` | A/B | no four-token GEMVs in a `--gemv` prefill |
+| `OMPH_NO_BF16_GEMV` | A/B | BF16 weights through the f16 path |
+| `OMPH_NO_F16_CACHE` | A/B | re-convert f16-path weights on every call |
+| `OMPH_HOST_ARGMAX` | A/B | greedy argmax on the host instead of the device (#102) |
+| `OMPH_SKIP_ATTN` / `OMPH_SKIP_FFN` / `OMPH_SKIP_BLOCKS` | ablation | no attention / no FFN / no blocks at all |
+| `OMPH_SKIP_GEMV` / `OMPH_SKIP_GEMV_TYPE=T` / `OMPH_SKIP_STAGE` | ablation | no fused GEMVs / none of GGUF type T / no f16 + hipBLASLt matmuls |
+
+`omph-gemv-bench` reads two of its own: `OMPH_BENCH_STREAMS=N` (alternate launches over N streams) and `OMPH_OCCUPANCY` (print the occupancy probe).
 
 ## Working agreements
 
