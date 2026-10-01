@@ -106,7 +106,7 @@ int main(int argc, char ** argv) {
             auto & e = by_type[t.type];
             e.first += 1;
             e.second += t.nbytes;
-            if (all || (!tensor_name.empty() && t.name == tensor_name)) {
+            if (all) {
                 print_tensor(t);
             }
         }

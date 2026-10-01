@@ -5,8 +5,13 @@
 
 extern "C" {
 
+#define OMPH_STR2(x) #x
+#define OMPH_STR(x) OMPH_STR2(x)
+
 const char * omph_version(void) {
-    return "0.1.0";
+    // one source of truth: the header's version macros
+    return OMPH_STR(OMPHALOS_VERSION_MAJOR) "." OMPH_STR(OMPHALOS_VERSION_MINOR) "." OMPH_STR(
+        OMPHALOS_VERSION_PATCH);
 }
 
 int omph_device_count(void) {
