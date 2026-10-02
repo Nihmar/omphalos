@@ -16,13 +16,22 @@
 //                     restore the checkpoint before the generation prompt, #158)
 //   --then FILE       then a second chat request from FILE (a conversation's
 //                     next turn: it continues the cached sequence when it extends it)
+//   --mmproj FILE     the vision encoder (builds with OMPH_LLAMA_DIR, #160)
+//   --image FILE      an image for the next <|image_pad|> of the prompt (repeat
+//                     for several; with --chat, one per image item of the request)
+//   --logits-out FILE the logits after the prompt, f32 (validation)
 #include "model/generator.hh"
 #include "runtime/options.hh"
+#include "runtime/timing.hh"
 #include "text/chat.hh"
 #include "text/json.hh"
+#ifdef OMPH_VISION
+#include "vision/encoder.hh"
+#endif
 
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <cstring>
 #include <iostream>
 #include <iterator>
@@ -43,7 +52,8 @@ int main(int argc, char ** argv) {
     bool prompt_ids = false;
     bool out_ids = false;
     int repeat = 1;
-    std::string then_path;
+    std::string then_path, mmproj, logits_out;
+    std::vector<std::string> image_paths;
     for (int i = 2; i < argc; ++i) {
         const auto val = [&]() -> const char * {
             if (i + 1 >= argc) {
@@ -67,6 +77,9 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--cache-mib")) cfg.cache_mib = std::atoll(val());
         else if (!std::strcmp(argv[i], "--repeat")) repeat = std::atoi(val());
         else if (!std::strcmp(argv[i], "--then")) then_path = val();
+        else if (!std::strcmp(argv[i], "--mmproj")) mmproj = val();
+        else if (!std::strcmp(argv[i], "--image")) image_paths.push_back(val());
+        else if (!std::strcmp(argv[i], "--logits-out")) logits_out = val();
         else {
             std::fprintf(stderr, "unknown option %s\n", argv[i]);
             return 2;
@@ -76,6 +89,32 @@ int main(int argc, char ** argv) {
         const std::string in((std::istreambuf_iterator<char>(std::cin)), std::istreambuf_iterator<char>());
         omph::model::Generator gen(cfg, omph::runtime::EnvOptions::from_env());
         const omph::text::Tokenizer & tok = gen.tokenizer();
+        const auto read_file = [](const std::string & path) {
+            FILE * f = std::fopen(path.c_str(), "rb");
+            if (f == nullptr) throw std::runtime_error("cannot open " + path);
+            std::string body;
+            char buf[65536];
+            size_t n = 0;
+            while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) body.append(buf, n);
+            std::fclose(f);
+            return body;
+        };
+        if (!image_paths.empty()) {
+#ifdef OMPH_VISION
+            if (mmproj.empty()) throw std::runtime_error("--image needs --mmproj");
+            omph::vision::Encoder enc(mmproj, cfg.model);
+            for (const std::string & path : image_paths) {
+                const double t0 = omph::runtime::now_ms();
+                req.images.push_back(enc.encode(read_file(path)));
+                std::fprintf(stderr, "image %s: %dx%d tokens, encoded in %.0f ms (CPU)\n", path.c_str(),
+                             req.images.back()->nx, req.images.back()->ny, omph::runtime::now_ms() - t0);
+            }
+#else
+            throw std::runtime_error("built without vision (configure with OMPH_LLAMA_DIR)");
+#endif
+        }
+        std::vector<float> first_logits;
+        if (!logits_out.empty()) req.prefill_logits = &first_logits;
         std::vector<int32_t> prompt;
         if (prompt_ids) {
             std::istringstream ss(in);
@@ -115,6 +154,14 @@ int main(int argc, char ** argv) {
             });
             std::printf("\n");
             std::fflush(stdout);
+            if (!logits_out.empty() && r == 0) {
+                FILE * f = std::fopen(logits_out.c_str(), "wb");
+                if (f == nullptr || std::fwrite(first_logits.data(), 4, first_logits.size(), f) != first_logits.size()) {
+                    std::fprintf(stderr, "cannot write %s\n", logits_out.c_str());
+                    return 1;
+                }
+                std::fclose(f);
+            }
             static const char * kStop[] = {"length", "end of generation", "stop token", "callback",
                                            "context full", "error"};
             const double tps = res.decode_ms > 0 ? 1000.0 * (double) res.tokens.size() / res.decode_ms : 0.0;

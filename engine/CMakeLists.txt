@@ -54,6 +54,28 @@ target_include_directories(omphalos
 target_compile_options(omphalos PRIVATE -O3)
 target_link_libraries(omphalos PRIVATE hip::host omph_warnings)
 
+# Vision on the CPU (#160): llama.cpp's mtmd from a CPU-only llama.cpp build
+# (no GPU backend may load into this process). Optional:
+#   -DOMPH_LLAMA_DIR=<llama.cpp source> -DOMPH_LLAMA_LIB=<that build's bin/ with libmtmd, libllama>
+set(OMPH_LLAMA_DIR "" CACHE PATH "llama.cpp source tree, for vision (empty: no vision)")
+set(OMPH_LLAMA_LIB "" CACHE PATH "the library directory of a CPU-only llama.cpp build")
+if(OMPH_LLAMA_DIR)
+    find_library(OMPH_MTMD_LIB mtmd PATHS ${OMPH_LLAMA_LIB} NO_DEFAULT_PATH REQUIRED)
+    find_library(OMPH_LLAMA_SO llama PATHS ${OMPH_LLAMA_LIB} NO_DEFAULT_PATH REQUIRED)
+    find_library(OMPH_GGML_SO ggml PATHS ${OMPH_LLAMA_LIB} NO_DEFAULT_PATH REQUIRED)
+    find_library(OMPH_GGML_BASE_SO ggml-base PATHS ${OMPH_LLAMA_LIB} NO_DEFAULT_PATH REQUIRED)
+    if(EXISTS ${OMPH_LLAMA_LIB}/libggml-hip.so OR EXISTS ${OMPH_LLAMA_LIB}/libggml-vulkan.so)
+        message(FATAL_ERROR "OMPH_LLAMA_LIB has a GPU backend: vision needs a CPU-only llama.cpp build")
+    endif()
+    target_sources(omphalos PRIVATE src/vision/encoder.cc)
+    target_include_directories(omphalos PRIVATE ${OMPH_LLAMA_DIR}/include ${OMPH_LLAMA_DIR}/ggml/include
+                                                ${OMPH_LLAMA_DIR}/tools/mtmd)
+    target_link_libraries(omphalos PRIVATE ${OMPH_MTMD_LIB} ${OMPH_LLAMA_SO} ${OMPH_GGML_SO} ${OMPH_GGML_BASE_SO})
+    set_target_properties(omphalos PROPERTIES BUILD_RPATH ${OMPH_LLAMA_LIB} INSTALL_RPATH ${OMPH_LLAMA_LIB})
+    target_compile_definitions(omphalos PUBLIC OMPH_VISION=1)
+    message(STATUS "omphalos: vision with ${OMPH_LLAMA_LIB}")
+endif()
+
 add_executable(omph-capi-demo examples/capi_demo.c)
 target_link_libraries(omph-capi-demo PRIVATE omphalos)
 target_compile_options(omph-capi-demo PRIVATE -Wall -Wextra -std=c11)
