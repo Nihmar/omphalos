@@ -1455,13 +1455,16 @@ __global__ void gemv_iq3s_ntg_kernel(const uint8_t * __restrict__ qs, const uint
             float dbr[R];
 #pragma unroll
             for (int r = 0; r < R; ++r) {
+                // the row is warp-uniform: its base pointers in SGPRs and 32-bit
+                // lane offsets, instead of 64-bit address math per load (-9 %)
                 const long long row = row0 + r <= rlast ? row0 + r : rlast;
-                q[r] = *reinterpret_cast<const uint2 *>(qs + row * blocks * 64 + s * 8);
-                qhb[r] = qh[row * blocks * 8 + s];
-                sg[r] = *reinterpret_cast<const uint32_t *>(signs + row * blocks * 32 + s * 4);
-                const uint8_t sc = scales[row * blocks * 4 + s / 2];
-                const float dv = __half2float(
-                    *reinterpret_cast<const __half *>(d + row * blocks * 2 + (s / 8) * 2));
+                const long long rb = __builtin_amdgcn_readfirstlane((int) row) * blocks;
+                const uint32_t so = (uint32_t) s;
+                q[r] = *reinterpret_cast<const uint2 *>(qs + rb * 64 + so * 8u);
+                qhb[r] = (qh + rb * 8)[so];
+                sg[r] = *reinterpret_cast<const uint32_t *>(signs + rb * 32 + so * 4u);
+                const uint8_t sc = (scales + rb * 4)[so / 2u];
+                const float dv = __half2float(*reinterpret_cast<const __half *>(d + rb * 2 + (so / 8u) * 2u));
                 dbr[r] = dv * (1.0f + 2.0f * (float) ((s & 1) ? (sc >> 4) : (sc & 0xF)));
             }
             float part[R][NT] = {};
