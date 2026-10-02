@@ -9,6 +9,11 @@ a user message, so a server prefills the haystack once and answers the four
 questions from its cached prefix. Greedy, thinking off; an answer is right
 when it contains the needle's code.
 
+--needles N spreads N needles (other vault names) evenly over the text;
+--hard adds two more same-vault distractors per needle (a proposed but never
+approved code, an "annex" with its own current code); --omph-env passes one
+more variable to omph-server (e.g. OMPH_KV_K4_LAYERS=..., #175).
+
 The same prompt text (rendered once with the GGUF's chat template by
 omph-tokenize) goes to both engines through their raw completion endpoints.
 
@@ -34,12 +39,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-KEYS = ["north", "south", "east", "west"]
-OTHER_VAULTS = ["central", "harbor", "mountain", "river"]
+KEYS = ["north", "south", "east", "west", "amber", "basalt", "cedar", "delta", "ember", "fjord", "granite",
+        "hollow", "iris", "juniper", "kestrel", "lagoon"]
+OTHER_VAULTS = ["central", "harbor", "mountain", "river", "summit", "valley"]
 WORDS = ["HERON", "MAPLE", "COBALT", "FALCON", "JUNIPER", "QUARTZ", "OTTER", "SAFFRON", "TUNDRA", "VIOLET",
          "WALNUT", "ZEPHYR", "BASALT", "CEDAR", "EMBER", "GARNET", "HAZEL", "IVORY", "LUPINE", "MARLIN",
          "NUTMEG", "ORCHID", "PEWTER", "RAVEN", "SPRUCE", "TIGER", "UMBER", "WILLOW", "AMBER", "BRAMBLE"]
-POSITIONS = [0.25, 0.50, 0.75, 1.00]
 SYSTEM = "Below is a long document. Answer the questions about it.\n\n<document>\n{}\n</document>"
 QUESTION = ("According to the document, what is the current access code for the {} vault? "
             "Reply with the code only.")
@@ -84,7 +89,8 @@ def count_tokens(tokenize: str, model: str, text: str) -> int:
     return len(out.split())
 
 
-def haystack(paragraphs: list[str], target: int, seed: int, tokenize: str, model: str) -> dict:
+def haystack(paragraphs: list[str], target: int, seed: int, tokenize: str, model: str, n_needles: int = 4,
+             hard: bool = False) -> dict:
     """~target tokens of consecutive wikitext paragraphs, with the needles and
     the distractors in it (paragraph boundaries)."""
     rng = random.Random(seed)
@@ -102,14 +108,20 @@ def haystack(paragraphs: list[str], target: int, seed: int, tokenize: str, model
             break
         chars_per_token *= target / tokens
     used: set[str] = set()
-    keys = KEYS[:]
+    keys = KEYS[:n_needles]
     rng.shuffle(keys)  # which vault sits at which position
-    needles = [{"key": k, "code": code(rng, used), "pos": p} for k, p in zip(keys, POSITIONS)]
+    positions = [(i + 1) / n_needles for i in range(n_needles)]
+    needles = [{"key": k, "code": code(rng, used), "pos": p} for k, p in zip(keys, positions)]
     distractors = []
-    for k in KEYS:
+    for k in KEYS[:n_needles]:
         distractors.append(f"The access code for the {k} vault used to be {code(rng, used)}, "
                            "but it was revoked last spring.")
         distractors.append(f"The current access code for the {k} gate is {code(rng, used)}.")
+        if hard:  # the same vault again, with a code that is not the current one
+            distractors.append(f"A new access code for the {k} vault, {code(rng, used)}, was proposed "
+                               "but never approved.")
+            distractors.append(f"Do not confuse the {k} vault with the {k} annex, whose current access code "
+                               f"is {code(rng, used)}.")
     for v in OTHER_VAULTS:
         distractors.append(f"The current access code for the {v} vault is {code(rng, used)}.")
     # insertion points: paragraph indices (the 100 % needle goes after the last one)
@@ -177,6 +189,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["omphalos", "llama"], required=True)
     ap.add_argument("--kv", choices=["k8q4", "k4q4"], required=True)
+    ap.add_argument("--needles", type=int, default=4, help=f"needles per haystack (up to {len(KEYS)})")
+    ap.add_argument("--hard", action="store_true", help="more same-vault distractors (proposed codes, annexes)")
+    ap.add_argument("--omph-env", default="", help="extra environment for omph-server, e.g. "
+                    "OMPH_KV_K4_LAYERS=0,3,5 (recorded as the kv label)")
     ap.add_argument("--lengths", default="25000,50000,75000,100000")
     ap.add_argument("--trials", type=int, default=1, help="haystacks per length (different text and codes)")
     ap.add_argument("--seed", type=int, default=166)
@@ -194,6 +210,9 @@ def main() -> None:
     url = f"http://127.0.0.1:{port}"
     if args.engine == "omphalos":
         env = {**os.environ, **({"OMPH_KV_K4": "1"} if args.kv == "k4q4" else {})}
+        if args.omph_env:
+            name, _, value = args.omph_env.partition("=")
+            env[name] = value
         cmd = [f"{args.omph}/omph-server", args.model, "--port", str(port), "--ctx", str(args.ctx)]
     else:
         if not args.llama_server:
@@ -212,13 +231,15 @@ def main() -> None:
         vram.reset()
         for trial in range(args.trials):
             for target in [int(x) for x in args.lengths.split(",")]:
-                hs = haystack(paragraphs, target, args.seed + 1000 * trial + target, tokenize, args.model)
+                hs = haystack(paragraphs, target, args.seed + 1000 * trial + target, tokenize, args.model,
+                              args.needles, args.hard)
                 system = SYSTEM.format(hs["text"])
                 for nd in hs["needles"]:
                     prompt = render(tokenize, args.model, system, QUESTION.format(nd["key"]))
                     answer, tm = ask(args.engine, url, prompt)
                     found = [c for c in hs["codes"] if c.lower() in answer.lower()]
-                    row = {"engine": args.engine, "kv": args.kv, "trial": trial, "length": target,
+                    kv = args.kv + (f" {args.omph_env}" if args.omph_env else "")
+                    row = {"engine": args.engine, "kv": kv, "trial": trial, "length": target,
                            "position": nd["pos"], "key": nd["key"], "code": nd["code"],
                            "correct": nd["code"].lower() in answer.lower(),
                            "distractor": bool(found) and nd["code"] not in found,
