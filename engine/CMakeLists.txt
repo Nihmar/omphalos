@@ -119,6 +119,10 @@ add_executable(omph-graph-probe src/tools/graph_probe.cc)
 target_include_directories(omph-graph-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(omph-graph-probe PRIVATE omphalos hip::host omph_warnings)
 
+add_executable(omph-attn-bench src/tools/attn_bench.cc)
+target_include_directories(omph-attn-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(omph-attn-bench PRIVATE omphalos hip::host omph_warnings)
+
 add_executable(omph-run src/tools/run.cc)
 target_include_directories(omph-run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(omph-run PRIVATE omphalos hip::host omph_warnings)
