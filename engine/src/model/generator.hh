@@ -40,7 +40,8 @@ struct Sampling {
 struct GenerateRequest {
     int64_t max_tokens = 256;
     Sampling sampling;
-    bool speculative = true;   // MTP drafts when greedy and the model has them
+    bool speculative = true;   // MTP drafts when the model has them: greedy gets plain greedy's tokens,
+                               // sampling plain sampling's distribution (speculative sampling, #197)
     std::vector<int32_t> stop;  // extra stop tokens (the end-of-generation ones always stop)
     // The images of the prompt, one per <|image_pad|> token, in order (#160).
     std::vector<std::shared_ptr<const Image>> images;
@@ -90,6 +91,17 @@ public:
 private:
     bool is_eog(int32_t id) const;
     int32_t sample(const std::vector<float> & logits, const Sampling & s);
+    // The sampling distribution of one logits row (temperature, top-k, min-p,
+    // top-p applied): the kept tokens with unnormalized weights, most likely
+    // first, and their total. sample() draws from it.
+    struct Dist {
+        std::vector<int32_t> ids;
+        std::vector<double> w;
+        double total = 0.0;
+    };
+    void distribution(const float * row, int64_t nv, const Sampling & s, Dist & d) const;
+    // A draw from d without token `skip` (-1: none).
+    int32_t draw(const Dist & d, int32_t skip);
     // A prompt with its images expanded: an image's positions hold ids
     // derived from its hash (negative: never a vocabulary token), so prefix
     // reuse sees which image is where; M-RoPE positions when there are images.

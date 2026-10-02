@@ -917,7 +917,7 @@ void Runner::enable_speculation(const int64_t max_tokens) {
 }
 
 bool Runner::verify(const std::vector<int32_t> & toks, const int64_t pos0,
-                    std::vector<int32_t> & argmax) {
+                    std::vector<int32_t> & argmax, std::vector<float> * rows) {
     const int64_t T = (int64_t) toks.size();
     if (spec_max_ == 0 || T < 1 || T > spec_max_) {
         return fail("verify: speculation not enabled, or too many tokens");
@@ -943,13 +943,17 @@ bool Runner::verify(const std::vector<int32_t> & toks, const int64_t pos0,
     verify_tokens_ = T;
     verify_pos0_ = pos0;
     argmax.clear();
-    verify_argmax_ = &argmax;
+    verify_argmax_ = rows == nullptr ? &argmax : nullptr;
     std::vector<float> logits;
     const bool ok = forward(toks, logits, std::string(), pos0, true, nullptr);
     verifying_ = false;
     verify_argmax_ = nullptr;
     if (!ok) {
         return false;
+    }
+    if (rows != nullptr) {
+        *rows = std::move(logits);
+        return (int64_t) rows->size() == T * h_.n_vocab || fail("verify: logits missing");
     }
     if ((int64_t) argmax.size() == T) {
         return true;  // the device argmax ran (the GEMV Q4_K head)

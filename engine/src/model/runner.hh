@@ -133,8 +133,11 @@ public:
     void enable_speculation(int64_t max_tokens);
     // Runs `toks` at positions pos0.. as one verification and returns every
     // row's greedy token in `argmax`. The caches and states then hold all of
-    // them until commit() says how many to keep.
-    bool verify(const std::vector<int32_t> & toks, int64_t pos0, std::vector<int32_t> & argmax);
+    // them until commit() says how many to keep. With `logits` (speculative
+    // sampling, #197) every row's logits come back instead (T x n_vocab, the
+    // decode step's values bit for bit) and `argmax` stays empty.
+    bool verify(const std::vector<int32_t> & toks, int64_t pos0, std::vector<int32_t> & argmax,
+                std::vector<float> * logits = nullptr);
     // Keeps the first `accepted` (1 .. T) tokens of the last verification:
     // swaps in the advanced states when all are kept, else replays the kept
     // prefix onto the old ones and restores the FP16-ring slots of the rest.

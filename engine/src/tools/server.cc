@@ -15,7 +15,8 @@
 //   --cors ORIGIN     allow browser requests from ORIGIN (e.g. "*")
 //   --temp T, --top-k K, --top-p P, --min-p M, --max-tokens N
 //                     defaults for requests that leave them out (default: greedy,
-//                     which decodes speculatively, until the context is full)
+//                     until the context is full); greedy and sampled requests both
+//                     decode speculatively with the MTP block (#197)
 //
 // Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions,
 // POST /v1/completions (stream or not). One request at a time; a chat's next
