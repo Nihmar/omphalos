@@ -87,13 +87,17 @@ ConvertStats convert_to_omph(const std::string & in_path, const std::string & ou
     for (size_t i = 0; i < ts.size(); ++i) {
         const gguf::TensorInfo & t = ts[i];
         const int64_t bb = quant_block_bytes(t.type);
-        const int64_t packed = bb > 0 && t.nbytes % (uint64_t) bb == 0
-                                   ? repacked_bytes(t.type, (int64_t) (t.nbytes / (uint64_t) bb))
-                                   : 0;
+        const int64_t k = (int64_t) t.ne[0];
+        const int64_t rows = bb > 0 && k % 256 == 0 ? (int64_t) (t.nbytes / (uint64_t) bb) / (k / 256) : 0;
+        const uint32_t layout = rows > 0 ? engine_layout(t.type) : 0;
         // the token embedding stays as it is: the engine gathers its rows on the host
-        if (packed > 0 && t.name != "token_embd.weight") {
-            layouts[i] = gguf::kLayoutRepack;
-            stored[i] = (uint64_t) packed;
+        if (layout != 0 && t.name != "token_embd.weight") {
+            const int64_t bytes = engine_layout_bytes(t.type, rows, k);
+            if (bytes <= 0) {
+                fail(t.name + " does not fit its engine layout (rows " + std::to_string(rows) + ")");
+            }
+            layouts[i] = layout;
+            stored[i] = (uint64_t) bytes;
         } else {
             stored[i] = t.nbytes;
         }
@@ -152,15 +156,15 @@ ConvertStats convert_to_omph(const std::string & in_path, const std::string & ou
         const gguf::TensorInfo & t = ts[i];
         w.pad_to(data_start + offsets[i]);
         const uint8_t * gguf_bytes = src.tensor_data(t);
-        if (layouts[i] == gguf::kLayoutRepack) {
-            const int64_t n_blocks = (int64_t) (t.nbytes / (uint64_t) quant_block_bytes(t.type));
+        if (layouts[i] != gguf::kLayoutGguf) {
+            const int64_t k = (int64_t) t.ne[0];
+            const int64_t rows = (int64_t) (t.nbytes / (uint64_t) quant_block_bytes(t.type)) / (k / 256);
             packed.clear();  // the layouts' padding is left unwritten: zeros, not the previous tensor
-            if (!repack_any(t.type, gguf_bytes, n_blocks, packed) || packed.size() != stored[i]) {
+            if (!to_engine_layout(t.type, gguf_bytes, rows, k, packed) || packed.size() != stored[i]) {
                 fail("repack failed for " + t.name);
             }
             // bit-exact: the stored layout must rebuild the GGUF bytes
-            rebuilt.assign((size_t) t.nbytes, 0);
-            if (!unrepack_any(t.type, packed.data(), n_blocks, rebuilt) || rebuilt.size() != t.nbytes ||
+            if (!from_engine_layout(t.type, packed.data(), rows, k, rebuilt) || rebuilt.size() != t.nbytes ||
                 std::memcmp(rebuilt.data(), gguf_bytes, (size_t) t.nbytes) != 0) {
                 fail("the repacked " + t.name + " does not rebuild the GGUF bytes");
             }

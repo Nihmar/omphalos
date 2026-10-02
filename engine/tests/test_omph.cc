@@ -69,7 +69,7 @@ int main() {
     // IQ3_S (110 B / 256 weights), Q4_K (144 B), an f32 vector, an IQ3_S token embedding
     const uint64_t iq3s = 110, q4k = 144;
     const std::vector<T> ts = {
-        {"blk.0.ffn_up.weight", {512, 8}, 21, 8 * 2 * iq3s},
+        {"blk.0.ffn_up.weight", {512, 16}, 21, 16 * 2 * iq3s},
         {"output_norm.weight", {512}, 0, 512 * 4},
         {"blk.0.attn_k.weight", {256, 4}, 12, 4 * 1 * q4k},
         {"token_embd.weight", {256, 3}, 21, 3 * 1 * iq3s},
@@ -129,17 +129,17 @@ int main() {
         CHECK(o.find("test.count") && o.find("test.count")->as_u64(v) && v == 7, "metadata copied (u32)");
         CHECK(o.find("omph.source_sha256") && o.find("omph.source_sha256")->as_str(s) && s == st.source_sha256,
               "sha256 recorded");
-        const uint32_t want_layout[4] = {1, 0, 1, 0};
+        const uint32_t want_layout[4] = {2, 0, 1, 0};  // IQ3_S tiles, f32, Q4_K repack, the embedding
         for (size_t i = 0; i < ts.size(); ++i) {
             const omph::gguf::TensorInfo * t = o.tensor(ts[i].name);
             CHECK(t != nullptr, "tensor %s present", ts[i].name.c_str());
             if (t == nullptr) continue;
             CHECK(t->layout == want_layout[i], "%s layout %u", t->name.c_str(), t->layout);
             CHECK(t->offset % 256 == 0, "%s offset aligned", t->name.c_str());
-            if (t->layout == omph::gguf::kLayoutRepack) {
+            if (t->layout != omph::gguf::kLayoutGguf) {
                 std::vector<uint8_t> packed;
-                const int64_t nb = (int64_t) (ts[i].bytes / omph::format::quant_block_bytes(ts[i].type));
-                omph::format::repack_any(ts[i].type, data[i].data(), nb, packed);
+                omph::format::to_engine_layout(ts[i].type, data[i].data(), (int64_t) ts[i].ne[1],
+                                               (int64_t) ts[i].ne[0], packed);
                 size_t first = packed.size();
                 for (size_t j = 0; j < packed.size() && j < t->stored; ++j) {
                     if (o.tensor_data(*t)[j] != packed[j]) {
