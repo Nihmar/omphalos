@@ -14,8 +14,13 @@ struct EnvOptions {
     bool kv_host = false;       // OMPH_KV_HOST: exact f32 cache in pinned host RAM (reference)
     bool kv_f32 = false;        // OMPH_KV_F32: exact f32 cache in VRAM instead of K Q8 / V Q4
     bool kv_k4 = false;         // OMPH_KV_K4: K in V's Q4 format too (#81, experiment)
-    uint64_t kv_k4_layers = 0;  // OMPH_KV_K4_LAYERS=i,j,...: K4 on those attention layers only (0-based
-                                // over the attention layers, bit i; #175)
+    // K4 on these attention layers (0-based over the 16 attention layers, bit i),
+    // the rest Q8 (#175): by default the eight least sensitive ones, measured one
+    // layer at a time (bench/results/k4-per-layer-175.txt). OMPH_KV_K4_LAYERS=i,j,...
+    // replaces the set, OMPH_KV_K4_LAYERS=none keeps every layer Q8.
+    static constexpr uint64_t kDefaultK4Layers = (1u << 2) | (1u << 4) | (1u << 5) | (1u << 6) |
+                                                 (1u << 7) | (1u << 9) | (1u << 11) | (1u << 15);
+    uint64_t kv_k4_layers = kDefaultK4Layers;
     int64_t kv_window = 128;    // OMPH_KV_WINDOW=N: FP16 ring of the last N tokens (0 = off)
 
     // --- decode paths (A/B switches)
