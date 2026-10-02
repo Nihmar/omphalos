@@ -51,7 +51,7 @@ def collect(omph: str, model: str, mtp: bool, n: int, temp: float, max_tokens: i
         wait_health(url, proc)
         for seed in range(n):
             r = post(url + "/v1/completions", {"prompt": PROMPT, "max_tokens": max_tokens, "temperature": temp,
-                                               "top_p": top_p, "seed": seed, "logprobs": None})
+                                               "top_p": top_p, "seed": seed})
             seqs.append(r["choices"][0]["text"])
     finally:
         proc.terminate()
