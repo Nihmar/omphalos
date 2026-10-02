@@ -242,8 +242,11 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         // KL under llama.cpp's q8_0/q4_0 up to 32k for 8.4 MB (#61);
         // OMPH_KV_WINDOW=0 turns it off.
         kv_window_ = env_.kv_window;
-        alloc(&kv_k16_, (size_t) n_kv * kv_window_ * attn_kv * 2);
-        alloc(&kv_v16_, (size_t) n_kv * kv_window_ * attn_kv * 2);
+        // kKvRingExtra slots more: every query of a short chunk (a
+        // verification) reads its own last kv_window_ keys exactly (#161)
+        kv_ring_ = kv_window_ > 0 ? kv_window_ + omph::kernels::kKvRingExtra : 0;
+        alloc(&kv_k16_, (size_t) n_kv * kv_ring_ * attn_kv * 2);
+        alloc(&kv_v16_, (size_t) n_kv * kv_ring_ * attn_kv * 2);
     }
     overlap_ = use_gemv_ && !env_.no_overlap;
     if (overlap_ && (hipStreamCreateWithFlags(&side_, hipStreamNonBlocking) != hipSuccess ||
@@ -555,7 +558,7 @@ size_t Runner::checkpoint_bytes() const {
     if (kv_k16_ != nullptr) {
         const int64_t n_kv = (int64_t) std::count_if(kv_index_.begin(), kv_index_.end(),
                                                      [](int64_t k) { return k >= 0; });
-        bytes += 2 * (size_t) n_kv * kv_window_ * h_.n_head_kv * h_.head_dim * 2;
+        bytes += 2 * (size_t) n_kv * kv_ring_ * h_.n_head_kv * h_.head_dim * 2;
     }
     if (mtp_pending_ != nullptr) bytes += (size_t) h_.n_embd * 4;
     return bytes;
@@ -592,7 +595,7 @@ bool Runner::checkpoint_copy(void * host, const bool save) {
     if (ok && kv_k16_ != nullptr) {
         const int64_t n_kv = (int64_t) std::count_if(kv_index_.begin(), kv_index_.end(),
                                                      [](int64_t k) { return k >= 0; });
-        const size_t ring = (size_t) n_kv * kv_window_ * h_.n_head_kv * h_.head_dim * 2;
+        const size_t ring = (size_t) n_kv * kv_ring_ * h_.n_head_kv * h_.head_dim * 2;
         ok = copy(kv_k16_, ring) && copy(kv_v16_, ring);
     }
     if (ok && mtp_pending_ != nullptr) {
@@ -889,7 +892,7 @@ void Runner::enable_speculation(const int64_t max_tokens) {
     if (kv_q8q4_ && kv_window_ > 0) {
         const int64_t n_kv = (int64_t) std::count_if(kv_index_.begin(), kv_index_.end(),
                                                      [](int64_t k) { return k >= 0; });
-        const size_t ring = (size_t) n_kv * kv_window_ * h_.n_head_kv * h_.head_dim * 2;
+        const size_t ring = (size_t) n_kv * kv_ring_ * h_.n_head_kv * h_.head_dim * 2;
         ring_backup_k_ = mem_.device(ring);
         ring_backup_v_ = mem_.device(ring);
     }
@@ -911,11 +914,11 @@ bool Runner::verify(const std::vector<int32_t> & toks, const int64_t pos0,
     const int64_t row_bytes = h_.n_head_kv * h_.head_dim * 2;
     if (ring_backup_k_ != nullptr &&
         !omph::kernels::kv_ring_copy(kv_k16_, kv_v16_, ring_backup_k_, ring_backup_v_, n_kv,
-                                     kv_window_, row_bytes, pos0, T, nullptr)) {
+                                     kv_ring_, row_bytes, pos0, T, nullptr)) {
         return fail("verify: ring backup failed");
     }
     if (env_.spec_check && ring_backup_k_ != nullptr) {
-        const size_t ring = (size_t) n_kv * kv_window_ * row_bytes;
+        const size_t ring = (size_t) n_kv * kv_ring_ * row_bytes;
         check_ring_k_.resize(ring);
         check_ring_v_.resize(ring);
         if (hipMemcpy(check_ring_k_.data(), kv_k16_, ring, hipMemcpyDeviceToHost) != hipSuccess ||
@@ -997,7 +1000,7 @@ bool Runner::commit(const int64_t accepted) {
         const int64_t n_kv = (int64_t) std::count_if(kv_index_.begin(), kv_index_.end(),
                                                      [](int64_t k) { return k >= 0; });
         if (!omph::kernels::kv_ring_copy(ring_backup_k_, ring_backup_v_, kv_k16_, kv_v16_, n_kv,
-                                         kv_window_, h_.n_head_kv * h_.head_dim * 2,
+                                         kv_ring_, h_.n_head_kv * h_.head_dim * 2,
                                          verify_pos0_ + accepted, T - accepted, nullptr)) {
             return fail("commit: ring restore failed");
         }
@@ -1011,12 +1014,12 @@ bool Runner::commit(const int64_t accepted) {
                 return fail("commit: ring check copy failed");
             }
             for (int64_t l = 0; l < n_kv; ++l) {
-                for (int64_t slot = 0; slot < kv_window_; ++slot) {
+                for (int64_t slot = 0; slot < kv_ring_; ++slot) {
                     bool kept = false;
                     for (int64_t i = 0; i < accepted; ++i) {
-                        kept = kept || (verify_pos0_ + i) % kv_window_ == slot;
+                        kept = kept || (verify_pos0_ + i) % kv_ring_ == slot;
                     }
-                    const size_t off = (size_t) ((l * kv_window_ + slot) * row);
+                    const size_t off = (size_t) ((l * kv_ring_ + slot) * row);
                     if (!kept && (std::memcmp(k.data() + off, check_ring_k_.data() + off, row) != 0 ||
                                   std::memcmp(v.data() + off, check_ring_v_.data() + off, row) != 0)) {
                         std::fprintf(stderr, "spec check: ring slot %lld of layer %lld not restored\n",

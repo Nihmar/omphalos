@@ -232,8 +232,8 @@ int main(int argc, char ** argv) {
             dev_alloc(&vq, (size_t) tokens * kv_out / 2);
             dev_alloc(&vs, (size_t) tokens * n_head_kv * nblk * 2);
             if (window > 0) {
-                dev_alloc(&k16, (size_t) window * kv_out * 2);
-                dev_alloc(&v16, (size_t) window * kv_out * 2);
+                dev_alloc(&k16, (size_t) (window + omph::kernels::kKvRingExtra) * kv_out * 2);
+                dev_alloc(&v16, (size_t) (window + omph::kernels::kKvRingExtra) * kv_out * 2);
             }
         }
         const size_t work_bytes =
@@ -287,7 +287,7 @@ int main(int argc, char ** argv) {
                 prep.v_scales = static_cast<__half *>(vs);
                 prep.k16 = static_cast<__half *>(k16);
                 prep.v16 = static_cast<__half *>(v16);
-                prep.window = window;
+                prep.ring = window + omph::kernels::kKvRingExtra;
                 prep.k_q4 = k_q4;
                 kv.k_q8 = static_cast<const uint8_t *>(kq);
                 kv.k_scales = ks;
@@ -296,6 +296,7 @@ int main(int argc, char ** argv) {
                 kv.k16 = k16;
                 kv.v16 = v16;
                 kv.window = window;
+                kv.ring = window + omph::kernels::kKvRingExtra;
                 kv.k_q4 = k_q4;
             } else {
                 kv.k_f32 = static_cast<const float *>(kf);

@@ -202,6 +202,7 @@ private:
         bool quant = false;
         QuantKv q{};
         int64_t window = 0;
+        int64_t ring = 0;
         bool k_q4 = false;
         float * k_f32 = nullptr;
         float * v_f32 = nullptr;
@@ -363,6 +364,7 @@ private:
     void * kv_k16_ = nullptr;
     void * kv_v16_ = nullptr;
     int64_t kv_window_ = 0;  // Q8/Q4 mode: 128 unless OMPH_KV_WINDOW says otherwise
+    int64_t kv_ring_ = 0;    // the FP16 ring's slots: window + kKvRingExtra (#161)
     bool kv_q8q4_ = false;
     bool kv_k4_ = false;  // K stored as Q4 (experiment, #81)
     bool kv_host_ = false;  // f32 KV in pinned host RAM (validation reference)

@@ -1,0 +1,24 @@
+# #161: speculative greedy bit-identical to plain greedy. Engine fix/161 vs main 55ddf36 (text paths of
+# 7655e70 are identical to it), same session, RX 9060 XT.
+#
+# Cause: the FP16 KV window (128) was relative to the end of a step's batch, so in a verification of T
+# tokens row t read T - 1 - t keys from Q8/Q4 that its own decode step reads from FP16 (max |d logit|
+# ~5e-3, enough to flip a near-tie: token 47 of a 300-token answer, top-2 gap 0.0022).
+# Fix: every query of a chunk of up to 16 tokens reads its own last 128 keys from the ring (15 slots more:
+# +0.94 MiB VRAM over 16 layers, the checkpoint +0.94 MB); the window-edge keys of a tile are read in
+# both versions. The decode step (T = 1) and the WMMA prefill (T >= 16) keep their arithmetic.
+#
+# 1. Identity
+#    verification rows with the plain run's context (2001-token prompt, 120 tokens):  119 / 119 bit-exact
+#                                                                        (before: ~5e-3 max |d logit|)
+#    omph-generate, 2001-token thinking prompt, 300 tokens: speculative == plain (before: differ at 47)
+#    omph-run --draft-mtp 3, wiki1000, 200 tokens, OMPH_SPEC_CHECK=1: identical, no rollback mismatch
+#    specval.sh (oracle drafts, k = 1 / 2 / 4, five KV modes): all identical
+#    ident.sh vs main (f16 prefill, tail, --gemv generate, f32 KV): all six outputs identical
+#
+# 2. Speed (wiki1000, interleaved runs)
+#    speculative ms / token (k = 3, 200 tokens)   main  19.13 19.17 19.18 19.17 20.05  median 19.17
+#                                                 new   19.19 19.21 19.21 19.20 20.08  median 19.21 (+0.2 %)
+#    plain step gpu ms (median of 65 steps)       main  45.79 45.86 45.83 45.84 45.83  median 45.83
+#                                                 new   45.82 45.86 45.85 45.83 45.84  median 45.84
+#    attention_gqa_kernel<Q8, 4>: 256 VGPRs, scratch 24 B / lane (main 8); <Q8, 1>: 104 VGPRs (main 99)

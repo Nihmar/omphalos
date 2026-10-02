@@ -148,8 +148,8 @@ __global__ __launch_bounds__(kPrepHd) void attn_prep_kernel(const AttnPrep a) {
     const long long sdst = (pos * a.nkv + h) * (kPrepHd / kKvBlock);  // scale offset
     const int b = d / (int) kKvBlock;
     const int lane = d & 31;
-    if (a.k16 != nullptr && pos + a.window >= a.pos0 + a.tokens) {  // FP16 ring (#48)
-        const long long slot = (pos % a.window) * a.nkv + h;
+    if (a.k16 != nullptr && pos + a.ring >= a.pos0 + a.tokens) {  // FP16 ring (#48, #161)
+        const long long slot = (pos % a.ring) * a.nkv + h;
         (is_k ? a.k16 : a.v16)[slot * kPrepHd + d] = __float2half(x);
     }
     float amax = fabsf(x);
@@ -191,7 +191,7 @@ bool attn_prep(const AttnPrep & a, hipStream_t stream) {
         a.hd != kPrepHd || a.nh <= 0 || a.nkv <= 0 || a.n_rot <= 0 || a.n_rot % 2 != 0 ||
         a.n_rot > a.hd || (a.k_q8 != nullptr && (a.k_scales == nullptr || a.v_q4 == nullptr ||
                                                  a.v_scales == nullptr)) ||
-        (a.k16 == nullptr) != (a.v16 == nullptr) || (a.k16 != nullptr && a.window <= 0)) {
+        (a.k16 == nullptr) != (a.v16 == nullptr) || (a.k16 != nullptr && a.ring <= 0)) {
         return false;
     }
     const dim3 grid((unsigned) a.tokens, (unsigned) (a.nh + 2 * a.nkv));
@@ -220,21 +220,23 @@ struct KvArgs {
     const __half * v_scales;
     const __half * k16;
     const __half * v16;
-    long long window;
+    long long window;  // a query reads its last `window` keys from the ring
+    long long ring;    // the ring's slots
     bool k_q4;
 };
 
 // Dimensions [16c, 16c + 16) of the K row of position p for KV head kvh, as one
-// 16-byte load for Q8 (dequantized; inside the FP16 window: the exact copy).
+// 16-byte load for Q8 (dequantized; from position wstart on: the exact copy in
+// the FP16 ring).
 template <bool Q8>
 __device__ inline void gqa_load_k16(const KvArgs & kv, const long long p, const long long kvh,
-                                    const long long nkv, const int c, const long long seq,
+                                    const long long nkv, const int c, const long long wstart,
                                     float * k) {
     const long long row = p * nkv + kvh;
     if constexpr (Q8) {
-        if (kv.k16 != nullptr && p + kv.window >= seq) {
+        if (kv.k16 != nullptr && p >= wstart) {
             const uint4 * src = reinterpret_cast<const uint4 *>(
-                kv.k16 + ((p % kv.window) * nkv + kvh) * kGqaHd + c * 16);
+                kv.k16 + ((p % kv.ring) * nkv + kvh) * kGqaHd + c * 16);
             uint4 h[2] = {src[0], src[1]};
             const __half * hv = reinterpret_cast<const __half *>(h);
 #pragma unroll
@@ -276,17 +278,17 @@ __device__ inline void gqa_load_k16(const KvArgs & kv, const long long p, const 
     }
 }
 
-// Dimensions [16c, 16c + 16) of the V row of position p (dequantized; inside
-// the FP16 window: the exact copy).
+// Dimensions [16c, 16c + 16) of the V row of position p (dequantized; from
+// position wstart on: the exact copy in the FP16 ring).
 template <bool Q8>
 __device__ inline void gqa_load_v16(const KvArgs & kv, const long long p, const long long kvh,
-                                    const long long nkv, const int c, const long long seq,
+                                    const long long nkv, const int c, const long long wstart,
                                     float * v) {
     const long long row = p * nkv + kvh;
     if constexpr (Q8) {
-        if (kv.v16 != nullptr && p + kv.window >= seq) {
+        if (kv.v16 != nullptr && p >= wstart) {
             const uint4 * src = reinterpret_cast<const uint4 *>(
-                kv.v16 + ((p % kv.window) * nkv + kvh) * kGqaHd + c * 16);
+                kv.v16 + ((p % kv.ring) * nkv + kvh) * kGqaHd + c * 16);
             uint4 h[2] = {src[0], src[1]};
             const __half * hv = reinterpret_cast<const __half *>(h);
 #pragma unroll
@@ -348,7 +350,7 @@ template <bool Q8, int TQ>
 __global__ __launch_bounds__(kGqaHd) void attention_gqa_kernel(
     const float * __restrict__ q, const KvArgs kv, float * __restrict__ work,
     const long long tokens, const long long seq, const int nh, const int nkv,
-    const float scale, const int splits, const long long blocks_per_split) {
+    const float scale, const int splits, const long long blocks_per_split, const bool per_query) {
     constexpr int G = kGqaGroup;
     constexpr int kRows = TQ * G;
     // Q rows in 16-dimension chunks padded to 20 floats: 16-byte aligned, so a
@@ -359,6 +361,7 @@ __global__ __launch_bounds__(kGqaHd) void attention_gqa_kernel(
     __shared__ float sc[kRows][kGqaKb];
     __shared__ float corr[kRows];
     __shared__ float vs[kGqaKb][kGqaHd];  // the block's V, staged by 16-byte loads (#136)
+    __shared__ float vs_q8[TQ][kGqaHd];   // the window-edge keys' Q8 V (#161)
 
     const int d = (int) threadIdx.x;
     const long long t0 = (long long) blockIdx.x * TQ;
@@ -367,6 +370,13 @@ __global__ __launch_bounds__(kGqaHd) void attention_gqa_kernel(
     const int nt = (int) (tokens - t0 < TQ ? tokens - t0 : TQ);
     const int R = nt * G;
     const long long qpos0 = seq - tokens + t0;  // cache position of the tile's first query
+    // The FP16 window per query (#161): token t of the tile reads keys from
+    // w_lo + t on from the ring, so the keys w_lo .. w_hi - 1 (fewer than nt)
+    // are FP16 for its earlier tokens and Q8 for its later ones, exactly as
+    // each token's own decode step reads them. A chunk longer than the ring
+    // allows shares one window, ending at seq.
+    const long long w_lo = per_query ? qpos0 - kv.window + 1 : seq - kv.window;
+    const long long w_hi = per_query ? qpos0 + nt - kv.window : seq - kv.window;
 
     for (int r = 0; r < kRows; ++r) {
         const long long h = (long long) kvh * G + r % G;
@@ -410,8 +420,8 @@ __global__ __launch_bounds__(kGqaHd) void attention_gqa_kernel(
     const auto load_block = [&](const long long kb, float * kd, float * vd) {
         const long long s = kb * kGqaKb + jj;
         if (kb < kb1 && s < n_keys) {
-            gqa_load_k16<Q8>(kv, s, kvh, nkv, c, seq, kd);
-            gqa_load_v16<Q8>(kv, s, kvh, nkv, c, seq, vd);
+            gqa_load_k16<Q8>(kv, s, kvh, nkv, c, w_lo, kd);
+            gqa_load_v16<Q8>(kv, s, kvh, nkv, c, w_lo, vd);
         } else {
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
@@ -424,17 +434,37 @@ __global__ __launch_bounds__(kGqaHd) void attention_gqa_kernel(
         load_block(kb, kc, vc);
         const long long s0 = kb * kGqaKb;
         const int bs = (int) (n_keys - s0 < kGqaKb ? n_keys - s0 : kGqaKb);
+        // a block holding window-edge keys (uniform): their Q8 versions too
+        const bool edge = Q8 && kv.k16 != nullptr && w_hi > w_lo && s0 < w_hi && s0 + kGqaKb > w_lo;
+        const long long sk = s0 + jj;  // this thread's key
+        const bool mine_edge = edge && sk >= w_lo && sk < w_hi && sk < n_keys;
         // this block's V into LDS for the per-dimension accumulation below
 #pragma unroll
         for (int i = 0; i < 16; i += 4) {
             *reinterpret_cast<float4 *>(&vs[jj][c * 16 + i]) =
                 make_float4(vc[i], vc[i + 1], vc[i + 2], vc[i + 3]);
         }
+        if (mine_edge) {  // and a window-edge key's Q8 V (through vc: no more registers)
+            gqa_load_v16<Q8>(kv, sk, kvh, nkv, c, 0x7fffffffffffffffLL, vc);
+#pragma unroll
+            for (int i = 0; i < 16; i += 4) {
+                *reinterpret_cast<float4 *>(&vs_q8[sk - w_lo][c * 16 + i]) =
+                    make_float4(vc[i], vc[i + 1], vc[i + 2], vc[i + 3]);
+            }
+        }
         // Scores: each thread dots its 16 dimensions of K with the matching
         // chunk of every row; the 16 lanes of a key then reduce through DPP.
+        // At the window's edge a row past the key's last FP16 token takes Q8.
         {
+            // At a window-edge key, rows in token order: once a row is past the
+            // key's last FP16 token, so are the rest, and kc becomes its Q8 K.
+            bool q8_loaded = false;
 #pragma unroll
             for (int r = 0; r < kRows; ++r) {
+                if (mine_edge && !q8_loaded && sk < w_lo + r / G) {
+                    gqa_load_k16<Q8>(kv, sk, kvh, nkv, c, 0x7fffffffffffffffLL, kc);
+                    q8_loaded = true;
+                }
                 float part = 0.0f;
 #pragma unroll
                 for (int i = 0; i < 16; ++i) {
@@ -474,12 +504,26 @@ __global__ __launch_bounds__(kGqaHd) void attention_gqa_kernel(
         for (int r = 0; r < kRows; ++r) {
             acc[r] *= corr[r];
         }
+        if (edge) {
+#pragma unroll 1
+            for (int j = 0; j < kGqaKb; ++j) {
+                const long long m = s0 + j - w_lo;  // the key's place in the edge
+                const bool in_edge = m >= 0 && s0 + j < w_hi;
+                const float vj = vs[j][d];
+                const float vq = in_edge ? vs_q8[m][d] : vj;
 #pragma unroll
-        for (int j = 0; j < kGqaKb; ++j) {  // weights past bs are 0, V too
-            const float vj = vs[j][d];
+                for (int r = 0; r < kRows; ++r) {
+                    acc[r] = fmaf(sc[r][j], in_edge && m < r / G ? vq : vj, acc[r]);
+                }
+            }
+        } else {
 #pragma unroll
-            for (int r = 0; r < kRows; ++r) {
-                acc[r] = fmaf(sc[r][j], vj, acc[r]);
+            for (int j = 0; j < kGqaKb; ++j) {  // weights past bs are 0, V too
+                const float vj = vs[j][d];
+#pragma unroll
+                for (int r = 0; r < kRows; ++r) {
+                    acc[r] = fmaf(sc[r][j], vj, acc[r]);
+                }
             }
         }
         __syncthreads();  // sc, corr and vs are rewritten by the next block
@@ -592,7 +636,7 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
             const int c = job % (kGqaHd / 16);
             float kc[16];
             if (s0 + key < n_keys) {
-                gqa_load_k16<Q8>(kv, s0 + key, kvh, nkv, c, seq, kc);
+                gqa_load_k16<Q8>(kv, s0 + key, kvh, nkv, c, seq - kv.window, kc);
             } else {
 #pragma unroll
                 for (int i = 0; i < 16; ++i) {
@@ -614,7 +658,7 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
             const int c = job % (kGqaHd / 16);
             float vc[16];
             if (s0 + key < n_keys) {
-                gqa_load_v16<Q8>(kv, s0 + key, kvh, nkv, c, seq, vc);
+                gqa_load_v16<Q8>(kv, s0 + key, kvh, nkv, c, seq - kv.window, vc);
             } else {
 #pragma unroll
                 for (int i = 0; i < 16; ++i) {
@@ -816,10 +860,10 @@ namespace {
 // grid: (count, layers, 2 = k / v); a block copies one ring row.
 __global__ void kv_ring_copy_kernel(const uint4 * __restrict__ src_k, const uint4 * __restrict__ src_v,
                                     uint4 * __restrict__ dst_k, uint4 * __restrict__ dst_v,
-                                    const long long window, const long long row_vec,
+                                    const long long ring, const long long row_vec,
                                     const long long pos_first) {
-    const long long slot = (pos_first + blockIdx.x) % window;
-    const long long off = ((long long) blockIdx.y * window + slot) * row_vec;
+    const long long slot = (pos_first + blockIdx.x) % ring;
+    const long long off = ((long long) blockIdx.y * ring + slot) * row_vec;
     const uint4 * src = (blockIdx.z == 0 ? src_k : src_v) + off;
     uint4 * dst = (blockIdx.z == 0 ? dst_k : dst_v) + off;
     for (long long i = threadIdx.x; i < row_vec; i += blockDim.x) {
@@ -830,11 +874,11 @@ __global__ void kv_ring_copy_kernel(const uint4 * __restrict__ src_k, const uint
 } // namespace
 
 bool kv_ring_copy(const void * src_k, const void * src_v, void * dst_k, void * dst_v,
-                  const int64_t layers, const int64_t window, const int64_t row_bytes,
+                  const int64_t layers, const int64_t ring, const int64_t row_bytes,
                   const int64_t pos_first, const int64_t count, hipStream_t stream) {
     if (src_k == nullptr || src_v == nullptr || dst_k == nullptr || dst_v == nullptr ||
-        layers <= 0 || window <= 0 || row_bytes <= 0 || row_bytes % 16 != 0 || pos_first < 0 ||
-        count < 0 || count > window) {
+        layers <= 0 || ring <= 0 || row_bytes <= 0 || row_bytes % 16 != 0 || pos_first < 0 ||
+        count < 0 || count > ring) {
         return false;
     }
     if (count == 0) {
@@ -843,7 +887,7 @@ bool kv_ring_copy(const void * src_k, const void * src_v, void * dst_k, void * d
     const dim3 grid((unsigned) count, (unsigned) layers, 2);
     kv_ring_copy_kernel<<<grid, 128, 0, stream>>>(
         static_cast<const uint4 *>(src_k), static_cast<const uint4 *>(src_v),
-        static_cast<uint4 *>(dst_k), static_cast<uint4 *>(dst_v), (long long) window,
+        static_cast<uint4 *>(dst_k), static_cast<uint4 *>(dst_v), (long long) ring,
         (long long) (row_bytes / 16), (long long) pos_first);
     return hipGetLastError() == hipSuccess;
 }
@@ -883,7 +927,8 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
         return false;
     }
     if (q8 ? (kv.k_scales == nullptr || kv.v_q4 == nullptr || kv.v_scales == nullptr ||
-              (kv.k16 == nullptr) != (kv.v16 == nullptr) || (kv.k16 != nullptr && kv.window <= 0))
+              (kv.k16 == nullptr) != (kv.v16 == nullptr) ||
+              (kv.k16 != nullptr && (kv.window <= 0 || kv.ring < kv.window)))
            : (kv.k_f32 == nullptr || kv.v_f32 == nullptr)) {
         return false;
     }
@@ -916,7 +961,10 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
                       static_cast<const __half *>(kv.k16),
                       static_cast<const __half *>(kv.v16),
                       kv.window > 0 ? kv.window : 1,
+                      kv.ring > 0 ? kv.ring : 1,
                       kv.k_q4};
+    // every query its own window when the ring holds them all (#161)
+    const bool per_query = tokens <= kKvRingExtra + 1 && kv.ring >= kv.window + kKvRingExtra;
     auto * w = static_cast<float *>(work);
     if (fa) {
         const dim3 fgrid((unsigned) ((tokens + kFaTokens - 1) / kFaTokens), (unsigned) nkv);
@@ -935,7 +983,7 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
     const dim3 grid((unsigned) ((tokens + tq - 1) / tq), (unsigned) nkv, (unsigned) splits);
 #define OMPH_GQA_LAUNCH(Q8, TQ)                                                              \
     attention_gqa_kernel<Q8, TQ><<<grid, kGqaHd, 0, stream>>>(q, args, w, tokens, seq, (int) nh, \
-                                                              (int) nkv, scale, splits, bps)
+                                                              (int) nkv, scale, splits, bps, per_query)
     if (q8) {
         if (tq == 4) {
             OMPH_GQA_LAUNCH(true, 4);
