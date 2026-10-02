@@ -80,7 +80,7 @@ typedef struct {
     float top_p;          /* 1: off */
     float min_p;          /* 0: off */
     uint64_t seed;
-    int speculative;      /* MTP drafts when greedy (default 1) */
+    int speculative;      /* MTP drafts, greedy or sampled (default 1) */
     const int32_t * stop; /* extra stop tokens */
     size_t n_stop;
 } omph_generate_params;

@@ -8,7 +8,7 @@
 //   --max N           tokens to generate (default 512)
 //   --temp T          sampling temperature (default 0: greedy)
 //   --top-k K, --top-p P, --min-p M, --seed S
-//   --no-spec         no MTP speculative decoding (greedy only uses it)
+//   --no-spec         no MTP speculative decoding (greedy, and sampling since #197)
 //   --no-mtp          do not load the MTP block (-352 MiB of VRAM)
 //   --ctx N           KV capacity (default 8192)
 //   --cache-mib N     host RAM for sequence checkpoints (default 2048, 0: none)
