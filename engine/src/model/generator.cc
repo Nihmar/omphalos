@@ -195,50 +195,67 @@ int32_t Generator::sample(const std::vector<float> & logits, const Sampling & s)
     return draw(d, -1);
 }
 
+// The kept set without sorting the vocabulary (#197: the full sort of ~10^5
+// candidates cost ~25 ms per row): top-k by selection, min-p by a threshold,
+// top-p over a descending prefix sorted only as far as its mass needs. The
+// kept tokens are in descending order when top-p applies, else in id order.
 void Generator::distribution(const float * row, const int64_t nv, const Sampling & s, Dist & d) const {
     const float inv_t = 1.0f / s.temperature;
     const float best = *std::max_element(row, row + nv);
-    std::vector<std::pair<float, int32_t>> cand;  // (scaled logit, id)
+    std::vector<std::pair<float, int32_t>> cand;  // (scaled logit, id), in id order
+    cand.reserve(4096);
     for (int64_t i = 0; i < nv; ++i) {
         const float z = (row[i] - best) * inv_t;
         if (z > -30.0f) {
             cand.emplace_back(z, (int32_t) i);
         }
     }
-    std::sort(cand.begin(), cand.end(), [](const auto & a, const auto & b) {
+    const auto higher = [](const auto & a, const auto & b) {
         return a.first > b.first || (a.first == b.first && a.second < b.second);
-    });
+    };
     if (s.top_k > 0 && (size_t) s.top_k < cand.size()) {
+        std::nth_element(cand.begin(), cand.begin() + s.top_k, cand.end(), higher);
         cand.resize((size_t) s.top_k);
+        std::sort(cand.begin(), cand.end(), [](const auto & a, const auto & b) { return a.second < b.second; });
     }
-    std::vector<double> p(cand.size());
     double sum = 0.0;
-    for (size_t i = 0; i < cand.size(); ++i) {
-        p[i] = std::exp((double) cand[i].first);
-        sum += p[i];
+    for (const auto & c : cand) {
+        sum += std::exp((double) c.first);
     }
-    size_t keep = cand.size();
-    if (s.min_p > 0.0f) {  // relative to the best (p[0] / sum)
-        const double floor = (double) s.min_p * p[0];
-        keep = 1;
-        while (keep < cand.size() && p[keep] >= floor) ++keep;
+    if (s.min_p > 0.0f) {  // relative to the best, whose weight is exp(0) = 1
+        const float floor = std::log(s.min_p);
+        cand.erase(std::remove_if(cand.begin(), cand.end(), [&](const auto & c) { return c.first < floor; }),
+                   cand.end());
     }
     if (s.top_p < 1.0f) {
+        // the smallest descending prefix whose mass (of all the candidates') reaches top_p
+        size_t sorted = 0;
+        size_t keep = cand.size();
         double acc = 0.0;
-        size_t k = 0;
-        while (k < keep) {
-            acc += p[k] / sum;
-            ++k;
-            if (acc >= (double) s.top_p) break;
+        for (size_t want = 64;; want *= 4) {
+            const size_t m = std::min(want, cand.size());
+            std::partial_sort(cand.begin() + (std::ptrdiff_t) sorted, cand.begin() + (std::ptrdiff_t) m, cand.end(),
+                              higher);
+            for (; sorted < m; ++sorted) {
+                acc += std::exp((double) cand[sorted].first) / sum;
+                if (acc >= (double) s.top_p) {
+                    keep = sorted + 1;
+                    break;
+                }
+            }
+            if (keep < cand.size() || m == cand.size()) {
+                break;
+            }
         }
-        keep = k;
+        cand.resize(keep);
     }
-    d.ids.resize(keep);
-    d.w.assign(p.begin(), p.begin() + (std::ptrdiff_t) keep);
+    d.ids.resize(cand.size());
+    d.w.resize(cand.size());
     d.total = 0.0;
-    for (size_t i = 0; i < keep; ++i) {
+    for (size_t i = 0; i < cand.size(); ++i) {
         d.ids[i] = cand[i].second;
-        d.total += p[i];
+        d.w[i] = std::exp((double) cand[i].first);
+        d.total += d.w[i];
     }
 }
 
