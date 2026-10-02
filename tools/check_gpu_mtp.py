@@ -22,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
+from omph_model import omph_file
 from omphalos_tools.golden import load, load_index, rel_diff, run_tool
 from omphalos_tools.model import Model
 from omphalos_tools.reference import Reference
@@ -50,7 +51,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "mtp.f32"
         gen = Path(tmp) / "gen.txt"
-        run_tool([args.tool, args.model, str(dump / "tokens.txt"), str(Path(tmp) / "x.f32"),
+        run_tool([args.tool, omph_file(args.model), str(dump / "tokens.txt"), str(Path(tmp) / "x.f32"),
                   "--last-logits", "--gemv", "--generate", "2", "--gen-out", str(gen),
                   "--mtp-out", str(out)])
         got = np.fromfile(out, dtype=np.float32).reshape(2, -1)

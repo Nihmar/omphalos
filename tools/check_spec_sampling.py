@@ -19,6 +19,7 @@ from collections import Counter
 from pathlib import Path
 
 from niah import free_port, post, wait_health
+from omph_model import omph_file
 
 ROOT = Path(__file__).resolve().parent.parent
 PROMPT = ("Here is a long list of random everyday words, one per line, no repeats:\n"
@@ -71,8 +72,8 @@ def main() -> None:
     args = ap.parse_args()
 
     tokenize = f"{args.omph}/omph-tokenize"
-    plain = collect(args.omph, args.model, False, args.n, args.temp, args.max_tokens, args.top_p)
-    spec = collect(args.omph, args.model, True, args.n, args.temp, args.max_tokens, args.top_p)
+    plain = collect(args.omph, omph_file(args.model), False, args.n, args.temp, args.max_tokens, args.top_p)
+    spec = collect(args.omph, omph_file(args.model), True, args.n, args.temp, args.max_tokens, args.top_p)
 
     def ids(text: str) -> list[int]:
         out = subprocess.run([tokenize, args.model, "--no-parse-special"], input=text, capture_output=True,
