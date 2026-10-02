@@ -99,7 +99,7 @@ If #169 lands first, #172 applies to the WMMA kernel.
 | issue | what | estimate |
 |---|---|---|
 | #63 | the low-bit GEMVs (IQ3_S, IQ3_XXS, IQ2_*): grid in LDS, dot2 inner loop, uint4 x staging, more rows per workgroup on small projections | -3-5 ms of 45.8 |
-| #174 | the NT = 2..4 verification GEMVs on the single-token kernels' fast path | -5-10 % per speculative step |
+| #174 | the NT = 2..4 verification GEMVs on the single-token kernels' fast path | done: verification step 51.3 -> 49.7 ms at 512 tokens, 57.0 -> 55.3 at 25k; speculative -3.5 / -2.7 % per token (`bench/results/verify-gemv-174.txt`) |
 
 ### Phase C: prefill attention at long context
 
