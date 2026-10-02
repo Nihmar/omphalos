@@ -45,7 +45,15 @@ struct Case {
     int64_t bytes = 0;  // bytes the kernel reads
 };
 
+// --nt N (#63): the timed launches run the N-token GEMVs (verification) on
+// N activation vectors, into g_ny
+int g_nt = 1;
+float * g_ny = nullptr;
+
 bool launch(const Case & c, const void * x, float * y, hipStream_t stream) {
+    if (g_nt > 1) {
+        return omph::kernels::gemv_multi(c.t->type, c.dev, x, g_ny, c.rows, c.k, g_nt, stream);
+    }
     if (c.t->type == 12) {
         return omph::kernels::gemv_q4k(c.dev, x, y, c.rows, c.k, stream);
     }
@@ -121,11 +129,27 @@ double time_ms(const std::vector<Case> & cases, const void * x, float * y, const
     for (int k = 1; k < ns; ++k) {
         (void) hipStreamCreateWithFlags(&st[(size_t) k], hipStreamNonBlocking);
     }
+    // ~1 s of passes first: the GPU clock ramps up under load (#141), and
+    // three passes left a +-10 % spread (#63)
     size_t n = 0;
-    for (int i = 0; i < 3; ++i) {
-        for (const Case & c : cases) {
-            (void) launch(c, x, y, st[n++ % st.size()]);
+    {
+        hipEvent_t w0, w1;
+        (void) hipEventCreate(&w0);
+        (void) hipEventCreate(&w1);
+        float spent = 0.0f;
+        while (spent < 1000.0f) {
+            (void) hipEventRecord(w0, st[0]);
+            for (const Case & c : cases) {
+                (void) launch(c, x, y, st[0]);
+            }
+            (void) hipEventRecord(w1, st[0]);
+            (void) hipEventSynchronize(w1);
+            float ms = 0.0f;
+            (void) hipEventElapsedTime(&ms, w0, w1);
+            spent += ms;
         }
+        (void) hipEventDestroy(w0);
+        (void) hipEventDestroy(w1);
     }
     (void) hipDeviceSynchronize();
     hipEvent_t e0, e1;
@@ -165,7 +189,7 @@ int main(int argc, char ** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: %s <model.gguf> [tensor] [--iters N] [--iq4-all] "
-                     "[--all-of-type T] [--multi] [--repack-only T]\n",
+                     "[--all-of-type T] [--multi] [--nt N] [--repack-only T]\n",
                      argv[0]);
         return 2;
     }
@@ -183,6 +207,8 @@ int main(int argc, char ** argv) {
             all_type = 23;
         } else if (std::strcmp(argv[i], "--all-of-type") == 0 && i + 1 < argc) {
             all_type = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--nt") == 0 && i + 1 < argc) {
+            g_nt = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--multi") == 0) {
             multi = true;
         } else if (std::strcmp(argv[i], "--dequant") == 0) {
@@ -441,7 +467,16 @@ int main(int argc, char ** argv) {
             }
             return bad == 0 ? 0 : 1;
         }
+        if (g_nt > 1 && hipMalloc(&g_ny, (size_t) rmax * 4 * 4) != hipSuccess) {
+            return fail("out of VRAM (--nt)");
+        }
         const double ms = time_ms(cases, dev_x, (float *) dev_y, iters, nullptr);
+        if (g_nt > 1) {  // the N-token kernels: time only (--multi checks them)
+            const double gbs = total_bytes / ms / 1e6;
+            std::printf("fused nt=%d : %.3f ms  (%.1f MiB read)  -> %.1f GB/s  (%.1f%% of %.1f)\n", g_nt, ms,
+                        total_bytes / (1024 * 1024), gbs, 100.0 * gbs / kMeasuredBandwidthGBs, kMeasuredBandwidthGBs);
+            return 0;
+        }
         if (!canary_ok()) {
             return fail("a GEMV wrote past its output rows");
         }
