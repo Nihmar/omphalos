@@ -105,7 +105,7 @@ If #169 lands first, #172 applies to the WMMA kernel.
 
 | issue | what | estimate |
 |---|---|---|
-| #173 | larger query tiles (32-64 per workgroup), or the earlier keys dequantized to f16 once per chunk in ~32 MB slices | -30-35 % prefill time at 100k |
+| #173 | larger query tiles (32-64 per workgroup), or the earlier keys dequantized to f16 once per chunk in ~32 MB slices | done in part: 48 queries per workgroup, prefill at 100k 249.8 -> 201.4 s (-19 %), 25k -8 % (`bench/results/prefill-attention-173.txt`); the rest is compute and register pressure |
 
 ### Phase E: VRAM and quality (maintainer decisions)
 
