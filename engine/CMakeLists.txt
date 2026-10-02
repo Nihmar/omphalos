@@ -25,6 +25,7 @@ target_compile_options(omph_warnings INTERFACE -Wall -Wextra)
 add_library(omphalos SHARED
     src/format/gguf.cc
     src/format/repack.cc
+    src/text/tokenizer.cc
     src/runtime/context.cc
     src/runtime/matmul.cc
     src/runtime/options.cc
@@ -48,6 +49,10 @@ target_include_directories(omphalos
 )
 target_compile_options(omphalos PRIVATE -O3)
 target_link_libraries(omphalos PRIVATE hip::host omph_warnings)
+
+add_executable(omph-tokenize src/tools/tokenize.cc)
+target_include_directories(omph-tokenize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(omph-tokenize PRIVATE omphalos omph_warnings)
 
 add_executable(omph-gguf-info src/tools/gguf_info.cc)
 target_include_directories(omph-gguf-info PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
