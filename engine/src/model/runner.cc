@@ -544,6 +544,74 @@ bool Runner::reset_sequence() {
     return hipDeviceSynchronize() == hipSuccess || fail("reset failed");
 }
 
+size_t Runner::checkpoint_bytes() const {
+    const int64_t channels = 2 * h_.ssm_n_kh * h_.ssm_s + h_.ssm_inner;
+    const size_t per_layer = ((size_t) (h_.ssm_conv_k - 1) * channels + (size_t) h_.ssm_n_vh * h_.ssm_s * h_.ssm_s) * 4;
+    size_t bytes = 0;
+    for (int64_t il = 0; il < h_.n_layer; ++il) {
+        if (states_[(size_t) il] != nullptr) bytes += per_layer;
+    }
+    if (kv_k16_ != nullptr) {
+        const int64_t n_kv = (int64_t) std::count_if(kv_index_.begin(), kv_index_.end(),
+                                                     [](int64_t k) { return k >= 0; });
+        bytes += 2 * (size_t) n_kv * kv_window_ * h_.n_head_kv * h_.head_dim * 2;
+    }
+    if (mtp_pending_ != nullptr) bytes += (size_t) h_.n_embd * 4;
+    return bytes;
+}
+
+void * Runner::checkpoint_alloc() {
+    return mem_.host(checkpoint_bytes(), "out of pinned host memory (checkpoint)");
+}
+
+// The checkpoint's parts in order: per recurrent layer the current conv tail
+// and state, then the K and V rings, then the MTP h. `save` copies them to
+// the host buffer, else from it (into the first conv slot).
+bool Runner::checkpoint_copy(void * host, const bool save) {
+    const int64_t channels = 2 * h_.ssm_n_kh * h_.ssm_s + h_.ssm_inner;
+    const size_t conv_bytes = (size_t) (h_.ssm_conv_k - 1) * channels * 4;
+    const size_t state_bytes = (size_t) h_.ssm_n_vh * h_.ssm_s * h_.ssm_s * 4;
+    auto * at = static_cast<uint8_t *>(host);
+    const auto copy = [&](void * dev, const size_t bytes) {
+        const hipError_t e = save ? hipMemcpyAsync(at, dev, bytes, hipMemcpyDeviceToHost, nullptr)
+                                  : hipMemcpyAsync(dev, at, bytes, hipMemcpyHostToDevice, nullptr);
+        at += bytes;
+        return e == hipSuccess;
+    };
+    if (hipDeviceSynchronize() != hipSuccess) {
+        return fail("checkpoint: device error");
+    }
+    bool ok = true;
+    for (int64_t il = 0; il < h_.n_layer && ok; ++il) {
+        if (states_[(size_t) il] == nullptr) continue;
+        auto * conv = static_cast<uint8_t *>(states_[(size_t) il]);
+        ok = copy(conv + (save && conv_flip_[(size_t) il] ? conv_bytes : 0), conv_bytes) &&
+             copy(state_cur_[(size_t) il], state_bytes);
+    }
+    if (ok && kv_k16_ != nullptr) {
+        const int64_t n_kv = (int64_t) std::count_if(kv_index_.begin(), kv_index_.end(),
+                                                     [](int64_t k) { return k >= 0; });
+        const size_t ring = (size_t) n_kv * kv_window_ * h_.n_head_kv * h_.head_dim * 2;
+        ok = copy(kv_k16_, ring) && copy(kv_v16_, ring);
+    }
+    if (ok && mtp_pending_ != nullptr) {
+        ok = copy(mtp_pending_, (size_t) h_.n_embd * 4);
+    }
+    if (!ok || hipDeviceSynchronize() != hipSuccess) {
+        return fail("checkpoint: copy failed");
+    }
+    if (!save) {
+        conv_flip_.assign((size_t) h_.n_layer, 0);
+        last_toks_.clear();
+        last_pos0_ = 0;
+    }
+    return true;
+}
+
+bool Runner::checkpoint_save(void * host) { return checkpoint_copy(host, true); }
+
+bool Runner::checkpoint_restore(const void * host) { return checkpoint_copy(const_cast<void *>(host), false); }
+
 // Allocates *p on first use (the f16-path buffers, #86).
 void * Runner::lazy(void ** p, const size_t bytes) {
     if (*p == nullptr) {

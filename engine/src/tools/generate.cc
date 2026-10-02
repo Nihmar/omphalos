@@ -11,8 +11,9 @@
 //   --no-spec         no MTP speculative decoding (greedy only uses it)
 //   --no-mtp          do not load the MTP block (-352 MiB of VRAM)
 //   --ctx N           KV capacity (default 8192)
+//   --cache-mib N     host RAM for sequence checkpoints (default 2048, 0: none)
 //   --repeat N        run the same request N times (the second and later
-//                     continue nothing: the prompt does not extend the cache)
+//                     restore the checkpoint before the generation prompt, #158)
 //   --then FILE       then a second chat request from FILE (a conversation's
 //                     next turn: it continues the cached sequence when it extends it)
 #include "model/generator.hh"
@@ -63,6 +64,7 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--min-p")) req.sampling.min_p = (float) std::atof(val());
         else if (!std::strcmp(argv[i], "--seed")) req.sampling.seed = std::strtoull(val(), nullptr, 10);
         else if (!std::strcmp(argv[i], "--ctx")) cfg.context = std::atoll(val());
+        else if (!std::strcmp(argv[i], "--cache-mib")) cfg.cache_mib = std::atoll(val());
         else if (!std::strcmp(argv[i], "--repeat")) repeat = std::atoi(val());
         else if (!std::strcmp(argv[i], "--then")) then_path = val();
         else {
@@ -117,9 +119,10 @@ int main(int argc, char ** argv) {
                                            "context full", "error"};
             const double tps = res.decode_ms > 0 ? 1000.0 * (double) res.tokens.size() / res.decode_ms : 0.0;
             std::fprintf(stderr,
-                         "prompt %lld tokens (%lld cached) in %.1f ms; %zu tokens in %.1f ms (%.2f ms/token, "
-                         "%.1f t/s); drafts %lld / %lld accepted; stop: %s\n",
-                         (long long) res.prompt_tokens, (long long) res.cached_tokens, res.prefill_ms,
+                         "prompt %lld tokens (%lld cached%s) in %.1f ms (checkpoints %.1f ms); %zu tokens in "
+                         "%.1f ms (%.2f ms/token, %.1f t/s); drafts %lld / %lld accepted; stop: %s\n",
+                         (long long) res.prompt_tokens, (long long) res.cached_tokens,
+                         res.restored ? ", restored" : "", res.prefill_ms, res.checkpoint_ms,
                          res.tokens.size(), res.decode_ms,
                          res.tokens.empty() ? 0.0 : res.decode_ms / (double) res.tokens.size(), tps,
                          (long long) res.accepted, (long long) res.drafted, kStop[(int) res.stop]);

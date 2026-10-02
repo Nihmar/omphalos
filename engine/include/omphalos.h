@@ -51,6 +51,9 @@ typedef struct {
     int64_t context;         /* KV capacity in tokens (default 8192) */
     int64_t chunk;           /* prefill chunk (default 512) */
     int mtp;                 /* load the MTP block for speculative decoding (default 1) */
+    int64_t cache_mib;       /* pinned host RAM for sequence checkpoints: a prompt that
+                                diverges from the cached one resumes from the latest
+                                checkpoint before the difference (default 2048, 0: none) */
 } omph_engine_params;
 
 void omph_engine_params_default(omph_engine_params * p);
