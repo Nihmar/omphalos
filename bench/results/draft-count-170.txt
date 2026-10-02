@@ -1,0 +1,38 @@
+# #170: does the number of MTP drafts per step need to adapt? Engine a6021c1 (main, before #189's
+# change: the plain rows k = 0 still had the side stream), RX 9060 XT, 2026-10-02.
+# omph-run --gemv --generate N (128; 64 at 100k), --draft-mtp k; one run per k, the same continuation for every
+# k (outputs identical to plain greedy). ms per generated token; median verify ms per step size; median draft.
+#
+#    wiki512.txt OMPH_X=1 k=0: plain 44.67 ms/token
+#    wiki512.txt OMPH_X=1 k=1: 25.05 ms per generated token (62 / 65 drafts); verify T2 44.99 draft 3.65
+#    wiki512.txt OMPH_X=1 k=2: 19.01 ms per generated token (83 / 88 drafts); verify T3 47.22 draft 7.28
+#    wiki512.txt OMPH_X=1 k=3: 16.30 ms per generated token (93 / 102 drafts); verify T4 49.41 draft 10.94
+#    wiki512.txt OMPH_X=1 k=4: 21.62 ms per generated token (102 / 108 drafts); verify T5 86.53 draft 14.57
+#    p_25000.txt OMPH_X=1 k=0: plain 57.13 ms/token
+#    p_25000.txt OMPH_X=1 k=1: 31.14 ms per generated token (52 / 75 drafts); verify T2 47.74 draft 4.05
+#    p_25000.txt OMPH_X=1 k=2: 27.27 ms per generated token (70 / 116 drafts); verify T3 50.46 draft 8.05
+#    p_25000.txt OMPH_X=1 k=3: 26.92 ms per generated token (76 / 156 drafts); verify T4 53.00 draft 11.44
+#    p_25000.txt OMPH_X=1 k=4: 43.45 ms per generated token (77 / 204 drafts); verify T5 90.28 draft 16.14
+#    p_25000.txt OMPH_KV_K4=1 k=0: plain 56.89 ms/token
+#    p_25000.txt OMPH_KV_K4=1 k=1: 30.47 ms per generated token (54 / 74 drafts); verify T2 47.41 draft 4.03
+#    p_25000.txt OMPH_KV_K4=1 k=2: 26.25 ms per generated token (71 / 112 drafts); verify T3 50.34 draft 8.06
+#    p_25000.txt OMPH_KV_K4=1 k=3: 26.14 ms per generated token (78 / 150 drafts); verify T4 52.81 draft 12.10
+#    p_25000.txt OMPH_KV_K4=1 k=4: 41.24 ms per generated token (80 / 196 drafts); verify T5 90.23 draft 15.24
+#    p_100000.txt OMPH_X=1 k=0: plain 54.46 ms/token
+#    p_100000.txt OMPH_X=1 k=1: 33.53 ms per generated token (28 / 35 drafts); verify T2 55.19 draft 4.48
+#    p_100000.txt OMPH_X=1 k=2: 28.92 ms per generated token (37 / 52 drafts); verify T3 60.19 draft 8.94
+#    p_100000.txt OMPH_X=1 k=3: 27.11 ms per generated token (41 / 66 drafts); verify T4 62.92 draft 13.39
+#    p_100000.txt OMPH_X=1 k=4: 37.99 ms per generated token (43 / 80 drafts); verify T5 100.27 draft 17.87
+#
+# Summary, ms per generated token:
+#                    k=0 (plain)  k=1     k=2     k=3     k=4
+#    short (wiki512)   44.67      25.05   19.01   16.30   21.62
+#    25k K8/V4         57.13      31.14   27.27   26.92   43.45
+#    25k K4/V4         56.89      30.47   26.25   26.14   41.24
+#    100k K8/V4        54.46      33.53   28.92   27.11   37.99
+#
+# k = 3 is the best or tied (25k K4/V4: 26.14 vs 26.25 for k = 2) everywhere, and speculation is never
+# slower than plain greedy since #169 / #172. k = 4 loses: a 5-token verification has no NT = 5 GEMVs
+# (86-100 ms vs 49-63 for 4 tokens). Acceptance varies with the content (25k: 50 % at k = 3; short: 91 %),
+# but even at 50 % k = 3 holds. An adaptive k would gain under ~1-2 %: not implemented.
+# (The k = 0 rows carry the side stream's bimodality fixed in #189: 25k 57.1 was a slow-side-stream run.)
