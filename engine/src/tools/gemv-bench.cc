@@ -28,14 +28,15 @@ int fail(const char * msg) {
     return 1;
 }
 
-bool repack_tensor(const uint32_t type, const void * src, const int64_t n_blocks,
-                    std::vector<uint8_t> & dst) {
-    return omph::format::repack_any(type, src, n_blocks, dst);
+// the engine's layout of the type (what omph-convert stores, #178)
+bool repack_tensor(const uint32_t type, const void * src, const int64_t rows, const int64_t k,
+                   std::vector<uint8_t> & dst) {
+    return omph::format::to_engine_layout(type, src, rows, k, dst);
 }
 
-bool unrepack_tensor(const uint32_t type, const void * src, const int64_t n_blocks,
+bool unrepack_tensor(const uint32_t type, const void * src, const int64_t rows, const int64_t k,
                      std::vector<uint8_t> & dst) {
-    return omph::format::unrepack_any(type, src, n_blocks, dst);
+    return omph::format::from_engine_layout(type, src, rows, k, dst);
 }
 
 struct Case {
@@ -60,8 +61,9 @@ bool launch(const Case & c, const void * x, float * y, hipStream_t stream) {
     if (g_gemm > 0) {
         return omph::kernels::gemm_q(c.t->type, c.dev, g_gx, g_gy, c.rows, c.k, g_gemm, c.rows, stream);
     }
-    if (g_nt > 1) {
-        return omph::kernels::gemv_multi(c.t->type, c.dev, x, g_ny, c.rows, c.k, g_nt, stream);
+    if (g_nt > 1) {  // one launch for up to 16 tokens where a type has it (#178)
+        return omph::kernels::gemv_tokens(c.t->type, c.dev, x, g_ny, c.rows, c.k, g_nt, stream) ||
+               omph::kernels::gemv_multi(c.t->type, c.dev, x, g_ny, c.rows, c.k, g_nt, stream);
     }
     if (c.t->type == 12) {
         return omph::kernels::gemv_q4k(c.dev, x, y, c.rows, c.k, stream);
@@ -104,8 +106,9 @@ bool prepare(const omph::gguf::File & file, const omph::gguf::TensorInfo * t, Ca
     const int64_t n_blocks = rows * (k / 256);
     std::vector<uint8_t> host;
     std::vector<uint8_t> rebuilt((size_t) t->nbytes);
-    if (!repack_tensor(t->type, file.tensor_data(*t), n_blocks, host) ||
-        !unrepack_tensor(t->type, host.data(), n_blocks, rebuilt)) {
+    (void) n_blocks;
+    if (!repack_tensor(t->type, file.tensor_data(*t), rows, k, host) ||
+        !unrepack_tensor(t->type, host.data(), rows, k, rebuilt)) {
         return false;
     }
     if (std::memcmp(rebuilt.data(), file.tensor_data(*t), (size_t) t->nbytes) != 0) {
@@ -251,8 +254,9 @@ int main(int argc, char ** argv) {
                 const int64_t n_blocks = (int64_t) (t.nbytes / (uint64_t) bb);
                 std::vector<uint8_t> packed;
                 std::vector<uint8_t> rebuilt((size_t) t.nbytes);
-                if (!repack_tensor(t.type, file.tensor_data(t), n_blocks, packed) ||
-                    !unrepack_tensor(t.type, packed.data(), n_blocks, rebuilt)) {
+                (void) n_blocks;
+                if (!repack_tensor(t.type, file.tensor_data(t), (int64_t) t.ne[1], (int64_t) t.ne[0], packed) ||
+                    !unrepack_tensor(t.type, packed.data(), (int64_t) t.ne[1], (int64_t) t.ne[0], rebuilt)) {
                     std::fprintf(stderr, "unsupported type for %s\n", t.name.c_str());
                     return 1;
                 }
@@ -323,12 +327,12 @@ int main(int argc, char ** argv) {
         void * dev_x = nullptr;
         void * dev_y = nullptr;
         void * dev_act32 = nullptr;
-        if (hipMalloc(&dev_x, (size_t) kmax * 4 * 2) != hipSuccess ||
+        if (hipMalloc(&dev_x, (size_t) kmax * 16 * 2) != hipSuccess ||
             hipMalloc(&dev_y, (size_t) (rmax + kCanary) * 4) != hipSuccess ||
-            hipMalloc(&dev_act32, (size_t) kmax * 4 * 4) != hipSuccess) {
+            hipMalloc(&dev_act32, (size_t) kmax * 16 * 4) != hipSuccess) {
             return fail("out of VRAM");
         }
-        std::vector<float> act((size_t) kmax * 4);
+        std::vector<float> act((size_t) kmax * 16);  // up to 16 tokens (--nt, --multi)
         uint32_t rng = 12345u;
         for (float & a : act) {
             rng = rng * 1664525u + 1013904223u;
@@ -423,21 +427,28 @@ int main(int argc, char ** argv) {
             void * xn = nullptr;
             void * y1 = nullptr;
             void * yn = nullptr;
-            if (hipMalloc(&xn, (size_t) c.k * 4 * 2) != hipSuccess ||
+            if (hipMalloc(&xn, (size_t) c.k * 16 * 2) != hipSuccess ||
                 hipMalloc(&y1, (size_t) c.rows * 4) != hipSuccess ||
-                hipMalloc(&yn, (size_t) c.rows * 4 * 4) != hipSuccess) {
+                hipMalloc(&yn, (size_t) c.rows * 16 * 4) != hipSuccess) {
                 return fail("out of VRAM (multi)");
             }
-            for (int t = 0; t < 4; ++t) {
+            for (int t = 0; t < 16; ++t) {
                 (void) hipMemcpy(static_cast<uint8_t *>(xn) + (size_t) t * c.k * 2,
                                  static_cast<uint8_t *>(dev_x) + (size_t) t * kmax * 2,
                                  (size_t) c.k * 2, hipMemcpyDeviceToDevice);
             }
             const double t1 = time_ms(cases, dev_x, (float *) dev_y, iters, nullptr);
             int bad = 0;
-            for (int nt = 2; nt <= 4; ++nt) {
-                if (!omph::kernels::gemv_multi(c.t->type, c.dev, xn, (float *) yn, c.rows, c.k, nt,
-                                               nullptr)) {
+            // the tile types: 1..16 tokens in one launch (#178); the others 2..4
+            const auto call = [&](const int nt) {
+                return omph::kernels::gemv_tokens(c.t->type, c.dev, xn, (float *) yn, c.rows, c.k, nt, nullptr) ||
+                       omph::kernels::gemv_multi(c.t->type, c.dev, xn, (float *) yn, c.rows, c.k, nt, nullptr);
+            };
+            const int max_nt = omph::kernels::gemv_tokens(c.t->type, c.dev, xn, (float *) yn, c.rows, c.k, 16,
+                                                          nullptr) ? 16 : 4;
+            (void) hipGetLastError();
+            for (int nt = 2; nt <= max_nt; ++nt) {
+                if (!call(nt)) {
                     std::printf("multi %d: not supported for type %u\n", nt, c.t->type);
                     return 1;
                 }
@@ -446,8 +457,7 @@ int main(int argc, char ** argv) {
                 (void) hipEventCreate(&e1);
                 (void) hipEventRecord(e0, nullptr);
                 for (int i = 0; i < iters; ++i) {
-                    (void) omph::kernels::gemv_multi(c.t->type, c.dev, xn, (float *) yn, c.rows,
-                                                     c.k, nt, nullptr);
+                    (void) call(nt);
                 }
                 (void) hipEventRecord(e1, nullptr);
                 (void) hipDeviceSynchronize();
@@ -478,7 +488,7 @@ int main(int argc, char ** argv) {
             }
             return bad == 0 ? 0 : 1;
         }
-        if (g_nt > 1 && hipMalloc(&g_ny, (size_t) rmax * 4 * 4) != hipSuccess) {
+        if (g_nt > 1 && hipMalloc(&g_ny, (size_t) rmax * g_nt * 4) != hipSuccess) {
             return fail("out of VRAM (--nt)");
         }
         if (g_gemm > 0) {

@@ -138,10 +138,10 @@ __global__ __launch_bounds__(256) void k_wil(const uint8_t * __restrict__ wt, co
 #pragma unroll
     for (int v = 0; v < 8; ++v) red[wv][h * 8 + v][t] = acc[v];
     __syncthreads();
-    if (tid < TILES * 16 * NT) {
-        const int tt2 = tid / (16 * NT);
-        const int m = (tid / NT) % 16;
-        const int tt = tid % NT;
+    for (int idx = tid; idx < TILES * 16 * NT; idx += blockDim.x) {
+        const int tt2 = idx / (16 * NT);
+        const int m = (idx / NT) % 16;
+        const int tt = idx % NT;
         float sum = red[tt2 * KW][m][tt];
 #pragma unroll
         for (int i = 1; i < KW; ++i) sum += red[tt2 * KW + i][m][tt];
