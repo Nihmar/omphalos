@@ -73,7 +73,8 @@ cmake --build /var/tmp/omphalos-llama-cpu -j --target mtmd llama
 cmake -S engine -B engine/build -DOMPH_LLAMA_DIR=<llama.cpp> -DOMPH_LLAMA_LIB=/var/tmp/omphalos-llama-cpu/bin
 
 # convert the GGUF once (#178): weights repacked into the kernels' layouts and verified bit for bit,
-# the metadata (tokenizer, chat template) copied, the source SHA-256 recorded; ~1 min, 11.3 GiB
+# the metadata (tokenizer, chat template) copied, the source SHA-256 recorded; ~1 min, 11.3 GiB.
+# The engine refuses an .omph of another format version (IQ3_S tiles: format 2): reconvert
 engine/build/omph-convert <model.gguf> [<model.omph>]
 
 # tokenizer (#148): text on stdin -> ids, or --decode ids -> text (reads a .gguf or an .omph)
@@ -200,7 +201,7 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_SKIP_ATTN` / `OMPH_SKIP_FFN` / `OMPH_SKIP_BLOCKS` | ablation | no attention / no FFN / no blocks at all |
 | `OMPH_SKIP_GEMV` / `OMPH_SKIP_GEMV_TYPE=T` / `OMPH_SKIP_STAGE` | ablation | no fused GEMVs / none of GGUF type T / no f16 + GEMM matmuls |
 
-`omph-gemv-bench <model> --all-of-type T [--nt N] [--gemm T]` times every tensor of a GGUF type back to back (1 s warm-up; `--nt N`: the N-token verification kernels, #63; `--gemm T`: the prefill's fused dequant + WMMA GEMM on T tokens, with its TFLOPS, #208); it reads two switches of its own: `OMPH_BENCH_STREAMS=N` (alternate launches over N streams) and `OMPH_OCCUPANCY` (print the occupancy probe).
+`omph-gemv-bench <model> --all-of-type T [--nt N] [--gemm T]` times every tensor of a GGUF type back to back (1 s warm-up; `--nt N`: the N-token verification kernels, #63, 2..4, or 2..16 for IQ3_S's tiles, #178; `--multi`: each token of an N-token call against the 1-token call; `--gemm T`: the prefill's fused dequant + WMMA GEMM on T tokens, with its TFLOPS, #208); it reads two switches of its own: `OMPH_BENCH_STREAMS=N` (alternate launches over N streams) and `OMPH_OCCUPANCY` (print the occupancy probe).
 
 ## Working agreements
 

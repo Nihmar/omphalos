@@ -104,6 +104,11 @@ bool Runner::matmul(const Mat & m, const void * x16, float * y, const int64_t n_
         const auto * xb = static_cast<const uint8_t *>(x16);
         // NT-token kernels (#126): groups of up to four tokens per weight read,
         // a remainder of 2 or 3 included; a type without them falls through.
+        // WMMA tile kernels (IQ3_S, #178): every token count up to 16 in one launch
+        if (!env_.no_b4 && omph::kernels::gemv_tokens(g->type, w, xb, y, n_out, k, (int) T, gemv_stream_)) {
+            return true;
+        }
+        (void) hipGetLastError();
         if (!env_.no_b4) {
             timer_gemv_.start(gemv_stream_);
             bool ok = true;

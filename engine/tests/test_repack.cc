@@ -82,6 +82,24 @@ int main() {
     }
     std::vector<uint8_t> out;
     CHECK(!omph::format::repack_any(0, nullptr, 1, out), "F32 has no repacked layout");
+    // the engine's layouts (#178): IQ3_S tiles round trip, rows a multiple of 16
+    for (const uint32_t type : types) {
+        for (const int64_t rows : {16, 48}) {
+            const int64_t k = 512;
+            const int64_t bb = omph::format::quant_block_bytes(type);
+            std::vector<uint8_t> src((size_t) (rows * (k / 256) * bb));
+            for (auto & c : src) c = (uint8_t) rng();
+            std::vector<uint8_t> lay, back;
+            const bool ok = omph::format::to_engine_layout(type, src.data(), rows, k, lay);
+            CHECK(ok && (int64_t) lay.size() == omph::format::engine_layout_bytes(type, rows, k),
+                  "%s: engine layout size", name_of(type));
+            CHECK(omph::format::from_engine_layout(type, lay.data(), rows, k, back) && back == src,
+                  "%s (%lld rows): engine layout round trip", name_of(type), (long long) rows);
+        }
+    }
+    CHECK(omph::format::engine_layout(21) == 2 && omph::format::iq3s_tiles_bytes(16, 2) == 2 * 1760,
+          "IQ3_S takes the tiles, 1760 bytes per tile and block");
+    CHECK(omph::format::engine_layout_bytes(21, 8, 512) == 0, "IQ3_S tiles need rows %% 16 == 0");
     std::printf("test_repack: %d failure(s)\n", omph_test::failures);
     return omph_test::failures == 0 ? 0 : 1;
 }

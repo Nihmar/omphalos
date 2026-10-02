@@ -1,0 +1,35 @@
+IQ3_S on the WMMA tile layout (#178, M9 stage C), engine 20e209a vs main a470297
+RX 9060 XT (gfx1200), Qwen3.8-27B GSQ-RCO IQ3_S + MTP, .omph format 2 (tiles) vs format 1 (repack)
+
+Layout (layout id 2, format/repack.hh): 16-row tiles x one 256-weight block = 1760 B
+(qs 1024, signs 512, qh 128, scales 64, d 32), each lane's bytes contiguous as the
+WMMA A operand loads them. Lossless: omph-convert rebuilds the GGUF bytes from every tile.
+One kernel family: the GEMV for 1..16 tokens in one launch (decode, verification), the
+GEMM for prefill chunks.
+
+Kernels, all IQ3_S tensors back to back (omph-gemv-bench --all-of-type 21, 3474 MiB)
+                     main (repack)   tiles
+  1 token            12.92 ms        12.92 ms  (88.6% of the measured 318 GB/s)
+  4 tokens (--nt 4)  14.45 ms        13.29 ms
+  8 tokens           -               13.32 ms
+  16 tokens          -               13.53 ms
+  GEMM, 512 tokens   50.3 TFLOPS     52.8 TFLOPS
+  --multi: every token of a 2..16-token call equals the 1-token call bit for bit (max|d| 0)
+
+End to end (OMPH_TIMING, ms per generated token, 5 alternating runs each, median)
+                     main    tiles
+  plain greedy       44.17   44.04
+  speculative (k=3)  16.88   16.62
+  prefill 4k tokens  ~4767   ~4748 ms
+
+Decode quality: 64 decode steps with the f32-KV run's greedy tokens forced in
+(compare_logits.py, mean KL against the f32-KV reference)
+  main (Q8/Q4 KV)        0.00087
+  tiles (Q8/Q4 KV)       0.00110
+  tiles + OMPH_KV_F32    0.00012
+  main vs tiles          0.00034
+  top-1 agreement 100% in every pair. The weights are bit-identical; the difference is the
+  accumulation order (WMMA k order) under the quantized KV cache.
+
+Checks: check_gpu_run --layers, check_gpu_decode --gemv, check_gpu_mtp, check_server PASS;
+speculative = plain greedy in every KV mode (15/15); CPU tests pass.

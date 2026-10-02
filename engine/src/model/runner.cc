@@ -75,11 +75,13 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 std::memcpy(embd_host_, file_.tensor_data(t), (size_t) t.nbytes);
                 continue;
             }
-            if (t.layout == omph::gguf::kLayoutRepack) {
-                const int64_t bb = omph::format::quant_block_bytes(t.type);
-                if (bb <= 0 || t.nbytes % (uint64_t) bb != 0 ||
-                    t.stored != (uint64_t) omph::format::repacked_bytes(t.type, (int64_t) (t.nbytes / (uint64_t) bb))) {
-                    throw std::runtime_error(t.name + ": stored size does not match the repacked layout");
+            if (t.layout != omph::gguf::kLayoutGguf) {
+                // the engine's layout of the type (format/repack.hh): IQ3_S tiles, else the repack
+                const int64_t k = (int64_t) t.ne[0];
+                const int64_t rows = t.ne.size() >= 2 ? (int64_t) t.ne[1] : 1;
+                if (t.layout != omph::format::engine_layout(t.type) ||
+                    t.stored != (uint64_t) omph::format::engine_layout_bytes(t.type, rows, k)) {
+                    throw std::runtime_error(t.name + ": not in this engine's layout (reconvert with omph-convert)");
                 }
                 GemvEntry e;
                 e.off = total;
@@ -88,8 +90,6 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 e.k = (int64_t) t.ne[0];
                 e.type = t.type;
                 gems_[t.name] = e;
-            } else if (t.layout != omph::gguf::kLayoutGguf) {
-                throw std::runtime_error(t.name + ": unknown layout " + std::to_string(t.layout));
             }
             places.push_back({&t, total});
             total += ((size_t) t.stored + 255) & ~(size_t) 255;

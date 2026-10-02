@@ -221,4 +221,34 @@ Iq2sLayout iq2s_layout(int64_t n_blocks);
 void repack_iq2_s(const void * src, int64_t n_blocks, void * dst);
 void unrepack_iq2_s(const void * src, int64_t n_blocks, void * dst);
 
+// ------------------------------------------------------------- IQ3_S tiles
+//
+// IQ3_S for the WMMA GEMVs and GEMM (#178, M9 stage C): built on the layout
+// above (pair-ordered signs), in 16-row tiles. Per tile and 256-weight block,
+// 1760 bytes (the 16 GGUF blocks' size), for the 32 lanes of a WMMA wave
+// (lane l: row l % 16, half h = l / 16, which takes weights 16 h .. 16 h + 15
+// of each sub-block):
+//   [ qs     ] 1024 B  lane l: 32 B, sub-block sb's qs word h at 4 sb
+//   [ signs  ]  512 B  lane l: 16 B, sub-block sb's sign bytes (h = 0: bytes
+//                      1, 3; h = 1: bytes 0, 2 of the pair-ordered word) at 2 sb
+//   [ qh     ]  128 B  lane l: 4 B, sub-block sb's qh nibble h at bits 4 sb
+//   [ scales ]   64 B  row r: the block's 4 scale bytes
+//   [ d      ]   32 B  row r: the block's f16 scale
+// Rows a multiple of 16. Lossless: unrepack rebuilds the GGUF bytes.
+constexpr int64_t kIq3sTileBytes = 1760;
+int64_t iq3s_tiles_bytes(int64_t rows, int64_t blocks_per_row);
+bool repack_iq3_s_tiles(const void * gguf, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
+bool unrepack_iq3_s_tiles(const void * tiles, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
+
+// ------------------------------------------------------- the engine's layout
+//
+// The layout the engine's kernels read a tensor of `type` in (format version 2,
+// #178): 2 (IQ3_S tiles) for IQ3_S, 1 (the repacked layout above) for the other
+// types with one, 0 (the GGUF bytes) otherwise; its size, and the conversions
+// both ways (rows x k weights, row-major).
+uint32_t engine_layout(uint32_t type);
+int64_t engine_layout_bytes(uint32_t type, int64_t rows, int64_t k);
+bool to_engine_layout(uint32_t type, const void * gguf, int64_t rows, int64_t k, std::vector<uint8_t> & dst);
+bool from_engine_layout(uint32_t type, const void * src, int64_t rows, int64_t k, std::vector<uint8_t> & gguf);
+
 } // namespace omph::format

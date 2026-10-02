@@ -3,6 +3,7 @@
 #include <array>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 namespace omph::format {
 namespace {
@@ -721,6 +722,144 @@ void unrepack_iq2_s(const void * src, const int64_t n_blocks, void * dst) {
         std::memcpy(out[b].qh, in + l.qh_off + b * 8, 8);
         std::memcpy(out[b].scales, in + l.sc_off + b * 8, 8);
         std::memcpy(&out[b].d, in + l.d_off + 2 * b, 2);
+    }
+}
+
+// ------------------------------------------------------------- IQ3_S tiles
+
+int64_t iq3s_tiles_bytes(const int64_t rows, const int64_t blocks_per_row) {
+    return rows % 16 == 0 ? rows / 16 * blocks_per_row * kIq3sTileBytes : 0;
+}
+
+bool repack_iq3_s_tiles(const void * gguf, const int64_t rows, const int64_t blocks, std::vector<uint8_t> & dst) {
+    if (rows % 16 != 0 || blocks <= 0) {
+        return false;
+    }
+    const int64_t n_blocks = rows * blocks;
+    const Iq3sLayout l = iq3s_layout(n_blocks);
+    std::vector<uint8_t> r((size_t) l.total);
+    repack_iq3_s(gguf, n_blocks, r.data());
+    const uint8_t * qs = r.data() + l.qs_off;
+    const uint8_t * qh = r.data() + l.qh_off;
+    const uint8_t * sg = r.data() + l.signs_off;
+    const uint8_t * sc = r.data() + l.scales_off;
+    const uint8_t * d = r.data() + l.d_off;
+    dst.assign((size_t) iq3s_tiles_bytes(rows, blocks), 0);
+    for (int64_t tile = 0; tile < rows / 16; ++tile) {
+        for (int64_t b = 0; b < blocks; ++b) {
+            uint8_t * o = dst.data() + (tile * blocks + b) * kIq3sTileBytes;
+            for (int l2 = 0; l2 < 32; ++l2) {
+                const int64_t row = tile * 16 + (l2 & 15);
+                const int h = l2 >> 4;
+                uint32_t qhw = 0;
+                for (int sb = 0; sb < 8; ++sb) {
+                    const int64_t s = (row * blocks + b) * 8 + sb;
+                    std::memcpy(o + l2 * 32 + sb * 4, qs + s * 8 + h * 4, 4);
+                    const uint8_t * w = sg + s * 4;
+                    o[1024 + l2 * 16 + sb * 2] = h == 0 ? w[1] : w[0];
+                    o[1024 + l2 * 16 + sb * 2 + 1] = h == 0 ? w[3] : w[2];
+                    qhw |= (uint32_t) ((qh[s] >> (4 * h)) & 0xF) << (4 * sb);
+                }
+                std::memcpy(o + 1536 + l2 * 4, &qhw, 4);
+            }
+            for (int rr = 0; rr < 16; ++rr) {
+                const int64_t row = tile * 16 + rr;
+                std::memcpy(o + 1664 + rr * 4, sc + (row * blocks + b) * 4, 4);
+                std::memcpy(o + 1728 + rr * 2, d + (row * blocks + b) * 2, 2);
+            }
+        }
+    }
+    return true;
+}
+
+bool unrepack_iq3_s_tiles(const void * tiles, const int64_t rows, const int64_t blocks, std::vector<uint8_t> & dst) {
+    if (rows % 16 != 0 || blocks <= 0) {
+        return false;
+    }
+    const int64_t n_blocks = rows * blocks;
+    const Iq3sLayout l = iq3s_layout(n_blocks);
+    std::vector<uint8_t> r((size_t) l.total, 0);
+    uint8_t * qs = r.data() + l.qs_off;
+    uint8_t * qh = r.data() + l.qh_off;
+    uint8_t * sg = r.data() + l.signs_off;
+    uint8_t * sc = r.data() + l.scales_off;
+    uint8_t * d = r.data() + l.d_off;
+    const auto * in = static_cast<const uint8_t *>(tiles);
+    for (int64_t tile = 0; tile < rows / 16; ++tile) {
+        for (int64_t b = 0; b < blocks; ++b) {
+            const uint8_t * o = in + (tile * blocks + b) * kIq3sTileBytes;
+            for (int l2 = 0; l2 < 32; ++l2) {
+                const int64_t row = tile * 16 + (l2 & 15);
+                const int h = l2 >> 4;
+                uint32_t qhw = 0;
+                std::memcpy(&qhw, o + 1536 + l2 * 4, 4);
+                for (int sb = 0; sb < 8; ++sb) {
+                    const int64_t s = (row * blocks + b) * 8 + sb;
+                    std::memcpy(qs + s * 8 + h * 4, o + l2 * 32 + sb * 4, 4);
+                    uint8_t * w = sg + s * 4;
+                    w[h == 0 ? 1 : 0] = o[1024 + l2 * 16 + sb * 2];
+                    w[h == 0 ? 3 : 2] = o[1024 + l2 * 16 + sb * 2 + 1];
+                    qh[s] = (uint8_t) (qh[s] | (((qhw >> (4 * sb)) & 0xF) << (4 * h)));
+                }
+            }
+            for (int rr = 0; rr < 16; ++rr) {
+                const int64_t row = tile * 16 + rr;
+                std::memcpy(sc + (row * blocks + b) * 4, o + 1664 + rr * 4, 4);
+                std::memcpy(d + (row * blocks + b) * 2, o + 1728 + rr * 2, 2);
+            }
+        }
+    }
+    dst.assign((size_t) n_blocks * 110, 0);
+    unrepack_iq3_s(r.data(), n_blocks, dst.data());
+    return true;
+}
+
+// ------------------------------------------------------- the engine's layout
+
+uint32_t engine_layout(const uint32_t type) {
+    if (type == 21) {
+        return 2;
+    }
+    return repacked_bytes(type, 1) > 0 ? 1 : 0;
+}
+
+int64_t engine_layout_bytes(const uint32_t type, const int64_t rows, const int64_t k) {
+    const int64_t bb = quant_block_bytes(type);
+    if (bb <= 0 || k % 256 != 0) {
+        return 0;
+    }
+    switch (engine_layout(type)) {
+        case 2: return iq3s_tiles_bytes(rows, k / 256);
+        case 1: return repacked_bytes(type, rows * (k / 256));
+        default: return 0;
+    }
+}
+
+bool to_engine_layout(const uint32_t type, const void * gguf, const int64_t rows, const int64_t k,
+                      std::vector<uint8_t> & dst) {
+    if (k % 256 != 0) {
+        return false;
+    }
+    switch (engine_layout(type)) {
+        case 2: return repack_iq3_s_tiles(gguf, rows, k / 256, dst);
+        case 1: return repack_any(type, gguf, rows * (k / 256), dst);
+        default: return false;
+    }
+}
+
+bool from_engine_layout(const uint32_t type, const void * src, const int64_t rows, const int64_t k,
+                        std::vector<uint8_t> & gguf) {
+    if (k % 256 != 0) {
+        return false;
+    }
+    switch (engine_layout(type)) {
+        case 2: return unrepack_iq3_s_tiles(src, rows, k / 256, gguf);
+        case 1: {
+            const int64_t n_blocks = rows * (k / 256);
+            gguf.assign((size_t) (n_blocks * quant_block_bytes(type)), 0);
+            return unrepack_any(type, src, n_blocks, gguf);
+        }
+        default: return false;
     }
 }
 

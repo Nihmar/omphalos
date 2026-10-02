@@ -529,7 +529,12 @@ Codebook tables (**[verify]** sizes): IQ2_XS grid 512 × 8 B, IQ2_S grid 1024 ×
 - **The engine** uploads the stored bytes as they are. Outputs are bit-identical to the GGUF + load-time repack path, and a 3-token run takes 0.89 s instead of 1.45 s.
 - **llama.cpp's mtmd** gets the vocabulary from a temporary tensor-less GGUF made from the copied metadata.
 
-**Next (M9 stage C):** the WMMA tile layouts of #178 / `bench/gemv/iq3s_wil.hip`, type by type, as new layout ids. One layout and one kernel family then serve decode (1 token), verification (2-16) and prefill (GEMM).
+**M9 stage C (in progress):** the WMMA tile layouts of #178 / `bench/gemv/iq3s_wil.hip`, type by type, as new layout ids (`omph.format_version` 2). One layout and one kernel family then serve decode (1 token), verification (2-16) and prefill (GEMM).
+- **IQ3_S (layout 2) is done.** Its 16-row tiles x 256-weight blocks are 1760 B, with each lane's bytes contiguous as the WMMA A operand loads them.
+  - The GEMV takes 1..16 tokens in one launch, and each token's output is bit-identical to the 1-token call. Verification of 4 tokens: 14.45 -> 13.29 ms over all IQ3_S tensors.
+  - The GEMM reaches 50.3 -> 52.8 TFLOPS.
+  - End to end: plain 44.17 -> 44.04 ms and speculative 16.88 -> 16.62 ms per token (`bench/results/iq3s-tiles-178.txt`).
+- **Next:** IQ4_XS, IQ3_XXS, Q4_K, the 2-bit types and Q6_K.
 
 ---
 
