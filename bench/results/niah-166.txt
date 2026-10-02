@@ -1,0 +1,32 @@
+# Needle in a haystack (#166): omphalos vs llama.cpp, K8/V4 and K4/V4. tools/niah.py, seed 166, one haystack per
+# length (wikitext-2 train), four needles at 25/50/75/100 % + 12 distractors, greedy, thinking off.
+# omphalos: engine 2d49be3 + #166 (main d6ec3ee has the same engine), omph-server --ctx 106496, MTP on (speculative
+# greedy). llama.cpp: the RX9060XT fork, build-hip, llama-server -c 106496 -ngl 999 -fa on -np 1, -ctk q8_0|q4_0
+# -ctv q4_0. Prefill = the first question of a haystack (the whole prompt); the next three questions reuse the
+# cached haystack (omphalos: a checkpoint, 34 tokens prefilled; llama.cpp: its context checkpoints, 516 tokens).
+# Decode = the answer (a short code, ~8 tokens): mean over the four questions. VRAM = device total, peak per
+# haystack (sysfs every 0.1 s, the desktop's ~0.2 GiB included). Single runs.
+#
+# engine    KV     length  found  prefill t/s (s)    decode t/s  VRAM peak MiB
+# omphalos  k8q4    25296  4/4      669 (   38)        46.4       15075
+# omphalos  k8q4    50635  4/4      545 (   93)        40.6       15075
+# omphalos  k8q4    75346  4/4      459 (  164)        33.7       15075
+# omphalos  k8q4   100721  4/4      395 (  255)        27.3       15124
+# omphalos  k4q4    25296  4/4      664 (   38)        46.3       14581
+# omphalos  k4q4    50635  4/4      538 (   94)        40.2       14686
+# omphalos  k4q4    75346  4/4      457 (  165)        33.5       14602
+# omphalos  k4q4   100721  4/4      389 (  259)        26.8       14687
+# llama     k8q4    25296  4/4      537 (   47)        18.3       15324
+# llama     k8q4    50635  4/4      480 (  106)        16.0       15508
+# llama     k8q4    75346  4/4      438 (  172)        14.0       15321
+# llama     k8q4   100721  4/4      402 (  250)        12.6       15376
+# llama     k4q4    25296  4/4      540 (   47)        15.1       14510
+# llama     k4q4    50635  4/4      484 (  105)        11.0       14548
+# llama     k4q4    75346  4/4      439 (  172)         9.0       14600
+# llama     k4q4   100721  4/4      402 (  250)         7.6       14760
+#
+# All 64 needles found by both engines with both caches; no distractor answered.
+# Caveats: omphalos decodes speculatively (MTP), llama.cpp plain; the answers are short, so the decode figures mix
+# the first step's cost with few tokens. At 100k llama.cpp's prefill (402 t/s) is level with omphalos' (389-395):
+# omphalos' lead at short context (669 vs 537 at 25k) is lost to long-context attention (#173).
+# Per-question rows (answers, timings, VRAM): bench/results/niah-166.jsonl.
