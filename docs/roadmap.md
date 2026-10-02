@@ -42,11 +42,10 @@ VRAM figures are the device total (the desktop's ~0.15-0.2 GiB included).
    decode (80 ms/token) is slower than plain greedy (66). The verification
    tile computes 24 rows (4 tokens x 6 query heads) with scalar FMAs: at
    short context attention is negligible and this does not show.
-3. **MTP acceptance drops with the context length:** 81 % of the drafts on
-   wiki1000, 49 % after 81k tokens, 33 % after 112k. The MTP KV is filled for
-   every prefill chunk (checked); either the content differs, or the MTP
-   block degrades at long context (its cache has no FP16 ring; its training
-   context is unknown).
+3. **MTP acceptance does not drop with the context length** (#168): on the
+   same text, the full 60k / 90k / 112k context accepts 53 / 60 / 51 % of the
+   drafts, the last 1000 tokens alone 58 / 49 / 67 %. The content decides;
+   the step cost is what grows (45-60 vs 23-28 ms/token).
 4. **The MTP prefill pass is cheap but not free:** +0.3 % of the prefill at
    112k, +0.7 % at 81k, +1.1-1.5 % at short context (a KV-only pass).
 5. **Prefill attention at long context** runs at ~15 TFLOPS effective vs
@@ -54,8 +53,14 @@ VRAM figures are the device total (the desktop's ~0.15-0.2 GiB included).
    again (32 times per 512-token chunk).
 6. **K4/V4** found every needle, as K8/V4 did, and saves ~0.9 GB at 110k,
    but its KL measured in #81 is over the q8_0/q4_0 budget.
-7. **Host <-> device copies** ran at 3.3 GB/s once (#158); to be re-checked
-   (#176), possibly a one-off power state.
+7. **Host <-> device copies** ran at 3.3 GB/s (the link trained at
+   2.5 GT/s); after the maintainer's fix 27.7 GB/s at PCIe 4.0 x16 (#176):
+   a checkpoint restores in 7.6 ms instead of 51.4.
+8. **Measured where the time goes** (#167, `bench/results/phase0-long-context-167.txt`):
+   the verification attention costs 3.8x the single-token attention on the
+   same keys (77 ms per step at 100k, more than all the GEMVs together); the
+   single-token attention reaches 40 % of the bandwidth; the prefill's WMMA
+   attention is 25 / 40 / 57 % of the prefill at 25k / 50k / 100k.
 
 ## 3. The plan
 
@@ -69,6 +74,9 @@ VRAM figures are the device total (the desktop's ~0.15-0.2 GiB included).
 | #176 | re-run the host <-> device bandwidth probe | confirm or retire the 3.3 GB/s figure |
 
 Hypotheses that phase 0 does not confirm are dropped before any code.
+Done 2026-10-02: the three attention hypotheses are confirmed (#167); the
+MTP acceptance hypothesis is not (#168: content, not context length); the
+PCIe link is fixed (#176).
 
 ### Phase A: speculation at long context (the largest expected gain)
 

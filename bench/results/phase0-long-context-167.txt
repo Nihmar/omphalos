@@ -1,0 +1,48 @@
+# Roadmap phase 0 (#167, #168, #176): where the time goes at long context. Engine 3a03f99 (main), 2026-10-02.
+# RX 9060 XT, PCIe 4.0 x16 after the maintainer's fix (27.7 GB/s).
+#
+# 1. Kernel trace (rocprofv3 --kernel-trace; tools/profile_trace.py), omph-run on the first N wikitext-2 train
+#    tokens, --gemv --generate 12 --draft-mtp 3: the prefill, then 12 speculative tokens.
+#
+#    context                                   25k        50k        100k
+#    prefill kernel time                       36.9 s     90.4 s     250.3 s
+#      WMMA attention                          25.3 %     40.0 %     57.0 %
+#      fused GEMM (gemm_q)                     60.6 %     48.8 %     34.9 %
+#    decode: verification attention (T = 4), per layer call
+#                                              1.27 ms    2.40 ms    4.78 ms
+#    decode: single-token attention (the MTP drafts), per call
+#                                              0.33 ms    0.64 ms    1.28 ms
+#    KV bytes per layer (1664 B per position)  41.6 MB    83.2 MB    166 MB
+#    effective bandwidth, single token         126 GB/s   130 GB/s   130 GB/s   (40 % of 318)
+#    effective bandwidth, verification          33 GB/s    35 GB/s    35 GB/s
+#    attention share of the decode kernel time 25.7 %     39.5 %     56.6 %
+#    verification attention per step (16 layers) 20 ms    38 ms      77 ms     (all GEMVs together: ~43 ms)
+#
+#    The verification tile (4 tokens x 6 heads, scalar FMAs) costs 3.8x the single-token attention on the
+#    same keys (#169); the single-token attention reaches 40 % of the bandwidth (#172); the prefill's WMMA
+#    attention passes the GEMM between 50k and 100k (#173).
+#
+#    Step totals (OMPH_TIMING median of 33 plain steps; speculative over 64 tokens):
+#    context   plain step gpu   speculative ms/token (accepted)
+#    25k       50.30            36.86 (36 / 81)
+#    50k       55.23            48.25 (35 / 87)
+#    100k      65.28            49.90 (41 / 66)
+#    The OMPH_SKIP_ATTN ablation gave ~52 ms at every length, above the 25k plain step: not used.
+#
+# 2. MTP acceptance (#168): the same text, the full context vs only the last 1000 tokens before the cut;
+#    omph-generate --prompt-ids --max 128 (speculative, k = 3).
+#    cut     full context                    last 1000 tokens
+#    60k     80 / 150 = 53 %, 45.5 ms/token   82 / 141 = 58 %, 25.4 ms/token
+#    90k     83 / 138 = 60 %, 49.6 ms/token   77 / 156 = 49 %, 28.0 ms/token
+#    112k    78 / 153 = 51 %, 60.4 ms/token   87 / 129 = 67 %, 23.1 ms/token
+#    No systematic drop with the context length: the content decides (the 33 % seen earlier was a 32-token
+#    sample). What grows is the step cost: same acceptance, 45-60 vs 23-28 ms/token.
+#
+# 3. Host <-> device after the PCIe fix (#176; bench/pcie/pcie_bw.hip): 27.7 GB/s for one 151 MiB copy,
+#    25.0-25.2 GB/s in 96 pieces, both directions; link 16.0 GT/s x16 (was 3.3 GB/s at 2.5 GT/s).
+#    Sequence checkpoints (#158), the 1977-token request of m10-checkpoints.txt, median of 5:
+#                          before (3.3 GB/s)   now (27.7 GB/s)
+#    save (incl. pending chunk)   61.2 ms          17.7 ms
+#    restore                      51.4 ms           7.6 ms
+#    retried request prefill     145.4 ms          99.3 ms
+#    first request prefill      2475.2 ms        2449.0 ms   (no checkpoints: 2325.8 ms then)
