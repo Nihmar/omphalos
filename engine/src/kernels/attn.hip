@@ -793,7 +793,11 @@ constexpr int kDcKeys = 16;
 constexpr int kDcWaves = 4;
 constexpr int kDcThreads = 32 * kDcWaves;
 constexpr int kDcDims = kGqaHd / kDcWaves;  // 64 per wave
-constexpr int kDcVLd = kDcKeys + 8;         // vt row stride
+// vt row stride: no padding. The transposed stores hit consecutive halves
+// either way; 8 KiB of vt instead of 12 lets 9 single-row-tile workgroups
+// share a WGP instead of 7, and their loads overlap each other's compute:
+// -10 % at 100k, -25 % at 25k (#172)
+constexpr int kDcVLd = kDcKeys;
 constexpr int kDcPLd = kDcKeys + 8;         // ps row stride
 constexpr int kDcMaxTokens = 8;             // 48 rows: three 16-row tiles
 
@@ -852,9 +856,9 @@ __global__ __launch_bounds__(kDcThreads) void attention_dec_kernel(
     const int splits, const long long tiles_per_split) {
     __shared__ __align__(16) _Float16 vt[kGqaHd * kDcVLd];
     __shared__ float part[kDcWaves][NRT][16][kDcKeys];          // score partials
-    // P: every wave computes the same values and writes them here (benign: equal
-    // values; the next pass's writes come after a barrier)
+    // P: each wave writes its rows' (the next pass's writes come after a barrier)
     __shared__ __align__(16) _Float16 ps[NRT][16 * kDcPLd];
+    __shared__ float crs[NRT][16];  // each row's O correction of the current pass
 
     const int tid = (int) threadIdx.x;
     const int lane = tid & 31;
@@ -894,13 +898,13 @@ __global__ __launch_bounds__(kDcThreads) void attention_dec_kernel(
             o[rt][j] = wmma_float8{};
         }
     }
-    // the softmax state of every row (the same in the four waves)
-    float m_run[NRT][8];
-    float l_run[NRT][8];
+    // the softmax state of this wave's rows: v = 2 w, 2 w + 1 of each row half
+    float m_run[NRT][2];
+    float l_run[NRT][2];
 #pragma unroll
     for (int rt = 0; rt < NRT; ++rt) {
 #pragma unroll
-        for (int v = 0; v < 8; ++v) {
+        for (int v = 0; v < 2; ++v) {
             m_run[rt][v] = -INFINITY;
             l_run[rt][v] = 0.0f;
         }
@@ -964,15 +968,15 @@ __global__ __launch_bounds__(kDcThreads) void attention_dec_kernel(
                 }
             }
             __syncthreads();
-            // every wave: the full scores (partials added in wave order), the
-            // online softmax (identical in the four waves), its own P, then
-            // O = O * corr + P V over its dimensions. Rows outside an edge
-            // pass's token: corr 1, P 0 (exact).
+            // each wave the softmax of a quarter of the rows (v = 2 w, 2 w + 1 of
+            // each row half; #172): the full scores (partials added in wave
+            // order), the online softmax, P and the O correction into LDS. Rows
+            // outside an edge pass's token: corr 1, P 0 (exact).
 #pragma unroll
             for (int rt = 0; rt < NRT; ++rt) {
 #pragma unroll
-                for (int v = 0; v < 8; ++v) {
-                    const int row = (lane >> 4) * 8 + v;
+                for (int vv = 0; vv < 2; ++vv) {
+                    const int row = (lane >> 4) * 8 + 2 * w + vv;
                     const int r = rt * 16 + row;
                     const int t = r / kGqaGroup;
                     float pv = 0.0f;
@@ -985,24 +989,33 @@ __global__ __launch_bounds__(kDcThreads) void attention_dec_kernel(
                         sv += part[3][rt][row][key];
                         const float x = s0 + key <= qpos0 + t ? sv : -INFINITY;
                         const float mx = row_max16(x);
-                        const float m_new = fmaxf(m_run[rt][v], mx);
+                        const float m_new = fmaxf(m_run[rt][vv], mx);
                         const bool none = m_new == -INFINITY;
                         const float m_use = none ? 0.0f : m_new;
-                        cr = none ? 1.0f : exp2f(m_run[rt][v] - m_use);
+                        cr = none ? 1.0f : exp2f(m_run[rt][vv] - m_use);
                         pv = exp2f(x - m_use);  // exp2(-inf) = 0
-                        l_run[rt][v] = l_run[rt][v] * cr + row_sum16(pv);
-                        m_run[rt][v] = m_new;
+                        l_run[rt][vv] = l_run[rt][vv] * cr + row_sum16(pv);
+                        m_run[rt][vv] = m_new;
                     }
                     pw[(rt * 16 + row) * kDcPLd + (lane & 15)] = (_Float16) pv;
+                    if ((lane & 15) == 0) {
+                        crs[rt][row] = cr;
+                    }
+                }
+            }
+            __syncthreads();
+            // O = O * corr + P V over this wave's dimensions
+#pragma unroll
+            for (int rt = 0; rt < NRT; ++rt) {
+#pragma unroll
+                for (int v = 0; v < 8; ++v) {
+                    const float cr = crs[rt][(lane >> 4) * 8 + v];
 #pragma unroll
                     for (int j = 0; j < kDcDims / 16; ++j) {
                         o[rt][j][v] *= cr;
                     }
                 }
             }
-            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
-            __builtin_amdgcn_wave_barrier();
-            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
 #pragma unroll
             for (int rt = 0; rt < NRT; ++rt) {
                 const wmma_half8 pa = *reinterpret_cast<const wmma_half8 *>(
@@ -1030,9 +1043,9 @@ __global__ __launch_bounds__(kDcThreads) void attention_dec_kernel(
                 for (int j = 0; j < kDcDims / 16; ++j) {
                     dst[2 + db + j * 16 + (lane & 15)] = o[rt][j][v];
                 }
-                if (w == 0 && (lane & 15) == 0) {
-                    dst[0] = m_run[rt][v];
-                    dst[1] = l_run[rt][v];
+                if (v / 2 == w && (lane & 15) == 0) {
+                    dst[0] = m_run[rt][v & 1];
+                    dst[1] = l_run[rt][v & 1];
                 }
             }
         }

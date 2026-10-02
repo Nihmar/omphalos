@@ -1,0 +1,50 @@
+# #172: decode / verification attention bandwidth. Engine f721304 (branch perf/172-decode-attn-bandwidth) vs
+# main 5be2cc8 (same attention code as fb36be1), RX 9060 XT, same session, 2026-10-02.
+#
+# 1. Diagnosis (main's kernel, omph-attn-bench at 100k, capacity 106496, per layer, us)
+#                 full    no KV loads   no compute
+#    T = 1         770       381           582
+#    T = 4        1386       983           637
+#    Loads and compute barely overlapped (full ~ sum). T = 1 was LDS-bound at 7 workgroups per WGP (12 KiB
+#    padded V tile); T = 4 was VGPR-bound (256, occupancy 5) and compute-bound: the four waves of a
+#    workgroup each ran the whole online softmax (identical copies).
+#    Tried and dropped: loading the next tile into registers while computing (VGPRs 160 -> 256 with spills,
+#    T = 4 2x slower); forcing occupancy 6 / 7 for T = 4 (no gain / spills); more key splits (mixed).
+#
+# 2. The changes
+#    a. V tile without row padding: 8 KiB instead of 12, 9 workgroups per WGP for T <= 2.
+#    b. The softmax split across the four waves (each a quarter of the rows), P and the O correction shared
+#       through LDS, one barrier: 4x less softmax work, VGPRs 160 -> 126 (T <= 2), 256 -> 190 (T 3-4).
+#    Same per-row arithmetic: decode logits bit-identical to main with K8/V4, K4/V4 and window 0
+#    (omph-run --gen-logits, 48 tokens of wiki1000); speculative output equal to plain greedy.
+#
+# 3. omph-attn-bench, one layer (attention + merge), median of 30, us
+#    capacity 106496 (the server / NIAH configuration, key chunk 832):
+#                     main     +a       +b       (GB/s at the end)
+#    K8/V4 100k T=1   771      691      626      266
+#    K8/V4 100k T=4  1387     1392      819      203
+#    K8/V4  25k T=1   282      213      173      241
+#    K8/V4  25k T=4   429      431      288      144
+#    K4/V4 100k T=1   752      671      548      210
+#    K4/V4 100k T=4  1374     1379      797      145
+#    K4/V4  25k T=1   254      206      166      174
+#    K4/V4  25k T=4   409      413      272      106
+#    capacity 25064 (omph-run on a 25k prompt, key chunk 224): K8/V4 T=1 201 -> 164, T=4 375 -> 226;
+#    K4/V4 T=1 147, T=4 227.
+#
+# 4. End to end: omph-run --gemv --generate 64, plain and --draft-mtp 3, OMPH_TIMING, alternating builds.
+#    Plain: median step gpu; speculative: ms per generated token, median verify (T = 4) and draft per cycle.
+#    Outputs identical between builds and between plain and speculative in every run.
+#
+#                         plain step       speculative ms/token      verify ms         accepted
+#                         main    branch   main     branch           main    branch
+#    25k K8/V4 (5 runs)   57.5    57.2     30.43    28.17-28.55      56.93   53.0     36 / 81
+#    25k K4/V4 (1 run)    see note 56.80   29.26    27.04            56.87   52.86    37 / 78
+#    100k K8/V4 (1 run)   65.81   63.60    31.32    27.11 (-13.4 %)  74.17   62.93    41 / 66
+#
+#    Note: the plain decode measured ~1.2x slower than earlier the same day in most runs, on both builds
+#    (100k: 65.8 vs 56.8 ms; 25k: 57 vs 47.7 in the first run of two series); the GEMV overlap calibration
+#    at load reads 5.3 vs 4.2 ms, so the GPU is slower from the first step. Clocks during decode: GFX
+#    3.0-3.3 GHz, MCLK 1258 MHz (max), FCLK 2016 MHz (max 2400), power at the 160 W cap, hotspot up to
+#    98 C. Builds alternate under the same conditions, so the comparisons hold; the cause is tracked in
+#    #189.

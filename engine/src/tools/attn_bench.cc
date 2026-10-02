@@ -1,13 +1,13 @@
 // omph-attn-bench — the decode / verification attention alone, on a synthetic
 // Q8/Q4 cache with the FP16 ring (#169): no model, no prefill, seconds.
 //
-// usage: omph-attn-bench [--seq N[,N...]] [--tokens T[,T...]] [--iters N] [--ctx N] [--chunk K]
+// usage: omph-attn-bench [--seq N[,N...]] [--tokens T[,T...]] [--iters N] [--ctx N] [--chunk K] [--k4]
 //   For each sequence length and token count: the median kernel time over
 //   --iters calls (attention + merge, one layer, hipEvent timing) of the WMMA
 //   decode kernel and of the scalar kernel, and the KV bytes read per second.
 //   Then the identity check speculation relies on: every query of a T-token
 //   call must equal, bit for bit, the same query run alone (T = 1) with the
-//   cache ending at its position.
+//   cache ending at its position. --k4: K in V's Q4 format (OMPH_KV_K4).
 #include "kernels/attn.hh"
 
 #include <hip/hip_fp16.h>
@@ -58,14 +58,16 @@ int main(int argc, char ** argv) {
     int iters = 20;
     int64_t ctx = 0;
     int64_t chunk_arg = 0;
+    bool k4 = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--seq") && i + 1 < argc) seqs = list(argv[++i]);
         else if (!std::strcmp(argv[i], "--tokens") && i + 1 < argc) toks = list(argv[++i]);
         else if (!std::strcmp(argv[i], "--iters") && i + 1 < argc) iters = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "--chunk") && i + 1 < argc) chunk_arg = std::atoll(argv[++i]);
+        else if (!std::strcmp(argv[i], "--k4")) k4 = true;
         else {
-            std::fprintf(stderr, "usage: %s [--seq N,...] [--tokens T,...] [--iters N] [--ctx N] [--chunk K]\n",
+            std::fprintf(stderr, "usage: %s [--seq N,...] [--tokens T,...] [--iters N] [--ctx N] [--chunk K] [--k4]\n",
                          argv[0]);
             return 2;
         }
@@ -78,8 +80,9 @@ int main(int argc, char ** argv) {
     std::mt19937 rng(169);
     std::uniform_int_distribution<int> byte(0, 255);
     std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
-    std::vector<uint8_t> kq((size_t) max_seq * kNkv * kHd), vq((size_t) max_seq * kNkv * kHd / 2);
-    for (auto & b : kq) b = (uint8_t) (int8_t) (byte(rng) % 255 - 127);
+    // K: Q8 values, or Q4 nibbles in V's format (--k4)
+    std::vector<uint8_t> kq((size_t) max_seq * kNkv * (k4 ? kHd / 2 : kHd)), vq((size_t) max_seq * kNkv * kHd / 2);
+    for (auto & b : kq) b = k4 ? (uint8_t) byte(rng) : (uint8_t) (int8_t) (byte(rng) % 255 - 127);
     for (auto & b : vq) b = (uint8_t) byte(rng);
     std::vector<__half> ksc((size_t) max_seq * kNkv * nblk), vsc(ksc.size());
     for (auto & x : ksc) x = __float2half(0.02f + 0.01f * std::fabs(uni(rng)));
@@ -99,6 +102,7 @@ int main(int argc, char ** argv) {
     kv.k16 = upload(k16);
     kv.v16 = upload(v16);
     kv.window = kWindow;
+    kv.k_q4 = k4;
     kv.ring = ring;
     const float * q = upload(qh);
     const float * gate = upload(gh);
@@ -134,8 +138,8 @@ int main(int argc, char ** argv) {
             spent += ms;
         }
     }
-    std::printf("key chunk %lld (capacity %lld); KV read per call and layer: 1664 B per position\n",
-                (long long) chunk, (long long) max_seq);
+    std::printf("key chunk %lld (capacity %lld); K%d/V4, KV read per call and layer: %d B per position\n",
+                (long long) chunk, (long long) max_seq, k4 ? 4 : 8, k4 ? 1152 : 1664);
     std::printf("%8s %3s %12s %10s %12s %10s %8s\n", "seq", "T", "wmma us", "GB/s", "scalar us", "GB/s", "ratio");
     for (const int64_t seq : seqs) {
         for (const int64_t t : toks) {
@@ -158,7 +162,7 @@ int main(int argc, char ** argv) {
                 std::sort(times.begin(), times.end());
                 us[m] = times[times.size() / 2];
             }
-            const double bytes = (double) seq * kNkv * (kHd + 2 * nblk + kHd / 2 + 2 * nblk);
+            const double bytes = (double) seq * kNkv * ((k4 ? kHd / 2 : kHd) + 2 * nblk + kHd / 2 + 2 * nblk);
             std::printf("%8lld %3lld %12.1f %10.1f %12.1f %10.1f %8.2f\n", (long long) seq, (long long) t, us[0],
                         bytes / us[0] / 1e3, us[1], bytes / us[1] / 1e3, us[1] / us[0]);
         }

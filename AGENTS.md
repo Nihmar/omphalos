@@ -100,8 +100,9 @@ engine/build/omph-run <model.gguf> models/golden/cpu/tokens.txt <out-logits.f32>
     --gemv --generate 3 --gen-out /tmp/gen.txt [--trace-dir DIR] [--tokens N]
 
 # the decode / verification attention alone on a synthetic cache (#169): kernel time and bandwidth
-# of the WMMA and scalar kernels per length and token count, plus the row identity check; seconds
-engine/build/omph-attn-bench [--seq 4096,32768,100000] [--tokens 1,4] [--ctx N] [--chunk K]
+# of the WMMA and scalar kernels per length and token count, plus the row identity check; seconds.
+# --k4: the K4/V4 cache (OMPH_KV_K4)
+engine/build/omph-attn-bench [--seq 4096,32768,100000] [--tokens 1,4] [--ctx N] [--chunk K] [--k4]
 
 # decode speed (PLAN.md §17): "step gpu" / "step wall" per token
 OMPH_TIMING=1 engine/build/omph-run <model> <tokens.txt> /tmp/x.f32 --last-logits \
