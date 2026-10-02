@@ -6,6 +6,7 @@
 #include "format/repack.hh"
 #include "kernels/dequant.hh"
 #include "kernels/elementwise.hh"
+#include "kernels/gemm.hh"
 #include "kernels/gemv.hh"
 #include "runtime/matmul.hh"
 
@@ -49,8 +50,16 @@ struct Case {
 // N activation vectors, into g_ny
 int g_nt = 1;
 float * g_ny = nullptr;
+// --gemm T (#208): the timed launches run the prefill's fused dequant + WMMA
+// GEMM on T tokens (x: T x k f16, y: T x rows f32)
+int g_gemm = 0;
+void * g_gx = nullptr;
+float * g_gy = nullptr;
 
 bool launch(const Case & c, const void * x, float * y, hipStream_t stream) {
+    if (g_gemm > 0) {
+        return omph::kernels::gemm_q(c.t->type, c.dev, g_gx, g_gy, c.rows, c.k, g_gemm, c.rows, stream);
+    }
     if (g_nt > 1) {
         return omph::kernels::gemv_multi(c.t->type, c.dev, x, g_ny, c.rows, c.k, g_nt, stream);
     }
@@ -189,7 +198,7 @@ int main(int argc, char ** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: %s <model.gguf> [tensor] [--iters N] [--iq4-all] "
-                     "[--all-of-type T] [--multi] [--nt N] [--repack-only T]\n",
+                     "[--all-of-type T] [--multi] [--nt N] [--gemm T] [--repack-only T]\n",
                      argv[0]);
         return 2;
     }
@@ -207,6 +216,8 @@ int main(int argc, char ** argv) {
             all_type = 23;
         } else if (std::strcmp(argv[i], "--all-of-type") == 0 && i + 1 < argc) {
             all_type = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--gemm") == 0 && i + 1 < argc) {
+            g_gemm = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--nt") == 0 && i + 1 < argc) {
             g_nt = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--multi") == 0) {
@@ -469,6 +480,28 @@ int main(int argc, char ** argv) {
         }
         if (g_nt > 1 && hipMalloc(&g_ny, (size_t) rmax * 4 * 4) != hipSuccess) {
             return fail("out of VRAM (--nt)");
+        }
+        if (g_gemm > 0) {
+            std::vector<uint16_t> gx((size_t) g_gemm * kmax);
+            uint32_t r = 777u;
+            for (uint16_t & h : gx) {  // f16 values in [-1, 1)
+                r = r * 1664525u + 1013904223u;
+                const float f = ((float) (r >> 8) / (float) (1u << 24) - 0.5f) * 2.0f;
+                const _Float16 hv = (_Float16) f;
+                std::memcpy(&h, &hv, 2);
+            }
+            if (hipMalloc(&g_gx, gx.size() * 2) != hipSuccess ||
+                hipMalloc(&g_gy, (size_t) g_gemm * rmax * 4) != hipSuccess ||
+                hipMemcpy(g_gx, gx.data(), gx.size() * 2, hipMemcpyHostToDevice) != hipSuccess) {
+                return fail("out of VRAM (--gemm)");
+            }
+            double flop = 0.0;
+            for (const Case & c : cases) {
+                flop += 2.0 * (double) c.rows * (double) c.k * g_gemm;
+            }
+            const double ms = time_ms(cases, dev_x, (float *) dev_y, iters, nullptr);
+            std::printf("gemm T=%d : %.3f ms  -> %.1f TFLOPS\n", g_gemm, ms, flop / ms / 1e9);
+            return 0;
         }
         const double ms = time_ms(cases, dev_x, (float *) dev_y, iters, nullptr);
         if (g_nt > 1) {  // the N-token kernels: time only (--multi checks them)
