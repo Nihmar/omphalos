@@ -40,6 +40,7 @@ CLASSES = [
     (r"DecIq1m", "gemm", "IQ1_M"), (r"DecQ6k", "gemm", "Q6_K"), (r"gemm", "gemm", None),
     (r"dequant", "dequant", None),
     (r"attention_wmma", "attention prefill", None),
+    (r"attention_gqa_merge", "attention merge", None),
     (r"attention_dec|attention_gqa", "attention decode", None),
     (r"attn_prep|kv_ring", "attention prep / KV write", None),
     (r"delta|gdn|conv", "delta-net", None),
@@ -183,7 +184,7 @@ def main() -> None:
     if dec:
         steps = sum(1 for r in dec if "argmax" in r["Kernel_Name"]) or 1
         tot, n, typ, busy, span = scan(dec)
-        att = sum(v for k, v in tot.items() if k.startswith("attention decode")) / steps
+        att = sum(v for k, v in tot.items() if k.startswith(("attention decode", "attention merge"))) / steps
         print(f"\n(decode attention: {att:.3f} ms per step against ~{kv_bytes / DRAM * 1e3:.3f} ms of KV reads at "
               f"{ctx} tokens)")
         table(f"decode, {steps} steps (per step)", tot, n, typ, dec_ceil, steps, "ms/step", busy, span)
