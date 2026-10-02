@@ -628,10 +628,11 @@ __global__ void gemv_iq3_ntg_kernel(const uint8_t * __restrict__ qs,
 #pragma unroll
             for (int r = 0; r < R; ++r) {
                 const long long row = row0 + r <= rlast ? row0 + r : rlast;
-                q[r] = *reinterpret_cast<const uint2 *>(qs + row * blocks * 64 + s * 8);
-                a[r] = *reinterpret_cast<const uint32_t *>(aux + row * blocks * 32 + s * 4);
-                db[r] = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 +
-                                                                       (s / 8) * 2)) *
+                const long long rb = __builtin_amdgcn_readfirstlane((int) row) * blocks;  // SGPR bases
+                const uint32_t so = (uint32_t) s;
+                q[r] = *reinterpret_cast<const uint2 *>(qs + rb * 64 + so * 8u);
+                a[r] = *reinterpret_cast<const uint32_t *>(aux + rb * 32 + so * 4u);
+                db[r] = __half2float(*reinterpret_cast<const __half *>(d + rb * 2 + (so / 8u) * 2u)) *
                         (0.5f + (float) (a[r] >> 28)) * 0.5f;
             }
             float part[R][NT] = {};
@@ -2917,7 +2918,7 @@ bool gemv_multi(const uint32_t type, const void * packed, const void * x_f16, fl
         case 18:
             if (nt == 2) return launch_iq3_ntg<2>(packed, x_f16, y, rows, k, stream);
             if (nt == 3) return launch_iq3_ntg<3>(packed, x_f16, y, rows, k, stream);
-            return launch_iq3_ntg<4, 2>(packed, x_f16, y, rows, k, stream);
+            return launch_iq3_ntg<4>(packed, x_f16, y, rows, k, stream);
         case 12:
             if (nt == 2) return launch_q4k_ntg<2>(packed, x_f16, y, rows, k, stream);
             if (nt == 3) return launch_q4k_ntg<3>(packed, x_f16, y, rows, k, stream);
