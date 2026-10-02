@@ -552,9 +552,12 @@ __global__ __launch_bounds__(kGqaHd) void attention_gqa_kernel(
 
 // --- WMMA prefill attention (#97) ------------------------------------------
 //
-// A workgroup takes 16 query tokens of one KV head: 6 waves, wave g the query
-// head kvh * 6 + g. Per tile of 32 keys, K and V are dequantized to f16 in LDS
-// once for the 6 heads (V transposed, so both WMMA operands are 16-byte
+// A workgroup takes kFaRowTiles x 16 query tokens of one KV head: 6 waves per
+// 16-token row tile, wave (rt, g) the query head kvh * 6 + g. Per tile of 32
+// keys, K and V are dequantized to f16 in LDS once for all of them (#173: with
+// one row tile per workgroup the staging served 16 queries and 2 workgroups
+// fit a WGP, 3 waves per SIMD; three row tiles cut a layer's 512-token chunk
+// at 100k from 92 to 59 ms) (V transposed, so both WMMA operands are 16-byte
 // loads), each wave computes its 16 x 32 scores with v_wmma (q in registers,
 // f16, prescaled), updates the online softmax in registers (the score tiles'
 // rows sit in the same lanes as the output accumulators' rows), passes P
@@ -564,10 +567,13 @@ __global__ __launch_bounds__(kGqaHd) void attention_gqa_kernel(
 typedef _Float16 wmma_half8 __attribute__((ext_vector_type(8)));
 typedef float wmma_float8 __attribute__((ext_vector_type(8)));
 
-constexpr int kFaTokens = 16;            // query tokens per workgroup (one WMMA row tile)
+constexpr int kFaTokens = 16;            // query tokens per wave (one WMMA row tile)
+constexpr int kFaRowTiles = 3;           // row tiles per workgroup: one K / V staging for all (#173)
+constexpr int kFaWgTokens = kFaTokens * kFaRowTiles;
 constexpr int kFaKeys = 32;              // keys per tile (16: slower, 64: over the LDS)
 constexpr int kFaSt = kFaKeys / 16;      // 16-key WMMA tiles per key tile
-constexpr int kFaThreads = 32 * kGqaGroup;
+constexpr int kFaWaves = kGqaGroup * kFaRowTiles;
+constexpr int kFaThreads = 32 * kFaWaves;
 constexpr int kFaKLd = kGqaHd + 8;       // Ks row stride (halves): conflict-free 16-lane reads
 constexpr int kFaVLd = kFaKeys + 8;      // Vt row stride
 constexpr int kFaPLd = kFaKeys + 8;      // Ps row stride
@@ -581,14 +587,18 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
     const float scale) {
     __shared__ _Float16 ks[kFaKeys * kFaKLd];
     __shared__ _Float16 vt[kGqaHd * kFaVLd];
-    __shared__ _Float16 ps[kGqaGroup][kFaTokens * kFaPLd];
+    __shared__ _Float16 ps[kFaWaves][kFaTokens * kFaPLd];
     const int tid = (int) threadIdx.x;
     const int lane = tid & 31;
-    const int g = tid >> 5;
+    const int wv = tid >> 5;
+    const int g = wv % kGqaGroup;   // query head within the KV group
+    const int rt = wv / kGqaGroup;  // row tile
     const int kvh = (int) blockIdx.y;
     const int h = kvh * kGqaGroup + g;
-    const long long t0 = (long long) blockIdx.x * kFaTokens;
-    const int nt = (int) (tokens - t0 < kFaTokens ? tokens - t0 : kFaTokens);
+    const long long wg0 = (long long) blockIdx.x * kFaWgTokens;
+    const long long t0 = wg0 + rt * kFaTokens;
+    // this wave's rows (none for a row tile past the end: it only stages)
+    const int nt = (int) (tokens - t0 < 0 ? 0 : tokens - t0 < kFaTokens ? tokens - t0 : kFaTokens);
     const long long qpos0 = seq - tokens + t0;  // cache position of the tile's first query
 
     // q as 16 A operands (k16 steps over the 256 dims): lane -> token lane % 16,
@@ -597,7 +607,7 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
     {
         const int r = lane & 15;
         const bool in = r < nt;
-        const float * qr = q + ((t0 + (in ? r : 0)) * nh + h) * kGqaHd + (lane >> 4) * 8;
+        const float * qr = q + ((in ? t0 + r : 0) * nh + h) * kGqaHd + (lane >> 4) * 8;
 #pragma unroll
         for (int s = 0; s < kGqaHd / 16; ++s) {
             const float4 a = *reinterpret_cast<const float4 *>(qr + s * 16);
@@ -622,9 +632,11 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
         m_run[v] = -INFINITY;
         l_run[v] = 0.0f;
     }
-    const long long n_keys = qpos0 + nt;  // keys up to the tile's last query
+    // keys up to the workgroup's last query: tiles past a row tile's own last
+    // query are masked out entirely (corr 1, P 0: its rows are unchanged)
+    const long long n_keys = seq - tokens + (tokens - wg0 < kFaWgTokens ? tokens : wg0 + kFaWgTokens);
     const long long n_tiles = (n_keys + kFaKeys - 1) / kFaKeys;
-    _Float16 * pw = ps[g];
+    _Float16 * pw = ps[wv];
     for (long long kt = 0; kt < n_tiles; ++kt) {
         const long long s0 = kt * kFaKeys;
         // K and V of keys s0 .. s0 + 31 into LDS as f16 (positions past n_keys: 0)
@@ -1252,7 +1264,7 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
     const bool per_query = tokens <= kKvRingExtra + 1 && kv.ring >= kv.window + kKvRingExtra;
     auto * w = static_cast<float *>(work);
     if (fa) {
-        const dim3 fgrid((unsigned) ((tokens + kFaTokens - 1) / kFaTokens), (unsigned) nkv);
+        const dim3 fgrid((unsigned) ((tokens + kFaWgTokens - 1) / kFaWgTokens), (unsigned) nkv);
         if (q8) {
             attention_wmma_kernel<true><<<fgrid, kFaThreads, 0, stream>>>(q, args, w, tokens, seq,
                                                                          (int) nh, (int) nkv, scale);
