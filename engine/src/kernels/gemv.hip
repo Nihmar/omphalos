@@ -2914,7 +2914,7 @@ bool gemv_multi(const uint32_t type, const void * packed, const void * x_f16, fl
         case 18:
             if (nt == 2) return launch_iq3_ntg<2>(packed, x_f16, y, rows, k, stream);
             if (nt == 3) return launch_iq3_ntg<3>(packed, x_f16, y, rows, k, stream);
-            return launch_iq3_ntg<4>(packed, x_f16, y, rows, k, stream);
+            return launch_iq3_ntg<4, 2>(packed, x_f16, y, rows, k, stream);
         case 12:
             if (nt == 2) return launch_q4k_ntg<2>(packed, x_f16, y, rows, k, stream);
             if (nt == 3) return launch_q4k_ntg<3>(packed, x_f16, y, rows, k, stream);
