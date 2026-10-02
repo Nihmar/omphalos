@@ -1,0 +1,405 @@
+// omph-server — an OpenAI-compatible HTTP server on the engine's Generator (#156).
+//
+// usage: omph-server <model.gguf> [options]
+//   --host H          address to bind (default 127.0.0.1)
+//   --port P          port (default 8080)
+//   --ctx N           KV capacity (default 8192)
+//   --chunk N         prefill chunk (default 512)
+//   --no-mtp          do not load the MTP block (no speculative decoding, -352 MiB of VRAM)
+//   --alias NAME      the model id in the API (default: the file name without .gguf)
+//   --api-key KEY     require "Authorization: Bearer KEY"
+//   --cors ORIGIN     allow browser requests from ORIGIN (e.g. "*")
+//   --temp T, --top-k K, --top-p P, --min-p M, --max-tokens N
+//                     defaults for requests that leave them out (default: greedy,
+//                     which decodes speculatively, until the context is full)
+//
+// Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions,
+// POST /v1/completions (stream or not). One request at a time; a chat's next
+// turn continues the cached sequence when its prompt extends it.
+#include "model/generator.hh"
+#include "runtime/options.hh"
+#include "server/http.hh"
+#include "server/openai.hh"
+#include "text/json.hh"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <random>
+#include <string>
+#include <vector>
+
+namespace {
+
+using omph::model::GenerateResult;
+using omph::server::Delta;
+using omph::text::Json;
+
+struct Server {
+    omph::model::Generator & gen;
+    std::string model_id;
+    std::string api_key;
+    std::string cors;
+    omph::server::Defaults defaults;
+
+    static Json num(const double v) { return Json::number(v, true); }
+    static Json str(const std::string & s) { return Json::string(s); }
+
+    bool reply(omph::server::Connection & c, const int status, const Json & body) {
+        return c.respond(status, "application/json", body.dump());
+    }
+    bool fail(omph::server::Connection & c, const int status, const std::string & message,
+              const std::string & type = "invalid_request_error", const std::string & param = "") {
+        return reply(c, status, omph::server::error_body(message, type, param));
+    }
+
+    Json model_object() const {
+        Json m = Json::object();
+        m.set("id", str(model_id));
+        m.set("object", str("model"));
+        m.set("created", num(0));
+        m.set("owned_by", str("omphalos"));
+        return m;
+    }
+
+    void handle(omph::server::Connection & c, const omph::server::Request & req) {
+        if (!cors.empty()) {
+            c.extra_headers = {{"Access-Control-Allow-Origin", cors}};
+        }
+        if (req.method == "OPTIONS") {  // CORS preflight
+            if (!cors.empty()) {
+                c.extra_headers.emplace_back("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                c.extra_headers.emplace_back("Access-Control-Allow-Headers", "Content-Type, Authorization");
+            }
+            c.respond(204, "", "");
+            return;
+        }
+        std::string path = req.path;
+        if (path.rfind("/v1/", 0) == 0) path.erase(0, 3);
+        if (path == "/health") {
+            Json ok = Json::object();
+            ok.set("status", str("ok"));
+            reply(c, 200, ok);
+            return;
+        }
+        if (!api_key.empty()) {
+            const std::string * auth = req.header("authorization");
+            if (auth == nullptr || *auth != "Bearer " + api_key) {
+                fail(c, 401, "invalid API key", "authentication_error");
+                return;
+            }
+        }
+        if (path == "/models" || path == "/models/" + model_id) {
+            if (req.method != "GET") {
+                fail(c, 405, "use GET");
+                return;
+            }
+            if (path != "/models") {
+                reply(c, 200, model_object());
+                return;
+            }
+            Json list = Json::object();
+            list.set("object", str("list"));
+            Json data = Json::array();
+            data.push(model_object());
+            list.set("data", std::move(data));
+            reply(c, 200, list);
+            return;
+        }
+        if (path == "/chat/completions" || path == "/completions") {
+            if (req.method != "POST") {
+                fail(c, 405, "use POST");
+                return;
+            }
+            complete(c, req, path == "/chat/completions");
+            return;
+        }
+        fail(c, 404, "no such endpoint: " + req.method + " " + req.path, "not_found_error");
+    }
+
+    void complete(omph::server::Connection & c, const omph::server::Request & req, const bool chat) {
+        omph::server::Job job;
+        try {
+            job = omph::server::parse_request(Json::parse(req.body), chat, defaults);
+        } catch (const omph::server::BadRequest & e) {
+            fail(c, 400, e.message, "invalid_request_error", e.param);
+            return;
+        } catch (const std::exception & e) {
+            fail(c, 400, std::string("invalid JSON body: ") + e.what());
+            return;
+        }
+        const omph::text::Tokenizer & tok = gen.tokenizer();
+        const std::vector<int32_t> prompt = job.prompt_ids.empty() ? tok.encode(job.prompt, true) : job.prompt_ids;
+        for (const int32_t t : prompt) {
+            if (t < 0 || t >= tok.size()) {
+                fail(c, 400, "token id " + std::to_string(t) + " out of range", "invalid_request_error", "prompt");
+                return;
+            }
+        }
+        if (prompt.empty()) {
+            fail(c, 400, "the prompt is empty", "invalid_request_error", "prompt");
+            return;
+        }
+        if ((int64_t) prompt.size() >= gen.context()) {
+            fail(c, 400,
+                 "the prompt is " + std::to_string(prompt.size()) + " tokens; the context holds " +
+                     std::to_string(gen.context()),
+                 "invalid_request_error", chat ? "messages" : "prompt");
+            return;
+        }
+        omph::model::GenerateRequest greq;
+        greq.max_tokens = job.max_tokens > 0 ? job.max_tokens : gen.context();
+        greq.sampling.temperature = job.temperature;
+        greq.sampling.top_k = job.top_k;
+        greq.sampling.top_p = job.top_p;
+        greq.sampling.min_p = job.min_p;
+        greq.sampling.seed = job.seeded ? job.seed : std::random_device{}() * 0x100000000ull + std::random_device{}();
+
+        const std::string id = omph::server::random_id(chat ? "chatcmpl-" : "cmpl-", 24);
+        const auto created = (double) std::time(nullptr);
+        // a chunk of the stream (or the response's frame)
+        const auto frame = [&](const char * object) {
+            Json f = Json::object();
+            f.set("id", str(id));
+            f.set("object", str(object));
+            f.set("created", num(created));
+            f.set("model", str(model_id));
+            return f;
+        };
+        const auto chunk = [&](Json delta_or_text, const Json & finish) {
+            Json f = frame(chat ? "chat.completion.chunk" : "text_completion");
+            Json choice = Json::object();
+            choice.set("index", num(0));
+            if (chat) {
+                choice.set("delta", std::move(delta_or_text));
+            } else {
+                choice.set("text", std::move(delta_or_text));
+            }
+            choice.set("logprobs", Json());
+            choice.set("finish_reason", finish);
+            Json choices = Json::array();
+            choices.push(std::move(choice));
+            f.set("choices", std::move(choices));
+            return f;
+        };
+        const auto call_json = [&](const omph::server::ToolCall & call, int index, bool streamed) {
+            Json fn = Json::object();
+            fn.set("name", str(call.name));
+            fn.set("arguments", str(call.arguments));
+            Json j = Json::object();
+            if (streamed) j.set("index", num(index));
+            j.set("id", str(call.id));
+            j.set("type", str("function"));
+            j.set("function", std::move(fn));
+            return j;
+        };
+
+        omph::server::OutputParser parser(job);
+        std::string reasoning, content, echo;
+        std::vector<omph::server::ToolCall> calls;
+        if (job.echo) {
+            echo = job.prompt_ids.empty() ? job.prompt : tok.decode(job.prompt_ids, false);
+        }
+        bool gone = false;  // the client closed the stream
+        int n_streamed_calls = 0;
+        const auto send = [&](const Delta & d) {
+            if (!job.stream) {
+                reasoning += d.reasoning;
+                content += d.content;
+                calls.insert(calls.end(), d.calls.begin(), d.calls.end());
+                return;
+            }
+            if (gone || d.empty()) return;
+            if (!chat) {
+                gone = !c.event(chunk(str(d.content), Json()).dump());
+                return;
+            }
+            if (!d.reasoning.empty()) {
+                Json delta = Json::object();
+                delta.set("reasoning_content", str(d.reasoning));
+                gone = gone || !c.event(chunk(std::move(delta), Json()).dump());
+            }
+            if (!d.content.empty()) {
+                Json delta = Json::object();
+                delta.set("content", str(d.content));
+                gone = gone || !c.event(chunk(std::move(delta), Json()).dump());
+            }
+            for (const auto & call : d.calls) {
+                Json delta = Json::object();
+                Json arr = Json::array();
+                arr.push(call_json(call, n_streamed_calls++, true));
+                delta.set("tool_calls", std::move(arr));
+                gone = gone || !c.event(chunk(std::move(delta), Json()).dump());
+            }
+        };
+        if (job.stream) {
+            gone = !c.begin_events();
+            if (!gone && chat) {
+                Json delta = Json::object();
+                delta.set("role", str("assistant"));
+                delta.set("content", str(""));
+                gone = !c.event(chunk(std::move(delta), Json()).dump());
+            } else if (!gone && !echo.empty()) {
+                gone = !c.event(chunk(str(echo), Json()).dump());
+            }
+        }
+        GenerateResult res;
+        if (!gone) {
+            res = gen.generate(prompt, greq, [&](const int32_t t) {
+                send(parser.push(tok.piece(t, false)));
+                return !gone && !parser.stopped();
+            });
+            send(parser.finish());
+        }
+        const bool error = res.stop == GenerateResult::Stop::Error;
+        const bool length = !parser.stopped() &&
+                            (res.stop == GenerateResult::Stop::Length || res.stop == GenerateResult::Stop::ContextFull);
+        const Json finish = str(omph::server::finish_reason(length, parser.any_tool_call()));
+        const auto completion_tokens = (double) res.tokens.size();
+        Json usage = Json::object();
+        usage.set("prompt_tokens", num((double) prompt.size()));
+        usage.set("completion_tokens", num(completion_tokens));
+        usage.set("total_tokens", num((double) prompt.size() + completion_tokens));
+        Json details = Json::object();
+        details.set("cached_tokens", num((double) res.cached_tokens));
+        usage.set("prompt_tokens_details", std::move(details));
+        // llama.cpp's timings, for clients that show them
+        Json timings = Json::object();
+        timings.set("prompt_n", num((double) (res.prompt_tokens - res.cached_tokens)));
+        timings.set("prompt_ms", Json::number(res.prefill_ms, false));
+        timings.set("predicted_n", num(completion_tokens));
+        timings.set("predicted_ms", Json::number(res.decode_ms, false));
+        timings.set("draft_n", num((double) res.drafted));
+        timings.set("draft_n_accepted", num((double) res.accepted));
+
+        if (job.stream) {
+            if (!gone) {
+                if (error) {
+                    c.event(omph::server::error_body("generation failed", "server_error").dump());
+                } else {
+                    Json last = chunk(chat ? Json::object() : str(""), finish);
+                    last.set("timings", timings);
+                    c.event(last.dump());
+                    if (job.include_usage) {
+                        Json u = frame(chat ? "chat.completion.chunk" : "text_completion");
+                        u.set("choices", Json::array());
+                        u.set("usage", usage);
+                        c.event(u.dump());
+                    }
+                }
+                c.event("[DONE]");
+            }
+        } else if (error) {
+            fail(c, 500, "generation failed", "server_error");
+        } else {
+            Json r = frame(chat ? "chat.completion" : "text_completion");
+            Json choice = Json::object();
+            choice.set("index", num(0));
+            if (chat) {
+                Json msg = Json::object();
+                msg.set("role", str("assistant"));
+                msg.set("content", content.empty() && !calls.empty() ? Json() : str(content));
+                if (!reasoning.empty()) msg.set("reasoning_content", str(reasoning));
+                if (!calls.empty()) {
+                    Json arr = Json::array();
+                    for (size_t i = 0; i < calls.size(); ++i) arr.push(call_json(calls[i], (int) i, false));
+                    msg.set("tool_calls", std::move(arr));
+                }
+                choice.set("message", std::move(msg));
+            } else {
+                choice.set("text", str(echo + content));
+            }
+            choice.set("logprobs", Json());
+            choice.set("finish_reason", finish);
+            Json choices = Json::array();
+            choices.push(std::move(choice));
+            r.set("choices", std::move(choices));
+            r.set("usage", std::move(usage));
+            r.set("timings", std::move(timings));
+            reply(c, 200, r);
+        }
+        static const char * kStop[] = {"length", "end of generation", "stop token", "stopped", "context full",
+                                       "error"};
+        std::fprintf(stderr,
+                     "%s %s: prompt %zu tokens (%lld cached) in %.0f ms; %zu tokens in %.0f ms (%.1f t/s); "
+                     "stop: %s%s\n",
+                     req.method.c_str(), req.path.c_str(), prompt.size(), (long long) res.cached_tokens,
+                     res.prefill_ms, res.tokens.size(), res.decode_ms,
+                     res.decode_ms > 0 ? 1000.0 * completion_tokens / res.decode_ms : 0.0,
+                     parser.stopped() ? "stop string" : kStop[(int) res.stop], gone ? " (client gone)" : "");
+    }
+};
+
+std::string default_id(const std::string & path) {
+    std::string name = path.substr(path.find_last_of('/') + 1);
+    if (name.size() > 5 && name.compare(name.size() - 5, 5, ".gguf") == 0) name.resize(name.size() - 5);
+    return name;
+}
+
+} // namespace
+
+int main(int argc, char ** argv) {
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: %s <model.gguf> [options]\n", argv[0]);
+        return 2;
+    }
+    omph::model::Generator::Config cfg;
+    cfg.model = argv[1];
+    std::string host = "127.0.0.1";
+    int port = 8080;
+    std::string alias, api_key, cors;
+    omph::server::Defaults defaults;
+    for (int i = 2; i < argc; ++i) {
+        const auto val = [&]() -> const char * {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "%s needs a value\n", argv[i]);
+                std::exit(2);
+            }
+            return argv[++i];
+        };
+        if (!std::strcmp(argv[i], "--host")) host = val();
+        else if (!std::strcmp(argv[i], "--port")) port = std::atoi(val());
+        else if (!std::strcmp(argv[i], "--ctx")) cfg.context = std::atoll(val());
+        else if (!std::strcmp(argv[i], "--chunk")) cfg.chunk = std::atoll(val());
+        else if (!std::strcmp(argv[i], "--no-mtp")) cfg.mtp = false;
+        else if (!std::strcmp(argv[i], "--alias")) alias = val();
+        else if (!std::strcmp(argv[i], "--api-key")) api_key = val();
+        else if (!std::strcmp(argv[i], "--cors")) cors = val();
+        else if (!std::strcmp(argv[i], "--temp")) defaults.temperature = (float) std::atof(val());
+        else if (!std::strcmp(argv[i], "--top-k")) defaults.top_k = std::atoi(val());
+        else if (!std::strcmp(argv[i], "--top-p")) defaults.top_p = (float) std::atof(val());
+        else if (!std::strcmp(argv[i], "--min-p")) defaults.min_p = (float) std::atof(val());
+        else if (!std::strcmp(argv[i], "--max-tokens")) defaults.max_tokens = std::atoll(val());
+        else {
+            std::fprintf(stderr, "unknown option %s\n", argv[i]);
+            return 2;
+        }
+    }
+    try {
+        omph::server::Listener listener(host, port);  // fail before the minute of loading
+        omph::model::Generator gen(cfg, omph::runtime::EnvOptions::from_env());
+        Server server{gen, alias.empty() ? default_id(cfg.model) : alias, api_key, cors, defaults};
+        std::fprintf(stderr, "omph-server: %s on http://%s:%d (context %lld)\n", server.model_id.c_str(),
+                     host.c_str(), port, (long long) gen.context());
+        while (true) {
+            const int fd = listener.accept_one();
+            if (fd < 0) {
+                std::perror("accept");
+                continue;
+            }
+            omph::server::Connection conn(fd);
+            omph::server::Request req;
+            if (!conn.read(req)) continue;
+            try {
+                server.handle(conn, req);
+            } catch (const std::exception & e) {  // the next request still gets served
+                std::fprintf(stderr, "%s %s: %s\n", req.method.c_str(), req.path.c_str(), e.what());
+                server.fail(conn, 500, e.what(), "server_error");
+            }
+        }
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
+}
