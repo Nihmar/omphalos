@@ -1,0 +1,43 @@
+# #169: WMMA attention for decode and verification. Engine aef556e vs main 8ef6388, same session, RX 9060 XT.
+#
+# 1. One layer (omph-attn-bench: random Q8/Q4 cache + FP16 ring, 24 query / 4 KV heads, attention + merge,
+#    median of 20 calls after a 1 s warm-up; reproducible within ~0.5 % run to run). Capacity 100000:
+#    key chunk 800 (capacity 100000); KV read per call and layer: 1664 B per position
+#         seq   T      wmma us       GB/s    scalar us       GB/s    ratio
+#        4096   1        113.2       60.2        132.4       51.5     1.17
+#        4096   4        176.8       38.6        315.8       21.6     1.79
+#       16384   1        149.0      183.0        235.2      115.9     1.58
+#       16384   4        274.7       99.2        877.2       31.1     3.19
+#       32768   1        292.8      186.2        476.2      114.5     1.63
+#       32768   4        577.4       94.4       1796.8       30.3     3.11
+#       65536   1        511.6      213.2        860.7      126.7     1.68
+#       65536   4        981.7      111.1       3348.3       32.6     3.41
+#      100000   1        771.3      215.7       1268.5      131.2     1.64
+#      100000   4       1429.7      116.4       4927.1       33.8     3.45
+#    identity: 0 of 20 rows of multi-token calls differ from the single-token call
+#    Capacity 8192 (the default context): T = 1 at 2k / 4k / 8k 34 / 50 / 78 us (scalar 42 / 72 / 122),
+#    T = 4 58 / 94 / 152 us (scalar 134 / 244 / 466).
+#
+#    The way there (100k keys, chunk 400, us for T = 1 / T = 4):
+#    prefill-derived kernel (6 waves = 6 heads, 16 query tokens per tile)   slower than scalar (122 vs 77 ms/step at 100k)
+#    rows = (token, head), 4 waves split the dims, 16-key tiles             1163 / 2150
+#    + one shared P buffer (less LDS, 4 -> 5 waves/SIMD)                     988 / 1740
+#    + K straight from memory into the WMMA operands (no K tile, 2 barriers) 759 / 1435
+#    key chunks: capacity / 128 (was / 64): at 4k keys in a 100k context 113 vs 200 us (T = 1)
+#
+# 2. End to end (omph-run, wikitext-2 train prompt, OMPH_TIMING median of the plain steps; speculative k = 3)
+#    prompt   build   plain step gpu ms            speculative ms / token
+#    1000     new     45.21 45.28 45.32            18.80 18.84 18.86
+#             scalar  45.33 45.40 45.41            19.07 19.10 19.12    (same binary, OMPH_ATTN_DEC_SCALAR=1)
+#             main    45.30 45.38 45.40            19.07 19.11 19.13
+#    50000    new     51.29                        35.99  (35 / 87 drafts)
+#             main    66.75                        48.25
+#    (Single 50k runs: the step medians are over 33 steps; earlier sessions measured main at 55 ms there,
+#     the GPU's state differs between sessions, so only same-session comparisons are used.)
+#
+# 3. Correctness
+#    verification rows vs the decode step (2k chat prompt and 20k wikitext, 120 tokens): 119 / 119 bit-exact
+#    each; speculative output == plain greedy; specval.sh (oracle drafts k = 1 / 2 / 4, five KV modes) identical.
+#    decode logits vs the f32-KV reference (wiki1000, 32 forced steps): KL 0.001299 (scalar kernel 0.001332);
+#    new vs scalar kernel: KL 1e-6 (default), 5e-6 (K4), 4e-6 (f32 KV), 5e-6 (no window).
+#    ident.sh vs main: prefill, tail, --gemv greedy tokens and f32-KV outputs identical.

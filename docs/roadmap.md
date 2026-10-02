@@ -82,7 +82,7 @@ PCIe link is fixed (#176).
 
 | issue | what | estimate | constraint |
 |---|---|---|---|
-| #169 | one WMMA attention kernel for decode and verification (T <= 16): 24 rows in two 16x16 tiles, memory-bound like the decode | verification step at 112k ~150 -> ~70 ms; speculative ~2x faster there | decode and verification share it, so rows stay bit-identical (#161) |
+| #169 | one WMMA attention kernel for decode and verification (T <= 8) | done: one layer at 100k 771 vs 1269 us (T = 1), 1430 vs 4927 (T = 4); at 50k plain step 51 vs 67 ms, speculative 36 vs 48 ms/token | rows bit-identical to the decode step (#161) |
 | #170 | adaptive speculation: a cost model (step times vs context length, recent acceptance) picks k per step, k = 0 included | speculative never slower than plain | output unchanged for any k |
 | #171 | MTP attention window: its KV only for the last N tokens (4-8k), drafts attend over those | MTP prefill cost to ~0, ~2 ms per step at 112k, ~0.2 GB less VRAM at 110k | may lower acceptance: measure with #168's test |
 
