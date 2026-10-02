@@ -97,7 +97,8 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
                    bool v_rotated, void * work, size_t work_bytes, hipStream_t stream,
                    void * out_f16 = nullptr,  // set: out is ignored, f16 written here
                    bool allow_wmma = true,    // 16+ tokens: the WMMA prefill kernel (#97)
-                   int64_t key_chunk = 0);    // > 0: keys per split, fixed for the run (#136)
+                   int64_t key_chunk = 0,     // > 0: keys per split, fixed for the run (#136)
+                   bool dec_wmma = true);     // with key_chunk, < 16 tokens: WMMA tiles (#169)
 
 // Keys per split for a run whose sequences reach max_seq (a multiple of 16).
 // With a fixed chunk every query sums its keys in the same order in any call
