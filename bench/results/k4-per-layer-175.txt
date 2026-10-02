@@ -1,0 +1,64 @@
+# #175: per-layer K precision. Engine 1aba84b (branch feat/175-per-layer-k4, OMPH_KV_K4_LAYERS), RX 9060 XT,
+# 2026-10-02. KL(exact f32 KV in host RAM || test) over the last 512 positions (tools/compare_logits.py),
+# the FP16 window of 128 on in every test run, V Q4 throughout. Attention layers 0-15 (model layers 3, 7, ... 63).
+#
+# 1. One layer at a time in K4 (the rest K8), wikitext-2 test, 16k tokens (wiki16k.txt):
+#                 KL mean   delta vs K8  p99     max     top-1
+#    K8 all       0.000890             0.0063  0.0417  99.02 %
+#    K4 all       0.002774             0.0263  0.1513  98.24 %
+#    K4 layer 0   0.001058  +0.000168  0.0112  0.0616  99.41 %
+#    K4 layer 1   0.001025  +0.000135  0.0057  0.1213  99.22 %
+#    K4 layer 2   0.000874  -0.000016  0.0079  0.0172  98.83 %
+#    K4 layer 3   0.001262  +0.000372  0.0116  0.0653  98.63 %
+#    K4 layer 4   0.000986  +0.000096  0.0107  0.0385  99.02 %
+#    K4 layer 5   0.000917  +0.000027  0.0056  0.0576  99.02 %
+#    K4 layer 6   0.000986  +0.000096  0.0064  0.0887  98.63 %
+#    K4 layer 7   0.000922  +0.000032  0.0066  0.0270  99.41 %
+#    K4 layer 8   0.001057  +0.000167  0.0055  0.0662  98.44 %
+#    K4 layer 9   0.000973  +0.000083  0.0084  0.0506  99.41 %
+#    K4 layer 10  0.001003  +0.000113  0.0068  0.0505  99.22 %
+#    K4 layer 11  0.000978  +0.000088  0.0075  0.0278  99.02 %
+#    K4 layer 12  0.001114  +0.000224  0.0105  0.0593  98.63 %
+#    K4 layer 13  0.001019  +0.000129  0.0093  0.0437  99.22 %
+#    K4 layer 14  0.001043  +0.000153  0.0098  0.0390  98.83 %
+#    K4 layer 15  0.000953  +0.000063  0.0078  0.0401  99.02 %
+#    The deltas add up: layers 0-15 sum to +0.00193 against +0.00188 for K4 everywhere.
+#    Least to most sensitive: 2, 5, 7, 15, 9, 11, 4, 6, 10, 13, 1, 14, 0, 8, 12, 3.
+#
+# 2. Mixes (K4 on the least sensitive layers), measured at 8k / 16k / 32k (wikitext-2 test, the text the
+#    layers were chosen on) and on 16k tokens of wikitext-2 train (not used for the choice):
+#    wiki16k    K8 all                         0.000890  p99 0.0063  max 0.0417  top-1 99.02 %
+#    wiki16k    mix C (2,5,7,15)               0.001049  p99 0.0072  max 0.0421  top-1 98.83 %
+#    wiki16k    mix A (2,5,7,15,9,11,4,6)      0.001456  p99 0.0140  max 0.0343  top-1 98.83 %
+#    wiki16k    K4 all                         0.002774  p99 0.0263  max 0.1513  top-1 98.24 %
+#    wiki8k     K8 all                         0.000824  p99 0.0070  max 0.0124  top-1 98.83 %
+#    wiki8k     mix C (2,5,7,15)               0.000936  p99 0.0084  max 0.0191  top-1 98.83 %
+#    wiki8k     mix A (2,5,7,15,9,11,4,6)      0.001219  p99 0.0135  max 0.0350  top-1 98.83 %
+#    wiki8k     K4 all                         0.001715  p99 0.0149  max 0.0446  top-1 97.66 %
+#    wiki32k    K8 all                         0.000723  p99 0.0052  max 0.0098  top-1 98.44 %
+#    wiki32k    mix C (2,5,7,15)               0.001021  p99 0.0101  max 0.0289  top-1 98.44 %
+#    wiki32k    mix A (2,5,7,15,9,11,4,6)      0.001414  p99 0.0138  max 0.0391  top-1 99.02 %
+#    wiki32k    K4 all                         0.002077  p99 0.0153  max 0.0296  top-1 97.07 %
+#    wtrain16k  K8 all                         0.000522  p99 0.0037  max 0.0109  top-1 99.02 %
+#    wtrain16k  mix C (2,5,7,15)               0.000749  p99 0.0068  max 0.0219  top-1 98.63 %
+#    wtrain16k  mix A (2,5,7,15,9,11,4,6)      0.000885  p99 0.0068  max 0.0234  top-1 98.44 %
+#    wtrain16k  K4 all                         0.001310  p99 0.0117  max 0.0311  top-1 97.46 %
+#
+#    Budget (#58): llama.cpp's own q8_0/q4_0 KV KL, 0.00162 / 0.00149 / 0.00135 at 8k / 16k / 32k
+#    (bench/results/m5-kv-kl-long.txt; its positions differ, so read as the same order of magnitude).
+#    Mix C (4 layers: 2, 5, 7, 15) stays under it everywhere; mix A (8 layers) is at it at 16k (0.00146 vs
+#    0.00149) and just over at 32k (0.00141 vs 0.00135); K4 everywhere is over at 16k and 32k.
+#
+# 3. VRAM: a K4 layer saves 128 B per KV head per token (272 -> 144 B), 512 B per token over the 4 KV heads:
+#    ~56 MB per layer at 110k. Mix C ~0.22 GB, mix A ~0.45 GB, K4 everywhere ~0.9 GB at 110k.
+#
+# 4. Hard needle-in-a-haystack (tools/niah.py --needles 8 --hard: per needle also the same vault's revoked
+#    code, a proposed-but-never-approved code and an "annex" code; plus gates and other vaults), 50k and
+#    100k, omph-server --ctx 106496, greedy, thinking off. VRAM peak over the run (device, desktop included).
+#    config                       50k    100k   distractor answers   VRAM peak    prefill 100k   decode
+#    K8/V4 (default)              8/8    8/8    0                    14986 MiB    487 t/s        53.0 t/s
+#    mix C (K4 on 2,5,7,15)       8/8    8/8    0                    14778 MiB    487 t/s        53.1 t/s
+#    mix A (K4 on 8 layers)       8/8    8/8    0                    14570 MiB    486 t/s        53.1 t/s
+#    K4/V4 everywhere             8/8    8/8    0                    14154 MiB    486 t/s        53.1 t/s
+#    Retrieval does not separate the four even with the harder distractors; speed is the same. The choice is
+#    VRAM (-208 / -416 / -832 MiB at a 106k context) against the KL of section 2.
