@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
+from omph_model import omph_file
 from omphalos_tools.golden import load, load_index, rel_diff
 
 
@@ -34,7 +35,7 @@ def main() -> None:
         tok_path = Path(tmp) / "tokens.txt"
         tok_path.write_text(" ".join(str(t) for t in tokens))
         logits_path = Path(tmp) / "logits.f32"
-        cmd = [args.tool, args.model, str(tok_path), str(logits_path)]
+        cmd = [args.tool, omph_file(args.model), str(tok_path), str(logits_path)]
         if args.layers:
             trace = Path(tmp) / "trace"
             trace.mkdir()

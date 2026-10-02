@@ -28,6 +28,9 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 const omph::runtime::EnvOptions & env, const bool last_logits_only,
                 const int64_t kv_capacity, const bool mtp)
     : env_(env), file_(path), h_(read_hparams(file_)), use_gemv_(use_gemv), mtp_(mtp) {
+    if (!file_.omph()) {
+        throw std::runtime_error(path + " is not an .omph file: convert the GGUF with omph-convert (#178)");
+    }
     timer_stage_.enable(env_.phases);
     timer_gemm_.enable(env_.phases);
     timer_gemv_.enable(env_.phases);
@@ -47,116 +50,58 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     const int64_t attn_fused = h_.n_head * 2 * h_.head_dim;    // 12288 (q | gate)
     const int64_t fused = std::max(ssm_channels, attn_fused);
 
-    // Per-tensor upload: the types with a fused GEMV kernel are repacked on
-    // the host first (PLAN.md §8.3), everything else goes up verbatim. Only
-    // one copy of each tensor is kept in VRAM.
+    // The weights come from the .omph file (#178) already in the layouts the
+    // kernels read (omph-convert repacked and verified them): one copy of each
+    // tensor goes up as it is stored. The token embedding is a row gather, not
+    // a matmul: it stays in pinned host memory and the dequant kernel reads
+    // the one row a token needs (10 KB at IQ2_S) over PCIe, which keeps 388 MiB
+    // out of VRAM (#92).
     {
         struct Place {
-            std::string name;
-            size_t off = 0;
+            const omph::gguf::TensorInfo * t;
+            size_t off;
         };
         std::vector<Place> places;
         size_t total = 0;
         for (const omph::gguf::TensorInfo & t : file_.tensors()) {
-            // The MTP block (blk.<n_layer>.*) is not run until M6 (#92).
             if (!in_stack(t.name)) {
                 continue;
             }
-            // The token embedding is a row gather, not a matmul: it stays in
-            // pinned host memory and the dequant kernel reads the one row a
-            // token needs (10 KB at IQ2_S) over PCIe, which keeps 388 MiB out
-            // of VRAM (#92).
             if (t.name == "token_embd.weight") {
+                if (t.layout != omph::gguf::kLayoutGguf) {
+                    throw std::runtime_error("token_embd.weight is not stored in the GGUF layout");
+                }
                 embd_host_ = mem_.host((size_t) t.nbytes, "cannot allocate the host embedding");
                 std::memcpy(embd_host_, file_.tensor_data(t), (size_t) t.nbytes);
                 continue;
             }
-            Place p;
-            p.name = t.name;
-            p.off = total;
-            const int64_t bb = omph::format::quant_block_bytes(t.type);
-            // Sized from the layout: the repack itself runs once, at upload.
-            const int64_t packed_bytes =
-                bb > 0 && t.nbytes % (uint64_t) bb == 0
-                    ? omph::format::repacked_bytes(t.type, (int64_t) (t.nbytes / (uint64_t) bb))
-                    : 0;
-            if (packed_bytes > 0) {
+            if (t.layout == omph::gguf::kLayoutRepack) {
+                const int64_t bb = omph::format::quant_block_bytes(t.type);
+                if (bb <= 0 || t.nbytes % (uint64_t) bb != 0 ||
+                    t.stored != (uint64_t) omph::format::repacked_bytes(t.type, (int64_t) (t.nbytes / (uint64_t) bb))) {
+                    throw std::runtime_error(t.name + ": stored size does not match the repacked layout");
+                }
                 GemvEntry e;
                 e.off = total;
-                e.bytes = (size_t) packed_bytes;
+                e.bytes = (size_t) t.stored;
                 e.rows = (int64_t) t.ne[1];
                 e.k = (int64_t) t.ne[0];
                 e.type = t.type;
                 gems_[t.name] = e;
-                total += ((size_t) packed_bytes + 255) & ~(size_t) 255;
-                places.push_back(p);
-                continue;
+            } else if (t.layout != omph::gguf::kLayoutGguf) {
+                throw std::runtime_error(t.name + ": unknown layout " + std::to_string(t.layout));
             }
-            total += ((size_t) t.nbytes + 255) & ~(size_t) 255;
-            places.push_back(p);
+            places.push_back({&t, total});
+            total += ((size_t) t.stored + 255) & ~(size_t) 255;
         }
         dev_weights_ = mem_.device(total, "cannot allocate the weight image");
         auto * base = static_cast<uint8_t *>(dev_weights_);
-        // The host repack is the bulk of the load (~7 s of thread time): the
-        // tensors are independent, so worker threads repack the next batch of
-        // them (the biggest first) while this thread uploads the current one.
-        // Every HIP call stays on this thread: each thread that touches HIP
-        // keeps ~2 MiB of VRAM for good (#129).
-        std::sort(places.begin(), places.end(), [&](const Place & a, const Place & b) {
-            return file_.tensor(a.name)->nbytes > file_.tensor(b.name)->nbytes;
-        });
-        const size_t n_workers = std::max(1u, std::min(std::thread::hardware_concurrency(), 8u));
-        const size_t n_batches = (places.size() + n_workers - 1) / n_workers;
-        std::vector<std::vector<uint8_t>> packed(2 * n_workers);  // two batches in flight
-        std::vector<char> failed(2 * n_workers);
-        const auto repack_batch = [&](const size_t batch) {
-            std::vector<std::thread> workers;
-            for (size_t j = 0; j < n_workers && batch * n_workers + j < places.size(); ++j) {
-                workers.emplace_back([&, batch, j] {
-                    const size_t slot = (batch % 2) * n_workers + j;
-                    const omph::gguf::TensorInfo * t =
-                        file_.tensor(places[batch * n_workers + j].name);
-                    const auto g = gems_.find(t->name);
-                    const int64_t bb = omph::format::quant_block_bytes(t->type);
-                    failed[slot] = g != gems_.end() && bb > 0 &&
-                                   (!omph::format::repack_any(t->type, file_.tensor_data(*t),
-                                                              (int64_t) (t->nbytes / (uint64_t) bb),
-                                                              packed[slot]) ||
-                                    packed[slot].size() != g->second.bytes);
-                });
-            }
-            return workers;
-        };
-        std::vector<std::thread> current = repack_batch(0);
-        for (size_t batch = 0; batch < n_batches; ++batch) {
-            for (std::thread & w : current) {
-                w.join();
-            }
-            current = batch + 1 < n_batches ? repack_batch(batch + 1) : std::vector<std::thread>{};
-            for (size_t j = 0; j < n_workers && batch * n_workers + j < places.size(); ++j) {
-                const size_t slot = (batch % 2) * n_workers + j;
-                const Place & p = places[batch * n_workers + j];
-                const omph::gguf::TensorInfo * t = file_.tensor(p.name);
-                if (failed[slot] != 0) {
-                    for (std::thread & w : current) {
-                        w.join();
-                    }
-                    throw std::runtime_error("repack failed for " + p.name);
-                }
-                const bool repacked = gems_.count(p.name) != 0 &&
-                                      omph::format::quant_block_bytes(t->type) > 0;
-                const void * src = repacked ? packed[slot].data() : file_.tensor_data(*t);
-                const size_t bytes = repacked ? packed[slot].size() : (size_t) t->nbytes;
-                if (hipMemcpy(base + p.off, src, bytes, hipMemcpyHostToDevice) != hipSuccess) {
-                    for (std::thread & w : current) {
-                        w.join();
-                    }
-                    throw std::runtime_error("cannot upload " + p.name);
-                }
-            }
-        }
         for (const Place & p : places) {
-            off_[p.name] = p.off;
+            if (hipMemcpy(base + p.off, file_.tensor_data(*p.t), (size_t) p.t->stored, hipMemcpyHostToDevice) !=
+                hipSuccess) {
+                throw std::runtime_error("cannot upload " + p.t->name);
+            }
+            off_[p.t->name] = p.off;
         }
     }
 

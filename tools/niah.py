@@ -37,6 +37,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from omph_model import omph_file
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 KEYS = ["north", "south", "east", "west", "amber", "basalt", "cedar", "delta", "ember", "fjord", "granite",
@@ -213,7 +215,7 @@ def main() -> None:
         if args.omph_env:
             name, _, value = args.omph_env.partition("=")
             env[name] = value
-        cmd = [f"{args.omph}/omph-server", args.model, "--port", str(port), "--ctx", str(args.ctx)]
+        cmd = [f"{args.omph}/omph-server", omph_file(args.model), "--port", str(port), "--ctx", str(args.ctx)]
     else:
         if not args.llama_server:
             sys.exit("--llama-server is required for --engine llama")

@@ -47,7 +47,7 @@ int omph_self_test(void);
 typedef struct omph_engine omph_engine;
 
 typedef struct {
-    const char * model_path; /* GGUF file */
+    const char * model_path; /* .omph file (omph-convert writes it from the GGUF, #178) */
     int64_t context;         /* KV capacity in tokens (default 8192) */
     int64_t chunk;           /* prefill chunk (default 512) */
     int mtp;                 /* load the MTP block for speculative decoding (default 1) */

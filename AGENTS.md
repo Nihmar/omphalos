@@ -57,7 +57,7 @@ Priorities, in order: **1) VRAM savings — 2) decode speed — 3) prefill speed
 
 ## Entry points
 
-Model path used below: `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (local, git-ignored).
+Model paths used below: `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (local, git-ignored) and the `.omph` file `omph-convert` writes from it (#178). The engine binaries that run the model (`omph-run`, `omph-generate`, `omph-server`, `omph-capi-demo`, the C ABI) load only `<model.omph>`; the validation tools and scripts take the GGUF (they derive the `.omph` next to it, `tools/omph_model.py`).
 
 ```sh
 # build
@@ -72,7 +72,11 @@ cmake -S <llama.cpp> -B /var/tmp/omphalos-llama-cpu -G Ninja -DCMAKE_BUILD_TYPE=
 cmake --build /var/tmp/omphalos-llama-cpu -j --target mtmd llama
 cmake -S engine -B engine/build -DOMPH_LLAMA_DIR=<llama.cpp> -DOMPH_LLAMA_LIB=/var/tmp/omphalos-llama-cpu/bin
 
-# tokenizer (#148): text on stdin -> ids, or --decode ids -> text
+# convert the GGUF once (#178): weights repacked into the kernels' layouts and verified bit for bit,
+# the metadata (tokenizer, chat template) copied, the source SHA-256 recorded; ~1 min, 11.3 GiB
+engine/build/omph-convert <model.gguf> [<model.omph>]
+
+# tokenizer (#148): text on stdin -> ids, or --decode ids -> text (reads a .gguf or an .omph)
 engine/build/omph-tokenize <model.gguf> [--no-parse-special] < prompt.txt > tokens.txt
 # chat template (#150): a JSON request {messages, tools?, add_generation_prompt?,
 # enable_thinking?, ...} on stdin -> the prompt (--chat) or its ids (--chat-ids)
@@ -83,20 +87,20 @@ engine/build/omph-tokenize <model.gguf> --chat-ids < request.json > tokens.txt
 # --repeat N the same request again (resumes from a checkpoint), --cache-mib N (0: no checkpoints),
 # --mmproj FILE --image FILE (one per image item / <|image_pad|>), --force IDS --logits-out FILE
 # (teacher-forced logits, validation)
-engine/build/omph-generate <model.gguf> --chat --max 256 < request.json
+engine/build/omph-generate <model.omph> --chat --max 256 < request.json
 
 # the C ABI (include/omphalos.h, #154) from plain C: load, chat, tokenize, generate
-engine/build/omph-capi-demo <model.gguf>
+engine/build/omph-capi-demo <model.omph>
 
 # OpenAI-compatible server (#156): /v1/chat/completions, /v1/completions, /v1/models, /health;
 # streamed or not, reasoning_content / tool_calls; one request at a time on 127.0.0.1:8080.
 # Options: --host --port --ctx --cache-ram MIB (sequence checkpoints in host RAM, #158; default
 # 2048) --mmproj FILE (images as base64 data: URLs, #160) --alias --api-key --cors ORIGIN, request defaults --temp
 # --top-k --top-p --min-p --max-tokens (default greedy: speculative MTP decoding)
-engine/build/omph-server <model.gguf> [--port 8080]
+engine/build/omph-server <model.omph> [--port 8080]
 
 # full forward pass: prefill + greedy decode (options in the table below)
-engine/build/omph-run <model.gguf> models/golden/cpu/tokens.txt <out-logits.f32> \
+engine/build/omph-run <model.omph> models/golden/cpu/tokens.txt <out-logits.f32> \
     --gemv --generate 3 --gen-out /tmp/gen.txt [--trace-dir DIR] [--tokens N]
 
 # the decode / verification attention alone on a synthetic cache (#169): kernel time and bandwidth

@@ -24,7 +24,9 @@ target_compile_options(omph_warnings INTERFACE -Wall -Wextra)
 
 add_library(omphalos SHARED
     src/format/gguf.cc
+    src/format/omph.cc
     src/format/repack.cc
+    src/format/sha256.cc
     src/text/tokenizer.cc
     src/text/json.cc
     src/text/chat.cc
@@ -87,6 +89,10 @@ target_link_libraries(omph-generate PRIVATE omphalos hip::host omph_warnings)
 add_executable(omph-server src/tools/server.cc src/server/http.cc src/server/openai.cc)
 target_include_directories(omph-server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(omph-server PRIVATE omphalos hip::host omph_warnings)
+
+add_executable(omph-convert src/tools/convert.cc)
+target_include_directories(omph-convert PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(omph-convert PRIVATE omphalos omph_warnings)
 
 add_executable(omph-tokenize src/tools/tokenize.cc)
 target_include_directories(omph-tokenize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

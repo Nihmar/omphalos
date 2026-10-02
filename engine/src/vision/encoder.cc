@@ -11,6 +11,8 @@
 #include <cstring>
 #include <stdexcept>
 #include <thread>
+#include <vector>
+#include <unistd.h>
 
 namespace omph::vision {
 namespace {
@@ -37,11 +39,34 @@ Encoder::Encoder(const std::string & mmproj, const std::string & model, const in
     mtmd_log_set(quiet, nullptr);
     mtmd_helper_log_set(quiet, nullptr);
     llama_backend_init();
-    // mtmd needs a vocabulary; vocab_only reads the metadata, no tensors
+    // mtmd needs a vocabulary; vocab_only reads the metadata, no tensors. The
+    // model is an .omph file (#178), which llama.cpp does not read: its
+    // metadata block is the source GGUF's, so it goes into a temporary GGUF
+    // with no tensors for llama.cpp to load.
     llama_model_params mp = llama_model_default_params();
     mp.vocab_only = true;
     mp.n_gpu_layers = 0;
-    vocab_ = llama_model_load_from_file(model.c_str(), mp);
+    {
+        const omph::gguf::File f(model);
+        char tmp[] = "/tmp/omph-vocab-XXXXXX";
+        const int fd = mkstemp(tmp);
+        if (fd < 0) {
+            throw std::runtime_error("vision: cannot create a temporary vocabulary file");
+        }
+        std::vector<uint8_t> head(24);
+        const uint32_t magic = 0x46554747u, version = 3;  // "GGUF" v3
+        const uint64_t n_tensors = 0, n_kv = f.kv_count();
+        std::memcpy(head.data(), &magic, 4);
+        std::memcpy(head.data() + 4, &version, 4);
+        std::memcpy(head.data() + 8, &n_tensors, 8);
+        std::memcpy(head.data() + 16, &n_kv, 8);
+        const size_t kv = (size_t) (f.kv_end() - f.kv_begin());
+        const bool ok = write(fd, head.data(), head.size()) == (ssize_t) head.size() &&
+                        write(fd, f.base() + f.kv_begin(), kv) == (ssize_t) kv;
+        close(fd);
+        vocab_ = ok ? llama_model_load_from_file(tmp, mp) : nullptr;
+        unlink(tmp);
+    }
     if (vocab_ == nullptr) {
         throw std::runtime_error("vision: cannot read the vocabulary of " + model);
     }

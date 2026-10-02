@@ -522,6 +522,15 @@ Codebook tables (**[verify]** sizes): IQ2_XS grid 512 × 8 B, IQ2_S grid 1024 ×
 
 **Plan:** implement **load-time repacking first** (fast iteration on layouts while writing kernels), then move the same logic into an offline converter (Python + NumPy via `uv`, or C++) once layouts stabilize. Don't freeze a format you'll change ten times while optimizing kernels.
 
+**Done (M9 stage B, #178, maintainer's decisions):**
+- **A separate file and a dedicated tool.** `omph-convert model.gguf` writes `model.omph`, and the engine loads **only** `.omph`.
+- **The format** is the GGUF v3 container with the magic `OMPH` (`format/gguf.hh` reads both): the source GGUF's metadata block copied verbatim (hyperparameters, tokenizer, chat template), plus `omph.format_version`, `omph.source_sha256`, `omph.tensor_layouts` (0: GGUF bytes, 1: §8.3's repack) and `omph.tensor_bytes`.
+- **The converter** stores every tensor a fused kernel reads in its repacked layout, after checking it rebuilds the GGUF bytes bit for bit. The token embedding and the f32 tensors keep the GGUF bytes; data sit on 256-byte boundaries.
+- **The engine** uploads the stored bytes as they are. Outputs are bit-identical to the GGUF + load-time repack path, and a 3-token run takes 0.89 s instead of 1.45 s.
+- **llama.cpp's mtmd** gets the vocabulary from a temporary tensor-less GGUF made from the copied metadata.
+
+**Next (M9 stage C):** the WMMA tile layouts of #178 / `bench/gemv/iq3s_wil.hip`, type by type, as new layout ids. One layout and one kernel family then serve decode (1 token), verification (2-16) and prefill (GEMM).
+
 ---
 
 ## 9. Loader, reference implementation, validation

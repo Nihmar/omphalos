@@ -37,7 +37,7 @@ Measured on the RX 9060 XT (details and conditions in `bench/results/`):
 | decode, plain | 45.8 ms/token (21.8 t/s; llama.cpp: 48.5 ms) |
 | prefill | ~860 t/s at 512 tokens, ~875 t/s at 2k, ~745 t/s at 16k (llama.cpp pp512: 622 t/s) |
 | VRAM | 12.0 GiB of the 16 in use after load with an 8k context and the MTP head, 11.7 without it (device total, ~0.15 GiB of desktop included) |
-| model load | ~4 s (file in the page cache) |
+| model load | <1 s from the `.omph` file (in the page cache): a 3-token run takes 0.89 s |
 | an image (640x488, 300 tokens) | 2.8 s to encode on the CPU, then a normal prefill |
 
 ## Build
@@ -54,7 +54,9 @@ line.
 ## Use
 
 ```sh
-M=models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+# once: the engine loads the .omph file omph-convert writes from the GGUF (#178)
+engine/build/omph-convert models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+M=models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph
 
 # a chat request (OpenAI-style messages) in, streamed text out
 echo '{"messages":[{"role":"user","content":"Hi!"}],"add_generation_prompt":true}' |

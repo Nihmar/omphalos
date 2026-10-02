@@ -24,6 +24,8 @@ from pathlib import Path
 
 import openai
 
+from omph_model import omph_file
+
 FAILURES: list[str] = []
 
 
@@ -94,7 +96,7 @@ def main() -> None:
         port = free_port()
         url = f"http://127.0.0.1:{port}"
         vision = ["--mmproj", args.mmproj] if args.image else []
-        proc = subprocess.Popen([args.server, args.model, "--port", str(port), "--ctx", str(args.ctx), *vision])
+        proc = subprocess.Popen([args.server, omph_file(args.model), "--port", str(port), "--ctx", str(args.ctx), *vision])
     try:
         wait_health(url, proc, 600)
         run_checks(url)

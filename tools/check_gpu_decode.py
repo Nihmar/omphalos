@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
+from omph_model import omph_file
 from omphalos_tools.golden import rel_diff, run_tool
 from omphalos_tools.model import Model
 from omphalos_tools.reference import Reference
@@ -83,7 +84,7 @@ def main() -> None:
         tok_path.write_text(" ".join(str(t) for t in tokens))
         gen_path = Path(tmp) / "gen.txt"
         t0 = time.time()
-        cmd = [args.tool, args.model, str(tok_path), str(Path(tmp) / "logits.f32"),
+        cmd = [args.tool, omph_file(args.model), str(tok_path), str(Path(tmp) / "logits.f32"),
                "--generate", str(args.generate), "--gen-out", str(gen_path)]
         if args.gemv:
             cmd.append("--gemv")

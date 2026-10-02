@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from compare_logits import N_VOCAB, log_softmax
+from omph_model import omph_file
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -77,7 +78,7 @@ def main() -> None:
             req = json.dumps({"messages": [{"role": "user", "content": content}],
                               "add_generation_prompt": True, "enable_thinking": False})
             img = ["--mmproj", args.mmproj, "--image", args.image] if kind == "image" else []
-            ids = run([gen, args.model, "--chat", "--max", "96", "--ids", *img], stdin=req).split("\n")[0]
+            ids = run([gen, omph_file(args.model), "--chat", "--max", "96", "--ids", *img], stdin=req).split("\n")[0]
             (t / "force.ids").write_text(ids)
             # the same prompt for llama.cpp: mtmd adds the vision tags itself
             marker = "<__media__>" if kind == "image" else ""
@@ -96,7 +97,7 @@ def main() -> None:
                 variants |= {" swap": {"OMPH_TEST_MROPE": "swap"}, " flat": {"OMPH_TEST_MROPE": "flat"}}
             for name, env in variants.items():
                 out = t / "ours.f32"
-                run([gen, args.model, "--chat", "--force", str(t / "force.ids"), "--logits-out", str(out), *img],
+                run([gen, omph_file(args.model), "--chat", "--force", str(t / "force.ids"), "--logits-out", str(out), *img],
                     env=env, stdin=req)
                 results[kind + name] = kl_stats(t / "ref.f32", out)
                 kl, p99, top1 = results[kind + name]
