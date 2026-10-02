@@ -70,6 +70,10 @@ engine/build/omph-tokenize <model.gguf> [--no-parse-special] < prompt.txt > toke
 # enable_thinking?, ...} on stdin -> the prompt (--chat) or its ids (--chat-ids)
 engine/build/omph-tokenize <model.gguf> --chat-ids < request.json > tokens.txt
 
+# generation (#152): text, a chat request (--chat) or ids (--prompt-ids) in, streamed text out;
+# greedy uses MTP speculation, --temp/--top-k/--top-p/--min-p/--seed sample, --then FILE a next turn
+engine/build/omph-generate <model.gguf> --chat --max 256 < request.json
+
 # full forward pass: prefill + greedy decode (options in the table below)
 engine/build/omph-run <model.gguf> models/golden/cpu/tokens.txt <out-logits.f32> \
     --gemv --generate 3 --gen-out /tmp/gen.txt [--trace-dir DIR] [--tokens N]
