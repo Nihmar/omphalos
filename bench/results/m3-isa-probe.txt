@@ -29,3 +29,14 @@ throughput (raw, 16 chains x 256 lanes x 256 workgroups):
 - The **vector** int8 dot `v_dot4_i32_i8` does exist and computes correctly on gfx1200 (inline asm). LLVM simply does not expose `__builtin_amdgcn_sdot4` for this target (`dot1-insts` is not advertised), which is what the M3.1 note hit.
 - Raw vector rates (16 independent chains, so vector-ALU-bound): int8 dot 14.3 TOPS, half2 8.4 TFLOPS, f32 4.4 TFLOPS. The int8 vector path is well under the fp16 matrix path.
 - **PLAN.md §10.5 INT8 prefill option: dead.** Use the FP16 WMMA path. **PLAN.md §10.1 decode GEMV: unchanged** — it is bandwidth-bound (measured 0.88 TFLOPS while reading 701 MiB in 2.90 ms), so dequant-in-register + f16/f32 FMA is the right shape and the ALU has 5x headroom for small-batch work.
+
+## Correction (#203, 2026-10-02): gfx1200 DOES have the int8 matrix path
+
+The "NO" above was the probe's mistake. It assembled gfx11's operand form of
+`v_wmma_i32_16x16x16_iu8` (wave32 RDNA3 takes 4-VGPR A/B; gfx12 takes 2-VGPR A/B).
+The gfx12 builtin `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12` compiles for
+gfx1200, and llama.cpp's MMQ uses it on RDNA4 (ggml-cuda/mma.cuh). Measured with
+random register operands, sustained under the 160 W cap (`bench/gemm/wmma_rates.hip`,
+`bench/results/ceilings-203.txt`):
+f16 88.7 TFLOPS, **iu8 168.6 TOPS (1.9x)**, fp8 166.4, iu4 (16x16x32) 337.2 TOPS.
+The M0 hipBLASLt int8 figure (26 TOPS) measured that library, not the hardware.

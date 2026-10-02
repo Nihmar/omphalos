@@ -1,0 +1,18 @@
+Measured ceilings of the RX 9060 XT (gfx1200, 16 WGPs), #203 phase 0, 2026-10-02, tree 0b32e24
+Every figure is sustained (seconds of back-to-back launches, the clocks settled); a
+cold single launch reads up to ~45 % low (LDS: 3.8 vs 7.0 TB/s), which is what
+misled #213's first analysis.
+
+DRAM read                318.3 GB/s        bench/bw_membench.hip (10 GiB, 10 passes, median)
+LDS read, ds_load_b128   6.6-7.0 TB/s      bench/gemm/lds_bw.hip (3 s; 128 WGs x 8 waves)
+                         = ~13.7 G 512-byte WMMA operands per second, above the f16 WMMA rate
+WMMA, random register operands, 4 A x 4 B per wave, 5 s each (bench/gemm/wmma_rates.hip):
+  f16  -> f32            88.7 TFLOPS
+  bf16 -> f32            89.2 TFLOPS
+  iu8  -> i32           168.6 TOPS          (1.9x f16: PLAN.md §10.5's "no int8 WMMA" was wrong)
+  fp8  -> f32           166.4 TFLOPS
+  iu4  -> i32 (16x16x32) 337.2 TOPS
+  constant operands instead of random: f16 ~107 TFLOPS (less switching power)
+Power during the WMMA runs: 160 W (the cap; power1_cap_max 182 W), GFX clock 2.63-2.82 GHz
+Kernel launch, dependent tiny kernels on one stream (bench/launch/gap.hip, 2 s warm-up):
+  stream 2.68 us per kernel, HIP graph 2.24 us per kernel
