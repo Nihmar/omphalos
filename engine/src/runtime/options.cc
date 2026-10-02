@@ -16,6 +16,19 @@ EnvOptions EnvOptions::from_env() {
     o.kv_host = flag("OMPH_KV_HOST");
     o.kv_f32 = flag("OMPH_KV_F32");
     o.kv_k4 = flag("OMPH_KV_K4");
+    if (const char * l = std::getenv("OMPH_KV_K4_LAYERS")) {
+        for (const char * p = l; *p != '\0';) {
+            char * end = nullptr;
+            const long i = std::strtol(p, &end, 10);
+            if (end == p) {
+                break;
+            }
+            if (i >= 0 && i < 64) {
+                o.kv_k4_layers |= (uint64_t) 1 << i;
+            }
+            p = *end == ',' ? end + 1 : end;
+        }
+    }
     if (const char * w = std::getenv("OMPH_KV_WINDOW")) {
         o.kv_window = std::atoll(w);
     }

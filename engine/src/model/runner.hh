@@ -366,7 +366,10 @@ private:
     int64_t kv_window_ = 0;  // Q8/Q4 mode: 128 unless OMPH_KV_WINDOW says otherwise
     int64_t kv_ring_ = 0;    // the FP16 ring's slots: window + kKvRingExtra (#161)
     bool kv_q8q4_ = false;
-    bool kv_k4_ = false;  // K stored as Q4 (experiment, #81)
+    // K stored as Q4 per attention layer (#81, #175), and each layer's offset
+    // into kv_kq_ (a Q4 layer's K takes half the bytes)
+    std::vector<uint8_t> kv_k4_;
+    std::vector<size_t> kv_kq_off_;
     bool kv_host_ = false;  // f32 KV in pinned host RAM (validation reference)
     void * kv_stage_k_ = nullptr;
     // Overlap of independent GEMVs (#71): the decode forks a layer's sibling

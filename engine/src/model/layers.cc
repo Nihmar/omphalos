@@ -39,7 +39,7 @@ Runner::KvView Runner::kv_view(const int64_t il) const {
         v.q = quant_kv(il);
         v.window = kv_window_;
         v.ring = kv_ring_;
-        v.k_q4 = kv_k4_;
+        v.k_q4 = kv_k4_[(size_t) kv_index_[il]] != 0;
     } else {
         // Null in the quantized-KV mode, where the f32 cache is never allocated.
         v.k_f32 = static_cast<float *>(kv_k_) + kv_index_[il] * max_seq_ * kv_out;
@@ -237,7 +237,7 @@ Runner::QuantKv Runner::quant_kv(const int64_t il) const {
     const int64_t kv_out = h_.n_head_kv * h_.head_dim;
     const int64_t nblk = h_.head_dim / 32;
     const int64_t kvl = kv_index_[il];
-    return {static_cast<uint8_t *>(kv_kq_) + kvl * max_seq_ * kv_out / (kv_k4_ ? 2 : 1),
+    return {static_cast<uint8_t *>(kv_kq_) + kv_kq_off_[(size_t) kvl],
             static_cast<uint8_t *>(kv_ks_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2,
             static_cast<uint8_t *>(kv_vq_) + kvl * max_seq_ * kv_out / 2,
             static_cast<uint8_t *>(kv_vs_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2,

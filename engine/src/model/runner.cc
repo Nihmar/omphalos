@@ -231,9 +231,17 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         // K Q8 + V Q4 with 32-element blocks: 272 B and 144 B per head per
         // token, against 1024 B each in f32 (PLAN.md §13).
         const int64_t nblk = h_.head_dim / 32;
-        // OMPH_KV_K4=1: K in V's Q4 format too (#81, experiment).
-        kv_k4_ = env_.kv_k4;
-        alloc(&kv_kq_, (size_t) n_kv * kvcap * attn_kv / (kv_k4_ ? 2 : 1));
+        // OMPH_KV_K4=1: K in V's Q4 format too (#81, experiment); or only on the
+        // attention layers of OMPH_KV_K4_LAYERS (#175).
+        kv_k4_.assign((size_t) n_kv, 0);
+        kv_kq_off_.assign((size_t) n_kv, 0);
+        size_t kq_bytes = 0;
+        for (int64_t i = 0; i < n_kv; ++i) {
+            kv_k4_[(size_t) i] = env_.kv_k4 || (i < 64 && ((env_.kv_k4_layers >> i) & 1));
+            kv_kq_off_[(size_t) i] = kq_bytes;
+            kq_bytes += (size_t) kvcap * attn_kv / (kv_k4_[(size_t) i] ? 2 : 1);
+        }
+        alloc(&kv_kq_, kq_bytes);
         alloc(&kv_ks_, (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2);
         alloc(&kv_vq_, (size_t) n_kv * kvcap * attn_kv / 2);
         alloc(&kv_vs_, (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2);
