@@ -1,0 +1,26 @@
+# VRAM and speed at long contexts (#166). Engine 2d49be3 (main) + the NIAH script. RX 9060 XT, 16304 MiB.
+# Device VRAM in use (sysfs, desktop included: 154-205 MiB idle).
+#
+# 1. After load, empty context (OMPH_TIMING "vram ... after load"; omph-generate --ctx N, KV allocated at load)
+#    context      with MTP    without MTP   K4/V4 + MTP
+#    8k           12018       11654
+#    80k (81920)  14010       13526         13370
+#    90k (92160)  14286       13796         13566
+#    100k (102400) 14564      14046         13764
+#    110k (112640) 14840      14306         13960
+#    per token of context: 27.7 KB with MTP, 26.0 KB without, 19.5 KB with K4
+#
+# 2. Context filled (wikitext-2 train ids, omph-generate --prompt-ids --max 32; peak sampled every 0.1 s)
+#    context / prompt          after load  peak    prefill                  decode (32 tokens)
+#    112640 / 112000, MTP      14840       15241   299.9 s (373 t/s)        80.3 ms/token, drafts 17 / 51 accepted
+#    112640 / 112000, no MTP   14306       14497   298.9 s (375 t/s)        66.1 ms/token
+#    112640 / 112000, K4 + MTP 13960       14361   301.6 s (371 t/s)        70.9 ms/token, drafts 17 / 45 accepted
+#    81920 / 81000, MTP        14010       14411   182.0 s (445 t/s)        51.7 ms/token, drafts 19 / 39 accepted
+#    81920 / 81000, no MTP     13526       13717   180.8 s (448 t/s)        60.1 ms/token
+#    (single runs; short-context references: plain decode 45.8 ms/token, prefill ~745 t/s at 16k)
+#
+# Reading: the decode grows ~0.18 ms per 1k tokens of context against ~0.084 ms for reading the KV at the
+# measured 318 GB/s ceiling (26.6 KB per position over the 16 attention layers): the decode attention
+# kernel runs at about half the bandwidth at long context. A speculative verification step costs ~150 ms
+# at 112k (2.3x a plain step): the 24-row scalar verification tile scales with the rows. Hypotheses from
+# timings, to be confirmed with a per-kernel profile.
