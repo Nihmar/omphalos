@@ -11,6 +11,8 @@ weights stay bit-exact with the GGUF (lossless re-layouts only).
   check command (Entry points);
 - [docs/technical-report.md](docs/technical-report.md): the kernels, layouts
   and measurements, with the math;
+- [docs/roadmap.md](docs/roadmap.md): the measured status at short and long
+  context and the planned performance work, one issue per item;
 - [tools/README.md](tools/README.md): the Python tooling and validation
   scripts.
 
