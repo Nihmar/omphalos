@@ -758,6 +758,9 @@ Errors in K change the pre-softmax scores (i.e. *where* the model looks); errors
 ### 13.5 Mixed precision per layer
 
 - With few attention layers, measure sensitivity **one layer at a time**: quantize a single layer to Q4, measure KL increase vs FP16 KV at long context. Assign Q8/Q4 per layer (K and V separately) under a VRAM budget — RCO spirit in miniature.
+- **Done for K (#175, `bench/results/k4-per-layer-175.txt`):** one layer at a time in K4 at 16k, the KL increases add up across layers. Least to most sensitive attention layer: 2, 5, 7, 15, 9, 11, 4, 6, 10, 13, 1, 14, 0, 8, 12, 3.
+  - **Default since #175 (maintainer's choice):** K4 on the eight least sensitive layers (2, 4, 5, 6, 7, 9, 11, 15), Q8 on the rest. KL 0.00122 / 0.00146 / 0.00141 at 8k / 16k / 32k, against 0.00082 / 0.00089 / 0.00072 for K8 everywhere and llama.cpp's q8_0/q4_0 budget of 0.00162 / 0.00149 / 0.00135. −0.4 GB at a 106k context. The hard NIAH (8 needles, same-vault distractors) gives 16/16 at 50k and 100k, as with K8.
+  - `OMPH_KV_K4_LAYERS=none` keeps K8 everywhere, `OMPH_KV_K4=1` puts K4 everywhere.
 
 ### 13.6 MTP layer KV can be aggressive
 
@@ -951,7 +954,7 @@ GQA-grouped flash attention (#59) makes the decode nearly flat in context: 58.4 
 Since #69 the Q8/Q4 KV is the engine's default (`OMPH_KV_F32=1` for the f32 reference).
 K at Q4 (#81, `OMPH_KV_K4=1`, -0.32 GB at 32k): KL 0.0017 / 0.0035 / 0.0021 at 8k / 16k /
 32k — about llama.cpp's q4_0/q4_0 (0.0025 / 0.0028 / 0.0026) but over the q8_0/q4_0
-budget, so K stays Q8 by default; a per-layer K choice (§13.5) is the open follow-up.
+budget, so K stayed Q8 by default; since #175 K is Q4 on the 8 least sensitive attention layers (§13.5).
 
 Decode after M5 (#63, #66; `bench/results/decode-step-20261001.txt`): **55.2 ms/token** at
 a 10-token prompt (58.0 on main measured the same day), 54.8 ms at 512 and 58.2 ms at 8k

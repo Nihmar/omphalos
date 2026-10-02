@@ -180,6 +180,7 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_KV_F32` | KV | exact f32 cache in VRAM (reference) |
 | `OMPH_KV_HOST` | KV | exact f32 cache in pinned host RAM (long-context reference) |
 | `OMPH_KV_K4` | KV | K in V's Q4 format too (#81, experiment) |
+| `OMPH_KV_K4_LAYERS=i,j,...\|none` | KV | K4 on those attention layers (0-15), the rest Q8. Default: 2, 4, 5, 6, 7, 9, 11, 15, the least sensitive ones (#175, PLAN.md §13.5, `bench/results/k4-per-layer-175.txt`); `none`: K8 everywhere (the pre-#175 cache) |
 | `OMPH_KV_WINDOW=N` | KV | every query reads its last N keys exactly from an FP16 ring of N + 15 slots (default 128, 0 = off; #161) |
 | `OMPH_OVERLAP` | A/B | a side stream for sibling GEMVs (#71); off by default since #189 (the persistent-warp GEMVs fill the GPU alone: 44.2 vs 44.9 ms per step, and a side stream the calibration keeps could cost ~9 ms). With it on, the runner times the overlap at load and drops a side stream that loses to running in order (#132), and re-times it when single-token steps turn 1.35x slower during the run (#144; `OMPH_TIMING` prints both) |
 | `OMPH_NO_B4` | A/B | no NT = 2..4-token GEMVs (verifications, short `--gemv` prefills): one launch per token |

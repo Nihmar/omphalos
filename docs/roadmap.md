@@ -111,7 +111,7 @@ If #169 lands first, #172 applies to the WMMA kernel.
 
 | issue | what |
 |---|---|
-| #175 | per-layer K precision (Q4 where the KL allows), or K4 by default above some context length; needs a harder retrieval test and the per-layer KL |
+| #175 | per-layer K precision: done, K4 on the 8 least sensitive attention layers by default (maintainer's choice), −0.4 GB at 106k, KL at llama.cpp's q8_0/q4_0 budget (`bench/results/k4-per-layer-175.txt`) |
 
 ### Housekeeping and backlog
 
@@ -148,7 +148,6 @@ decides.
 
 ## 6. Decisions for the maintainer
 
-- K precision (#175): keep Q8 K, per-layer K4, or K4 above some length.
 - M9 (#178): when, and whether the GGUF path stays next to the converted
   format.
 - Whether the MTP window (#171) is acceptable if it costs some acceptance.
