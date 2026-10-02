@@ -796,7 +796,6 @@ __global__ void gemv_iq4_ntg_kernel(const uint8_t * __restrict__ qs,
     float acc[R][NT] = {};
     if (row0 < rows) {
         for (long long s = lane; s < n_sub; s += 32) {
-            const long long blk = s / 8;
             const int sub = (int) (s % 8);
             uint32_t xl[NT][8];  // weights 0..15
             uint32_t xh[NT][8];  // weights 16..31
@@ -812,8 +811,10 @@ __global__ void gemv_iq4_ntg_kernel(const uint8_t * __restrict__ qs,
 #pragma unroll
             for (int r = 0; r < R; ++r) {
                 const long long row = row0 + r <= rlast ? row0 + r : rlast;
-                const uint4 q = *reinterpret_cast<const uint4 *>(qs + row * blocks * 128 + s * 16);
-                const uint2 mt = *reinterpret_cast<const uint2 *>(meta + (row * blocks + blk) * 8);
+                const long long rb = __builtin_amdgcn_readfirstlane((int) row) * blocks;  // SGPR bases
+                const uint32_t so = (uint32_t) s;
+                const uint4 q = *reinterpret_cast<const uint4 *>(qs + rb * 128 + so * 16u);
+                const uint2 mt = *reinterpret_cast<const uint2 *>(meta + rb * 8 + (so / 8u) * 8u);
                 const uint32_t w[4] = {q.x, q.y, q.z, q.w};
                 float pl[NT] = {};
                 float ph[NT] = {};
