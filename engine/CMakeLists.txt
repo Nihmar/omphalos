@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(omphalos LANGUAGES CXX HIP)
+project(omphalos LANGUAGES C CXX HIP)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,6 +29,7 @@ add_library(omphalos SHARED
     src/text/json.cc
     src/text/chat.cc
     src/runtime/context.cc
+    src/runtime/engine_api.cc
     src/runtime/matmul.cc
     src/runtime/options.cc
     src/model/hparams.cc
@@ -52,6 +53,10 @@ target_include_directories(omphalos
 )
 target_compile_options(omphalos PRIVATE -O3)
 target_link_libraries(omphalos PRIVATE hip::host omph_warnings)
+
+add_executable(omph-capi-demo examples/capi_demo.c)
+target_link_libraries(omph-capi-demo PRIVATE omphalos)
+target_compile_options(omph-capi-demo PRIVATE -Wall -Wextra -std=c11)
 
 add_executable(omph-generate src/tools/generate.cc)
 target_include_directories(omph-generate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
