@@ -1,4 +1,8 @@
-// GGUF reader for the omphalos engine (PLAN.md §9.1).
+// GGUF reader for the omphalos engine (PLAN.md §9.1), and for the engine's
+// own .omph files (#178, PLAN.md §8.4): the same container with the magic
+// "OMPH", the source GGUF's metadata copied verbatim, four omph.* keys (format
+// version, source SHA-256, every tensor's layout and stored bytes), and the
+// weights already in the layouts the kernels read (omph-convert writes them).
 //
 // Minimal on purpose: mmap the file, parse the header, the metadata KV block
 // and the tensor table. Only what this one model needs — no generality.
@@ -51,12 +55,21 @@ const TypeInfo * type_info(uint32_t type);
 // Byte size of a tensor with these dims (ne[0] fastest); 0 when unknown.
 uint64_t type_nbytes(uint32_t type, const std::vector<uint64_t> & ne);
 
+// .omph tensor layouts (omph.tensor_layouts)
+enum Layout : uint32_t {
+    kLayoutGguf = 0,    // the GGUF bytes as they are
+    kLayoutRepack = 1,  // format/repack.hh's layout of the type (PLAN.md §8.3)
+};
+constexpr uint32_t kOmphFormatVersion = 1;
+
 struct TensorInfo {
     std::string name;
     std::vector<uint64_t> ne;   // ne[0] is the fastest / contiguous dimension
     uint32_t type = 0;          // ggml type id
     uint64_t offset = 0;        // relative to the start of the data section
-    uint64_t nbytes = 0;        // computed from ne and type
+    uint64_t nbytes = 0;        // computed from ne and type (the GGUF bytes)
+    uint32_t layout = kLayoutGguf;  // .omph: how the stored bytes are laid out
+    uint64_t stored = 0;        // bytes in the file: nbytes, or the layout's size
 };
 
 class File {
@@ -68,6 +81,12 @@ public:
     File & operator=(const File &) = delete;
 
     uint32_t gguf_version() const { return version_; }
+    // An .omph file (magic "OMPH") rather than a GGUF one.
+    bool omph() const { return omph_; }
+    // The byte range of the metadata KV block (omph-convert copies it).
+    uint64_t kv_begin() const { return kv_begin_; }
+    uint64_t kv_end() const { return kv_end_; }
+    uint64_t kv_count() const { return kv_.size(); }
     const std::vector<std::pair<std::string, Value>> & metadata() const { return kv_; }
     const Value * find(std::string_view key) const;
     // Every element of an array (the metadata keeps only the first 256 of a
@@ -88,6 +107,9 @@ private:
     const uint8_t * base_ = nullptr;
     size_t size_ = 0;
     uint32_t version_ = 0;
+    bool omph_ = false;
+    uint64_t kv_begin_ = 0;
+    uint64_t kv_end_ = 0;
     uint64_t data_offset_ = 0;
     std::vector<std::pair<std::string, Value>> kv_;
     std::unordered_map<std::string, size_t> kv_index_;

@@ -12,7 +12,8 @@
 namespace omph::gguf {
 namespace {
 
-constexpr uint32_t kMagic = 0x46554747u;  // "GGUF" little-endian
+constexpr uint32_t kMagic = 0x46554747u;      // "GGUF" little-endian
+constexpr uint32_t kOmphMagic = 0x48504D4Fu;  // "OMPH" little-endian
 // The cursor reads the file's little-endian fields with plain loads.
 static_assert(std::endian::native == std::endian::little, "little-endian host required");
 
@@ -195,9 +196,11 @@ File::File(const std::string & path) {
     // The destructor does not run when the constructor throws: unmap here.
     try {
         Cursor c{base_, base_ + size_};
-        if (c.u32() != kMagic) {
-            fail("bad magic (not a GGUF file)");
+        const uint32_t magic = c.u32();
+        if (magic != kMagic && magic != kOmphMagic) {
+            fail("bad magic (not a GGUF or .omph file)");
         }
+        omph_ = magic == kOmphMagic;
         version_ = c.u32();
         if (version_ != 3) {
             fail("unsupported GGUF version " + std::to_string(version_));
@@ -205,6 +208,7 @@ File::File(const std::string & path) {
         const uint64_t tensor_count = c.u64();
         const uint64_t kv_count = c.u64();
 
+        kv_begin_ = (uint64_t) (c.p - base_);
         kv_.reserve(std::min<uint64_t>(kv_count, 4096));
         for (uint64_t i = 0; i < kv_count; ++i) {
             std::string key = c.str();
@@ -217,6 +221,7 @@ File::File(const std::string & path) {
             kv_.emplace_back(std::move(key), std::move(v));
         }
 
+        kv_end_ = (uint64_t) (c.p - base_);
         tensors_.reserve(std::min<uint64_t>(tensor_count, 4096));
         for (uint64_t i = 0; i < tensor_count; ++i) {
             TensorInfo ti;
@@ -232,10 +237,28 @@ File::File(const std::string & path) {
             ti.type = c.u32();
             ti.offset = c.u64();
             ti.nbytes = type_nbytes(ti.type, ti.ne);
+            ti.stored = ti.nbytes;
             tensor_index_.emplace(ti.name, tensors_.size());
             tensors_.push_back(std::move(ti));
         }
 
+        if (omph_) {
+            // every tensor's layout and stored size, in table order
+            uint64_t fv = 0;
+            const Value * ver = find("omph.format_version");
+            if (ver == nullptr || !ver->as_u64(fv) || fv != kOmphFormatVersion) {
+                fail("unsupported .omph format version (reconvert the model with omph-convert)");
+            }
+            const std::vector<int64_t> layouts = int_array("omph.tensor_layouts");
+            const std::vector<int64_t> stored = int_array("omph.tensor_bytes");
+            if (layouts.size() != tensors_.size() || stored.size() != tensors_.size()) {
+                fail("omph.tensor_layouts / omph.tensor_bytes do not match the tensor table");
+            }
+            for (size_t i = 0; i < tensors_.size(); ++i) {
+                tensors_[i].layout = (uint32_t) layouts[i];
+                tensors_[i].stored = (uint64_t) stored[i];
+            }
+        }
         uint64_t alignment = 32;  // ggml default
         if (const Value * a = find("general.alignment")) {
             uint64_t v = 0;
@@ -258,7 +281,7 @@ File::File(const std::string & path) {
             if (t.nbytes == 0) {
                 fail("row size is not a whole number of blocks for tensor " + t.name);
             }
-            if (t.offset > data_bytes || t.nbytes > data_bytes - t.offset) {
+            if (t.offset > data_bytes || t.stored > data_bytes - t.offset) {
                 fail("data of tensor " + t.name + " extends beyond the end of the file");
             }
         }
