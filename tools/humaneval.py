@@ -166,6 +166,7 @@ def main() -> None:
             row = {"task_id": pb["task_id"], "engine": args.engine, "omph_env": args.omph_env, "passed": ok,
                    "error": "" if ok else err, "capped": res["capped"], "answer_cut": res["answer_cut"],
                    "thinking_chars": len(res["thinking"]), "completion": code, "answer": res["answer"],
+                   "thinking": res["thinking"],
                    "predicted_n": res["predicted_n"], "predicted_ms": round(res["predicted_ms"], 1),
                    "prompt_n": res["prompt_n"], "prompt_ms": round(res["prompt_ms"], 1), "wall_s": res["wall_s"]}
             with open(args.out, "a") as f:
