@@ -1,0 +1,38 @@
+# #197: speculative sampling with MTP drafts (temperature > 0) and the faster sampler. Engine aa0f123 (branch
+# feat/197-speculative-sampling, built in engine/build-dev), RX 9060 XT, 2026-10-02.
+#
+# 1. Speed: omph-generate --chat --max 256 (thinking off), top-p 0.95; "plain" = --no-spec. ms per generated token.
+#    Before the sampler change (full sort of the candidates), seeds 1-3, median:
+#                         plain    speculative   speedup   drafts accepted
+#    code, T 0.6          44.4     18.5          2.4x      77 %
+#    code, T 1.0          53.6     33.7          1.6x      72 %
+#    story, T 0.6         44.8     30.0          1.5x      35 %
+#    story, T 1.0         71.0     54.7          1.3x      34 %
+#    After it (seed 1):
+#    code, T 1.0          45.1     19.6          2.3x      76 %
+#    story, T 1.0         45.2     32.2          1.4x      33 %
+#    greedy (speculative) for reference: code 18.4 ms (78 %), story 28.0 ms (40 %): the story's low acceptance
+#    is the text's, not the sampling's.
+#    The sampler change alone: plain sampled decode at T 1.0 71.0 -> 45.2 ms/token, as fast as greedy.
+#
+# 2. Distribution: tools/check_spec_sampling.py, 400 continuations of 4 tokens per mode (omph-server
+#    --no-mtp vs default), seeds 0-399 in both modes, TVD per position and a permutation test (2000 rounds):
+#    400 samples per mode, temperature 1.0, top_p 1.0
+#    position 0: 133 distinct tokens, TVD plain vs spec 0.000 (plain half vs half 0.460), permutation p = 1.000
+#    position 1: 74 distinct tokens, TVD plain vs spec 0.075 (plain half vs half 0.190), permutation p = 1.000
+#    position 2: 173 distinct tokens, TVD plain vs spec 0.300 (plain half vs half 0.400), permutation p = 0.637
+#    position 3: 185 distinct tokens, TVD plain vs spec 0.295 (plain half vs half 0.357), permutation p = 0.299
+#    whole continuations: 680 distinct, permutation p = 0.156
+#    PASS
+#    400 samples per mode, temperature 0.6, top_p 0.95
+#    position 0: 36 distinct tokens, TVD plain vs spec 0.000 (plain half vs half 0.235), permutation p = 1.000
+#    position 1: 16 distinct tokens, TVD plain vs spec 0.003 (plain half vs half 0.095), permutation p = 1.000
+#    position 2: 46 distinct tokens, TVD plain vs spec 0.145 (plain half vs half 0.225), permutation p = 0.568
+#    position 3: 63 distinct tokens, TVD plain vs spec 0.162 (plain half vs half 0.225), permutation p = 0.214
+#    whole continuations: 255 distinct, permutation p = 0.938
+#    PASS
+#    The same seeds in both modes make positions 0-1 nearly paired (the first token is drawn identically), so
+#    their p-values say nothing; positions 2-3 and the whole continuations, where the streams diverge, show
+#    no difference (TVD below the plain half-vs-half noise). A stricter run would use disjoint seeds.
+#
+# 3. Greedy unchanged: the oracle speculative validation (15 cases) identical on the dev build.

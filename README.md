@@ -20,11 +20,11 @@ weights stay bit-exact with the GGUF (lossless re-layouts only).
 
 | | |
 |---|---|
-| Decode | fused dequant + dot GEMVs on load-time repacked weights; greedy decoding drafts 3 tokens per step with the model's own MTP head and verifies them in one pass, with output bit-identical to plain greedy |
+| Decode | fused dequant + dot GEMVs on load-time repacked weights; every decode drafts 3 tokens per step with the model's own MTP head and verifies them in one pass: greedy output bit-identical to plain greedy, sampled output with plain sampling's distribution (speculative sampling, #197) |
 | Prefill | fused dequant + WMMA GEMM, WMMA flash attention, token-parallel delta net |
 | KV cache | V in Q4; K in Q4 on the 8 least sensitive of the 16 attention layers and Q8 on the rest (#175); the last 128 tokens exact in an FP16 ring |
 | Text | the GGUF's byte-level BPE tokenizer and its chat template (thinking, reasoning effort, tool calls), reimplemented in C++ and checked against llama.cpp and jinja2 |
-| Sampling | greedy (speculative), or temperature / top-k / top-p / min-p with a seed |
+| Sampling | greedy, or temperature / top-k / top-p / min-p with a seed; both decode speculatively (code at temperature 0.6: 18.5 vs 44.4 ms/token) |
 | Cache reuse | a prompt that extends the cached sequence prefills only its new tokens; checkpoints in host RAM let a retried answer or an edited history resume from an earlier point |
 | Vision | images encoded on the CPU by llama.cpp's mtmd (no VRAM), fed as embeddings with M-RoPE positions |
 | Interfaces | `omph-generate` (CLI), `omph-server` (OpenAI-compatible HTTP), `libomphalos.so` with a C ABI (`engine/include/omphalos.h`) |
