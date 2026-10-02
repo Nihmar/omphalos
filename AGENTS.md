@@ -66,6 +66,9 @@ cmake --build engine/build -j
 
 # tokenizer (#148): text on stdin -> ids, or --decode ids -> text
 engine/build/omph-tokenize <model.gguf> [--no-parse-special] < prompt.txt > tokens.txt
+# chat template (#150): a JSON request {messages, tools?, add_generation_prompt?,
+# enable_thinking?, ...} on stdin -> the prompt (--chat) or its ids (--chat-ids)
+engine/build/omph-tokenize <model.gguf> --chat-ids < request.json > tokens.txt
 
 # full forward pass: prefill + greedy decode (options in the table below)
 engine/build/omph-run <model.gguf> models/golden/cpu/tokens.txt <out-logits.f32> \
@@ -90,6 +93,7 @@ uv run python check_gpu_decode.py [--gemv]        # greedy decode vs the NumPy r
                                                   # (cached in models/golden/cpu; --refresh)
 uv run python check_tokenizer.py <model> <llama.cpp>/bin/llama-tokenize [--fuzz N]
                                                   # tokenizer vs llama.cpp, token for token
+uv run python check_chat_template.py <model>      # chat template vs jinja2, byte for byte
 uv run python compare_logits.py ref.f32 test.f32  # KL + top-1 agreement over every
                                                   # position (e.g. OMPH_KV_F32=1 vs default)
 
@@ -105,7 +109,7 @@ engine/build/omph-run <model> <tokens.txt> /tmp/p.f32 --last-logits --gemv --gen
 
 # CPU-only tests (no GPU, no ROCm; what CI runs, .github/workflows/ci.yml)
 cmake -S engine/tests -B engine/build-tests && cmake --build engine/build-tests -j
-ctest --test-dir engine/build-tests --output-on-failure   # repack round trip, GGUF parser, tokenizer
+ctest --test-dir engine/build-tests --output-on-failure   # repack round trip, GGUF parser, tokenizer, JSON + chat
 cd tools && uv run ruff check . && uv run python -m pytest tests -q   # decoders vs gguf-py
 uv run python check_doc_math.py ../docs/*.md ../PLAN.md        # math GitHub would mangle
 

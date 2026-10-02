@@ -26,6 +26,8 @@ add_library(omphalos SHARED
     src/format/gguf.cc
     src/format/repack.cc
     src/text/tokenizer.cc
+    src/text/json.cc
+    src/text/chat.cc
     src/runtime/context.cc
     src/runtime/matmul.cc
     src/runtime/options.cc
