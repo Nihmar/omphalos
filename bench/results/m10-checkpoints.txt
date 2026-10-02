@@ -1,0 +1,33 @@
+# M10: sequence checkpoints in host RAM (#158). Engine d619480, same session.
+# RX 9060 XT, omph-generate --chat --max 1 (thinking off), "prompt ... in X ms" = prefill wall
+# (restore / save included), median of 5. --cache-mib 0 = no checkpoints; --repeat 2 = the same
+# request twice in one process (the second resumes from the checkpoint before the generation prompt).
+#
+# 1. Prefill (ms):                 no checkpoints      first request (saves)    retry (restores)
+#    1977 tokens                   2325.8              2475.2 (+149, +6.4 %)    145.4 (1970 cached)
+#       runs                       2322.1 2322.8 2325.8 2329.0 2330.1
+#                                  2471.9 2474.2 2475.2 2479.2 2479.8
+#                                  145.3 145.5 145.3 145.4 145.6
+#    725 tokens                    895.5               1043.8 (+148, +16.5 %)   143.7
+#       runs                       890.3 894.3 895.5 897.4 896.6
+#                                  1040.8 1043.3 1043.8 1043.8 1045.6
+#                                  143.2 143.9 143.9 143.4 143.7
+#
+# 2. Where the save cost goes (1977 tokens):
+#    the copy, 151.6 MB (48 delta-net states + conv tails, FP16 ring, MTP h)   ~47 ms (+ the pending chunk: 61 ms)
+#    the cut: the 7-token generation prompt runs as its own pass (GEMVs)       ~90 ms
+#    restore (host -> device copy)                                              51 ms
+#
+# 3. Host <-> device bandwidth on this machine: 3.3 GB/s both ways (hipMemcpy 151 MB, pinned,
+#    coherent or not, 1 or 96 copies). The GPU's upstream link (root port 00:01.0 <-> 01:00.0)
+#    runs at 2.5 GT/s x16 (PCIe 1.0 rate; max 32 GT/s), and amdgpu's pp_dpm_pcie lists only
+#    2.5 GT/s levels. At PCIe 5.0 x16 rates the copies would take ~6-8 ms each.
+#
+# 4. Output: identical to a fresh run without checkpoints (greedy, 139-token answer to a
+#    2060-token second turn whose history dropped the reasoning: 1996 tokens restored, prefill
+#    2520.9 -> 258.2 ms); retried requests give the same tokens (3 repeats, 96 tokens).
+#    omph-server (tools/check_server.py): retry 1283 of 1288 prompt tokens from a checkpoint,
+#    the next turn without reasoning_content 1283 of 1406.
+#
+# Threshold: a cut is made only where it saves >= 512 tokens of prefill (worst case without
+# reuse: +~150 ms on ~700 ms); below that, re-prefilling costs about as much as the cut.

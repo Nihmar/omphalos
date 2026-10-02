@@ -100,6 +100,18 @@ public:
     // positions the new sequence has written.
     bool reset_sequence();
 
+    // --- sequence checkpoints (#158) ---
+    // What a checkpoint holds: the state after the kept sequence that its next
+    // tokens read and cannot rebuild from the KV caches — every delta-net
+    // state and conv tail, the FP16 KV ring, the MTP block's h. The Q8/Q4 KV
+    // (and the MTP KV) stay in VRAM: restoring is valid while the positions
+    // below the checkpoint hold the same tokens as when it was saved.
+    size_t checkpoint_bytes() const;
+    // A pinned host buffer of checkpoint_bytes(), freed with the runner.
+    void * checkpoint_alloc();
+    bool checkpoint_save(void * host);
+    bool checkpoint_restore(const void * host);
+
     // --- speculative decoding (#122) ---
     // Allocates what a verification of up to `max_tokens` tokens needs to be
     // rolled back (the alternate delta-net states, +151 MB, the replay records,
@@ -125,6 +137,7 @@ public:
                    std::vector<float> * logits = nullptr);
 
 private:
+    bool checkpoint_copy(void * host, bool save);
     // Final norm and lm_head of the T rows in h16_, into `logits` on the host
     // (or, with `greedy` on a single-token GEMV step, only the argmax). Returns
     // once the results are on the host.

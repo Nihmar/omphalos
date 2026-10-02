@@ -19,6 +19,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import openai
 
@@ -141,6 +142,22 @@ def run_checks(url: str) -> None:
     cached = r2.usage.prompt_tokens_details.cached_tokens
     check(cached >= r.usage.prompt_tokens, f"next turn: {cached} of {r2.usage.prompt_tokens} prompt tokens cached")
     check("yes" in (r2.choices[0].message.content or "").lower(), f"answer: {r2.choices[0].message.content!r}")
+
+    # checkpoints (#158): a retried answer, and a next turn without the
+    # reasoning, resume from the checkpoint before the generation prompt
+    notes = (Path(__file__).resolve().parent.parent / "PLAN.md").read_text()[20000:24000]
+    q = [{"role": "user", "content": "Summarize these notes in one sentence.\n\n" + notes}]
+    r = client.chat.completions.create(model=model, messages=q, max_tokens=2048, extra_body=effort)
+    again = client.chat.completions.create(model=model, messages=q, max_tokens=2048, extra_body=effort)
+    n = r.usage.prompt_tokens
+    cached = again.usage.prompt_tokens_details.cached_tokens
+    check(n - 8 <= cached < n and again.choices[0].message.content == r.choices[0].message.content,
+          f"retry: {cached} of {n} prompt tokens from a checkpoint, the same answer")
+    turn2 = q + [{"role": "assistant", "content": r.choices[0].message.content},
+                 {"role": "user", "content": "Shorter."}]
+    r2 = client.chat.completions.create(model=model, messages=turn2, max_tokens=2048, extra_body=effort)
+    cached = r2.usage.prompt_tokens_details.cached_tokens
+    check(n - 8 <= cached < n, f"next turn without the reasoning: {cached} of {r2.usage.prompt_tokens} cached")
 
     # a tool call round trip
     tools = [{"type": "function", "function": {

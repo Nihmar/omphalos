@@ -71,7 +71,8 @@ engine/build/omph-tokenize <model.gguf> [--no-parse-special] < prompt.txt > toke
 engine/build/omph-tokenize <model.gguf> --chat-ids < request.json > tokens.txt
 
 # generation (#152): text, a chat request (--chat) or ids (--prompt-ids) in, streamed text out;
-# greedy uses MTP speculation, --temp/--top-k/--top-p/--min-p/--seed sample, --then FILE a next turn
+# greedy uses MTP speculation, --temp/--top-k/--top-p/--min-p/--seed sample, --then FILE a next turn,
+# --repeat N the same request again (resumes from a checkpoint), --cache-mib N (0: no checkpoints)
 engine/build/omph-generate <model.gguf> --chat --max 256 < request.json
 
 # the C ABI (include/omphalos.h, #154) from plain C: load, chat, tokenize, generate
@@ -79,7 +80,8 @@ engine/build/omph-capi-demo <model.gguf>
 
 # OpenAI-compatible server (#156): /v1/chat/completions, /v1/completions, /v1/models, /health;
 # streamed or not, reasoning_content / tool_calls; one request at a time on 127.0.0.1:8080.
-# Options: --host --port --ctx --alias --api-key --cors ORIGIN, request defaults --temp
+# Options: --host --port --ctx --cache-ram MIB (sequence checkpoints in host RAM, #158; default
+# 2048) --alias --api-key --cors ORIGIN, request defaults --temp
 # --top-k --top-p --min-p --max-tokens (default greedy: speculative MTP decoding)
 engine/build/omph-server <model.gguf> [--port 8080]
 

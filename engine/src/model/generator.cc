@@ -30,6 +30,10 @@ Generator::Generator(const Config & config, const omph::runtime::EnvOptions & en
     if (tokenizer_->eos() >= 0 && !is_eog(tokenizer_->eos())) {
         eog_.push_back(tokenizer_->eos());
     }
+    im_start_ = tokenizer_->find("<|im_start|>");
+    if (config_.cache_mib > 0) {
+        max_checkpoints_ = (size_t) (config_.cache_mib << 20) / runner_->checkpoint_bytes();
+    }
 }
 
 bool Generator::is_eog(const int32_t id) const {
@@ -37,18 +41,129 @@ bool Generator::is_eog(const int32_t id) const {
 }
 
 // Runs toks[from..] at positions from.. in prefill chunks; the last chunk's
-// logits row ends in last_logits.
-bool Generator::feed(const std::vector<int32_t> & toks, const int64_t from,
-                     std::vector<float> & last_logits) {
+// logits row ends in last_logits. A chunk also ends at each of `cuts`, where
+// a checkpoint is saved.
+bool Generator::feed(const std::vector<int32_t> & toks, const int64_t from, std::vector<float> & last_logits,
+                     const std::vector<int64_t> & cuts, GenerateResult & res) {
     const int64_t n = (int64_t) toks.size();
-    for (int64_t off = from; off < n; off += config_.chunk) {
-        const int64_t m = std::min<int64_t>(config_.chunk, n - off);
-        const std::vector<int32_t> part(toks.begin() + off, toks.begin() + off + m);
-        if (!runner_->forward(part, last_logits, std::string(), off, off + m == n)) {
+    size_t ci = 0;
+    for (int64_t off = from; off < n;) {
+        while (ci < cuts.size() && cuts[ci] <= off) ++ci;
+        int64_t end = std::min<int64_t>(off + config_.chunk, n);
+        const bool cut = ci < cuts.size() && cuts[ci] <= end;
+        if (cut) end = cuts[ci];
+        const std::vector<int32_t> part(toks.begin() + off, toks.begin() + end);
+        if (!runner_->forward(part, last_logits, std::string(), off, end == n)) {
             return false;
         }
+        if (cut) {
+            const double t0 = omph::runtime::now_ms();
+            if (!save_checkpoint(toks, end)) return false;
+            res.checkpoint_ms += omph::runtime::now_ms() - t0;
+        }
+        off = end;
     }
     return true;
+}
+
+// The cached sequence still holds the checkpoint's tokens: its KV positions
+// are the ones the checkpoint's state was computed with.
+bool Generator::valid(const Checkpoint & c) const {
+    return c.tokens.size() <= seq_.size() && std::equal(c.tokens.begin(), c.tokens.end(), seq_.begin());
+}
+
+// Where to save checkpoints in toks[from..]: before <|im_start|> tokens (a
+// special token: the tokens before it do not depend on what follows), the
+// first and the last one -- the first message of the new part (a shared
+// system prompt, an edited message) and the generation prompt (a retried
+// answer, a history whose reasoning the client dropped). Only where the
+// prefill it saves is at least kMinSaved tokens: each cut costs one more pass
+// over the weights for the tokens after it, plus the copy (~150 ms, #158).
+std::vector<int64_t> Generator::checkpoint_positions(const std::vector<int32_t> & toks, const int64_t from) const {
+    constexpr int64_t kMinSaved = 512;
+    std::vector<int64_t> cand;
+    if (max_checkpoints_ == 0 || im_start_ < 0) return cand;
+    for (int64_t p = std::max<int64_t>(from + 1, 1); p < (int64_t) toks.size(); ++p) {
+        if (toks[(size_t) p] == im_start_) cand.push_back(p);
+    }
+    std::vector<int64_t> cuts;
+    int64_t base = from;  // where a restore of this prompt would start without these cuts
+    for (const int64_t p : {cand.empty() ? -1 : cand.front(), cand.empty() ? -1 : cand.back()}) {
+        if (p > base && p - base >= kMinSaved && (cuts.empty() || cuts.back() != p)) {
+            cuts.push_back(p);
+            base = p;
+        }
+    }
+    return cuts;
+}
+
+bool Generator::save_checkpoint(const std::vector<int32_t> & toks, const int64_t pos) {
+    void * buf = nullptr;
+    if (checkpoints_.size() >= max_checkpoints_) {  // the least recently used goes
+        auto lru = std::min_element(checkpoints_.begin(), checkpoints_.end(),
+                                    [](const Checkpoint & a, const Checkpoint & b) { return a.used < b.used; });
+        buf = lru->host;
+        checkpoints_.erase(lru);
+    } else if (!spare_.empty()) {
+        buf = spare_.back();
+        spare_.pop_back();
+    } else {
+        try {
+            buf = runner_->checkpoint_alloc();
+        } catch (const std::exception &) {  // no more pinned memory: keep what we have
+            max_checkpoints_ = checkpoints_.size();
+            return true;
+        }
+    }
+    if (!runner_->checkpoint_save(buf)) {
+        spare_.push_back(buf);
+        return false;
+    }
+    checkpoints_.push_back({std::vector<int32_t>(toks.begin(), toks.begin() + pos), buf, ++clock_});
+    return true;
+}
+
+// Drops the checkpoints that cannot become valid again (the cached sequence
+// differs within their tokens), or all of them.
+void Generator::drop_checkpoints(const bool all) {
+    for (size_t i = checkpoints_.size(); i-- > 0;) {
+        const Checkpoint & c = checkpoints_[i];
+        const size_t m = std::min(c.tokens.size(), seq_.size());
+        if (all || !std::equal(c.tokens.begin(), c.tokens.begin() + m, seq_.begin())) {
+            spare_.push_back(c.host);
+            checkpoints_.erase(checkpoints_.begin() + (std::ptrdiff_t) i);
+        }
+    }
+}
+
+// Brings the caches to the longest usable prefix of `prompt`: the cached
+// sequence when the prompt extends it, else the latest valid checkpoint
+// within their common prefix, else nothing. Returns its length.
+int64_t Generator::resume(const std::vector<int32_t> & prompt, GenerateResult & res) {
+    size_t common = 0;
+    while (common < seq_.size() && common < prompt.size() && seq_[common] == prompt[common]) ++common;
+    if (!seq_.empty() && common == seq_.size() && common < prompt.size()) {
+        return (int64_t) common;
+    }
+    Checkpoint * best = nullptr;
+    for (Checkpoint & c : checkpoints_) {
+        if (c.tokens.size() <= common && c.tokens.size() < prompt.size() && valid(c) &&
+            (best == nullptr || c.tokens.size() > best->tokens.size())) {
+            best = &c;
+        }
+    }
+    if (best != nullptr) {
+        const double t0 = omph::runtime::now_ms();
+        if (runner_->checkpoint_restore(best->host)) {
+            res.checkpoint_ms += omph::runtime::now_ms() - t0;
+            res.restored = true;
+            best->used = ++clock_;
+            seq_.resize(best->tokens.size());
+            return (int64_t) seq_.size();
+        }
+    }
+    seq_.clear();
+    return runner_->reset_sequence() ? 0 : -1;
 }
 
 // Host sampling: temperature, then top-k, min-p and top-p over the tokens
@@ -121,26 +236,23 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt, const Ge
         }
     }
     rng_.seed(req.sampling.seed);
-    // Continue the cached sequence when the prompt extends it (a chat's next
-    // turn); otherwise start over.
-    int64_t from = 0;
-    if (!seq_.empty() && prompt.size() > seq_.size() &&
-        std::equal(seq_.begin(), seq_.end(), prompt.begin())) {
-        from = (int64_t) seq_.size();
-    } else if (!runner_->reset_sequence()) {
+    const double t0 = omph::runtime::now_ms();
+    const int64_t from = resume(prompt, res);
+    if (from < 0) {
+        drop_checkpoints(true);
         res.stop = GenerateResult::Stop::Error;
         return res;
     }
     res.cached_tokens = from;
-    seq_.assign(prompt.begin(), prompt.begin() + from);
-    const double t0 = omph::runtime::now_ms();
     std::vector<float> logits;
-    if (!feed(prompt, from, logits)) {
+    if (!feed(prompt, from, logits, checkpoint_positions(prompt, from), res)) {
         seq_.clear();
+        drop_checkpoints(true);
         res.stop = GenerateResult::Stop::Error;
         return res;
     }
     seq_ = prompt;
+    drop_checkpoints(false);
     const double t1 = omph::runtime::now_ms();
     res.prefill_ms = t1 - t0;
 
@@ -234,6 +346,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt, const Ge
     }
     if (res.stop == GenerateResult::Stop::Error) {
         seq_.clear();  // the caches are in an unknown state: start over next time
+        drop_checkpoints(true);
     }
     res.decode_ms = omph::runtime::now_ms() - t1;
     return res;

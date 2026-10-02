@@ -40,6 +40,8 @@ struct GenerateResult {
     Stop stop = Stop::Length;
     int64_t prompt_tokens = 0;
     int64_t cached_tokens = 0;    // of the prompt, already in the caches
+    bool restored = false;        // ... from a checkpoint (#158)
+    double checkpoint_ms = 0.0;   // saving / restoring checkpoints (in prefill_ms)
     double prefill_ms = 0.0;
     double decode_ms = 0.0;
     int64_t drafted = 0;
@@ -54,6 +56,7 @@ public:
         int64_t chunk = 512;     // prefill chunk (activation buffers)
         bool mtp = true;         // load the MTP block for speculative decoding
         int64_t draft_k = 3;     // drafts per speculative step (#126: 3 is the best)
+        int64_t cache_mib = 2048;  // host RAM for sequence checkpoints (#158); 0: none
     };
     Generator(const Config & config, const omph::runtime::EnvOptions & env);
 
@@ -62,14 +65,28 @@ public:
 
     // Generates after `prompt`. on_token(id) gets every generated token as it
     // is decided; returning false stops (Stop::Callback). The prompt continues
-    // the cached sequence when it starts with it, else the caches restart.
+    // the cached sequence when it starts with it, else the latest checkpoint
+    // within their common prefix (#158), else the caches restart.
     GenerateResult generate(const std::vector<int32_t> & prompt, const GenerateRequest & request,
                             const std::function<bool(int32_t)> & on_token);
 
 private:
     bool is_eog(int32_t id) const;
     int32_t sample(const std::vector<float> & logits, const Sampling & s);
-    bool feed(const std::vector<int32_t> & toks, int64_t from, std::vector<float> & last_logits);
+    bool feed(const std::vector<int32_t> & toks, int64_t from, std::vector<float> & last_logits,
+              const std::vector<int64_t> & cuts, GenerateResult & res);
+    // Sequence checkpoints (#158): the state after tokens[0, pos), in pinned
+    // host RAM; valid while seq_ starts with `tokens`.
+    struct Checkpoint {
+        std::vector<int32_t> tokens;
+        void * host = nullptr;
+        uint64_t used = 0;  // LRU clock
+    };
+    bool valid(const Checkpoint & c) const;
+    int64_t resume(const std::vector<int32_t> & prompt, GenerateResult & res);
+    std::vector<int64_t> checkpoint_positions(const std::vector<int32_t> & prompt, int64_t from) const;
+    bool save_checkpoint(const std::vector<int32_t> & prompt, int64_t pos);
+    void drop_checkpoints(bool all);
 
     Config config_;
     omph::runtime::EnvOptions env_;
@@ -78,6 +95,12 @@ private:
     std::unique_ptr<Runner> runner_;
     std::vector<int32_t> eog_;
     std::vector<int32_t> seq_;  // the tokens whose KV / state are in the caches
+    std::vector<Checkpoint> checkpoints_;
+    std::vector<void *> spare_;  // host buffers of evicted checkpoints
+    size_t max_checkpoints_ = 0;
+    size_t n_buffers_ = 0;
+    uint64_t clock_ = 0;
+    int32_t im_start_ = -1;
     std::mt19937_64 rng_;
 };
 

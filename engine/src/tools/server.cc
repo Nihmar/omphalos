@@ -6,6 +6,8 @@
 //   --ctx N           KV capacity (default 8192)
 //   --chunk N         prefill chunk (default 512)
 //   --no-mtp          do not load the MTP block (no speculative decoding, -352 MiB of VRAM)
+//   --cache-ram MIB   pinned host RAM for sequence checkpoints (default 2048, 0: none): a
+//                     retried answer or a history without the reasoning resumes from one
 //   --alias NAME      the model id in the API (default: the file name without .gguf)
 //   --api-key KEY     require "Authorization: Bearer KEY"
 //   --cors ORIGIN     allow browser requests from ORIGIN (e.g. "*")
@@ -322,9 +324,10 @@ struct Server {
         static const char * kStop[] = {"length", "end of generation", "stop token", "stopped", "context full",
                                        "error"};
         std::fprintf(stderr,
-                     "%s %s: prompt %zu tokens (%lld cached) in %.0f ms; %zu tokens in %.0f ms (%.1f t/s); "
+                     "%s %s: prompt %zu tokens (%lld cached%s) in %.0f ms; %zu tokens in %.0f ms (%.1f t/s); "
                      "stop: %s%s\n",
                      req.method.c_str(), req.path.c_str(), prompt.size(), (long long) res.cached_tokens,
+                     res.restored ? ", checkpoint" : "",
                      res.prefill_ms, res.tokens.size(), res.decode_ms,
                      res.decode_ms > 0 ? 1000.0 * completion_tokens / res.decode_ms : 0.0,
                      parser.stopped() ? "stop string" : kStop[(int) res.stop], gone ? " (client gone)" : "");
@@ -363,6 +366,7 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--ctx")) cfg.context = std::atoll(val());
         else if (!std::strcmp(argv[i], "--chunk")) cfg.chunk = std::atoll(val());
         else if (!std::strcmp(argv[i], "--no-mtp")) cfg.mtp = false;
+        else if (!std::strcmp(argv[i], "--cache-ram")) cfg.cache_mib = std::atoll(val());
         else if (!std::strcmp(argv[i], "--alias")) alias = val();
         else if (!std::strcmp(argv[i], "--api-key")) api_key = val();
         else if (!std::strcmp(argv[i], "--cors")) cors = val();
