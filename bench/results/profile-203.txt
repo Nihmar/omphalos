@@ -1,0 +1,71 @@
+Per-kernel profile against the measured ceilings (#203 phase 1), tree 5e41dfa, 2026-10-03
+RX 9060 XT at its 160 W cap; ceilings: bench/results/ceilings-203.txt. Traces: rocprofv3
+--kernel-trace, analysed with tools/profile_kernels.py (GEMV: tensor bytes at 318.3 GB/s; GEMM
+and prefill attention: FLOPs at the f16 WMMA's 88.7 TFLOPS). Times are under the profiler
+(decode step 45.3 ms vs 44.0 unprofiled). Default KV (mix A); OMPH_KV_K4=1 at 32k changes the
+decode attention only (3.29 -> 3.11 ms per step) and nothing else.
+
+Hardware counters: on gfx1200 with rocprofiler-sdk 1.1 only GRBM_GUI_ACTIVE, SQ_WAVES and
+SQ_BUSY_CYCLES return data (SQ instruction / wait counters, LDS, TCP, GL2C, FETCH_SIZE and the
+derived metrics read 0; groups of 3+ abort the run), and PC sampling is not supported on the
+agent. The causes below therefore come from controlled experiments (ablations, micro-benches).
+
+== Decode, plain greedy, context 512 (per step: 45.3 ms; GPU idle between kernels 2.48 ms)
+class               ms/step  ceiling  eff   loss
+gemv IQ3_S           13.04    11.44   88%   1.60
+gemv IQ4_XS          10.95     9.49   87%   1.46
+gemv IQ3_XXS          7.37     6.52   88%   0.85
+gemv Q4_K (+ head)    5.56     4.97   89%   0.59
+gemv IQ2_S            1.68     1.24   73%   0.45
+gemv Q2_K/IQ2_XS/IQ2_XXS/IQ1_M  2.41  1.82  -  0.59
+delta-net             1.08                    1.08
+norms + swiglu + attention + prep + argmax   0.75   0.75
+idle                  2.48                    2.48
+GEMVs by tensor size: >= 20 MiB at 89-94 % of 318 GB/s, 13-16 MiB at 74-80 %, ~2 MiB at 50-66 %.
+Cause (bench/launch/stream_size.hip, a pure streaming read, back-to-back launches over a 2 GiB
+pool): 12.9 MiB 50.2 us (GEMV 55.0), 21.5 MiB 77.3 (78.6), 36.5 MiB 127.1 (132.4), i.e. ~300 GB/s
+plus 3-11 us per launch. The GEMVs are within 1-5 us of a kernel that only reads: their loss is
+the per-launch fill / drain of the memory pipeline (~3.6 ms per step over ~420 GEMV launches)
+plus 318 -> ~302 GB/s at these sizes; with the 2.5 ms of idle gaps, ~6 ms per step is the cost
+of launching ~700 kernels. Lever: fewer, larger launches (the tensors that share an input in
+one launch; .omph may store them concatenated), small kernels folded into neighbours.
+
+== Decode, speculative (MTP k = 3), context 512: 16.4 ms per generated token, 17 verification
+rounds for 64 tokens (3.8 tokens per round). Drafting: the 682 MiB output head per draft
+(51 launches, 116 ms) and the MTP block (Q6_K, 62 ms) = ~2.8 ms per token (17 %). The
+verification GEMVs (x4) behave as the plain ones per launch.
+
+== Prefill, 4096 tokens (8 chunks of 512): 4.84 s, idle 1.4 %
+class                   ms     ceiling  eff   loss
+gemm IQ3_S            1329      783    59%    546
+gemm IQ3_XXS           853      501    59%    352
+gemm IQ4_XS            843      525    62%    318
+gemm Q4_K/IQ2/Q2_K/IQ1_M   745  438   ~59%   307
+delta-net              487                    487
+attention prefill      181       37    21%    144
+swiglu                 150                    150   (f32 gate/up re-read: bandwidth-bound)
+norms                  107                    107
+attention prep/KV, merge  66                   66
+embedding (dequant)      9                      9   (4096 launches, one per token, + gaps)
+GEMM cause so far (#213, ablations at 512 tokens, 1 s warm-up): 53 TFLOPS; without the B
+operand reads from LDS 74, without the weight decode unchanged (hidden); not LDS bandwidth
+(7 TB/s sustained) but the reads' issue / latency against the WMMAs; the int8 WMMA (1.9x)
+is untried.
+
+== Prefill, 32768 tokens: 45.9 s
+attention prefill 10368 ms at 23 % of its FLOP ceiling (loss 7988) -- the largest single loss
+gemm (all types) 28.6 s at 59-64 % (loss ~10.7 s); delta-net 3732; swiglu 1206; norms 853;
+attention prep 330, merge 187; embedding 70 (32768 launches); idle 541.
+
+== Ranked items (recoverable ms, estimate; each gets its own issue)
+decode (priority 2):
+  D1  launch count: GEMV fill/drain ~3.6 + idle 2.5 ms per step       -> fuse same-input GEMVs, fold small kernels
+  D2  MTP drafting: the full head per draft, ~1.8 ms per token        -> design choice (a reduced draft head)
+  D3  delta-net decode 1.1 ms per step                                -> its own ceiling first
+  D4  low-bit GEMVs (IQ2_S, Q2_K, IQ1_M) 45-76 % : ~0.9 ms           -> partly D1 (small tensors)
+prefill (priority 3):
+  P1  GEMM 59-64 % of the f16 ceiling: ~1.5 s at 4k, ~10.7 s at 32k  -> int8 WMMA prototype (#213), restructure
+  P2  attention at 32k: 8 s lost at 23 %                              -> #191
+  P3  delta-net 0.49 s at 4k, 3.7 s at 32k                            -> its ceiling, then the kernels
+  P4  swiglu + norms 0.26 s at 4k, 2.1 s at 32k                       -> fold into the GEMM epilogue (f16 out)
+  P5  embedding: one launch per token                                 -> one gather kernel (small, easy)

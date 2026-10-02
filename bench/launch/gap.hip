@@ -3,6 +3,7 @@
 //   hipcc -O3 --offload-arch=gfx1200 -o /var/tmp/gap bench/launch/gap.hip && /var/tmp/gap
 #include <hip/hip_runtime.h>
 
+#include <chrono>
 #include <cstdio>
 
 __global__ void tiny(float * p, int n) {
@@ -20,7 +21,12 @@ int main() {
     (void) hipEventCreate(&a);
     (void) hipEventCreate(&b);
     const auto run = [&]() { for (int i = 0; i < N; ++i) tiny<<<n / 256, 256, 0, s>>>(p, n); };
-    for (int w = 0; w < 20; ++w) run();
+    // ~2 s of warm-up: the clocks ramp first (#203 phase 0)
+    const auto t0 = std::chrono::steady_clock::now();
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 2.0) {
+        run();
+        (void) hipStreamSynchronize(s);
+    }
     (void) hipStreamSynchronize(s);
     float ms = 0;
     for (int rep = 0; rep < 3; ++rep) {

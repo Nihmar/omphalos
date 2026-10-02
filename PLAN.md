@@ -68,7 +68,7 @@
 | Compute units | 32 | wave32 execution |
 | VRAM | 16 GB GDDR6, 128-bit bus | |
 | Memory bandwidth (spec) | ~320 GB/s | **Measured (M0): 318.3 GB/s** streaming read — 99.5% of spec, not the usual 85–90% (`bench/bw_membench.hip`) |
-| FP16 matrix (WMMA) throughput | ~100 TFLOPS dense (spec) | **Measured (M8, #132): ~100 TFLOPS raw** (independent `v_wmma_f32_16x16x16_f16` chains, f32 accumulate; 70 with 4 chains); hipBLASLt ~46-49 at the model's M=512 shapes, the engine's own WMMA GEMM 60-64; INT8 measured **~26 TOPS (0.57×)**, i.e. *not* ~2× |
+| FP16 matrix (WMMA) throughput | ~100 TFLOPS dense (spec) | **Measured (M8, #132): ~100 TFLOPS raw** (independent `v_wmma_f32_16x16x16_f16` chains, f32 accumulate; 70 with 4 chains); hipBLASLt ~46-49 at the model's M=512 shapes, the engine's own WMMA GEMM 60-64; INT8: hipBLASLt measured ~26 TOPS (0.57×), but the hardware's iu8 WMMA sustains **168.6 TOPS, 1.9× f16** (88.7 sustained with random operands under the 160 W cap; #203, `bench/results/ceilings-203.txt`) |
 | LDS | 64 KB per workgroup | Enough for IQ codebook tables + GEMM tiles |
 | Bus | PCIe 5.0 x16 | Host↔device transfers of embeddings/logits are cheap |
 
@@ -174,9 +174,8 @@ target, four things separate us:
    memory per pass: 27.5 B params x 2 B = **54 GB of writes** plus 11.28 GB of
    reads. Dequantizing into LDS inside the GEMM removes almost all of it.
 2. **Small/skinny GEMMs.** hipBLASLt at M = 10 is nowhere near the measured
-   **46 TFLOPS fp16 at M = 512** — and fp16 WMMA is the only matrix path this GPU
-   has (the int8 tile does not exist on gfx1200, see §10.5 and
-   `bench/results/m3-isa-probe.txt`).
+   **46 TFLOPS fp16 at M = 512** (M3 also concluded that fp16 WMMA was the only
+   matrix path; corrected by #203: the iu8 tile exists at 1.9x, §10.5).
 3. **Sequential DeltaNet.** The decode-shaped gated delta net runs one token per
    step: O(T) dependent launches (~120k for a 512-token prompt). The chunked
    WY/UT form (§10.3) is what removes that, and it is the hardest piece in the
@@ -198,7 +197,7 @@ During prefill, weights are read once per micro-batch (e.g. 512 tokens) and reus
 - **Measured baseline (llama.cpp, M0):** **622.7 t/s** prefill at empty context (pp512, f16 KV, `-t 6`) → ≈ **34 TFLOPS achieved**. The historical "~750 t/s" figure did not reproduce.
 - Against the measured fp16 GEMM ceiling (~46 TFLOPS, §2) → **~74% of it**; against the ~100 TFLOPS spec peak → ~34%.
 - Target for a well-tuned dequant + WMMA path: originally **~50–60% of peak → ~900–1100 t/s**; the M0 measurement revises this to **~700–800 t/s**. Hard: IQ decoding (codebook lookups, sign unpacking, scales) competes with the matrix units; DeltaNet chunked prefill and attention add FLOPs that are less matrix-friendly.
-- **M0 update (measured):** the fp16 GEMM ceiling at the model's M=512 shapes is **~46 TFLOPS** (hipBLASLt; §2) — the prefill ceiling for a dequant+WMMA path is ~**850 t/s** before dequant overhead. The INT8 route measured *slower* than fp16 (~26 TOPS, 0.57×) — do not count on a ~2× INT8 speedup until a raw WMMA check confirms it (§10.5).
+- **M0 update (measured):** the fp16 GEMM ceiling at the model's M=512 shapes is **~46 TFLOPS** (hipBLASLt; §2) — the prefill ceiling for a dequant+WMMA path is ~**850 t/s** before dequant overhead. The INT8 route measured *slower* than fp16 through hipBLASLt (~26 TOPS, 0.57×); the raw iu8 WMMA check (#203) does confirm ~1.9× in hardware (§10.5).
 - The real ceiling is measured (M0) with `bench/hipblaslt_gemm_bench.hip` at the model's projection shapes (M = 512); `hipblaslt-bench` itself is not packaged on this distro.
 
 ### 4.3 What MTP can give on decode
@@ -561,7 +560,7 @@ Listed in order of how much runtime they account for.
 ### 10.1 Quantized GEMV (decode) — ~85–90% of decode time
 
 - One kernel per quant type present in the allocation (templated), **fused dequant + dot**; dequantized weights never touch memory.
-- ⚠️ **No int8 *matrix* path on RDNA4.** `v_wmma_i32_16x16x16_iu8` is not in the gfx1200 ISA (it is in gfx1100's); gfx1200 gained the fp16/f32 WMMA tile instead — that is where the measured 46 TFLOPS fp16 comes from. The *vector* int8 dot `v_dot4_i32_i8` **does** exist and computes correctly on gfx1200, but LLVM does not expose `__builtin_amdgcn_sdot4` for this target (`dot1-insts` is not advertised) and it runs at ~14 TOPS (measured, `bench/results/m3-isa-probe.txt`) — well under the fp16 matrix path. So: **dequantize in registers and accumulate with f16/f32 FMA**. Decode is bandwidth-bound (measured 0.88 TFLOPS while reading 701 MiB in 2.90 ms), so the ALU has ~5× headroom and only the bytes per weight matter.
+- ~~No int8 *matrix* path on RDNA4~~ **[corrected, #203]:** gfx1200 has `v_wmma_i32_16x16x16_iu8` (gfx12 operand form; M3's probe assembled gfx11's), sustaining 168.6 TOPS = 1.9× the f16 WMMA (`bench/results/ceilings-203.txt`); llama.cpp's MMQ uses it on RDNA4. The *vector* int8 dot `v_dot4_i32_i8` **does** exist and computes correctly on gfx1200, but LLVM does not expose `__builtin_amdgcn_sdot4` for this target (`dot1-insts` is not advertised) and it runs at ~14 TOPS (measured, `bench/results/m3-isa-probe.txt`) — well under the fp16 matrix path. So: **dequantize in registers and accumulate with f16/f32 FMA**. Decode is bandwidth-bound (measured 0.88 TFLOPS while reading 701 MiB in 2.90 ms), so the ALU has ~5× headroom and only the bytes per weight matter.
 - Activations stay f16 (the milestone-2 kernels already produce f16 activations), so no activation quantization step is needed.
 - Scales applied per sub-block in FP32 (a per-32-weight sub-block term); codebook/grid values are dequantized in registers.
 - Codebooks + sign tables in LDS (loaded once per workgroup).
@@ -606,7 +605,7 @@ plus short causal conv1d on q/k/v (keep the conv tail as state), gates/normaliza
 Two options:
 
 - **FP16 path**: dequantize weight tiles to FP16 in LDS, `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (or rocWMMA). Numerically closest to reference.
-- **INT8 path: dead on this hardware [resolved, M3].** There is no int8 WMMA tile on gfx1200 (`v_wmma_i32_16x16x16_iu8` assembles for gfx1100, not for gfx1200), and the vector int8 dot `v_dot4_i32_i8` runs at ~14 TOPS (measured, `bench/results/m3-isa-probe.txt`), far under the 46 TFLOPS fp16 matrix path. That fully explains the M0 measurement of INT8 hipBLASLt at 0.57× FP16: the library has no int8 matrix hardware to use. **Use the FP16 WMMA path.**
+- **INT8 path: available [corrected, #203; M3 had it wrong].** gfx1200's iu8 WMMA sustains 168.6 TOPS against 88.7 TFLOPS f16 (random operands, 160 W cap; `bench/results/ceilings-203.txt`). M3's probe assembled gfx11's operand form and concluded there was none; M0's hipBLASLt int8 figure measured the library. An int8 prefill GEMM (exact integer weights, activations quantized per 32-block as llama.cpp's MMQ does) changes the activations' numerics: a candidate of #203 phase 2, decided by KL against the f16 path.
 - Double-buffer LDS tiles; overlap global loads, dequant and WMMA; tune tile sizes for 32 CUs. Start slow and correct.
 
 ### 10.6 Small ops
@@ -1007,7 +1006,7 @@ whatever the remaining ~15 us-per-launch kernels cost.
 - [x] Tied embeddings? (decides whether `token_embd` can go to host RAM separately). → **untied** (separate `output.weight`, Q4_K).
 - [x] Allocation file: all quant types present; do `gate`/`up` and Q/K/V share types? `lm_head` type? → see §3: mix listed; `gate`/`up` differ in 40/65 layers; DeltaNet `attn_qkv` is fused, full-attention layers have separate Q/K/V; `lm_head` = Q4_K.
 - [x] MTP: exact inputs (`h` pre- or post-norm), chaining for k > 1. → **#121/#124** (llama.cpp `graph_mtp` + draft-mtp): `h` is the target's hidden **after `output_norm`**; `x = eh_proj([enorm(embed(t)); hnorm(h)])` (embedding first), then a full-attention block with its own KV, `shared_head_norm` and the shared `output.weight`; position p pairs (h_{p-1}, t_p), h = 0 at p = 0; a chained draft feeds back the block's own `shared_head_norm` output. GPU vs NumPy (fed llama.cpp's `h_nextn`): rel 4.5e-2 on both drafts (`check_gpu_mtp.py`). Image positions (#160): the MTP block's embedding input at an image position is the image row the stack saw, at the same M-RoPE position.
-- [x] RDNA4 specs: FP16/INT8 matrix peak, LDS size, cache sizes; ROCm version on CachyOS. → ROCm 7.2.4; fp16 WMMA **~100 TFLOPS raw** (#132; hipBLASLt reached ~46-49 at M=512, the engine's own GEMM 60-64); INT8 ~26 TOPS; LDS 64 KB per workgroup.
+- [x] RDNA4 specs: FP16/INT8 matrix peak, LDS size, cache sizes; ROCm version on CachyOS. → ROCm 7.2.4; fp16 WMMA **~100 TFLOPS raw** (#132; hipBLASLt reached ~46-49 at M=512, the engine's own GEMM 60-64); INT8: iu8 WMMA 168.6 TOPS sustained (#203; hipBLASLt's int8 measured ~26); LDS 64 KB per workgroup.
 - [x] llama.cpp `new_state` buffer layout vs the engine kernels → **settled in M2**: the engine keeps the delta-net state as `(n_vh, state_size, state_size)` with the ggml k-head tiling (`h % n_kh`); the per-token outputs match the reference, so the fused kernel's internal (dumped) buffer layout is irrelevant for us.
 - [x] `mtmd.h` API for extracting image embeddings. → **#160**: see §14.5.
 - [ ] RDNA4 memory OC support in LACT.
