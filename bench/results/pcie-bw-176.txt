@@ -1,0 +1,17 @@
+# Host <-> device copy bandwidth (#176), bench/pcie/pcie_bw.hip, 2026-10-02 after a reboot (kernel 7.2.8-2).
+# 151 MiB per copy, pinned host memory; the 4th of 4 repetitions.
+#
+#   coherent     D2H   1 piece:   47.34 ms   3.3 GB/s
+#   coherent     H2D   1 piece:   47.13 ms   3.4 GB/s
+#   noncoherent  D2H   1 piece:   47.73 ms   3.3 GB/s
+#   noncoherent  H2D   1 piece:   47.55 ms   3.3 GB/s
+#   coherent     D2H  96 pieces:  48.17 ms   3.3 GB/s
+#   coherent     H2D  96 pieces:  48.53 ms   3.3 GB/s
+#   noncoherent  D2H  96 pieces:  48.13 ms   3.3 GB/s
+#   noncoherent  H2D  96 pieces:  48.41 ms   3.3 GB/s
+#
+# sysfs during the copies: root port 00:01.0 current_link_speed 2.5 GT/s x16 (max 32 GT/s);
+# amdgpu pp_dpm_pcie lists only 2.5 GT/s levels. Same figures as the first measurement (#158), so not a
+# one-off power state: the GPU's upstream link trains at PCIe 1.0 rate. 2.5 GT/s x16 with 8b/10b is
+# 4 GB/s raw, 3.3 GB/s of payload as measured. A PCIe 5.0 x16 link would give ~25 GB/s.
+# Likely a firmware / slot setting (BIOS PCIe speed, riser, or link training); not changeable from here.
