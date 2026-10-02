@@ -408,6 +408,7 @@ float pass_ms(const std::vector<const Tensor *> & ts, const int nt, const __half
 
 } // namespace
 
+#ifndef IQ3S_DIAG_NO_MAIN
 int main() {
     const struct { long long rows, k; int n; const char * name; } shapes[] = {
         {1024, 5120, 7, "attn_k/v"},    {5120, 6144, 32, "attn_out/ssm_out"}, {5120, 17408, 22, "ffn_down"},
@@ -540,3 +541,4 @@ int main() {
     }
     return 0;
 }
+#endif
