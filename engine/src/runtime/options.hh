@@ -22,6 +22,7 @@ struct EnvOptions {
     int gemm_min = 16;          // OMPH_GEMM_MIN=T: --gemv runs of T+ tokens take the GEMM path
     bool no_fused_gemm = false; // OMPH_NO_FUSED_GEMM: dequant to f16, then the GEMM (#141)
     bool attn_scalar = false;   // OMPH_ATTN_SCALAR: prefill attention without WMMA (#97)
+    bool attn_dec_scalar = false;  // OMPH_ATTN_DEC_SCALAR: decode / verification attention on the scalar kernel (#169)
     bool gdn_serial = false;    // OMPH_GDN_SERIAL: a chunk's delta rule in one launch (#96)
     bool no_b4 = false;         // OMPH_NO_B4: no NT-token GEMVs (verification, --gemv prefill)
     bool no_bf16_gemv = false;  // OMPH_NO_BF16_GEMV: BF16 weights through the f16 path

@@ -99,6 +99,10 @@ engine/build/omph-server <model.gguf> [--port 8080]
 engine/build/omph-run <model.gguf> models/golden/cpu/tokens.txt <out-logits.f32> \
     --gemv --generate 3 --gen-out /tmp/gen.txt [--trace-dir DIR] [--tokens N]
 
+# the decode / verification attention alone on a synthetic cache (#169): kernel time and bandwidth
+# of the WMMA and scalar kernels per length and token count, plus the row identity check; seconds
+engine/build/omph-attn-bench [--seq 4096,32768,100000] [--tokens 1,4] [--ctx N] [--chunk K]
+
 # decode speed (PLAN.md §17): "step gpu" / "step wall" per token
 OMPH_TIMING=1 engine/build/omph-run <model> <tokens.txt> /tmp/x.f32 --last-logits \
     --gemv --generate 65 --gen-out /tmp/gen.txt
@@ -181,6 +185,7 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_GEMM_MIN=T` | A/B | `--gemv` runs of T+ tokens (prefill chunks) take the GEMM path (default 16, the measured crossover with the fused GEMM; #129, #141) |
 | `OMPH_NO_FUSED_GEMM` | A/B | dequantize each weight to f16, then the GEMM, instead of the fused dequant + WMMA GEMM (#141) |
 | `OMPH_STAGE_MIB=N` | A/B | f16 weights staged for the GEMM in row slices of ~N MiB (default 20, cache-resident; 0 = whole tensors; #129, #132) |
+| `OMPH_ATTN_DEC_SCALAR` | A/B | decode / verification attention on the scalar kernel instead of the WMMA one (#169) |
 | `OMPH_ATTN_SCALAR` | A/B | prefill attention on the scalar kernel instead of the WMMA one (#97) |
 | `OMPH_GDN_SERIAL` | A/B | a multi-token delta rule in one launch (one workgroup per head) instead of the token-parallel form (#96) |
 | `OMPH_NO_BF16_GEMV` | A/B | BF16 weights through the f16 path |
