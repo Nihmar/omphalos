@@ -100,18 +100,24 @@ bool launch(const Case & c, const void * x, float * y, hipStream_t stream) {
 
 // Repacks a tensor on the host, verifies the rebuild is byte-identical, and
 // uploads it.
+bool prepare_bytes(const omph::gguf::TensorInfo * t, const uint8_t * src, const int64_t rows, const int64_t k,
+                   Case & c);
+
 bool prepare(const omph::gguf::File & file, const omph::gguf::TensorInfo * t, Case & c) {
-    const int64_t k = (int64_t) t->ne[0];
-    const int64_t rows = (int64_t) t->ne[1];
-    const int64_t n_blocks = rows * (k / 256);
+    return prepare_bytes(t, file.tensor_data(*t), (int64_t) t->ne[1], (int64_t) t->ne[0], c);
+}
+
+// `rows` rows of GGUF bytes at `src` in the type of `t` (rows of several
+// tensors back to back form one tensor: --merge-type)
+bool prepare_bytes(const omph::gguf::TensorInfo * t, const uint8_t * src, const int64_t rows, const int64_t k,
+                   Case & c) {
+    const size_t nbytes = (size_t) (rows * (int64_t) (t->nbytes / t->ne[1]));
     std::vector<uint8_t> host;
-    std::vector<uint8_t> rebuilt((size_t) t->nbytes);
-    (void) n_blocks;
-    if (!repack_tensor(t->type, file.tensor_data(*t), rows, k, host) ||
-        !unrepack_tensor(t->type, host.data(), rows, k, rebuilt)) {
+    std::vector<uint8_t> rebuilt(nbytes);
+    if (!repack_tensor(t->type, src, rows, k, host) || !unrepack_tensor(t->type, host.data(), rows, k, rebuilt)) {
         return false;
     }
-    if (std::memcmp(rebuilt.data(), file.tensor_data(*t), (size_t) t->nbytes) != 0) {
+    if (std::memcmp(rebuilt.data(), src, nbytes) != 0) {
         std::fprintf(stderr, "repack of %s is not lossless\n", t->name.c_str());
         return false;
     }
@@ -201,7 +207,7 @@ int main(int argc, char ** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: %s <model.gguf> [tensor] [--iters N] [--iq4-all] "
-                     "[--all-of-type T] [--multi] [--nt N] [--gemm T] [--repack-only T]\n",
+                     "[--all-of-type T] [--multi] [--nt N] [--gemm T] [--merge-type T] [--repack-only T]\n",
                      argv[0]);
         return 2;
     }
@@ -212,6 +218,7 @@ int main(int argc, char ** argv) {
     bool deq = false;
     int all_type = -1;
     int repack_only = -1;
+    int merge_type = -1;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
             iters = std::atoi(argv[++i]);
@@ -227,6 +234,8 @@ int main(int argc, char ** argv) {
             multi = true;
         } else if (std::strcmp(argv[i], "--dequant") == 0) {
             deq = true;
+        } else if (std::strcmp(argv[i], "--merge-type") == 0 && i + 1 < argc) {
+            merge_type = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--repack-only") == 0 && i + 1 < argc) {
             repack_only = std::atoi(argv[++i]);
         } else if (argv[i][0] != '-') {
@@ -238,6 +247,70 @@ int main(int argc, char ** argv) {
             return fail("kernels not built for wave32");
         }
         omph::gguf::File file(model);
+        if (merge_type >= 0) {
+            // #203 D1: the sibling GEMVs of a layer (one input: ffn_gate + ffn_up,
+            // attn_qkv + attn_gate, attn_q + attn_k + attn_v) when all of type T,
+            // timed as separate launches and as one launch on their rows
+            // concatenated (a valid tensor: GGUF rows are contiguous)
+            std::vector<Case> sep, mrg;
+            std::vector<std::vector<uint8_t>> keep;
+            const char * groups[3][3] = {{"ffn_gate", "ffn_up", nullptr},
+                                         {"attn_qkv", "attn_gate", nullptr},
+                                         {"attn_q", "attn_k", "attn_v"}};
+            int64_t kmax = 0, rmax = 0;
+            for (int l = 0; l < 64; ++l) {
+                for (const auto & g : groups) {
+                    std::vector<const omph::gguf::TensorInfo *> ts;
+                    for (const char * n : g) {
+                        if (n == nullptr) break;
+                        const auto * t = file.tensor("blk." + std::to_string(l) + "." + n + ".weight");
+                        if (t != nullptr) ts.push_back(t);
+                    }
+                    bool ok = ts.size() >= 2;
+                    for (const auto * t : ts) {
+                        ok = ok && (int) t->type == merge_type && t->ne[0] == ts[0]->ne[0];
+                    }
+                    if (!ok) continue;
+                    std::vector<uint8_t> cat;
+                    int64_t rows = 0;
+                    for (const auto * t : ts) {
+                        Case c;
+                        if (!prepare(file, t, c)) return fail("repack failed");
+                        sep.push_back(c);
+                        cat.insert(cat.end(), file.tensor_data(*t), file.tensor_data(*t) + t->nbytes);
+                        rows += (int64_t) t->ne[1];
+                    }
+                    Case m;
+                    if (!prepare_bytes(ts[0], cat.data(), rows, (int64_t) ts[0]->ne[0], m)) {
+                        return fail("merged repack failed");
+                    }
+                    mrg.push_back(m);
+                    kmax = std::max(kmax, m.k);
+                    rmax = std::max(rmax, m.rows);
+                }
+            }
+            if (mrg.empty()) return fail("no sibling group of that type");
+            void * x = nullptr;
+            void * y = nullptr;
+            std::vector<_Float16> hx((size_t) kmax * 16);
+            for (size_t i = 0; i < hx.size(); ++i) hx[i] = (_Float16) (((int) (i * 7919 % 2001) - 1000) / 1000.0f);
+            if (hipMalloc(&x, hx.size() * 2) != hipSuccess || hipMalloc(&y, (size_t) rmax * 16 * 4) != hipSuccess ||
+                hipMalloc(&g_ny, (size_t) rmax * 16 * 4) != hipSuccess ||
+                hipMemcpy(x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice) != hipSuccess) {
+                return fail("out of VRAM (merge)");
+            }
+            double mib = 0;
+            for (const Case & c : mrg) mib += (double) c.bytes / 1048576.0;
+            for (int rep = 0; rep < 3; ++rep) {  // alternated: the clocks drift
+                const double ts = time_ms(sep, x, (float *) y, iters, nullptr);
+                const double tm = time_ms(mrg, x, (float *) y, iters, nullptr);
+                std::printf("type %d nt %d: %zu groups (%zu -> %zu launches, %.1f MiB): separate %.3f ms, merged %.3f ms, "
+                            "%.1f us saved per launch removed\n",
+                            merge_type, g_nt, mrg.size(), sep.size(), mrg.size(), mib, ts, tm,
+                            (ts - tm) * 1e3 / (double) (sep.size() - mrg.size()));
+            }
+            return 0;
+        }
         if (repack_only >= 0) {
             int64_t n_tensors = 0;
             int64_t n_src = 0;
