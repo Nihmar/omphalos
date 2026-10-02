@@ -793,7 +793,11 @@ constexpr int kDcKeys = 16;
 constexpr int kDcWaves = 4;
 constexpr int kDcThreads = 32 * kDcWaves;
 constexpr int kDcDims = kGqaHd / kDcWaves;  // 64 per wave
-constexpr int kDcVLd = kDcKeys + 8;         // vt row stride
+// vt row stride: no padding. The transposed stores hit consecutive halves
+// either way; 8 KiB of vt instead of 12 lets 9 single-row-tile workgroups
+// share a WGP instead of 7, and their loads overlap each other's compute:
+// -10 % at 100k, -25 % at 25k (#172)
+constexpr int kDcVLd = kDcKeys;
 constexpr int kDcPLd = kDcKeys + 8;         // ps row stride
 constexpr int kDcMaxTokens = 8;             // 48 rows: three 16-row tiles
 
