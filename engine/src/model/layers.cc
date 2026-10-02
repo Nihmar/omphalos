@@ -38,6 +38,7 @@ Runner::KvView Runner::kv_view(const int64_t il) const {
     if (kv_q8q4_) {
         v.q = quant_kv(il);
         v.window = kv_window_;
+        v.ring = kv_ring_;
         v.k_q4 = kv_k4_;
     } else {
         // Null in the quantized-KV mode, where the f32 cache is never allocated.
@@ -96,7 +97,7 @@ bool Runner::attn_layer(const int64_t il, const LayerWeights & L, const int64_t 
         prep.v_scales = reinterpret_cast<__half *>(kv.q.vsc);
         prep.k16 = kv.window > 0 ? reinterpret_cast<__half *>(kv.q.k16) : nullptr;
         prep.v16 = kv.window > 0 ? reinterpret_cast<__half *>(kv.q.v16) : nullptr;
-        prep.window = kv.window;
+        prep.ring = kv.ring;
         prep.k_q4 = kv.k_q4;
     }
     if (!proj_ok || !omph::kernels::attn_prep(prep, nullptr)) {
@@ -240,8 +241,8 @@ Runner::QuantKv Runner::quant_kv(const int64_t il) const {
             static_cast<uint8_t *>(kv_ks_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2,
             static_cast<uint8_t *>(kv_vq_) + kvl * max_seq_ * kv_out / 2,
             static_cast<uint8_t *>(kv_vs_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2,
-            static_cast<uint8_t *>(kv_k16_) + kvl * kv_window_ * kv_out * 2,
-            static_cast<uint8_t *>(kv_v16_) + kvl * kv_window_ * kv_out * 2};
+            static_cast<uint8_t *>(kv_k16_) + kvl * kv_ring_ * kv_out * 2,
+            static_cast<uint8_t *>(kv_v16_) + kvl * kv_ring_ * kv_out * 2};
 }
 
 // KV write + attention, on either the f32 cache (memcpy) or the Q8/Q4 one
@@ -260,6 +261,7 @@ bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T
         kv.k16 = kv_in.window > 0 ? kv_in.q.k16 : nullptr;
         kv.v16 = kv_in.window > 0 ? kv_in.q.v16 : nullptr;
         kv.window = kv_in.window;
+        kv.ring = kv_in.ring;
         kv.k_q4 = kv_in.k_q4;
         return omph::kernels::attention_gqa(
             static_cast<const float *>(q_), kv, static_cast<const float *>(gate_),

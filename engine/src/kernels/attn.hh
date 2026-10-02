@@ -17,6 +17,12 @@ namespace omph::kernels {
 // #81) K uses V's Q4 format too. The last `window` tokens are also kept exactly
 // in an FP16 ring.
 
+// The FP16 ring holds kKvRingExtra positions more than the window (#161):
+// every query of a chunk of up to kKvRingExtra + 1 tokens reads its own last
+// `window` keys from it, so a token's attention does not depend on how many
+// tokens its step runs (a verification row is bit-identical to a decode step).
+constexpr long long kKvRingExtra = 15;
+
 // --- fused attention prep (#79) -------------------------------------------
 //
 // One launch for the Q/gate split, the QK RMSNorm, the partial NeoX RoPE on q
@@ -53,7 +59,7 @@ struct AttnPrep {
     __half * v_scales = nullptr;
     __half * k16 = nullptr;          // FP16 ring, or null
     __half * v16 = nullptr;
-    long long window = 0;
+    long long ring = 0;              // its slots (window + kKvRingExtra)
     bool k_q4 = false;               // quantize K as Q4 into k_q8 (V's format, #81)
 };
 bool attn_prep(const AttnPrep & a, hipStream_t stream);
@@ -71,7 +77,8 @@ struct KvCache {
     const void * v_scales = nullptr;
     const void * k16 = nullptr;
     const void * v16 = nullptr;
-    int64_t window = 0;
+    int64_t window = 0;  // the keys a query reads from the FP16 ring: its last `window`
+    int64_t ring = 0;    // the ring's slots (window + kKvRingExtra)
     bool k_q4 = false;  // k_q8 holds K in V's Q4 format (#81)
 };
 
@@ -98,12 +105,12 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
 int64_t attention_key_chunk(int64_t max_seq);
 
 // Copies the FP16-ring slots of positions pos_first .. pos_first + count - 1
-// (slot = position % window) of every layer from (src_k, src_v) to
-// (dst_k, dst_v), all laid out as the ring: layers x window x row_bytes. Saves
+// (slot = position % ring) of every layer from (src_k, src_v) to
+// (dst_k, dst_v), all laid out as the ring: layers x ring x row_bytes. Saves
 // the slots a speculative verification overwrites, and restores those of the
 // rejected positions (#98, #122). row_bytes % 16 == 0.
 bool kv_ring_copy(const void * src_k, const void * src_v, void * dst_k, void * dst_v,
-                  int64_t layers, int64_t window, int64_t row_bytes, int64_t pos_first,
+                  int64_t layers, int64_t ring, int64_t row_bytes, int64_t pos_first,
                   int64_t count, hipStream_t stream);
 
 // Workspace for any call with up to `max_tokens` query tokens (and, with a
