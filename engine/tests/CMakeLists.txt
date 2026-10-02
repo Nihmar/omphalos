@@ -13,12 +13,13 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 set(OMPH_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../src)
-add_library(omph_format STATIC ${OMPH_SRC}/format/gguf.cc ${OMPH_SRC}/format/repack.cc)
+add_library(omph_format STATIC ${OMPH_SRC}/format/gguf.cc ${OMPH_SRC}/format/repack.cc
+            ${OMPH_SRC}/text/tokenizer.cc)
 target_include_directories(omph_format PUBLIC ${OMPH_SRC})
 target_compile_options(omph_format PRIVATE -Wall -Wextra)
 
 enable_testing()
-foreach(t test_repack test_gguf)
+foreach(t test_repack test_gguf test_tokenizer)
     add_executable(${t} ${t}.cc)
     target_link_libraries(${t} PRIVATE omph_format)
     target_compile_options(${t} PRIVATE -Wall -Wextra)
