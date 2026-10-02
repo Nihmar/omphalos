@@ -215,7 +215,7 @@ private:
 
     // Runs `side` on the side stream and `main` on the default one, both after
     // everything issued so far; the default stream continues once both are done.
-    // Without overlap (prefill, or OMPH_NO_OVERLAP) they simply run in order.
+    // Without overlap (the default, and prefill) they simply run in order.
     template <typename Side, typename Main>
     bool fork_join(const int64_t T, Side && side, Main && main) {
         if (!overlap_ || T != 1) {

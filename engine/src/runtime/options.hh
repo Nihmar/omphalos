@@ -17,7 +17,7 @@ struct EnvOptions {
     int64_t kv_window = 128;    // OMPH_KV_WINDOW=N: FP16 ring of the last N tokens (0 = off)
 
     // --- decode paths (A/B switches)
-    bool no_overlap = false;    // OMPH_NO_OVERLAP: no side stream for sibling GEMVs (#71)
+    bool overlap = false;       // OMPH_OVERLAP: a side stream for sibling GEMVs (#71; off by default, #189)
     int stage_mib = 20;         // OMPH_STAGE_MIB=N: f16 weight slices of ~N MiB (0: whole)
     int gemm_min = 16;          // OMPH_GEMM_MIN=T: --gemv runs of T+ tokens take the GEMM path
     bool no_fused_gemm = false; // OMPH_NO_FUSED_GEMM: dequant to f16, then the GEMM (#141)

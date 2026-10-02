@@ -19,7 +19,7 @@ EnvOptions EnvOptions::from_env() {
     if (const char * w = std::getenv("OMPH_KV_WINDOW")) {
         o.kv_window = std::atoll(w);
     }
-    o.no_overlap = flag("OMPH_NO_OVERLAP");
+    o.overlap = flag("OMPH_OVERLAP");
     if (const char * s = std::getenv("OMPH_STAGE_MIB")) {
         o.stage_mib = std::atoi(s);
     }
