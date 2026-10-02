@@ -162,6 +162,7 @@ int64_t Generator::resume(const std::vector<int32_t> & prompt, GenerateResult & 
     if (!seq_.empty() && common == seq_.size() && common < prompt.size()) {
         return (int64_t) common;
     }
+
     Checkpoint * best = nullptr;
     for (Checkpoint & c : checkpoints_) {
         if (c.tokens.size() <= common && c.tokens.size() < prompt.size() && valid(c) &&
@@ -380,17 +381,26 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
             while (a + 1 < (int64_t) batch.size() && batch[(size_t) a + 1] == am[(size_t) a]) {
                 ++a;
             }
-            if (!runner_->commit(a + 1)) {
+            res.accepted += a;
+            // The accepted drafts in order; when one ends the generation, the
+            // caches keep the tokens before it, as the plain path never feeds
+            // its last token (else an end-of-generation and what the model
+            // drafted after it would sit in the cached sequence, #160).
+            int64_t keep = a + 1;
+            for (int64_t j = 1; j <= a; ++j) {
+                if (!emit(batch[(size_t) j])) {
+                    keep = j;
+                    go = false;
+                    break;
+                }
+            }
+            if (!runner_->commit(keep)) {
                 res.stop = GenerateResult::Stop::Error;
                 break;
             }
-            seq_.insert(seq_.end(), batch.begin(), batch.begin() + a + 1);
-            res.accepted += a;
-            for (int64_t j = 0; j < a && go; ++j) {
-                go = emit(batch[(size_t) j + 1]);
-            }
-            next = am[(size_t) a];
+            seq_.insert(seq_.end(), batch.begin(), batch.begin() + keep);
             if (go) {
+                next = am[(size_t) a];
                 go = emit(next);
             }
         }
