@@ -37,6 +37,7 @@ add_library(omphalos SHARED
     src/model/layers.cc
     src/model/dispatch.cc
     src/model/mtp.cc
+    src/model/generator.cc
     src/kernels/probe.hip
     src/kernels/dequant.hip
     src/kernels/elementwise.hip
@@ -51,6 +52,10 @@ target_include_directories(omphalos
 )
 target_compile_options(omphalos PRIVATE -O3)
 target_link_libraries(omphalos PRIVATE hip::host omph_warnings)
+
+add_executable(omph-generate src/tools/generate.cc)
+target_include_directories(omph-generate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(omph-generate PRIVATE omphalos hip::host omph_warnings)
 
 add_executable(omph-tokenize src/tools/tokenize.cc)
 target_include_directories(omph-tokenize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

@@ -518,6 +518,32 @@ void Runner::watch_step_end() {
     }
 }
 
+bool Runner::reset_sequence() {
+    const int64_t ssm_q = h_.ssm_n_kh * h_.ssm_s;
+    const int64_t ssm_channels = 2 * ssm_q + h_.ssm_inner;
+    const size_t n_state = (size_t) h_.ssm_n_vh * h_.ssm_s * h_.ssm_s;
+    const size_t n_conv = (size_t) (h_.ssm_conv_k - 1) * ssm_channels;
+    for (int64_t il = 0; il < h_.n_layer; ++il) {
+        if (states_[(size_t) il] == nullptr) {
+            continue;
+        }
+        // the two conv tails sit at the start of the layer's block; the state
+        // in use may be the alternate buffer after a speculative commit
+        if (hipMemsetAsync(states_[(size_t) il], 0, 2 * n_conv * 4, nullptr) != hipSuccess ||
+            hipMemsetAsync(state_cur_[(size_t) il], 0, n_state * 4, nullptr) != hipSuccess) {
+            return fail("reset: cannot clear the delta-net state");
+        }
+    }
+    conv_flip_.assign((size_t) h_.n_layer, 0);
+    if (mtp_pending_ != nullptr &&
+        hipMemsetAsync(mtp_pending_, 0, (size_t) h_.n_embd * 4, nullptr) != hipSuccess) {
+        return fail("reset: cannot clear the MTP h");
+    }
+    last_toks_.clear();
+    last_pos0_ = 0;
+    return hipDeviceSynchronize() == hipSuccess || fail("reset failed");
+}
+
 // Allocates *p on first use (the f16-path buffers, #86).
 void * Runner::lazy(void ** p, const size_t bytes) {
     if (*p == nullptr) {
