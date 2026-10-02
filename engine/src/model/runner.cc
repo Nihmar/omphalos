@@ -248,7 +248,12 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         alloc(&kv_k16_, (size_t) n_kv * kv_ring_ * attn_kv * 2);
         alloc(&kv_v16_, (size_t) n_kv * kv_ring_ * attn_kv * 2);
     }
-    overlap_ = use_gemv_ && !env_.no_overlap;
+    // Off by default (#189): with the persistent-warp GEMVs (#63) one GEMV
+    // fills the GPU, and the measured step is 0.7 ms faster in order (44.2 vs
+    // 44.9 ms), while a side stream the calibration keeps can still cost
+    // ~9 ms per step (53.6) below the watchdog's threshold. OMPH_OVERLAP=1
+    // brings it back, with the calibration and the watchdog.
+    overlap_ = use_gemv_ && env_.overlap;
     if (overlap_ && (hipStreamCreateWithFlags(&side_, hipStreamNonBlocking) != hipSuccess ||
                      hipEventCreateWithFlags(&ev_fork_, hipEventDisableTiming) != hipSuccess ||
                      hipEventCreateWithFlags(&ev_join_, hipEventDisableTiming) != hipSuccess)) {
@@ -469,7 +474,7 @@ void Runner::calibrate_overlap() {
 // activation buffers it uses are free. A step's time grows only slowly with
 // the context, so this does not fire on long runs.
 void Runner::watch_step_begin(const int64_t T) {
-    if (T != 1 || side_ == nullptr || env_.no_overlap) {
+    if (T != 1 || side_ == nullptr || !env_.overlap) {
         return;
     }
     if (recal_pending_ && recalibrations_ < kMaxRecalibrations) {

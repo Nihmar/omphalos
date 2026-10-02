@@ -1,0 +1,25 @@
+# #189: the plain decode step was bimodal (~44-48 ms or ~54-57 ms per step, from run to run). Engine a6021c1
+# (main) and the branch perf/189-no-side-stream, RX 9060 XT, 2026-10-02.
+#
+# 1. Plain decode (omph-run wiki1000, --gemv --generate 32, OMPH_TIMING median step gpu), main, alternating
+#    the side stream (default then) with OMPH_NO_OVERLAP=1:
+#    run           side stream   no side stream    calibration (serial vs side stream 1, kept)
+#    1             44.93         44.22             4.487 vs 4.118
+#    2             44.93         44.21             5.343 vs 5.305
+#    3             44.93         44.21             5.360 vs 5.296
+#    4             44.95         44.27             5.355 vs 5.318
+#    5             53.57         44.22             5.311 vs 5.278
+#    A side stream the load-time calibration keeps can still cost ~9 ms per step: 1.2x, under the #144
+#    watchdog's 1.35x. And a good one now loses 0.7 ms: since the persistent-warp GEMVs (#63) one GEMV
+#    fills the GPU. The same bimodality showed at 25k (47.7 vs 57 ms) and 100k (54.5 vs 63.6-65.8) in the
+#    #172 / #170 runs. Verifications (T > 1) never used the side stream: a 2-token verification at 25k
+#    (47.7 ms) measured faster than a slow plain step (57.1).
+#    Speculative decode (wiki1000, k = 3, 128 tokens, 4 runs each): 16.80-16.87 ms/token either way.
+#
+# 2. Change: the side stream is off by default; OMPH_OVERLAP=1 brings it back with its calibration and
+#    watchdog. Plain decode, default, 5 runs: 44.21 / 44.24 / 44.24 / 44.21 / 44.23 ms; no calibration
+#    at load. Tokens identical with OMPH_OVERLAP=1; speculative validation (15 cases, OMPH_OVERLAP=1 among
+#    them), CPU tests and check_server.py pass.
+#
+#    The power / hotspot throttling seen in long prefills (amdgpu_top: PPT0, TEMP_HOTSPOT) is separate and
+#    stays a maintainer setting (#189 comments).
