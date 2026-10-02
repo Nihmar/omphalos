@@ -116,6 +116,7 @@ def main() -> None:
     ap.add_argument("--answer-tokens", type=int, default=4096)
     ap.add_argument("--timeout", type=float, default=20.0, help="seconds per test program")
     ap.add_argument("--limit", type=int, default=0, help="only the first N problems")
+    ap.add_argument("--tasks", default="", help="only these problem numbers, e.g. 47,145,158")
     ap.add_argument("--ctx", type=int, default=16384)
     ap.add_argument("--model", default=str(ROOT / "models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"))
     ap.add_argument("--omph", default=str(ROOT / "engine/build"))
@@ -128,6 +129,9 @@ def main() -> None:
         problems = [json.loads(line) for line in f]
     if args.limit:
         problems = problems[:args.limit]
+    if args.tasks:
+        wanted = {f"HumanEval/{t.strip()}" for t in args.tasks.split(",")}
+        problems = [p for p in problems if p["task_id"] in wanted]
     done = set()
     if Path(args.out).exists():
         with open(args.out) as f:
