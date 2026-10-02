@@ -20,6 +20,8 @@
 //   --image FILE      an image for the next <|image_pad|> of the prompt (repeat
 //                     for several; with --chat, one per image item of the request)
 //   --logits-out FILE the logits after the prompt, f32 (validation)
+//   --force FILE      decode these token ids instead (one per step); --logits-out
+//                     then gets the prompt's row and every step's (validation)
 #include "model/generator.hh"
 #include "runtime/options.hh"
 #include "runtime/timing.hh"
@@ -52,7 +54,7 @@ int main(int argc, char ** argv) {
     bool prompt_ids = false;
     bool out_ids = false;
     int repeat = 1;
-    std::string then_path, mmproj, logits_out;
+    std::string then_path, mmproj, logits_out, force_path;
     std::vector<std::string> image_paths;
     for (int i = 2; i < argc; ++i) {
         const auto val = [&]() -> const char * {
@@ -80,6 +82,7 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--mmproj")) mmproj = val();
         else if (!std::strcmp(argv[i], "--image")) image_paths.push_back(val());
         else if (!std::strcmp(argv[i], "--logits-out")) logits_out = val();
+        else if (!std::strcmp(argv[i], "--force")) force_path = val();
         else {
             std::fprintf(stderr, "unknown option %s\n", argv[i]);
             return 2;
@@ -114,7 +117,17 @@ int main(int argc, char ** argv) {
 #endif
         }
         std::vector<float> first_logits;
-        if (!logits_out.empty()) req.prefill_logits = &first_logits;
+        std::vector<int32_t> forced;
+        if (!force_path.empty()) {
+            std::istringstream fs(read_file(force_path));
+            long long v = 0;
+            while (fs >> v) forced.push_back((int32_t) v);
+            req.force = &forced;
+            req.max_tokens = (int64_t) forced.size();
+            if (!logits_out.empty()) req.forced_logits = &first_logits;
+        } else if (!logits_out.empty()) {
+            req.prefill_logits = &first_logits;
+        }
         std::vector<int32_t> prompt;
         if (prompt_ids) {
             std::istringstream ss(in);

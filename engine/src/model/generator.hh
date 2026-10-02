@@ -45,6 +45,10 @@ struct GenerateRequest {
     // The images of the prompt, one per <|image_pad|> token, in order (#160).
     std::vector<std::shared_ptr<const Image>> images;
     std::vector<float> * prefill_logits = nullptr;  // validation: the logits after the prompt
+    // validation: decode these tokens instead of choosing (one per step, no
+    // speculation), appending every step's logits row (the prompt's first)
+    const std::vector<int32_t> * force = nullptr;
+    std::vector<float> * forced_logits = nullptr;
 };
 
 struct GenerateResult {

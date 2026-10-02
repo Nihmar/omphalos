@@ -44,8 +44,10 @@ struct EnvOptions {
     bool trace_alloc = false;   // OMPH_TRACE_ALLOC: every f16 scratch allocation
     bool trace_f16 = false;     // OMPH_TRACE_F16: matmuls that fall back to the f16 path
     bool trace_stage = false;   // OMPH_TRACE_STAGE: every f16 staging / cache hit
-    bool spec_check = false;
-    int test_bad_side = 0;      // OMPH_TEST_BAD_SIDE=N: the rejected side stream back after N steps (#144)    // OMPH_SPEC_CHECK: verify every speculative rollback (slow)
+    bool spec_check = false;    // OMPH_SPEC_CHECK: verify every speculative rollback (slow)
+    int test_bad_side = 0;      // OMPH_TEST_BAD_SIDE=N: the rejected side stream back after N steps (#144)
+    int test_mrope = 0;         // OMPH_TEST_MROPE=swap|flat: image positions with h / w swapped, or
+                                // sequential (validation of the M-RoPE layout, #160)
 
     static EnvOptions from_env();
 };

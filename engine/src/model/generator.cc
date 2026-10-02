@@ -267,9 +267,12 @@ bool Generator::expand(const std::vector<int32_t> & prompt, const GenerateReques
             out.tokens.push_back(id);
             out.image_of.push_back(im);
             out.image_row.push_back(i);
-            out.mpos.insert(out.mpos.end(), {(int32_t) r, (int32_t) (r + i / im->nx), (int32_t) (r + i % im->nx)});
+            int32_t h = (int32_t) (r + i / im->nx), w = (int32_t) (r + i % im->nx);
+            if (env_.test_mrope == 1) std::swap(h, w);           // validation ablations
+            if (env_.test_mrope == 2) h = w = (int32_t) (r + i);
+            out.mpos.insert(out.mpos.end(), {env_.test_mrope == 2 ? h : (int32_t) r, h, w});
         }
-        r += std::max(im->nx, im->ny);
+        r += env_.test_mrope == 2 ? im->n_tokens() : std::max(im->nx, im->ny);
     }
     out.rope_end = r;
     return next == req.images.size();
@@ -314,8 +317,12 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
     const double t1 = omph::runtime::now_ms();
     res.prefill_ms = t1 - t0;
 
-    const bool greedy = req.sampling.temperature <= 0.0f;
-    int32_t next = sample(logits, req.sampling);
+    const bool forcing = req.force != nullptr && !req.force->empty();
+    const bool greedy = req.sampling.temperature <= 0.0f && !forcing;
+    int32_t next = forcing ? (*req.force)[0] : sample(logits, req.sampling);
+    if (forcing && req.forced_logits != nullptr) {
+        req.forced_logits->insert(req.forced_logits->end(), logits.begin(), logits.end());
+    }
     // a token decided: report it, and say whether to go on
     const auto emit = [&](const int32_t t) {
         res.tokens.push_back(t);
@@ -347,7 +354,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
         return res;
     }
     bool go = emit(next);
-    if (greedy && req.speculative && config_.mtp) {
+    if (greedy && req.speculative && config_.mtp && !forcing) {
         // Speculative greedy (#122, #124): draft k tokens with the MTP block,
         // verify [next, drafts] in one forward, keep the drafts the model
         // agrees with plus its own next token. Same tokens as plain greedy.
@@ -398,7 +405,15 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
                 break;
             }
             seq_.push_back(next);
-            next = on_device >= 0 ? on_device : sample(step, req.sampling);
+            if (forcing) {
+                if (req.forced_logits != nullptr) {
+                    req.forced_logits->insert(req.forced_logits->end(), step.begin(), step.end());
+                }
+                if (res.tokens.size() >= req.force->size()) break;
+                next = (*req.force)[res.tokens.size()];
+            } else {
+                next = on_device >= 0 ? on_device : sample(step, req.sampling);
+            }
             go = emit(next);
         }
     }

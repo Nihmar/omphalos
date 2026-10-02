@@ -1,6 +1,7 @@
 #include "runtime/options.hh"
 
 #include <cstdlib>
+#include <string>
 
 namespace omph::runtime {
 
@@ -51,6 +52,9 @@ EnvOptions EnvOptions::from_env() {
     o.spec_check = flag("OMPH_SPEC_CHECK");
     if (const char * b = std::getenv("OMPH_TEST_BAD_SIDE")) {
         o.test_bad_side = std::atoi(b);
+    }
+    if (const char * m = std::getenv("OMPH_TEST_MROPE")) {
+        o.test_mrope = std::string(m) == "swap" ? 1 : std::string(m) == "flat" ? 2 : 0;
     }
     return o;
 }

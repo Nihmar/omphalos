@@ -17,3 +17,12 @@ g++ -O2 -std=c++17 "$here/dump_tensors.cpp" \
     -o "$here/dump_tensors"
 
 echo "built $here/dump_tensors"
+
+# the image reference (#160): llama.cpp + mtmd, the text model on the GPU
+g++ -O2 -std=c++17 "$here/dump_mtmd_logits.cpp" \
+    -I"$llama_dir/include" -I"$llama_dir/ggml/include" -I"$llama_dir/tools/mtmd" \
+    -L"$llama_dir/$build/bin" -lmtmd -lllama -lggml -lggml-base \
+    -Wl,-rpath,"$llama_dir/$build/bin" \
+    -o "$here/dump_mtmd_logits"
+
+echo "built $here/dump_mtmd_logits"
