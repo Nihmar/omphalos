@@ -1,0 +1,32 @@
+# #63: low-bit single-token GEMVs. Engine 89aab16 vs main fe678bf, same session, RX 9060 XT.
+# omph-gemv-bench --all-of-type T: every tensor of a type back to back on one stream, 1 s warm-up,
+# 3 runs (spread <= 0.1 %); ms per pass.
+#
+#   type      MiB    main      new       change   how
+#   IQ3_S     3474   14.12     13.10     -7.2 %   persistent warps (1-2-token kernels); 3-4 tokens unchanged
+#   IQ4_XS    2882   10.95     10.72     -2.1 %   persistent warps
+#   IQ3_XXS   1979    8.42      7.48    -11.2 %   pipelined weight loads, 2 rows per warp, persistent warps
+#   Q4_K       827    3.29      3.18     -3.1 %   persistent warps
+#   Q6_K       332    1.233     1.219    -1.1 %   persistent warps
+#   Q2_K       230    1.074     1.017    -5.3 %   persistent warps
+#   IQ2_S      375    1.69      1.70      =       persistent warps measured slower: unchanged
+#   IQ2_XS     211    0.870     0.870     =       idem
+#   IQ2_XXS     94    0.446     0.446     =       idem
+#   IQ3_S --nt 2: 14.04 -> 13.01 ms; --nt 3 / 4: unchanged (13.5 / 15.16; persistent measured slower)
+#
+# What bounds IQ3_S (diagnostics, all on IQ3_S):
+#   loads only, no decode or dot products           13.5 ms  (the full kernel: 13.9 before persistence)
+#   the same kernel, launches spread over 4 streams 11.71 ms (98 % of 318 GB/s)
+#   an empty kernel, back to back                   3.2-4.3 us per launch (x 144 launches)
+#   synthetic stream of the same bytes, any layout  ~320 GB/s
+#   -> the single-stream loss is per-launch: start, drain and launch gaps of small (2-36 MiB) tensors.
+# Tried and dropped (slower): 12-byte qs+signs records (15.5 ms), merged qh/scales record (-1.9 % on one
+# token, +10 % on the 4-token kernel), loads pipelining (15.1), non-temporal loads (15.1), two sub-blocks
+# per lane (15.9), more/fewer rows per warp, balanced persistent grid (13.3).
+#
+# End to end (omph-run wiki1000, OMPH_TIMING median of 65 steps; speculative k = 3, 200 tokens):
+#   plain step gpu ms     main 45.40 45.40 (57.86)   new 44.86 44.91 (54.76)   -1.1 %
+#   speculative ms/token  main 19.14 19.53 19.23     new 19.22 19.13 18.90     within noise
+#   (parenthesized: one outlier run in each build). In the decode the sibling GEMVs already overlap on
+#   the side stream, which hides most of the launch tails the single-stream benchmark shows.
+# Identity: decode-step logits bit-identical to main (32 steps), ident.sh 6/6, specval.sh 15/15.
