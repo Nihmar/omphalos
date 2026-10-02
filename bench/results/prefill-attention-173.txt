@@ -1,0 +1,37 @@
+# #173: prefill attention at long context. Engine 641a464 (branch perf/173-prefill-attention) vs main 5be2cc8
+# (same prefill attention code as e5380dd), RX 9060 XT, same session, 2026-10-02.
+#
+# 1. Diagnosis: omph-attn-bench --tokens 512 (one layer, one 512-token chunk), capacity 106496, ms
+#                                  full    no K/V dequant   no compute
+#    main (1 row tile / workgroup)
+#      25k                         22.3    17.9             11.7
+#      100k                        92.5    70.0             50.9
+#    3 row tiles / workgroup
+#      25k                         14.7    12.1              3.7
+#      100k                        59.1    47.3             14.4
+#    main staged (dequantized) each 32-key tile of K and V in LDS for 16 queries; at 45 KiB of LDS per
+#    workgroup 2 fit a WGP: 3 waves per SIMD. The kernel also spills (256 VGPRs, 116-432 B per lane).
+#
+# 2. Change: three 16-token row tiles per workgroup (18 waves) share one staging; tiles past a row tile's
+#    last query are fully masked, so each wave computes exactly as before: prefill logits bit-identical to
+#    main (K8/V4, K4/V4, window 0; 1000-token prompt, last 600 rows, and the last row at 2k / 4k / 25k / 100k).
+#
+#    omph-attn-bench --tokens 512, ms:   main     now
+#      K8/V4 25k / 50k / 100k            22.5 / 44.6 / 92.4    14.6 / 29.6 / 59.1
+#      K4/V4 25k / 50k / 100k            22.3 / 44.8 / 92.7    14.6 / 29.5 / 59.1
+#
+#    Tried and dropped (100k, ms): 2 row tiles 75.5; 4 row tiles over the 64 KiB of LDS; 16-key tiles
+#    with 4 row tiles 59.4, with 5 row tiles 79.3 (spills); rescaling O only when a row max moved 59.6
+#    (more spills); wave pairs (keys split for the scores, dimensions for O; no spills) 64.6 (4 barriers
+#    per tile, 32 queries per staging).
+#
+# 3. End to end: omph-run --gemv --generate 1, OMPH_TIMING prefill wall, alternating builds; last logits
+#    identical in every run.
+#                        main                  branch
+#    25k K8/V4 (3 runs)  36.69 s (681 t/s)     33.77 s (740 t/s)   -8.0 %
+#    25k K4/V4 (1 run)   36.78 s               33.75 s             -8.2 %
+#    100k K8/V4 (1 run)  249.8 s (400 t/s)     201.4 s (497 t/s)   -19.4 %
+#
+#    The issue's target was -30-35 % at 100k. What is left is compute: 47 ms of the 59 at 100k against
+#    ~25 ms of WMMA at the GPU's peak, with 256 VGPRs and spills (O 16 x 256 f32 and q in registers per
+#    wave); the GPU is also power- and hotspot-throttled in long prefills (#189).
