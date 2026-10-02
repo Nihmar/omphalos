@@ -1,0 +1,24 @@
+# #195: HumanEval (164 problems), omphalos vs llama.cpp, same model (Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp), 2026-10-02.
+# tools/humaneval.py: each problem rendered once with the GGUF's chat template (thinking on, reasoning effort
+# xhigh = the template's default), the same raw prompt to each engine, greedy (temperature 0); thinking capped
+# at 8192 tokens (then "</think>" appended and the answer generated, up to 4096); the last ```python block
+# + the tests run in a bubblewrap sandbox (no network, read-only filesystem, 20 s).
+# omphalos: main at f865c88 (K4 on 8 attention layers, #175), omph-server --ctx 16384, greedy = speculative
+#   MTP decoding (output identical to plain greedy). llama.cpp: the RX9060XT fork, build-hip llama-server,
+#   -c 16384 -ngl 999 -fa on -ctk q8_0 -ctv q4_0, no speculation.
+#
+#              pass@1            thinking capped   tokens generated (median / problem)   decode     wall
+#   omphalos   161 / 164 98.2 %  13                253,527 (619)                          48.5 t/s   88 min
+#   llama.cpp  160 / 164 97.6 %  15                275,009 (674)                          19.8 t/s   233 min
+#
+#   failed: omphalos 47, 145, 158; llama.cpp 106, 145, 158, 160. Both pass 159; only omphalos 106 and 160;
+#   only llama.cpp 47. 145 and 158 fail on both (145: the spec is ambiguous about the digits of negative
+#   numbers, both engines hit the thinking cap; 158: the lexicographic tie-break). 47's docstring example is
+#   wrong (15.0 for a median of 8.0): both engines hit the cap there, and the answer after the forced close
+#   differs.
+#   Identical final code: 53 / 164. Long greedy reasoning amplifies tiny numeric differences (kernel
+#   summation orders, K4/K8 vs q8_0/q4_0 KV) into different paths; the scores agree within one problem.
+#
+# #200 (part): omphalos's three misses rerun each on a fresh server (humaneval.py --tasks): the same answer
+#   and completion, token for token, as in the 164-request warm run. Those failures are the model's own, not
+#   state carried between requests.
