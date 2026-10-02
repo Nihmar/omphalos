@@ -1,0 +1,25 @@
+# M7: images on the CPU (#160). Engine f55a5ef. RX 9060 XT; Ryzen host, mtmd from a CPU-only
+# llama.cpp build (GGML_NATIVE, all hardware threads); llama.cpp's tools/mtmd/test-1.jpeg (640x488).
+#
+# 1. Costs (omph-generate --chat, thinking off, "Describe this image in two sentences.")
+#    preprocessing + encode (CPU, mmproj BF16, 27-layer ViT)    2751-2773 ms (4 runs: 2760, 2773, 2755, 2751)
+#    image tokens                                                20 x 15 = 300 (+ 21 text = 321 prompt tokens)
+#    prefill, 321 tokens                                         722-732 ms (5 runs: 722, 726, 725, 732, 726)
+#    decode (speculative, 82 tokens)                             22.7 ms/token, 44 t/s
+#    the same image again (encoder cache)                        0 ms
+#    VRAM: peak during an image run 11820 MiB vs 12359 for a text run (sysfs, whole device): no VRAM
+#    for vision
+#
+# 2. Against llama.cpp (tools/check_vision.py): llama.cpp text model on the GPU, f16 KV; both encode on
+#    the CPU with mtmd. Teacher-forced through omphalos' greedy answer; KL(llama.cpp || omphalos) per position.
+#                                   KL mean    p99        top-1     positions
+#    text only (same question)      0.001155   0.007059   100.00 %  52
+#    text only, f32 KV              0.001157   0.007040   100.00 %  52
+#    image                          0.000979   0.010050    97.56 %  82
+#    image, f32 KV                  0.000660   0.006635    98.78 %  82
+#    image, h / w swapped           0.009394   0.173718    97.56 %  82   (OMPH_TEST_MROPE=swap)
+#    image, 1D positions            0.006520   0.072018    96.34 %  82   (OMPH_TEST_MROPE=flat)
+#    prompt tokens identical to llama.cpp's (321 with the image's 300 rows, 19 without)
+#
+# 3. Next turn of an image chat (omph-server, check_server.py --image): 352 of 369 prompt tokens reused
+#    (needed the speculative-commit fix in this branch: 0 before).
