@@ -98,6 +98,8 @@ Value read_value(Cursor & c, ValueType t) {
                 fail("nested arrays are not supported");
             }
             v.array_len = n;
+            v.elem_type = elem_type;
+            v.array_offset = (uint64_t) (uintptr_t) c.p;  // made relative by the caller
             constexpr uint64_t kKeep = 256;  // keep big arrays cheap
             for (uint64_t k = 0; k < n; ++k) {
                 Value elem = read_value(c, elem_type);
@@ -208,7 +210,11 @@ File::File(const std::string & path) {
             std::string key = c.str();
             const ValueType t = (ValueType) c.u32();
             kv_index_.emplace(key, kv_.size());
-            kv_.emplace_back(std::move(key), read_value(c, t));
+            Value v = read_value(c, t);
+            if (v.type == ValueType::ARRAY) {
+                v.array_offset -= (uint64_t) (uintptr_t) base_;
+            }
+            kv_.emplace_back(std::move(key), std::move(v));
         }
 
         tensors_.reserve(std::min<uint64_t>(tensor_count, 4096));
@@ -277,6 +283,55 @@ const Value * File::find(std::string_view key) const {
 const TensorInfo * File::tensor(std::string_view name) const {
     const auto it = tensor_index_.find(std::string(name));
     return it == tensor_index_.end() ? nullptr : &tensors_[it->second];
+}
+
+namespace {
+
+const Value & array_value(const File & f, const std::string_view key) {
+    const Value * v = f.find(key);
+    if (v == nullptr || v->type != ValueType::ARRAY) {
+        fail("no array " + std::string(key));
+    }
+    return *v;
+}
+
+} // namespace
+
+std::vector<std::string> File::string_array(const std::string_view key) const {
+    const Value & v = array_value(*this, key);
+    if (v.elem_type != ValueType::STRING) {
+        fail(std::string(key) + " is not a string array");
+    }
+    Cursor c{base_ + v.array_offset, base_ + size_};
+    std::vector<std::string> out;
+    out.reserve((size_t) v.array_len);
+    for (uint64_t k = 0; k < v.array_len; ++k) {
+        out.push_back(c.str());
+    }
+    return out;
+}
+
+std::vector<int64_t> File::int_array(const std::string_view key) const {
+    const Value & v = array_value(*this, key);
+    Cursor c{base_ + v.array_offset, base_ + size_};
+    std::vector<int64_t> out;
+    out.reserve((size_t) v.array_len);
+    for (uint64_t k = 0; k < v.array_len; ++k) {
+        const Value e = read_value(c, v.elem_type);
+        switch (v.elem_type) {
+            case ValueType::UINT8:
+            case ValueType::UINT16:
+            case ValueType::UINT32:
+            case ValueType::UINT64:
+            case ValueType::BOOL: out.push_back((int64_t) e.u); break;
+            case ValueType::INT8:
+            case ValueType::INT16:
+            case ValueType::INT32:
+            case ValueType::INT64: out.push_back(e.i); break;
+            default: fail(std::string(key) + " is not an integer array");
+        }
+    }
+    return out;
 }
 
 } // namespace omph::gguf

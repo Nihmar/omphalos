@@ -30,6 +30,8 @@ struct Value {
     uint64_t array_len = 0;
     bool truncated = false;      // big arrays keep only the first elements
     std::vector<Value> array;
+    ValueType elem_type = ValueType::UINT8;  // arrays: the element type
+    uint64_t array_offset = 0;   // arrays: file offset of the first element (File::*_array)
 
     bool as_u64(uint64_t & out) const;
     bool as_str(std::string_view & out) const;
@@ -68,6 +70,11 @@ public:
     uint32_t gguf_version() const { return version_; }
     const std::vector<std::pair<std::string, Value>> & metadata() const { return kv_; }
     const Value * find(std::string_view key) const;
+    // Every element of an array (the metadata keeps only the first 256 of a
+    // big one): strings, or integers of any width. Throw if `key` is missing
+    // or of another type.
+    std::vector<std::string> string_array(std::string_view key) const;
+    std::vector<int64_t> int_array(std::string_view key) const;
     const std::vector<TensorInfo> & tensors() const { return tensors_; }
     const TensorInfo * tensor(std::string_view name) const;
     uint64_t data_offset() const { return data_offset_; }
