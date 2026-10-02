@@ -62,6 +62,10 @@ add_executable(omph-generate src/tools/generate.cc)
 target_include_directories(omph-generate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(omph-generate PRIVATE omphalos hip::host omph_warnings)
 
+add_executable(omph-server src/tools/server.cc src/server/http.cc src/server/openai.cc)
+target_include_directories(omph-server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(omph-server PRIVATE omphalos hip::host omph_warnings)
+
 add_executable(omph-tokenize src/tools/tokenize.cc)
 target_include_directories(omph-tokenize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(omph-tokenize PRIVATE omphalos omph_warnings)
