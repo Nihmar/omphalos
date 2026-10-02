@@ -12,6 +12,7 @@ seeded sampling; the errors of invalid requests.
 """
 
 import argparse
+import base64
 import json
 import socket
 import subprocess
@@ -82,6 +83,9 @@ def main() -> None:
     ap.add_argument("--server", default="../engine/build/omph-server")
     ap.add_argument("--model", default="../models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf")
     ap.add_argument("--ctx", type=int, default=8192)
+    ap.add_argument("--image", help="also check images (the server gets --mmproj): an image of the moon landing "
+                    "front page, e.g. llama.cpp's tools/mtmd/test-1.jpeg")
+    ap.add_argument("--mmproj", default="../models/mmproj-Qwen3.8-27B-BF16.gguf")
     args = ap.parse_args()
 
     proc = None
@@ -89,10 +93,13 @@ def main() -> None:
     if url is None:
         port = free_port()
         url = f"http://127.0.0.1:{port}"
-        proc = subprocess.Popen([args.server, args.model, "--port", str(port), "--ctx", str(args.ctx)])
+        vision = ["--mmproj", args.mmproj] if args.image else []
+        proc = subprocess.Popen([args.server, args.model, "--port", str(port), "--ctx", str(args.ctx), *vision])
     try:
         wait_health(url, proc, 600)
         run_checks(url)
+        if args.image:
+            run_image_checks(url, Path(args.image))
     finally:
         if proc is not None:
             proc.terminate()
@@ -206,7 +213,7 @@ def run_checks(url: str) -> None:
     # errors
     code, body = raw_post(url, "/v1/chat/completions", b"{not json")
     check(code == 400 and "error" in body, "invalid JSON: 400")
-    for what, extra in [("n = 2", {"n": 2}), ("an image", None)]:
+    for what, extra in [("n = 2", {"n": 2}), ("a non-base64 image URL", None)]:
         msgs = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:,"}}]}] \
             if extra is None else [{"role": "user", "content": "Hi"}]
         try:
@@ -216,6 +223,32 @@ def run_checks(url: str) -> None:
             check(True, f"{what}: 400")
     code, body = raw_post(url, "/v1/embeddings", b"{}")
     check(code == 404 and "error" in body, "unknown endpoint: 404")
+
+
+def run_image_checks(url: str, image: Path) -> None:
+    client = openai.OpenAI(base_url=url + "/v1", api_key="none", timeout=600)
+    model = client.models.list().data[0].id
+    data = "data:image/jpeg;base64," + base64.b64encode(image.read_bytes()).decode()
+    q = [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": data}},
+        {"type": "text", "text": "What event is this newspaper front page about? One sentence."}]}]
+    no_think = {"chat_template_kwargs": {"enable_thinking": False}}
+    r = client.chat.completions.create(model=model, messages=q, max_tokens=96, extra_body=no_think)
+    text = r.choices[0].message.content or ""
+    check("moon" in text.lower(), f"image: {text!r} ({r.usage.prompt_tokens} prompt tokens)")
+    _, s_content, _, _, _ = stream_chat(client, model=model, messages=q, max_tokens=96, extra_body=no_think)
+    check(s_content == text, "image: streamed answer")
+    turn2 = q + [{"role": "assistant", "content": text}, {"role": "user", "content": "Which year?"}]
+    r2 = client.chat.completions.create(model=model, messages=turn2, max_tokens=64, extra_body=no_think)
+    cached = r2.usage.prompt_tokens_details.cached_tokens
+    check(cached >= r.usage.prompt_tokens and "1969" in (r2.choices[0].message.content or ""),
+          f"image: next turn {cached} of {r2.usage.prompt_tokens} cached: {r2.choices[0].message.content!r}")
+    try:
+        client.chat.completions.create(model=model, max_tokens=8, messages=[{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,bm90IGFuIGltYWdl"}}]}])
+        check(False, "image: undecodable data rejected")
+    except openai.BadRequestError:
+        check(True, "image: undecodable data: 400")
 
 
 if __name__ == "__main__":

@@ -41,6 +41,7 @@ struct Job {
     bool stream = false;
     bool include_usage = false;   // stream_options.include_usage
     bool echo = false;            // /v1/completions: the prompt before the completion
+    std::vector<std::string> images;  // the image files' bytes, in prompt order (#160)
 };
 
 // An invalid request: the message of a 400 answer.
@@ -110,6 +111,10 @@ const char * finish_reason(bool length, bool tool_calls);
 // The bytes of `text` that end in a whole UTF-8 character (the rest may be
 // completed by the next token).
 size_t utf8_complete(const std::string & text);
+
+// Base64 (RFC 4648, padding optional, whitespace ignored) to bytes; false
+// on any other character.
+bool base64_decode(const std::string & in, std::string & out);
 
 // A random identifier: prefix + n letters and digits (chatcmpl-..., call_...).
 std::string random_id(const std::string & prefix, size_t n);

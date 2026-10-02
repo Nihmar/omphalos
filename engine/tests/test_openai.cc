@@ -106,8 +106,22 @@ int main() {
     CHECK(rejects(R"({"messages":[]})"), "no messages");
     CHECK(rejects(R"({"messages":[{"role":"user","content":"Hi"}],"n":2})"), "n > 1");
     CHECK(rejects(R"({"messages":[{"role":"user","content":"Hi"}],"temperature":"hot"})"), "bad temperature");
-    CHECK(rejects(R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]})"),
-          "images");
+    CHECK(rejects(R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]})") &&
+              rejects(R"({"messages":[{"role":"user","content":[{"type":"image_url",)"
+                      R"("image_url":{"url":"https://example.com/a.png"}}]}]})") &&
+              rejects(R"({"messages":[{"role":"user","content":[{"type":"image_url",)"
+                      R"("image_url":{"url":"data:,x"}}]}]})") &&
+              rejects(R"({"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{}}]}]})"),
+          "images other than base64 data: URLs, audio");
+    j = chat_job(R"({"messages":[{"role":"user","content":[{"type":"text","text":"What is it?"},)"
+                 R"({"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8gd29ybGQ="}}]}]})");
+    CHECK(j.images == std::vector<std::string>{"hello world"} &&
+              j.prompt.find("What is it?<|vision_start|><|image_pad|><|vision_end|><|im_end|>") != std::string::npos,
+          "an image: its bytes, its place in the prompt");
+    std::string bytes;
+    CHECK(omph::server::base64_decode("SGk-_w", bytes) && bytes == "Hi>\xff" &&
+              !omph::server::base64_decode("SGk=SGk", bytes) && !omph::server::base64_decode("S*Gk", bytes),
+          "base64 (URL-safe alphabet, padding)");
     CHECK(rejects(R"({"messages":[{"role":"assistant","content":"Hi"}]})"), "the template's own errors");
     j = omph::server::parse_request(Json::parse(R"({"prompt":[[1,2,3]],"echo":true})"), false, {});
     CHECK(!j.chat && j.prompt_ids == std::vector<int32_t>({1, 2, 3}) && j.echo, "completions: token ids");
