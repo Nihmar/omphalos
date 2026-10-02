@@ -7,7 +7,8 @@
 //   decode kernel and of the scalar kernel, and the KV bytes read per second.
 //   Then the identity check speculation relies on: every query of a T-token
 //   call must equal, bit for bit, the same query run alone (T = 1) with the
-//   cache ending at its position. --k4: K in V's Q4 format (OMPH_KV_K4).
+//   cache ending at its position (calls of up to 8 tokens; longer ones take the
+//   prefill kernel, timed only). --k4: K in V's Q4 format (OMPH_KV_K4).
 #include "kernels/attn.hh"
 
 #include <hip/hip_fp16.h>
@@ -175,7 +176,8 @@ int main(int argc, char ** argv) {
     (void) hipMalloc(&one, (size_t) kNh * kHd * 4);
     for (const int64_t seq : seqs) {
         for (const int64_t t : toks) {
-            if (t < 2 || !call(t, seq, true, out)) continue;
+            // the identity is the decode / verification kernel's (#161): steps of up to 8 tokens
+            if (t < 2 || t > 8 || !call(t, seq, true, out)) continue;
             (void) hipMemcpy(batch.data(), out, (size_t) t * kNh * kHd * 4, hipMemcpyDeviceToHost);
             for (int64_t r = 0; r < t; ++r) {
                 // the query of row r alone: q row r is the first row of q + r * kNh * kHd
