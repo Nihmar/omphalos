@@ -259,7 +259,7 @@ __global__ void gemv_iq4_kernel(const uint8_t * __restrict__ qs, const uint8_t *
 // Same outer-product shape as the other kernels: kIq3Rows rows per warp, the
 // activation read scalar, the grid (1 KiB) and the sign table (128 B) in LDS.
 constexpr long long kIq3ChunkSub = 256;  // 8192 weights staged per LDS refill
-constexpr long long kIq3Rows = 4;        // output rows computed per warp
+constexpr long long kIq3Rows = 2;        // output rows computed per warp
 
 __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ aux,
                                 const uint8_t * __restrict__ d, const __half * __restrict__ x,
@@ -289,6 +289,23 @@ __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t *
             __syncthreads();  // keep the barrier count identical across warps
             continue;
         }
+        // software pipeline: the next sub-block's weights are loaded while this
+        // one is computed (#63)
+        uint2 qn[kIq3Rows];
+        uint32_t an[kIq3Rows];
+        __half dn[kIq3Rows];
+        const auto fetch = [&](const long long s) {
+#pragma unroll
+            for (int r = 0; r < kIq3Rows; ++r) {
+                const long long row = row0 + r <= rlast ? row0 + r : rlast;
+                qn[r] = *reinterpret_cast<const uint2 *>(qs + row * blocks * 64 + s * 8);
+                an[r] = *reinterpret_cast<const uint32_t *>(aux + row * blocks * 32 + s * 4);
+                dn[r] = *reinterpret_cast<const __half *>(d + row * blocks * 2 + (s / 8) * 2);
+            }
+        };
+        if (base + lane < base + len) {
+            fetch(base + lane);
+        }
         for (long long s = base + lane; s < base + len; s += 32) {
             const uint4 * xv = reinterpret_cast<const uint4 *>(xs + (s - base) * kXPitch);
             uint2 q[kIq3Rows];
@@ -296,12 +313,12 @@ __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t *
             float db[kIq3Rows];
 #pragma unroll
             for (int r = 0; r < kIq3Rows; ++r) {
-                const long long row = row0 + r <= rlast ? row0 + r : rlast;
-                q[r] = *reinterpret_cast<const uint2 *>(qs + row * blocks * 64 + s * 8);
-                a[r] = *reinterpret_cast<const uint32_t *>(aux + row * blocks * 32 + s * 4);
-                db[r] = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 +
-                                                                       (s / 8) * 2)) *
-                        (0.5f + (float) (a[r] >> 28)) * 0.5f;
+                q[r] = qn[r];
+                a[r] = an[r];
+                db[r] = __half2float(dn[r]) * (0.5f + (float) (a[r] >> 28)) * 0.5f;
+            }
+            if (s + 32 < base + len) {
+                fetch(s + 32);
             }
             float part[kIq3Rows] = {};
 #pragma unroll
@@ -963,6 +980,7 @@ __global__ void gemv_q2k_ntg_kernel(const uint8_t * __restrict__ sc, const uint8
 // a float-per-weight loop (#63).
 constexpr long long kIq3sChunkSub = 256;  // 8192 weights staged per LDS refill
 constexpr long long kIq3sRows = 4;        // output rows computed per warp
+constexpr int kIq3sNtPersistMax = 2;      // N-token kernels up to this N on persistent warps (#63)
 
 __global__ void gemv_iq3s_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ qh,
                                  const uint8_t * __restrict__ signs,
@@ -1059,6 +1077,98 @@ __global__ void gemv_iq3s_kernel(const uint8_t * __restrict__ qs, const uint8_t 
     }
 }
 
+// IQ3_S with persistent warps (#63), for rows of up to one x chunk: as many
+// workgroups as fit on the GPU at once; each stages x in LDS once, then its
+// warps take groups of kIq3sRows rows in turn (grid stride). A launch then
+// ends within one row group of each other warp instead of a whole round of
+// workgroups: the tensors are small (7-120 us per launch) and those tails cost
+// ~12 % of the bandwidth.
+__global__ void gemv_iq3s_pw_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ qh,
+                                    const uint8_t * __restrict__ signs, const uint8_t * __restrict__ scales,
+                                    const uint8_t * __restrict__ d,
+                                    const __half * __restrict__ x, float * __restrict__ y,
+                                    const long long rows, const long long n_sub) {
+    extern __shared__ uint8_t smem[];
+    __half * xs = reinterpret_cast<__half *>(smem);
+    uint32_t * grid = reinterpret_cast<uint32_t *>(smem + n_sub * 64);  // 512 x 4 bytes
+    for (int i = threadIdx.x; i < 512; i += blockDim.x) {
+        grid[i] = omph::quant::kIq3sGrid[i];
+    }
+    for (long long i = threadIdx.x; i < n_sub * 32; i += blockDim.x) {
+        xs[i] = x[i];
+    }
+    __syncthreads();
+
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const long long blocks = n_sub / 8;
+    const long long rlast = rows - 1;
+    const long long n_groups = (rows + kIq3sRows - 1) / kIq3sRows;
+    const long long stride = (long long) gridDim.x * (blockDim.x / 32);
+    for (long long grp = (long long) blockIdx.x * (blockDim.x / 32) + warp; grp < n_groups; grp += stride) {
+        const long long row0 = grp * kIq3sRows;
+        float acc[kIq3sRows] = {};
+        for (long long s = lane; s < n_sub; s += 32) {
+            const uint4 * xv = reinterpret_cast<const uint4 *>(xs + s * 32);
+            uint2 q[kIq3sRows];
+            uint32_t qhb[kIq3sRows];
+            uint32_t sg[kIq3sRows];
+            float dbr[kIq3sRows];
+#pragma unroll
+            for (int r = 0; r < kIq3sRows; ++r) {
+                const long long row = row0 + r <= rlast ? row0 + r : rlast;
+                q[r] = *reinterpret_cast<const uint2 *>(qs + row * blocks * 64 + s * 8);
+                qhb[r] = qh[row * blocks * 8 + s];
+                sg[r] = *reinterpret_cast<const uint32_t *>(signs + row * blocks * 32 + s * 4);
+                const uint8_t sc = scales[row * blocks * 4 + s / 2];
+                const float dv = __half2float(
+                    *reinterpret_cast<const __half *>(d + row * blocks * 2 + (s / 8) * 2));
+                dbr[r] = dv * (1.0f + 2.0f * (float) ((s & 1) ? (sc >> 4) : (sc & 0xF)));
+            }
+            float part[kIq3sRows] = {};
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const uint4 xq = xv[l];
+#pragma unroll
+                for (int r = 0; r < kIq3sRows; ++r) {
+                    const uint32_t lo = (q[r].x >> (16 * (l & 1))) & 0xFFFFu;
+                    const uint32_t word = l < 2 ? lo : (q[r].y >> (16 * (l & 1))) & 0xFFFFu;
+                    const uint32_t i1 = (word & 0xFFu) | (((qhb[r] >> (2 * l)) & 1u) << 8);
+                    const uint32_t i2 = (word >> 8) | (((qhb[r] >> (2 * l + 1)) & 1u) << 8);
+                    const uint32_t b1 = grid[i1];
+                    const uint32_t b2 = grid[i2];
+                    const uint2 g1 = make_uint2(grid_pair_to_half2<0x04010400u>(b1),
+                                                grid_pair_to_half2<0x04030402u>(b1));
+                    const uint2 g2 = make_uint2(grid_pair_to_half2<0x04010400u>(b2),
+                                                grid_pair_to_half2<0x04030402u>(b2));
+                    constexpr uint32_t kSign2 = 0x80008000u;
+                    float p = part[r];
+                    p = dot2(((sg[r] << (4 * l)) & kSign2) | g1.x, xq.x, p);
+                    p = dot2(((sg[r] << (4 * l + 1)) & kSign2) | g1.y, xq.y, p);
+                    p = dot2(((sg[r] << (4 * l + 2)) & kSign2) | g2.x, xq.z, p);
+                    p = dot2(((sg[r] << (4 * l + 3)) & kSign2) | g2.y, xq.w, p);
+                    part[r] = p;
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kIq3sRows; ++r) {
+                acc[r] = fmaf(dbr[r], part[r], acc[r]);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < kIq3sRows; ++r) {
+            float v = acc[r];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                v += __shfl_down(v, off);
+            }
+            if (lane == 0 && row0 + r < rows) {
+                y[row0 + r] = v;
+            }
+        }
+    }
+}
+
 
 
 // IQ3_S for NT = 2..4 tokens at once (a speculative verification, #126): the
@@ -1089,13 +1199,16 @@ __global__ void gemv_iq3s_ntg_kernel(const uint8_t * __restrict__ qs, const uint
 
     const int warp = (int) threadIdx.x / 32;
     const int lane = (int) threadIdx.x % 32;
-    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * R;
     const long long blocks = n_sub / 8;
     const long long rlast = rows - 1;
     const long long k = n_sub * 32;
-
+    // persistent warps (#63): row groups taken in turn, grid sized to what fits
+    const long long n_groups = (rows + R - 1) / R;
+    const long long stride = (long long) gridDim.x * (blockDim.x / 32);
+    for (long long grp = (long long) blockIdx.x * (blockDim.x / 32) + warp; grp < n_groups; grp += stride) {
+    const long long row0 = grp * R;
     float acc[R][NT] = {};
-    if (row0 < rows) {
+    {
         for (long long s = lane; s < n_sub; s += 32) {
             uint2 q[R];
             uint32_t qhb[R];
@@ -1171,6 +1284,7 @@ __global__ void gemv_iq3s_ntg_kernel(const uint8_t * __restrict__ qs, const uint
             }
         }
     }
+}
 }
 
 // Q2_K: 84-byte blocks, sixteen 16-weight sub-blocks each with a 4-bit scale and
@@ -2004,6 +2118,27 @@ bool gemv_iq3_s(const void * packed, const void * x_f16, float * y, const int64_
     const int64_t chunk = n_sub < kIq3sChunkSub ? n_sub : kIq3sChunkSub;
     const size_t smem = (size_t) chunk * 64 + 512 * 4;
     const auto * base = static_cast<const uint8_t *>(packed);
+    if (n_sub <= kIq3sChunkSub) {
+        // persistent warps: as many workgroups as fit at once (queried once)
+        static int fit = 0;
+        if (fit == 0) {
+            int per_cu = 0;
+            int dev = 0;
+            hipDeviceProp_t prop{};
+            (void) hipGetDevice(&dev);
+            (void) hipGetDeviceProperties(&prop, dev);
+            (void) hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, gemv_iq3s_pw_kernel, 256,
+                                                                (size_t) kIq3sChunkSub * 64 + 512 * 4);
+            fit = (per_cu > 0 ? per_cu : 1) * prop.multiProcessorCount;
+        }
+        const long long groups = (rows + kIq3sRows - 1) / kIq3sRows;
+        const long long need = (groups + 7) / 8;
+        const unsigned wgs = (unsigned) (need < fit ? need : fit);
+        gemv_iq3s_pw_kernel<<<wgs, 256, (size_t) n_sub * 64 + 512 * 4, stream>>>(
+            base + l.qs_off, base + l.qh_off, base + l.signs_off, base + l.scales_off, base + l.d_off,
+            static_cast<const __half *>(x_f16), y, rows, n_sub);
+        return hipGetLastError() == hipSuccess;
+    }
     const dim3 grid((unsigned) ((rows + 8 * kIq3sRows - 1) / (8 * kIq3sRows)));
     gemv_iq3s_kernel<<<grid, 256, smem, stream>>>(base + l.qs_off, base + l.qh_off,
                                                   base + l.signs_off, base + l.scales_off,
@@ -2095,7 +2230,20 @@ bool launch_iq3s_ntg(const void * packed, const void * x_f16, float * y, const i
     const int64_t n_blocks = rows * (k / 256);
     const omph::format::Iq3sLayout l = omph::format::iq3s_layout(n_blocks);
     const auto * base = static_cast<const uint8_t *>(packed);
-    const dim3 grid((unsigned) ((rows + 8 * R - 1) / (8 * R)));
+    static int fit = 0;  // workgroups that fit at once (persistent warps)
+    if (fit == 0) {
+        int per_cu = 0;
+        int dev = 0;
+        hipDeviceProp_t prop{};
+        (void) hipGetDevice(&dev);
+        (void) hipGetDeviceProperties(&prop, dev);
+        (void) hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, gemv_iq3s_ntg_kernel<NT, R>, 256, 512 * 4);
+        fit = (per_cu > 0 ? per_cu : 1) * prop.multiProcessorCount;
+    }
+    const long long need = (rows + 8 * R - 1) / (8 * R);
+    // NT = 4 is compute-bound: the full grid (each warp one group) measured faster
+    const long long cap = NT <= kIq3sNtPersistMax ? (long long) fit : need;
+    const dim3 grid((unsigned) (need < cap ? need : cap));
     gemv_iq3s_ntg_kernel<NT, R><<<grid, 256, 512 * 4, stream>>>(
         base + l.qs_off, base + l.qh_off, base + l.signs_off, base + l.scales_off, base + l.d_off,
         static_cast<const __half *>(x_f16), y, rows, k / 32, 0);
