@@ -628,10 +628,11 @@ __global__ void gemv_iq3_ntg_kernel(const uint8_t * __restrict__ qs,
 #pragma unroll
             for (int r = 0; r < R; ++r) {
                 const long long row = row0 + r <= rlast ? row0 + r : rlast;
-                q[r] = *reinterpret_cast<const uint2 *>(qs + row * blocks * 64 + s * 8);
-                a[r] = *reinterpret_cast<const uint32_t *>(aux + row * blocks * 32 + s * 4);
-                db[r] = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 +
-                                                                       (s / 8) * 2)) *
+                const long long rb = __builtin_amdgcn_readfirstlane((int) row) * blocks;  // SGPR bases
+                const uint32_t so = (uint32_t) s;
+                q[r] = *reinterpret_cast<const uint2 *>(qs + rb * 64 + so * 8u);
+                a[r] = *reinterpret_cast<const uint32_t *>(aux + rb * 32 + so * 4u);
+                db[r] = __half2float(*reinterpret_cast<const __half *>(d + rb * 2 + (so / 8u) * 2u)) *
                         (0.5f + (float) (a[r] >> 28)) * 0.5f;
             }
             float part[R][NT] = {};
@@ -795,7 +796,6 @@ __global__ void gemv_iq4_ntg_kernel(const uint8_t * __restrict__ qs,
     float acc[R][NT] = {};
     if (row0 < rows) {
         for (long long s = lane; s < n_sub; s += 32) {
-            const long long blk = s / 8;
             const int sub = (int) (s % 8);
             uint32_t xl[NT][8];  // weights 0..15
             uint32_t xh[NT][8];  // weights 16..31
@@ -811,8 +811,10 @@ __global__ void gemv_iq4_ntg_kernel(const uint8_t * __restrict__ qs,
 #pragma unroll
             for (int r = 0; r < R; ++r) {
                 const long long row = row0 + r <= rlast ? row0 + r : rlast;
-                const uint4 q = *reinterpret_cast<const uint4 *>(qs + row * blocks * 128 + s * 16);
-                const uint2 mt = *reinterpret_cast<const uint2 *>(meta + (row * blocks + blk) * 8);
+                const long long rb = __builtin_amdgcn_readfirstlane((int) row) * blocks;  // SGPR bases
+                const uint32_t so = (uint32_t) s;
+                const uint4 q = *reinterpret_cast<const uint4 *>(qs + rb * 128 + so * 16u);
+                const uint2 mt = *reinterpret_cast<const uint2 *>(meta + rb * 8 + (so / 8u) * 8u);
                 const uint32_t w[4] = {q.x, q.y, q.z, q.w};
                 float pl[NT] = {};
                 float ph[NT] = {};
@@ -1455,13 +1457,16 @@ __global__ void gemv_iq3s_ntg_kernel(const uint8_t * __restrict__ qs, const uint
             float dbr[R];
 #pragma unroll
             for (int r = 0; r < R; ++r) {
+                // the row is warp-uniform: its base pointers in SGPRs and 32-bit
+                // lane offsets, instead of 64-bit address math per load (-9 %)
                 const long long row = row0 + r <= rlast ? row0 + r : rlast;
-                q[r] = *reinterpret_cast<const uint2 *>(qs + row * blocks * 64 + s * 8);
-                qhb[r] = qh[row * blocks * 8 + s];
-                sg[r] = *reinterpret_cast<const uint32_t *>(signs + row * blocks * 32 + s * 4);
-                const uint8_t sc = scales[row * blocks * 4 + s / 2];
-                const float dv = __half2float(
-                    *reinterpret_cast<const __half *>(d + row * blocks * 2 + (s / 8) * 2));
+                const long long rb = __builtin_amdgcn_readfirstlane((int) row) * blocks;
+                const uint32_t so = (uint32_t) s;
+                q[r] = *reinterpret_cast<const uint2 *>(qs + rb * 64 + so * 8u);
+                qhb[r] = (qh + rb * 8)[so];
+                sg[r] = *reinterpret_cast<const uint32_t *>(signs + rb * 32 + so * 4u);
+                const uint8_t sc = (scales + rb * 4)[so / 2u];
+                const float dv = __half2float(*reinterpret_cast<const __half *>(d + rb * 2 + (so / 8u) * 2u));
                 dbr[r] = dv * (1.0f + 2.0f * (float) ((s & 1) ? (sc >> 4) : (sc & 0xF)));
             }
             float part[R][NT] = {};
@@ -1954,6 +1959,104 @@ __global__ void gemv_q6k_kernel(const uint8_t * __restrict__ ql, const uint8_t *
         }
         if (lane == 0 && row0 + r < rows) {
             y[row0 + r] = v;
+        }
+    }
+}
+
+// Q6_K for NT = 2..4 tokens (#174): the single-token kernel's operations per
+// token (bit-identical results), the weights decoded once for all NT tokens and
+// the activations read from global memory (L1 / L2), as the other NT kernels.
+// Before it, a multi-token Q6_K matmul ran one launch per token.
+template <int NT, int R>
+__global__ void gemv_q6k_ntg_kernel(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
+                                    const uint8_t * __restrict__ sc, const uint8_t * __restrict__ d,
+                                    const __half * __restrict__ x, float * __restrict__ y,
+                                    const long long rows, const long long n_sub) {
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * R;
+    if (row0 >= rows) {
+        return;
+    }
+    const long long blocks = n_sub / 8;
+    const long long rlast = rows - 1;
+    const long long k = n_sub * 32;
+
+    float acc[R][NT] = {};
+    for (long long g = lane; g < n_sub / 4; g += 32) {
+        const long long blk = g >> 1;
+        const int half = (int) (g & 1);
+        float part[R][NT];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const long long row = row0 + r <= rlast ? row0 + r : rlast;
+            const uint4 * pql =
+                reinterpret_cast<const uint4 *>(ql + row * blocks * 128 + blk * 128 + half * 64);
+            const uint4 * pqh =
+                reinterpret_cast<const uint4 *>(qh + row * blocks * 64 + blk * 64 + half * 32);
+            const uint2 scw = *reinterpret_cast<const uint2 *>(sc + row * blocks * 16 + blk * 16 + half * 8);
+            const float dv = __half2float(*reinterpret_cast<const __half *>(d + row * blocks * 2 + blk * 2));
+            const uint4 l0 = pql[0], l1 = pql[1], l2 = pql[2], l3 = pql[3];
+            const uint4 h0 = pqh[0], h1 = pqh[1];
+            const uint32_t qlw[16] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w,
+                                      l2.x, l2.y, l2.z, l2.w, l3.x, l3.y, l3.z, l3.w};
+            const uint32_t qhw[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+            float sub[NT][8] = {};
+#pragma unroll
+            for (int wi = 0; wi < 8; ++wi) {
+                const int is = wi >> 2;
+                const uint32_t lo = qlw[wi];
+                const uint32_t hi = qlw[wi + 8];
+                const uint32_t hb = qhw[wi];
+                const uint32_t c[4] = {
+                    (lo & 0x0F0F0F0Fu) | ((hb & 0x03030303u) << 4),
+                    (hi & 0x0F0F0F0Fu) | ((hb & 0x0C0C0C0Cu) << 2),
+                    ((lo >> 4) & 0x0F0F0F0Fu) | (hb & 0x30303030u),
+                    ((hi >> 4) & 0x0F0F0F0Fu) | ((hb >> 2) & 0x30303030u)};
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const uint32_t w0 = q6_pair_to_half2<0x04010400u>(c[j]);
+                    const uint32_t w1 = q6_pair_to_half2<0x04030402u>(c[j]);
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        const uint2 xv = reinterpret_cast<const uint2 *>(x + t * k + g * 128)[j * 8 + wi];
+                        const float u = dot2(w0, xv.x, sub[t][2 * j + is]);
+                        sub[t][2 * j + is] = dot2(w1, xv.y, u);
+                    }
+                }
+            }
+            const uint32_t sw[2] = {scw.x, scw.y};
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                float pr = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float s8 = (float) (int8_t) (sw[i >> 2] >> (8 * (i & 3)));
+                    pr = fmaf(s8, sub[t][i], pr);
+                }
+                part[r][t] = dv * pr;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                acc[r][t] += part[r][t];
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            float v = acc[r][t];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                v += __shfl_down(v, off);
+            }
+            if (lane == 0 && row0 + r < rows) {
+                y[t * rows + row0 + r] = v;
+            }
         }
     }
 }
@@ -2791,6 +2894,17 @@ bool gemv_bf16(const void * w, const void * x_f16, float * y, const int64_t rows
     return hipGetLastError() == hipSuccess;
 }
 
+template <int NT, int R = 2>
+bool launch_q6k_ntg(const void * packed, const void * x_f16, float * y, const int64_t rows,
+                    const int64_t k, hipStream_t stream) {
+    const omph::format::Q6kLayout l = omph::format::q6k_layout(rows * (k / 256));
+    const auto * base = static_cast<const uint8_t *>(packed);
+    gemv_q6k_ntg_kernel<NT, R><<<(unsigned) ((rows + 8 * R - 1) / (8 * R)), 256, 0, stream>>>(
+        base + l.ql_off, base + l.qh_off, base + l.sc_off, base + l.d_off, static_cast<const __half *>(x_f16), y,
+        rows, k / 32);
+    return hipGetLastError() == hipSuccess;
+}
+
 bool gemv_multi(const uint32_t type, const void * packed, const void * x_f16, float * y,
                 const int64_t rows, const int64_t k, const int nt, hipStream_t stream) {
     if (packed == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
@@ -2830,6 +2944,10 @@ bool gemv_multi(const uint32_t type, const void * packed, const void * x_f16, fl
             if (nt == 2) return launch_q2k_ntg<2>(packed, x_f16, y, rows, k, stream);
             if (nt == 3) return launch_q2k_ntg<3>(packed, x_f16, y, rows, k, stream);
             return launch_q2k_ntg<4>(packed, x_f16, y, rows, k, stream);
+        case 14:
+            if (nt == 2) return launch_q6k_ntg<2>(packed, x_f16, y, rows, k, stream);
+            if (nt == 3) return launch_q6k_ntg<3>(packed, x_f16, y, rows, k, stream);
+            return launch_q6k_ntg<4>(packed, x_f16, y, rows, k, stream);
         default: return false;
     }
 }

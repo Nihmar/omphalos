@@ -1,0 +1,44 @@
+# #174: the NT = 2..4 verification GEMVs. Engine 2f73843 (branch perf/174-verify-gemv) vs main 5be2cc8,
+# RX 9060 XT, same session, 2026-10-02.
+#
+# 1. Where the IQ3_S GEMV's time goes (bench/gemv/iq3s_diag.hip: the engine's IQ3_S kernels with ablations,
+#    random weights shaped like the model's 144 IQ3_S tensors, 3474 MiB; median of 9 passes, ms)
+#
+#                 full    no weight   no grid   no x     no weights   weight loads   empty
+#                         loads       lookups            and no x     only           launches
+#    NT = 1       13.01   13.22       12.95     13.25    12.76        12.99          0.32
+#    NT = 4       15.20   13.05       15.45     14.74    12.24        12.34          0.35
+#
+#    NT = 1 runs at the speed of its weight loads (280 GB/s, 88 % of 318); its ALU work alone takes about as
+#    long, so both are hidden behind each other. NT = 4 is 2.9 ms over its loads, from ALU work. ISA of the
+#    inner loop (one sub-block, 4 rows): NT = 1 665 instructions (64 dot2, ~420 decode, 60 64-bit address
+#    adds, 36 LDS, 20 VMEM); NT = 4 919 (256 dot2, the same decode and address math). Per-warp timestamps:
+#    4-5 us of staging per launch, 6-11 us of end spread on the small tensors. (rocprofv3's SQ instruction
+#    counters read 0 on gfx1200.)
+#
+# 2. The changes, omph-gemv-bench --all-of-type T --nt 4 (median of 3; every NT = 2..4 kernel bit-identical
+#    to the single-token kernel, --multi max|d| 0)
+#
+#    type        before    after     one token   change
+#    IQ3_S       15.11     14.45     13.11       row bases in SGPRs (readfirstlane), 32-bit lane offsets
+#    IQ3_XXS      9.63      8.76      7.48       the same, then 4 rows per warp again (2 rows: 9.34 / 9.28)
+#    IQ4_XS      10.91     10.76     10.72       row bases in SGPRs
+#    Q6_K        ~4.9       1.44      1.22       a new NT = 2..4 kernel (before: one launch per token)
+#    Q4_K         3.19      3.19      3.19       unchanged
+#    IQ2_XS / IQ2_XXS / IQ2_S / Q2_K   1.28 / 0.62 / 2.12 / 1.69 (one token 0.87 / 0.45 / 1.69 / 1.05):
+#                SGPR row bases measured within 1 %, not kept
+#    The same change in the single-token IQ3_S kernel: 14.5 vs 13.0 ms (diagnostic), not kept.
+#
+#    The 8 Q6_K tensors are the MTP block's: its multi-token runs (short prefills, catching up on accepted
+#    tokens) take the new kernel, the verification does not use them.
+#
+# 3. End to end: omph-run --gemv --draft-mtp 3, OMPH_TIMING, alternating builds, 5 runs each; median over the
+#    full (T = 4) cycles of each run, then the median of the 5 runs. Outputs identical in all 20 runs.
+#
+#    prompt              verify ms (T = 4)      draft ms          ms per generated token   accepted
+#                        main     branch        main    branch    main     branch
+#    wiki512, 128 gen    51.34    49.66         10.96   10.95     16.96    16.36 (-3.5 %)  93 / 102
+#    25k, 64 gen         56.95    55.26         12.20   12.20     30.43    29.60 (-2.7 %)  36 / 81
+#
+#    Speculative validation (oracle drafts, every N-th corrupted; KV f32 / window 0 / K4 / no overlap /
+#    SPEC_CHECK; k = 1, 2, 4): output identical to plain greedy in all 15 cases.
