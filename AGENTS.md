@@ -77,6 +77,12 @@ engine/build/omph-generate <model.gguf> --chat --max 256 < request.json
 # the C ABI (include/omphalos.h, #154) from plain C: load, chat, tokenize, generate
 engine/build/omph-capi-demo <model.gguf>
 
+# OpenAI-compatible server (#156): /v1/chat/completions, /v1/completions, /v1/models, /health;
+# streamed or not, reasoning_content / tool_calls; one request at a time on 127.0.0.1:8080.
+# Options: --host --port --ctx --alias --api-key --cors ORIGIN, request defaults --temp
+# --top-k --top-p --min-p --max-tokens (default greedy: speculative MTP decoding)
+engine/build/omph-server <model.gguf> [--port 8080]
+
 # full forward pass: prefill + greedy decode (options in the table below)
 engine/build/omph-run <model.gguf> models/golden/cpu/tokens.txt <out-logits.f32> \
     --gemv --generate 3 --gen-out /tmp/gen.txt [--trace-dir DIR] [--tokens N]
@@ -101,6 +107,8 @@ uv run python check_gpu_decode.py [--gemv]        # greedy decode vs the NumPy r
 uv run python check_tokenizer.py <model> <llama.cpp>/bin/llama-tokenize [--fuzz N]
                                                   # tokenizer vs llama.cpp, token for token
 uv run python check_chat_template.py <model>      # chat template vs jinja2, byte for byte
+uv run python check_server.py [--url URL]         # omph-server end to end with the openai
+                                                  # client (starts ../engine/build/omph-server)
 uv run python compare_logits.py ref.f32 test.f32  # KL + top-1 agreement over every
                                                   # position (e.g. OMPH_KV_F32=1 vs default)
 
