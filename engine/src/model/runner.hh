@@ -30,6 +30,14 @@ namespace omph::model {
 using omph::runtime::PhaseTimer;
 using omph::runtime::Scratch;
 
+// What a forward reads besides token ids (#160): embedding rows that replace
+// some tokens (an image's), and M-RoPE positions.
+struct ForwardInputs {
+    std::vector<int64_t> rows;     // indices into the tokens, ascending
+    const float * embd = nullptr;  // rows.size() x n_embd, host memory
+    std::vector<int32_t> mpos;     // tokens x 3 (t, h, w), or empty: text positions
+};
+
 class Runner {
     // A tensor repacked for a fused GEMV (PLAN.md §8.3).
     struct GemvEntry {
@@ -88,9 +96,15 @@ public:
     // greedy (decode, --gemv): set to the argmax token computed on the device,
     // and the logits stay there (#102); -1 when this path did not run, and the
     // caller takes the argmax of `logits`.
+    // `in` (#160): image embedding rows and M-RoPE positions; the MTP KV fill
+    // after it reads them too.
     bool forward(const std::vector<int32_t> & toks, std::vector<float> & logits,
                  const std::string & trace_dir, const int64_t start_pos = 0,
-                 const bool want_logits = true, int32_t * greedy = nullptr);
+                 const bool want_logits = true, int32_t * greedy = nullptr,
+                 const ForwardInputs * in = nullptr);
+    // Text RoPE position = cache position + delta (<= 0 after images, #160),
+    // for every forward without M-RoPE positions, verification and draft.
+    void set_rope_delta(int64_t delta) { rope_delta_ = delta; }
 
     const HParams & hparams() const { return h_; }
 
@@ -307,7 +321,15 @@ private:
     // positions pos0..; kv_only stops after the K / V write, `head` also runs
     // shared_head_norm + lm_head and returns the greedy token.
     bool mtp_block(const int32_t * toks, const float * h_in, int64_t pos0, int64_t T,
-                   bool kv_only, int32_t * argmax = nullptr, std::vector<float> * logits = nullptr);
+                   bool kv_only, int32_t * argmax = nullptr, std::vector<float> * logits = nullptr,
+                   const ForwardInputs * in = nullptr);
+    // the inputs of the forward being run (#160); its M-RoPE positions on the device
+    const ForwardInputs * inputs_ = nullptr;
+    void * mpos_dev_ = nullptr;
+    int64_t rope_delta_ = 0;
+    // embeddings of tokens [0, T) into dst (n_embd f32 rows): token rows from
+    // the table, image rows from `in`
+    bool embed(const int32_t * toks, int64_t T, const ForwardInputs * in, float * dst);
     // The KV fill of the first `keep` tokens of the last forward.
     bool mtp_fill(int64_t keep);
     std::vector<float *> state_cur_;  // recurrent layers: the state the next step reads

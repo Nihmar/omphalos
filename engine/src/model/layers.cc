@@ -84,6 +84,9 @@ bool Runner::attn_layer(const int64_t il, const LayerWeights & L, const int64_t 
     prep.hd = h_.head_dim;
     prep.n_rot = (int) h_.n_rot;
     prep.freq_base = (float) h_.freq_base;
+    prep.mpos = inputs_ != nullptr && !inputs_->mpos.empty() ? static_cast<const int *>(mpos_dev_) : nullptr;
+    prep.rope_delta = rope_delta_;
+    for (int c = 0; c < 3; ++c) prep.sections[c] = h_.rope_sections[c];
     prep.eps = (float) h_.eps;
     prep.rotate = kv.quant;
     if (kv.quant) {

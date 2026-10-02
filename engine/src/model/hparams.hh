@@ -24,6 +24,7 @@ struct HParams {
     int64_t ssm_conv_k = 0;
     double eps = 1e-6;
     double freq_base = 10000.0;
+    int rope_sections[3] = {0, 0, 0};  // M-RoPE t / h / w frequency pairs (#160)
 };
 
 // Throws when a hyperparameter is missing or outside what the kernels support.

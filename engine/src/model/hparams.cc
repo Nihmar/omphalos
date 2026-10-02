@@ -55,6 +55,10 @@ HParams read_hparams(const omph::gguf::File & f) {
     meta_int(f, "qwen35.ssm.conv_kernel", h.ssm_conv_k);
     h.eps = meta_float(f, "qwen35.attention.layer_norm_rms_epsilon", 1e-6);
     h.freq_base = meta_float(f, "qwen35.rope.freq_base", 10000.0);
+    if (f.find("qwen35.rope.dimension_sections") != nullptr) {
+        const std::vector<int64_t> sec = f.int_array("qwen35.rope.dimension_sections");
+        for (size_t i = 0; i < 3 && i < sec.size(); ++i) h.rope_sections[i] = (int) sec[i];
+    }
     // the vocab comes from the embedding table; trailing MTP blocks (the
     // nextn.* group, ignored by the normal decode path) are not part of the
     // stack we run here

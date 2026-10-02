@@ -40,8 +40,15 @@ __device__ inline float prep_block_sum(float v, float * red) {
     return t;
 }
 
+// RoPE positions of one token: t, h, w (equal for text), and whether they
+// are the interleaved M-RoPE's (#160).
+struct RopePos {
+    long long t, h, w;
+    bool mrope;
+};
+
 // NeoX RoPE on the first n_rot dimensions of a head held one value per thread.
-__device__ inline float prep_rope(const float x, float * buf, const long long pos,
+__device__ inline float prep_rope(const float x, float * buf, const RopePos rp, const int * sections,
                                   const int n_rot, const float freq_base) {
     const int d = (int) threadIdx.x;
     buf[d] = x;
@@ -50,6 +57,13 @@ __device__ inline float prep_rope(const float x, float * buf, const long long po
     const int half = n_rot / 2;
     if (d < n_rot) {
         const int i = d < half ? d : d - half;
+        long long pos = rp.t;
+        if (rp.mrope) {  // llama.cpp's IMROPE sector rule; the 4th section is unused
+            pos = (i % 3 == 1 && i < 3 * sections[1])   ? rp.h
+                  : (i % 3 == 2 && i < 3 * sections[2]) ? rp.w
+                  : (i % 3 == 0 && i < 3 * sections[0]) ? rp.t
+                                                        : 0;
+        }
         const float theta = (float) pos / powf(freq_base, (float) (2 * i) / (float) n_rot);
         const float c = cosf(theta);
         const float s = sinf(theta);
@@ -96,6 +110,10 @@ __global__ __launch_bounds__(kPrepHd) void attn_prep_kernel(const AttnPrep a) {
     const long long role = blockIdx.y;
     const int d = (int) threadIdx.x;
     const long long pos = a.pos0 + t;
+    RopePos rp{pos + a.rope_delta, pos + a.rope_delta, pos + a.rope_delta, false};
+    if (a.mpos != nullptr) {
+        rp = {a.mpos[3 * t], a.mpos[3 * t + 1], a.mpos[3 * t + 2], true};
+    }
     if (role < a.nh) {
         const long long h = role;
         const float * src = a.qg + (t * a.nh + h) * 2 * kPrepHd;
@@ -103,7 +121,7 @@ __global__ __launch_bounds__(kPrepHd) void attn_prep_kernel(const AttnPrep a) {
         float x = src[d];
         const float inv = 1.0f / sqrtf(prep_block_sum(x * x, red) / (float) kPrepHd + a.eps);
         x = x * inv * a.q_norm[d] * 1.0f;
-        x = prep_rope(x, buf, pos, a.n_rot, a.freq_base);
+        x = prep_rope(x, buf, rp, a.sections, a.n_rot, a.freq_base);
         if (a.rotate) {
             x = prep_hadamard(x, buf);
         }
@@ -117,7 +135,7 @@ __global__ __launch_bounds__(kPrepHd) void attn_prep_kernel(const AttnPrep a) {
     if (is_k) {
         const float inv = 1.0f / sqrtf(prep_block_sum(x * x, red) / (float) kPrepHd + a.eps);
         x = x * inv * a.k_norm[d] * 1.0f;
-        x = prep_rope(x, buf, pos, a.n_rot, a.freq_base);
+        x = prep_rope(x, buf, rp, a.sections, a.n_rot, a.freq_base);
     }
     if (a.rotate) {
         x = prep_hadamard(x, buf);
