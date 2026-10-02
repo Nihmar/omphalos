@@ -64,6 +64,9 @@ Model path used below: `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (local, git-i
 cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release
 cmake --build engine/build -j
 
+# tokenizer (#148): text on stdin -> ids, or --decode ids -> text
+engine/build/omph-tokenize <model.gguf> [--no-parse-special] < prompt.txt > tokens.txt
+
 # full forward pass: prefill + greedy decode (options in the table below)
 engine/build/omph-run <model.gguf> models/golden/cpu/tokens.txt <out-logits.f32> \
     --gemv --generate 3 --gen-out /tmp/gen.txt [--trace-dir DIR] [--tokens N]
@@ -85,6 +88,8 @@ uv run python check_gpu_run.py  <model> --layers  # 64-layer stack vs the dump
 uv run python check_gpu_mtp.py                    # MTP draft head vs NumPy fed llama.cpp's h
 uv run python check_gpu_decode.py [--gemv]        # greedy decode vs the NumPy reference
                                                   # (cached in models/golden/cpu; --refresh)
+uv run python check_tokenizer.py <model> <llama.cpp>/bin/llama-tokenize [--fuzz N]
+                                                  # tokenizer vs llama.cpp, token for token
 uv run python compare_logits.py ref.f32 test.f32  # KL + top-1 agreement over every
                                                   # position (e.g. OMPH_KV_F32=1 vs default)
 
@@ -100,7 +105,7 @@ engine/build/omph-run <model> <tokens.txt> /tmp/p.f32 --last-logits --gemv --gen
 
 # CPU-only tests (no GPU, no ROCm; what CI runs, .github/workflows/ci.yml)
 cmake -S engine/tests -B engine/build-tests && cmake --build engine/build-tests -j
-ctest --test-dir engine/build-tests --output-on-failure   # repack round trip, GGUF parser
+ctest --test-dir engine/build-tests --output-on-failure   # repack round trip, GGUF parser, tokenizer
 cd tools && uv run ruff check . && uv run python -m pytest tests -q   # decoders vs gguf-py
 uv run python check_doc_math.py ../docs/*.md ../PLAN.md        # math GitHub would mangle
 
