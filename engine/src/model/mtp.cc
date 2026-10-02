@@ -26,19 +26,19 @@ namespace omph::model {
 
 bool Runner::mtp_block(const int32_t * toks, const float * h_in, const int64_t pos0,
                        const int64_t T, const bool kv_only, int32_t * argmax,
-                       std::vector<float> * logits) {
+                       std::vector<float> * logits, const ForwardInputs * in) {
     const int64_t ne = h_.n_embd;
     if (!mtp_ || T <= 0 || T > max_tokens_ || pos0 + T > max_seq_) {
         return fail("mtp: not enabled, or tokens out of range");
     }
     // embeddings into cur_, then [enorm(e); hnorm(h)] per token into ffn16_ (f16)
     auto * cat = static_cast<__half *>(ffn16_);
+    if (!embed(toks, T, in, static_cast<float *>(cur_))) {  // an image row: its embedding (#160)
+        return false;
+    }
     for (int64_t t = 0; t < T; ++t) {
         float * e = static_cast<float *>(cur_) + t * ne;
-        const uint8_t * row =
-            static_cast<const uint8_t *>(embd_host_) + (size_t) toks[t] * embd_row_bytes_;
-        if (!omph::kernels::dequantize(embd_type_, row, e, ne, false, nullptr) ||
-            !omph::kernels::add_rms_norm_f16(e, nullptr, nullptr, mtp_enorm_, cat + t * 2 * ne,
+        if (!omph::kernels::add_rms_norm_f16(e, nullptr, nullptr, mtp_enorm_, cat + t * 2 * ne,
                                              1, ne, (float) h_.eps, nullptr) ||
             !omph::kernels::add_rms_norm_f16(h_in + t * ne, nullptr, nullptr, mtp_hnorm_,
                                              cat + t * 2 * ne + ne, 1, ne, (float) h_.eps,
@@ -124,8 +124,10 @@ bool Runner::mtp_fill(const int64_t keep) {
                   row, hipMemcpyDeviceToDevice) != hipSuccess) {
         return fail("mtp fill: h copy failed");
     }
+    // inside a forward: its image rows and M-RoPE positions (the rows of
+    // [0, keep) are the forward's)
     return mtp_block(last_toks_.data(), static_cast<const float *>(mtp_hin_), last_pos0_, keep,
-                     true);
+                     true, nullptr, nullptr, inputs_);
 }
 
 bool Runner::mtp_draft(const int32_t token, const int64_t pos, const int64_t k,

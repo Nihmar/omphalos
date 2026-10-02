@@ -64,6 +64,14 @@ Model path used below: `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (local, git-i
 cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release
 cmake --build engine/build -j
 
+# build with vision (#160): llama.cpp's mtmd from a CPU-only llama.cpp build (out of tree;
+# every GPU backend off: the encoder must never touch VRAM), then point the engine at it
+cmake -S <llama.cpp> -B /var/tmp/omphalos-llama-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_HIP=OFF -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=ON \
+    -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF
+cmake --build /var/tmp/omphalos-llama-cpu -j --target mtmd llama
+cmake -S engine -B engine/build -DOMPH_LLAMA_DIR=<llama.cpp> -DOMPH_LLAMA_LIB=/var/tmp/omphalos-llama-cpu/bin
+
 # tokenizer (#148): text on stdin -> ids, or --decode ids -> text
 engine/build/omph-tokenize <model.gguf> [--no-parse-special] < prompt.txt > tokens.txt
 # chat template (#150): a JSON request {messages, tools?, add_generation_prompt?,
@@ -72,7 +80,9 @@ engine/build/omph-tokenize <model.gguf> --chat-ids < request.json > tokens.txt
 
 # generation (#152): text, a chat request (--chat) or ids (--prompt-ids) in, streamed text out;
 # greedy uses MTP speculation, --temp/--top-k/--top-p/--min-p/--seed sample, --then FILE a next turn,
-# --repeat N the same request again (resumes from a checkpoint), --cache-mib N (0: no checkpoints)
+# --repeat N the same request again (resumes from a checkpoint), --cache-mib N (0: no checkpoints),
+# --mmproj FILE --image FILE (one per image item / <|image_pad|>), --force IDS --logits-out FILE
+# (teacher-forced logits, validation)
 engine/build/omph-generate <model.gguf> --chat --max 256 < request.json
 
 # the C ABI (include/omphalos.h, #154) from plain C: load, chat, tokenize, generate
@@ -81,7 +91,7 @@ engine/build/omph-capi-demo <model.gguf>
 # OpenAI-compatible server (#156): /v1/chat/completions, /v1/completions, /v1/models, /health;
 # streamed or not, reasoning_content / tool_calls; one request at a time on 127.0.0.1:8080.
 # Options: --host --port --ctx --cache-ram MIB (sequence checkpoints in host RAM, #158; default
-# 2048) --alias --api-key --cors ORIGIN, request defaults --temp
+# 2048) --mmproj FILE (images as base64 data: URLs, #160) --alias --api-key --cors ORIGIN, request defaults --temp
 # --top-k --top-p --min-p --max-tokens (default greedy: speculative MTP decoding)
 engine/build/omph-server <model.gguf> [--port 8080]
 
@@ -111,6 +121,10 @@ uv run python check_tokenizer.py <model> <llama.cpp>/bin/llama-tokenize [--fuzz 
 uv run python check_chat_template.py <model>      # chat template vs jinja2, byte for byte
 uv run python check_server.py [--url URL]         # omph-server end to end with the openai
                                                   # client (starts ../engine/build/omph-server)
+    [--image <llama.cpp>/tools/mtmd/test-1.jpeg]  # ... and images (the server gets --mmproj)
+uv run python check_vision.py --image <llama.cpp>/tools/mtmd/test-1.jpeg
+                                                  # images vs llama.cpp, teacher-forced logits
+                                                  # (needs tools/native/dump_mtmd_logits)
 uv run python compare_logits.py ref.f32 test.f32  # KL + top-1 agreement over every
                                                   # position (e.g. OMPH_KV_F32=1 vs default)
 
@@ -131,7 +145,7 @@ cd tools && uv run ruff check . && uv run python -m pytest tests -q   # decoders
 uv run python check_doc_math.py ../docs/*.md ../PLAN.md        # math GitHub would mangle
 
 # regenerating the golden dump (CPU backend, needs a llama.cpp build)
-tools/native/build.sh <llama.cpp-dir> && tools/native/dump_tensors ...
+tools/native/build.sh <llama.cpp-dir> && tools/native/dump_tensors ...   # also builds dump_mtmd_logits
 ```
 
 ### `omph-run` options and environment switches
@@ -155,6 +169,7 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_TIMING` | diagnostics | VRAM after load, per-step `step gpu` / `step wall` |
 | `OMPH_PHASES` | diagnostics | per-phase GPU totals; its ~460 events per step add ~2.6 ms, so never measure the step with it (#100) |
 | `OMPH_TEST_BAD_SIDE=N` | diagnostics | swap the side stream the calibration rejected back in after N decode steps: exercises the #144 watchdog |
+| `OMPH_TEST_MROPE=swap\|flat` | ablation | image positions with h and w exchanged, or 1D: must score worse in `check_vision.py` (#160) |
 | `OMPH_SPEC_CHECK` | diagnostics | check every speculative rollback: the replay bit-exact against `gdn_step`, the FP16 ring restored (slow) |
 | `OMPH_TRACE_ALLOC` / `OMPH_TRACE_F16` / `OMPH_TRACE_STAGE` | diagnostics | f16-scratch allocations / matmuls falling back to the f16 path / f16 staging and cache hits |
 | `OMPH_KV_F32` | KV | exact f32 cache in VRAM (reference) |

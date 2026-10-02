@@ -31,6 +31,7 @@ Generator::Generator(const Config & config, const omph::runtime::EnvOptions & en
         eog_.push_back(tokenizer_->eos());
     }
     im_start_ = tokenizer_->find("<|im_start|>");
+    image_pad_ = tokenizer_->find("<|image_pad|>");
     if (config_.cache_mib > 0) {
         max_checkpoints_ = (size_t) (config_.cache_mib << 20) / runner_->checkpoint_bytes();
     }
@@ -43,17 +44,33 @@ bool Generator::is_eog(const int32_t id) const {
 // Runs toks[from..] at positions from.. in prefill chunks; the last chunk's
 // logits row ends in last_logits. A chunk also ends at each of `cuts`, where
 // a checkpoint is saved.
-bool Generator::feed(const std::vector<int32_t> & toks, const int64_t from, std::vector<float> & last_logits,
+bool Generator::feed(const Expanded & p, const int64_t from, std::vector<float> & last_logits,
                      const std::vector<int64_t> & cuts, GenerateResult & res) {
+    const std::vector<int32_t> & toks = p.tokens;
     const int64_t n = (int64_t) toks.size();
+    const int64_t ne = runner_->hparams().n_embd;
     size_t ci = 0;
+    std::vector<float> rows;  // the chunk's image rows
     for (int64_t off = from; off < n;) {
         while (ci < cuts.size() && cuts[ci] <= off) ++ci;
         int64_t end = std::min<int64_t>(off + config_.chunk, n);
         const bool cut = ci < cuts.size() && cuts[ci] <= end;
         if (cut) end = cuts[ci];
         const std::vector<int32_t> part(toks.begin() + off, toks.begin() + end);
-        if (!runner_->forward(part, last_logits, std::string(), off, end == n)) {
+        ForwardInputs in;
+        rows.clear();
+        for (int64_t j = off; j < end; ++j) {
+            if (const Image * im = p.image_of[(size_t) j]) {
+                in.rows.push_back(j - off);
+                const float * src = im->embd.data() + p.image_row[(size_t) j] * ne;
+                rows.insert(rows.end(), src, src + ne);
+            }
+        }
+        in.embd = rows.data();
+        if (!p.mpos.empty()) in.mpos.assign(p.mpos.begin() + 3 * off, p.mpos.begin() + 3 * end);
+        const bool with_inputs = !in.rows.empty() || !in.mpos.empty();
+        if (!runner_->forward(part, last_logits, std::string(), off, end == n, nullptr,
+                              with_inputs ? &in : nullptr)) {
             return false;
         }
         if (cut) {
@@ -145,6 +162,7 @@ int64_t Generator::resume(const std::vector<int32_t> & prompt, GenerateResult & 
     if (!seq_.empty() && common == seq_.size() && common < prompt.size()) {
         return (int64_t) common;
     }
+
     Checkpoint * best = nullptr;
     for (Checkpoint & c : checkpoints_) {
         if (c.tokens.size() <= common && c.tokens.size() < prompt.size() && valid(c) &&
@@ -221,19 +239,59 @@ int32_t Generator::sample(const std::vector<float> & logits, const Sampling & s)
     return cand[keep - 1].second;
 }
 
-GenerateResult Generator::generate(const std::vector<int32_t> & prompt, const GenerateRequest & req,
+// The prompt with each <|image_pad|> replaced by its image's rows, and the
+// positions: text advances by 1, an image starting at p0 gives its row i
+// (t, h, w) = (p0, p0 + i / nx, p0 + i % nx) and advances by max(nx, ny), as
+// llama.cpp's mtmd does for M-RoPE models.
+bool Generator::expand(const std::vector<int32_t> & prompt, const GenerateRequest & req, Expanded & out) const {
+    const int64_t ne = runner_->hparams().n_embd;
+    const bool mrope = !req.images.empty();
+    size_t next = 0;
+    int64_t r = 0;
+    for (const int32_t t : prompt) {
+        if (t < 0 || t >= tokenizer_->size()) return false;
+        if (t != image_pad_ || image_pad_ < 0) {
+            out.tokens.push_back(t);
+            out.image_of.push_back(nullptr);
+            out.image_row.push_back(0);
+            if (mrope) out.mpos.insert(out.mpos.end(), {(int32_t) r, (int32_t) r, (int32_t) r});
+            ++r;
+            continue;
+        }
+        if (next >= req.images.size()) return false;  // a placeholder without an image
+        const Image * im = req.images[next++].get();
+        if (im == nullptr || im->nx <= 0 || im->ny <= 0 || (int64_t) im->embd.size() != im->n_tokens() * ne) {
+            return false;
+        }
+        const int32_t id = -1 - (int32_t) (im->hash & 0x3fffffff);
+        for (int64_t i = 0; i < im->n_tokens(); ++i) {
+            out.tokens.push_back(id);
+            out.image_of.push_back(im);
+            out.image_row.push_back(i);
+            int32_t h = (int32_t) (r + i / im->nx), w = (int32_t) (r + i % im->nx);
+            if (env_.test_mrope == 1) std::swap(h, w);           // validation ablations
+            if (env_.test_mrope == 2) h = w = (int32_t) (r + i);
+            out.mpos.insert(out.mpos.end(), {env_.test_mrope == 2 ? h : (int32_t) r, h, w});
+        }
+        r += env_.test_mrope == 2 ? im->n_tokens() : std::max(im->nx, im->ny);
+    }
+    out.rope_end = r;
+    return next == req.images.size();
+}
+
+GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, const GenerateRequest & req,
                                    const std::function<bool(int32_t)> & on_token) {
     GenerateResult res;
-    res.prompt_tokens = (int64_t) prompt.size();
-    if (prompt.empty() || (int64_t) prompt.size() >= config_.context) {
-        res.stop = prompt.empty() ? GenerateResult::Stop::Error : GenerateResult::Stop::ContextFull;
+    Expanded ex;
+    if (prompt_ids.empty() || !expand(prompt_ids, req, ex)) {
+        res.stop = GenerateResult::Stop::Error;
         return res;
     }
-    for (const int32_t t : prompt) {
-        if (t < 0 || t >= tokenizer_->size()) {
-            res.stop = GenerateResult::Stop::Error;
-            return res;
-        }
+    const std::vector<int32_t> & prompt = ex.tokens;
+    res.prompt_tokens = (int64_t) prompt.size();
+    if ((int64_t) prompt.size() >= config_.context) {
+        res.stop = GenerateResult::Stop::ContextFull;
+        return res;
     }
     rng_.seed(req.sampling.seed);
     const double t0 = omph::runtime::now_ms();
@@ -245,7 +303,8 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt, const Ge
     }
     res.cached_tokens = from;
     std::vector<float> logits;
-    if (!feed(prompt, from, logits, checkpoint_positions(prompt, from), res)) {
+    runner_->set_rope_delta(0);  // text-only prompts; with images every chunk has its positions
+    if (!feed(ex, from, logits, checkpoint_positions(prompt, from), res)) {
         seq_.clear();
         drop_checkpoints(true);
         res.stop = GenerateResult::Stop::Error;
@@ -253,11 +312,18 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt, const Ge
     }
     seq_ = prompt;
     drop_checkpoints(false);
+    // generated tokens: RoPE position = cache position + delta (0 without images)
+    runner_->set_rope_delta(ex.rope_end - (int64_t) prompt.size());
+    if (req.prefill_logits != nullptr) *req.prefill_logits = logits;
     const double t1 = omph::runtime::now_ms();
     res.prefill_ms = t1 - t0;
 
-    const bool greedy = req.sampling.temperature <= 0.0f;
-    int32_t next = sample(logits, req.sampling);
+    const bool forcing = req.force != nullptr && !req.force->empty();
+    const bool greedy = req.sampling.temperature <= 0.0f && !forcing;
+    int32_t next = forcing ? (*req.force)[0] : sample(logits, req.sampling);
+    if (forcing && req.forced_logits != nullptr) {
+        req.forced_logits->insert(req.forced_logits->end(), logits.begin(), logits.end());
+    }
     // a token decided: report it, and say whether to go on
     const auto emit = [&](const int32_t t) {
         res.tokens.push_back(t);
@@ -289,7 +355,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt, const Ge
         return res;
     }
     bool go = emit(next);
-    if (greedy && req.speculative && config_.mtp) {
+    if (greedy && req.speculative && config_.mtp && !forcing) {
         // Speculative greedy (#122, #124): draft k tokens with the MTP block,
         // verify [next, drafts] in one forward, keep the drafts the model
         // agrees with plus its own next token. Same tokens as plain greedy.
@@ -315,17 +381,26 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt, const Ge
             while (a + 1 < (int64_t) batch.size() && batch[(size_t) a + 1] == am[(size_t) a]) {
                 ++a;
             }
-            if (!runner_->commit(a + 1)) {
+            res.accepted += a;
+            // The accepted drafts in order; when one ends the generation, the
+            // caches keep the tokens before it, as the plain path never feeds
+            // its last token (else an end-of-generation and what the model
+            // drafted after it would sit in the cached sequence, #160).
+            int64_t keep = a + 1;
+            for (int64_t j = 1; j <= a; ++j) {
+                if (!emit(batch[(size_t) j])) {
+                    keep = j;
+                    go = false;
+                    break;
+                }
+            }
+            if (!runner_->commit(keep)) {
                 res.stop = GenerateResult::Stop::Error;
                 break;
             }
-            seq_.insert(seq_.end(), batch.begin(), batch.begin() + a + 1);
-            res.accepted += a;
-            for (int64_t j = 0; j < a && go; ++j) {
-                go = emit(batch[(size_t) j + 1]);
-            }
-            next = am[(size_t) a];
+            seq_.insert(seq_.end(), batch.begin(), batch.begin() + keep);
             if (go) {
+                next = am[(size_t) a];
                 go = emit(next);
             }
         }
@@ -340,7 +415,15 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt, const Ge
                 break;
             }
             seq_.push_back(next);
-            next = on_device >= 0 ? on_device : sample(step, req.sampling);
+            if (forcing) {
+                if (req.forced_logits != nullptr) {
+                    req.forced_logits->insert(req.forced_logits->end(), step.begin(), step.end());
+                }
+                if (res.tokens.size() >= req.force->size()) break;
+                next = (*req.force)[res.tokens.size()];
+            } else {
+                next = on_device >= 0 ? on_device : sample(step, req.sampling);
+            }
             go = emit(next);
         }
     }

@@ -8,6 +8,8 @@
 //   --no-mtp          do not load the MTP block (no speculative decoding, -352 MiB of VRAM)
 //   --cache-ram MIB   pinned host RAM for sequence checkpoints (default 2048, 0: none): a
 //                     retried answer or a history without the reasoning resumes from one
+//   --mmproj FILE     the vision encoder: images as base64 data: URLs in image_url
+//                     items, encoded on the CPU (builds with OMPH_LLAMA_DIR, #160)
 //   --alias NAME      the model id in the API (default: the file name without .gguf)
 //   --api-key KEY     require "Authorization: Bearer KEY"
 //   --cors ORIGIN     allow browser requests from ORIGIN (e.g. "*")
@@ -20,10 +22,17 @@
 // turn continues the cached sequence when its prompt extends it.
 #include "model/generator.hh"
 #include "runtime/options.hh"
+#include "runtime/timing.hh"
 #include "server/http.hh"
 #include "server/openai.hh"
 #include "text/json.hh"
+#ifdef OMPH_VISION
+#include "vision/encoder.hh"
+#endif
 
+#include <algorithm>
+#include <memory>
+#include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -44,6 +53,9 @@ struct Server {
     std::string api_key;
     std::string cors;
     omph::server::Defaults defaults;
+#ifdef OMPH_VISION
+    omph::vision::Encoder * vision = nullptr;
+#endif
 
     static Json num(const double v) { return Json::number(v, true); }
     static Json str(const std::string & s) { return Json::string(s); }
@@ -143,14 +155,43 @@ struct Server {
             fail(c, 400, "the prompt is empty", "invalid_request_error", "prompt");
             return;
         }
-        if ((int64_t) prompt.size() >= gen.context()) {
+        omph::model::GenerateRequest greq;
+        const int32_t image_pad = tok.find("<|image_pad|>");
+        if (std::count(prompt.begin(), prompt.end(), image_pad) != (std::ptrdiff_t) job.images.size()) {
+            fail(c, 400, "the prompt's image placeholders do not match its images", "invalid_request_error",
+                 "messages");
+            return;
+        }
+        if (!job.images.empty()) {
+#ifdef OMPH_VISION
+            if (vision == nullptr) {
+                fail(c, 400, "this server has no vision encoder (start it with --mmproj)", "invalid_request_error",
+                     "messages");
+                return;
+            }
+            const double t0 = omph::runtime::now_ms();
+            try {
+                for (const std::string & bytes : job.images) greq.images.push_back(vision->encode(bytes));
+            } catch (const std::runtime_error & e) {
+                fail(c, 400, e.what(), "invalid_request_error", "messages");
+                return;
+            }
+            std::fprintf(stderr, "%zu image(s) ready in %.0f ms (CPU)\n", job.images.size(),
+                         omph::runtime::now_ms() - t0);
+#else
+            fail(c, 400, "this server was built without vision", "invalid_request_error", "messages");
+            return;
+#endif
+        }
+        int64_t prompt_len = (int64_t) prompt.size();  // with the images' rows
+        for (const auto & im : greq.images) prompt_len += im->n_tokens() - 1;
+        if (prompt_len >= gen.context()) {
             fail(c, 400,
-                 "the prompt is " + std::to_string(prompt.size()) + " tokens; the context holds " +
+                 "the prompt is " + std::to_string(prompt_len) + " tokens; the context holds " +
                      std::to_string(gen.context()),
                  "invalid_request_error", chat ? "messages" : "prompt");
             return;
         }
-        omph::model::GenerateRequest greq;
         greq.max_tokens = job.max_tokens > 0 ? job.max_tokens : gen.context();
         greq.sampling.temperature = job.temperature;
         greq.sampling.top_k = job.top_k;
@@ -260,9 +301,9 @@ struct Server {
         const Json finish = str(omph::server::finish_reason(length, parser.any_tool_call()));
         const auto completion_tokens = (double) res.tokens.size();
         Json usage = Json::object();
-        usage.set("prompt_tokens", num((double) prompt.size()));
+        usage.set("prompt_tokens", num((double) prompt_len));
         usage.set("completion_tokens", num(completion_tokens));
-        usage.set("total_tokens", num((double) prompt.size() + completion_tokens));
+        usage.set("total_tokens", num((double) prompt_len + completion_tokens));
         Json details = Json::object();
         details.set("cached_tokens", num((double) res.cached_tokens));
         usage.set("prompt_tokens_details", std::move(details));
@@ -326,7 +367,7 @@ struct Server {
         std::fprintf(stderr,
                      "%s %s: prompt %zu tokens (%lld cached%s) in %.0f ms; %zu tokens in %.0f ms (%.1f t/s); "
                      "stop: %s%s\n",
-                     req.method.c_str(), req.path.c_str(), prompt.size(), (long long) res.cached_tokens,
+                     req.method.c_str(), req.path.c_str(), (size_t) prompt_len, (long long) res.cached_tokens,
                      res.restored ? ", checkpoint" : "",
                      res.prefill_ms, res.tokens.size(), res.decode_ms,
                      res.decode_ms > 0 ? 1000.0 * completion_tokens / res.decode_ms : 0.0,
@@ -351,7 +392,7 @@ int main(int argc, char ** argv) {
     cfg.model = argv[1];
     std::string host = "127.0.0.1";
     int port = 8080;
-    std::string alias, api_key, cors;
+    std::string alias, api_key, cors, mmproj;
     omph::server::Defaults defaults;
     for (int i = 2; i < argc; ++i) {
         const auto val = [&]() -> const char * {
@@ -368,6 +409,7 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--no-mtp")) cfg.mtp = false;
         else if (!std::strcmp(argv[i], "--cache-ram")) cfg.cache_mib = std::atoll(val());
         else if (!std::strcmp(argv[i], "--alias")) alias = val();
+        else if (!std::strcmp(argv[i], "--mmproj")) mmproj = val();
         else if (!std::strcmp(argv[i], "--api-key")) api_key = val();
         else if (!std::strcmp(argv[i], "--cors")) cors = val();
         else if (!std::strcmp(argv[i], "--temp")) defaults.temperature = (float) std::atof(val());
@@ -384,6 +426,15 @@ int main(int argc, char ** argv) {
         omph::server::Listener listener(host, port);  // fail before the minute of loading
         omph::model::Generator gen(cfg, omph::runtime::EnvOptions::from_env());
         Server server{gen, alias.empty() ? default_id(cfg.model) : alias, api_key, cors, defaults};
+#ifdef OMPH_VISION
+        std::unique_ptr<omph::vision::Encoder> vision;
+        if (!mmproj.empty()) {
+            vision = std::make_unique<omph::vision::Encoder>(mmproj, cfg.model);
+            server.vision = vision.get();
+        }
+#else
+        if (!mmproj.empty()) throw std::runtime_error("--mmproj: built without vision (OMPH_LLAMA_DIR)");
+#endif
         std::fprintf(stderr, "omph-server: %s on http://%s:%d (context %lld)\n", server.model_id.c_str(),
                      host.c_str(), port, (long long) gen.context());
         while (true) {

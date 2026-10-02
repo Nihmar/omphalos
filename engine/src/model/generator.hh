@@ -19,6 +19,16 @@
 
 namespace omph::model {
 
+// An encoded image (#160): nx x ny embedding rows (n_embd floats each, row
+// major), and its content hash (the identity of its positions in the cache).
+struct Image {
+    std::vector<float> embd;
+    int nx = 0;
+    int ny = 0;
+    uint64_t hash = 0;
+    int64_t n_tokens() const { return (int64_t) nx * ny; }
+};
+
 struct Sampling {
     float temperature = 0.0f;  // 0: greedy
     int top_k = 0;             // 0: off
@@ -32,13 +42,20 @@ struct GenerateRequest {
     Sampling sampling;
     bool speculative = true;   // MTP drafts when greedy and the model has them
     std::vector<int32_t> stop;  // extra stop tokens (the end-of-generation ones always stop)
+    // The images of the prompt, one per <|image_pad|> token, in order (#160).
+    std::vector<std::shared_ptr<const Image>> images;
+    std::vector<float> * prefill_logits = nullptr;  // validation: the logits after the prompt
+    // validation: decode these tokens instead of choosing (one per step, no
+    // speculation), appending every step's logits row (the prompt's first)
+    const std::vector<int32_t> * force = nullptr;
+    std::vector<float> * forced_logits = nullptr;
 };
 
 struct GenerateResult {
     enum class Stop { Length, EndOfGeneration, StopToken, Callback, ContextFull, Error };
     std::vector<int32_t> tokens;  // generated, including a final stop token
     Stop stop = Stop::Length;
-    int64_t prompt_tokens = 0;
+    int64_t prompt_tokens = 0;    // with each image's tokens
     int64_t cached_tokens = 0;    // of the prompt, already in the caches
     bool restored = false;        // ... from a checkpoint (#158)
     double checkpoint_ms = 0.0;   // saving / restoring checkpoints (in prefill_ms)
@@ -73,7 +90,18 @@ public:
 private:
     bool is_eog(int32_t id) const;
     int32_t sample(const std::vector<float> & logits, const Sampling & s);
-    bool feed(const std::vector<int32_t> & toks, int64_t from, std::vector<float> & last_logits,
+    // A prompt with its images expanded: an image's positions hold ids
+    // derived from its hash (negative: never a vocabulary token), so prefix
+    // reuse sees which image is where; M-RoPE positions when there are images.
+    struct Expanded {
+        std::vector<int32_t> tokens;
+        std::vector<const Image *> image_of;  // per position: its image, or null
+        std::vector<int64_t> image_row;       // per position: the row in its image
+        std::vector<int32_t> mpos;            // 3 per position, or empty (text only)
+        int64_t rope_end = 0;                 // the RoPE position after the prompt
+    };
+    bool expand(const std::vector<int32_t> & prompt, const GenerateRequest & req, Expanded & out) const;
+    bool feed(const Expanded & p, int64_t from, std::vector<float> & last_logits,
               const std::vector<int64_t> & cuts, GenerateResult & res);
     // Sequence checkpoints (#158): the state after tokens[0, pos), in pinned
     // host RAM; valid while seq_ starts with `tokens`.
@@ -101,6 +129,7 @@ private:
     size_t n_buffers_ = 0;
     uint64_t clock_ = 0;
     int32_t im_start_ = -1;
+    int32_t image_pad_ = -1;
     std::mt19937_64 rng_;
 };
 

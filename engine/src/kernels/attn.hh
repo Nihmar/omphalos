@@ -32,7 +32,14 @@ struct AttnPrep {
     const float * q_norm = nullptr;  // (hd)
     const float * k_norm = nullptr;  // (hd)
     long long tokens = 0;
-    long long pos0 = 0;
+    long long pos0 = 0;              // cache position of the first token
+    // RoPE positions (#160). Text: cache position + rope_delta (an image fills
+    // more cache rows than it advances positions). With images, mpos gives
+    // (t, h, w) per token for the interleaved M-RoPE: frequency pair i takes
+    // t / h / w for i mod 3 = 0 / 1 / 2 within 3 * sections[c].
+    const int * mpos = nullptr;      // (tokens, 3) on the device, or null
+    long long rope_delta = 0;
+    int sections[3] = {0, 0, 0};
     long long nh = 0;
     long long nkv = 0;
     long long hd = 0;

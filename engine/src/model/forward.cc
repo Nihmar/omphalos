@@ -41,10 +41,60 @@ void write_f32(const std::string & path, const std::vector<float> & data) {
 // greedy (decode, --gemv): set to the argmax token computed on the device,
 // and the logits stay there (#102); -1 when this path did not run, and the
 // caller takes the argmax of `logits`.
+// Token rows dequantized from the table (pinned host memory: the kernel reads
+// the row over PCIe), image rows copied from `in`.
+bool Runner::embed(const int32_t * toks, const int64_t T, const ForwardInputs * in, float * dst) {
+    const int64_t ne = h_.n_embd;
+    size_t next = 0;  // the next image row of `in`
+    for (int64_t t = 0; t < T; ++t) {
+        if (in != nullptr && next < in->rows.size() && in->rows[next] == t) {
+            size_t run = 1;  // a run of consecutive image rows: one copy
+            while (next + run < in->rows.size() && in->rows[next + run] == t + (int64_t) run) ++run;
+            if (hipMemcpyAsync(dst + t * ne, in->embd + next * ne, run * ne * 4, hipMemcpyHostToDevice,
+                               nullptr) != hipSuccess) {
+                return fail("image embedding upload failed");
+            }
+            t += (int64_t) run - 1;
+            next += run;
+            continue;
+        }
+        const uint8_t * src = static_cast<const uint8_t *>(embd_host_) + (size_t) toks[t] * embd_row_bytes_;
+        if (!omph::kernels::dequantize(embd_type_, src, dst + t * ne, ne, false, nullptr)) {
+            return fail("embedding dequant failed");
+        }
+    }
+    return true;
+}
+
 bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & logits,
              const std::string & trace_dir, const int64_t start_pos,
-             const bool want_logits, int32_t * greedy) {
+             const bool want_logits, int32_t * greedy, const ForwardInputs * in) {
     const int64_t T = (int64_t) toks.size();
+    // the inputs stay visible to the layers (M-RoPE) and the MTP fill until
+    // this forward returns
+    struct Scope {
+        const ForwardInputs *& slot;
+        ~Scope() { slot = nullptr; }
+    } scope{inputs_};
+    if (in != nullptr) {
+        if (!in->mpos.empty() && (int64_t) in->mpos.size() != 3 * T) {
+            return fail("forward: M-RoPE positions do not match the tokens");
+        }
+        for (size_t i = 0; i < in->rows.size(); ++i) {
+            if (in->rows[i] < 0 || in->rows[i] >= T || (i > 0 && in->rows[i] <= in->rows[i - 1]) ||
+                in->embd == nullptr) {
+                return fail("forward: bad embedding rows");
+            }
+        }
+        if (!in->mpos.empty()) {
+            if (mpos_dev_ == nullptr) mpos_dev_ = mem_.device((size_t) max_tokens_ * 3 * 4);
+            if (T > max_tokens_ || hipMemcpy(mpos_dev_, in->mpos.data(), (size_t) T * 3 * 4,
+                                             hipMemcpyHostToDevice) != hipSuccess) {
+                return fail("forward: M-RoPE position upload failed");
+            }
+        }
+        inputs_ = in;
+    }
     if (greedy != nullptr) {
         *greedy = -1;
     }
@@ -63,16 +113,8 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
     }
     const int64_t ne = h_.n_embd;
 
-    // token embeddings, one row at a time (the table is quantized and lives
-    // in pinned host memory: the kernel reads the row over PCIe)
-    for (int64_t t = 0; t < T; ++t) {
-        const uint8_t * src =
-            static_cast<const uint8_t *>(embd_host_) + (size_t) toks[t] * embd_row_bytes_;
-        if (!omph::kernels::dequantize(embd_type_, src,
-                                       static_cast<uint8_t *>(x_) + t * ne * 4, ne, false,
-                                       nullptr)) {
-            return fail("embedding dequant failed");
-        }
+    if (!embed(toks.data(), T, in, static_cast<float *>(x_))) {
+        return false;
     }
 
     // Set when the previous layer's final residual add already wrote this

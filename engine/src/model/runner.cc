@@ -541,6 +541,7 @@ bool Runner::reset_sequence() {
     }
     last_toks_.clear();
     last_pos0_ = 0;
+    rope_delta_ = 0;
     return hipDeviceSynchronize() == hipSuccess || fail("reset failed");
 }
 

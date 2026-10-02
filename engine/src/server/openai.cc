@@ -85,17 +85,32 @@ std::string effort(const Json & v) {
     bad("unsupported reasoning_effort " + e, "reasoning_effort");
 }
 
-bool has_media(const Json & content) {
-    if (!content.is_array()) return false;
+// A message's images, in order, appended to `images` as file bytes: only
+// data: URLs (the server fetches nothing and reads no local file). Audio,
+// video and files are refused.
+void collect_images(const Json & content, std::vector<std::string> & images) {
+    if (!content.is_array()) return;
     for (const Json & item : content.items()) {
         const Json & type = item.get("type");
         const std::string t = type.is_string() ? type.as_string() : "";
-        if (t == "image_url" || t == "image" || t == "input_audio" || t == "video" || t == "file" ||
-            item.has("image_url") || item.has("image") || item.has("video")) {
-            return true;
+        if (t == "input_audio" || t == "video" || t == "file" || t == "video_url" || item.has("video")) {
+            bad("audio, video and file inputs are not supported", "messages");
         }
+        if (!(t == "image_url" || t == "image" || item.has("image_url") || item.has("image"))) continue;
+        const Json & iu = item.has("image_url") ? item.get("image_url") : item.get("image");
+        const Json & url = iu.is_object() ? iu.get("url") : iu;
+        const std::string u = url.is_string() ? url.as_string() : "";
+        const size_t comma = u.find(',');
+        if (u.rfind("data:", 0) != 0 || comma == std::string::npos || comma < 12 ||
+            u.compare(comma - 7, 7, ";base64") != 0) {
+            bad("images must be base64 data: URLs (data:image/png;base64,...)", "messages");
+        }
+        std::string bytes;
+        if (!base64_decode(u.substr(comma + 1), bytes) || bytes.empty()) {
+            bad("an image's base64 data is invalid", "messages");
+        }
+        images.push_back(std::move(bytes));
     }
-    return false;
 }
 
 void parse_sampling(const Json & body, const Defaults & d, Job & job) {
@@ -179,9 +194,7 @@ Job parse_request(const Json & body, const bool chat, const Defaults & defaults)
     Json msgs = Json::array();
     for (const Json & m : messages.items()) {
         if (!m.is_object()) bad("every message must be an object", "messages");
-        if (has_media(m.get("content"))) {
-            bad("image, audio and file inputs are not supported yet", "messages");
-        }
+        collect_images(m.get("content"), job.images);
         Json copy = Json::object();
         for (const auto & [k, v] : m.members()) {
             if (k == "role" && v.is_string() && v.as_string() == "developer") {
@@ -441,6 +454,33 @@ size_t utf8_complete(const std::string & s) {
         return len > back ? s.size() - back : s.size();
     }
     return s.size();
+}
+
+bool base64_decode(const std::string & in, std::string & out) {
+    out.clear();
+    out.reserve(in.size() / 4 * 3);
+    uint32_t acc = 0;
+    int bits = 0;
+    size_t pad = 0;
+    for (const char c : in) {
+        int v = -1;
+        if (c >= 'A' && c <= 'Z') v = c - 'A';
+        else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
+        else if (c >= '0' && c <= '9') v = c - '0' + 52;
+        else if (c == '+' || c == '-') v = 62;
+        else if (c == '/' || c == '_') v = 63;
+        else if (c == '=') { ++pad; continue; }
+        else if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+        else return false;
+        if (pad > 0) return false;  // data after the padding
+        acc = (acc << 6) | (uint32_t) v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out += (char) ((acc >> bits) & 0xFF);
+        }
+    }
+    return pad <= 2;
 }
 
 std::string random_id(const std::string & prefix, const size_t n) {
