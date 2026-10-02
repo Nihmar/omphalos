@@ -90,7 +90,7 @@ PCIe link is fixed (#176).
 
 | issue | what | estimate |
 |---|---|---|
-| #172 | 32-64-key blocks, the next block loaded while computing, one barrier per block, more key splits at long context (fixed per run) | plain decode at 112k 66 -> ~57 ms |
+| #172 | 32-64-key blocks, the next block loaded while computing, one barrier per block, more key splits at long context (fixed per run) | done differently: V tile without padding (occupancy) and the softmax split across the waves; one layer at 100k 771 -> 626 us (T = 1), 1387 -> 819 (T = 4); speculative at 100k 31.3 -> 27.1 ms/token (`bench/results/decode-attention-172.txt`) |
 
 If #169 lands first, #172 applies to the WMMA kernel.
 
