@@ -142,6 +142,38 @@ struct DecIq3s {  // GGUF type 21
     }
 };
 
+// IQ3_S in the WMMA tiles of format/repack.hh (#178): the same Raw and the
+// same values as DecIq3s, read from the tile of 16 rows and the block that
+// hold (row, s): the qs words, sign bytes and qh nibbles of the row's two lanes.
+struct DecIq3sTile {  // GGUF type 21, .omph layout 2
+    const uint8_t * base;
+    long long blocks;  // 256-weight blocks per row
+    using Raw = DecIq3s::Raw;
+    static DecIq3sTile make(const uint8_t * base, const int64_t /*n_blocks*/, const long long blocks) {
+        return {base, blocks};
+    }
+    __device__ Raw load(const long long row, const long long s) const {
+        const uint8_t * o = base + ((row >> 4) * blocks + (s >> 3)) * omph::format::kIq3sTileBytes;
+        const int r = (int) (row & 15);
+        const int sb = (int) (s & 7);
+        Raw w;
+        w.q.x = *reinterpret_cast<const uint32_t *>(o + r * 32 + sb * 4);
+        w.q.y = *reinterpret_cast<const uint32_t *>(o + (r + 16) * 32 + sb * 4);
+        const uint32_t q0 = *reinterpret_cast<const uint32_t *>(o + 1536 + r * 4);
+        const uint32_t q1 = *reinterpret_cast<const uint32_t *>(o + 1536 + (r + 16) * 4);
+        w.qhb = ((q0 >> (4 * sb)) & 0xFu) | (((q1 >> (4 * sb)) & 0xFu) << 4);
+        const uint8_t * s0 = o + 1024 + r * 16 + sb * 2;         // half 0: bytes 1, 3
+        const uint8_t * s1 = o + 1024 + (r + 16) * 16 + sb * 2;  // half 1: bytes 0, 2
+        w.sg = (uint32_t) s1[0] | (uint32_t) s0[0] << 8 | (uint32_t) s1[1] << 16 | (uint32_t) s0[1] << 24;
+        w.sc = o[1664 + r * 4 + (sb >> 1)];
+        w.dv = load_half(o + 1728 + r * 2);
+        return w;
+    }
+    __device__ void decode(const Raw & r, const long long s, float (&v)[32]) const {
+        DecIq3s{}.decode(r, s, v);
+    }
+};
+
 struct DecIq3xxs {  // GGUF type 18
     const uint8_t * qs;
     const uint8_t * aux;
