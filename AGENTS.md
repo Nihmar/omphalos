@@ -74,6 +74,9 @@ engine/build/omph-tokenize <model.gguf> --chat-ids < request.json > tokens.txt
 # greedy uses MTP speculation, --temp/--top-k/--top-p/--min-p/--seed sample, --then FILE a next turn
 engine/build/omph-generate <model.gguf> --chat --max 256 < request.json
 
+# the C ABI (include/omphalos.h, #154) from plain C: load, chat, tokenize, generate
+engine/build/omph-capi-demo <model.gguf>
+
 # full forward pass: prefill + greedy decode (options in the table below)
 engine/build/omph-run <model.gguf> models/golden/cpu/tokens.txt <out-logits.f32> \
     --gemv --generate 3 --gen-out /tmp/gen.txt [--trace-dir DIR] [--tokens N]
