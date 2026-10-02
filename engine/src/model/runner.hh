@@ -94,6 +94,12 @@ public:
 
     const HParams & hparams() const { return h_; }
 
+    // Starts a new sequence at position 0 without reloading: zeroes the
+    // delta-net states, the conv tails and the MTP block's h (#152). The KV
+    // caches need nothing: positions restart, and attention reads only the
+    // positions the new sequence has written.
+    bool reset_sequence();
+
     // --- speculative decoding (#122) ---
     // Allocates what a verification of up to `max_tokens` tokens needs to be
     // rolled back (the alternate delta-net states, +151 MB, the replay records,
