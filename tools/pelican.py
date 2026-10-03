@@ -188,11 +188,12 @@ def write_readme(out: Path, rows: list, args) -> None:
         ("Rendered with the model's chat template (thinking on, reasoning effort xhigh, the template's default), "
          "the same raw prompt to omphalos (`omph-server`) and llama.cpp (`llama-server`, HIP), context 64K, no "
          "thinking budget. KV cache k8q4: omphalos' default (K4 on 8 layers, V4), llama.cpp `-ctk q8_0 -ctv "
-         "q4_0`; k4q4 runs: omphalos `OMPH_KV_K4=1`, llama.cpp `-ctk q4_0 -ctv q4_0`. Temperature 0 is greedy; temperature 1 samples with top_k 20, top_p 0.95, min_p 0, "
+         "q4_0`; k4q4 runs: omphalos `OMPH_KV_K4=1`, llama.cpp `-ctk q4_0 -ctv q4_0`. Temperature 0 is greedy; 0.6 and 1 sample with top_k 20, top_p 0.95, min_p 0, "
          f"seed {SEED}. MTP: omphalos' speculative decoding (3 drafts), llama.cpp's `--spec-type draft-mtp "
          "--spec-draft-n-max 3`. DFlash2: the z-lab Q4_K_M drafter, 7 drafts (omphalos `--dflash`, llama.cpp "
          "`-md ... --spec-type draft-dflash --spec-draft-n-max 7`). The images are each SVG's first frame (`rsvg-convert`); open the `.svg` "
-         "files in a browser for the animation. `tools/pelican.py` produced everything here."), "",
+         "files in a browser for the animation. `tools/pelican.py` produced everything here."
+         " omphalos runs from 2026-10-04 on (the `dflash` runs, `mtp-k4q4-t0.6`) also draft with n-grams of the context (on by default since #199, sampled runs included); the older ones predate them (#262 separates the two)."), "",
         "| run | KV | tokens (thinking + answer) | total time | prefill | decode | peak VRAM (idle) |",
         "|---|---|---|---|---|---|---|",
     ]
