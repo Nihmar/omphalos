@@ -2790,7 +2790,9 @@ __device__ __forceinline__ void group_body(const GroupItem & t, const __half * _
         case 16: tiles_body<qd::TileIq2xxs, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
         case 22: tiles_body<qd::TileIq2s, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
         case 10: tiles_body<qd::TileQ2k, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
-        case 14: q6k_ntg_body<NT, 2>(t.p[0], t.p[1], t.p[2], t.p[3], x, t.y, t.rows, t.n, b, lds); break;
+        case 14:
+            if constexpr (NT == 4) q6k_ntg_body<NT, 2>(t.p[0], t.p[1], t.p[2], t.p[3], x, t.y, t.rows, t.n, b, lds);
+            break;
         default: break;
     }
 }
@@ -2808,8 +2810,8 @@ __global__ __launch_bounds__(256, 8) void gemv_group_kernel(const GroupArgs g, c
 }
 
 // One member's device record (the launch helpers' layout arithmetic); false
-// for a type without an NT body.
-bool group_item(const GemvGroupItem & in, GroupItem & o) {
+// for a type without an NT body: the tiles take any token count, Q6_K only 4.
+bool group_item(const GemvGroupItem & in, GroupItem & o, const int nt) {
     const int64_t rows = in.rows;
     const int64_t k = in.k;
     const int64_t nb = rows * (k / 256);
@@ -2837,6 +2839,7 @@ bool group_item(const GemvGroupItem & in, GroupItem & o) {
         // IQ1_M (#226) is left out: its 16 KiB codebook in the shared LDS cost
         // the grouped launch more than the one launch it saves
         case 14: {
+            if (nt != 4) return false;
             const auto l = omph::format::q6k_layout(nb);
             o.p[0] = base + l.ql_off; o.p[1] = base + l.qh_off; o.p[2] = base + l.sc_off; o.p[3] = base + l.d_off;
             ntg(2);
@@ -2851,7 +2854,7 @@ bool group_item(const GemvGroupItem & in, GroupItem & o) {
 bool gemv_group(const GemvGroupItem * items, const int n, const void * x_f16, const int nt, hipStream_t stream) {
     // NT = 4 only: at 2 and 3 tokens the grouped kernel is no faster (2) or
     // slower (3: -1.5 ms over the model's groups, spills), #214
-    if (items == nullptr || x_f16 == nullptr || n < 2 || n > kGemvGroupMax || nt != 4) {
+    if (items == nullptr || x_f16 == nullptr || n < 2 || n > kGemvGroupMax || nt < 1 || nt > kTileMaxTokens) {
         return false;
     }
     GroupArgs g{};
@@ -2860,13 +2863,20 @@ bool gemv_group(const GemvGroupItem * items, const int n, const void * x_f16, co
     for (int i = 0; i < n; ++i) {
         const GemvGroupItem & in = items[i];
         if (in.packed == nullptr || in.y == nullptr || in.rows <= 0 || in.k <= 0 || in.k % 256 != 0 ||
-            in.k != items[0].k || !group_item(in, g.it[i])) {
+            in.k != items[0].k || !group_item(in, g.it[i], nt)) {
             return false;
         }
         total += g.it[i].blocks;
     }
     const auto * x = static_cast<const __half *>(x_f16);
-    gemv_group_kernel<4><<<total, 256, 0, stream>>>(g, x);
+    switch (nt) {
+#define OMPH_GROUP_NT(N) case N: gemv_group_kernel<N><<<total, 256, 0, stream>>>(g, x); break;
+        OMPH_GROUP_NT(1) OMPH_GROUP_NT(2) OMPH_GROUP_NT(3) OMPH_GROUP_NT(4) OMPH_GROUP_NT(5) OMPH_GROUP_NT(6)
+        OMPH_GROUP_NT(7) OMPH_GROUP_NT(8) OMPH_GROUP_NT(9) OMPH_GROUP_NT(10) OMPH_GROUP_NT(11) OMPH_GROUP_NT(12)
+        OMPH_GROUP_NT(13) OMPH_GROUP_NT(14) OMPH_GROUP_NT(15) OMPH_GROUP_NT(16)
+#undef OMPH_GROUP_NT
+        default: return false;
+    }
     return hipGetLastError() == hipSuccess;
 }
 
