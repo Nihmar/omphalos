@@ -42,7 +42,8 @@ bool Runner::gemv_one(const int type, const void * w, const void * x, float * y,
 }
 
 bool Runner::grouped(const void * x16, const int64_t k, const int64_t T, std::initializer_list<Sibling> s) {
-    if (!use_gemv_ || T != 4 || T >= gemm_min_ || env_.no_b4 || env_.no_group || env_.skip_gemv ||
+    // 1..16 tokens where every member is in tiles (#255); Q6_K at 4 tokens only (#214)
+    if (!use_gemv_ || T > 16 || (T > 1 && !gemv_path(T)) || env_.no_b4 || env_.no_group || env_.skip_gemv ||
         env_.skip_gemv_type >= 0 || s.size() < 2 || s.size() > (size_t) omph::kernels::kGemvGroupMax) {
         return false;
     }

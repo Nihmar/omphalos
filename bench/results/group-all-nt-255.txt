@@ -1,0 +1,20 @@
+# Sibling GEMVs in one launch at 1..16 tokens (#255, #203 D1), 2026-10-03, RX 9060 XT, 160 W cap.
+# Branch perf/255-group-all-nt on main da86f54 (.omph format 5).
+#
+# All sibling groups of the model (omph-gemv-bench --group --nt N; 127 of 128 groups, 143 launches fewer,
+# 0 member outputs differ at every N), separate vs grouped, ms per pass over the groups:
+#   N        1       2       3       4       8       12      16
+#   sep      24.436  24.765  24.994  25.153  25.752  26.319  25.980
+#   grouped  23.652  23.936  24.132  24.295  24.897  25.399  25.162
+#   saved    0.784   0.830   0.861   0.858   0.855   0.920   0.818   (5.5-6.4 us per launch removed)
+#
+# End to end, same binary, OMPH_NO_GROUP=1 alternated, 5 runs, median (omph-run --gemv; plain: golden
+# prompt, 65 tokens, step gpu; MTP --draft-mtp 3 / DFlash2 --dflash: 3k wikitext prompt, 200 tokens, ms
+# per verification step); outputs identical between the two in every run:
+#               separate  grouped
+#   plain       42.24     41.46 ms   (-1.8 %)
+#   MTP step    53.80     52.86 ms   (vs main, which grouped the 4-token verifications already: 52.84)
+#   DFlash2     57.88     56.94 ms   (-1.6 %)
+#
+# Checks: oracle drafts of 3, 8, 15 tokens, --draft-corrupt 4, OMPH_SPEC_CHECK=1, K8 and OMPH_KV_K4=1:
+# identical to plain greedy; check_gpu_decode --gemv, check_server, the CPU tests pass.
