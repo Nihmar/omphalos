@@ -28,10 +28,12 @@ bool dflash_ring_put(const float * src, int64_t T, int64_t row, int64_t pos0, __
 // Non-causal block attention: queries q (T, 32, 128) at positions pos0 + t see
 // the ring's keys at positions max(0, pos0 + t - n_swa + 1) .. pos0 - 1 whose
 // tag holds that position, and all T block keys bk / bv (T, 8, 128); out (T,
-// 32 * 128) f32. GQA: query head h reads KV head h / 4.
+// 32 * 128) f32. GQA: query head h reads KV head h / 4. T <= 8; `ws` holds
+// dflash_attention_ws_floats(slots) floats (flash-decoding partials).
 bool dflash_attention(const float * q, const __half * ring_k, const __half * ring_v, const int32_t * tags,
                       int64_t slots, const float * bk, const float * bv, int64_t T, int64_t pos0, int64_t n_swa,
-                      float scale, float * out, hipStream_t stream);
+                      float scale, float * ws, float * out, hipStream_t stream);
+int64_t dflash_attention_ws_floats(int64_t slots);
 
 // DFlash2's two-tap dynamic convolution inside the block: out[t][c] =
 // sum_tap (dyn[t][g + groups * (tap + 2 * side)] + base[c + n * (tap + 2 * side)])

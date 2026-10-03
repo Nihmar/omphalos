@@ -60,6 +60,10 @@ struct EnvOptions {
     int test_bad_side = 0;      // OMPH_TEST_BAD_SIDE=N: the rejected side stream back after N steps (#144)
     int test_mrope = 0;         // OMPH_TEST_MROPE=swap|flat: image positions with h / w swapped, or
                                 // sequential (validation of the M-RoPE layout, #160)
+    float dflash_keep = 0.12f;  // OMPH_DFLASH_KEEP=P: draft position n only while the measured chance
+                                // that drafts 1..n are all kept is >= P (0: always all, #245)
+    float dflash_pmin = 0.0f;   // OMPH_DFLASH_PMIN=P: DFlash2 drafts stop where the selector's best
+                                // candidate has softmax probability < P (#245)
     int test_q8act = 0;         // OMPH_TEST_Q8ACT=B: every prefill GEMM's input quantized to int8 in blocks
                                 // of B along k and back: an int8 GEMM's numerics (#213)
 

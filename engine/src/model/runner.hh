@@ -421,10 +421,18 @@ private:
     void * dfl_bv_ = nullptr;
     void * dfl_dyn_ = nullptr;     // conv coefficients (B, 4 x groups) f32
     void * dfl_sgate_ = nullptr;   // selector gate (B, 256) f32
+    void * dfl_attn_ws_ = nullptr; // attention partials
     void * dfl_logits_ = nullptr;  // (B - 1, n_vocab) f32
     int32_t * dfl_ids_ = nullptr;  // (B - 1, 16)
     float * dfl_vals_ = nullptr;
     float * dfl_scores_ = nullptr; // (B - 1, 16, 16)
+    // Adaptive draft length: per draft position n, an average of "the first n
+    // drafts were all kept" over the steps that drafted n; a step drafts the
+    // positions above OMPH_DFLASH_KEEP, all of them every 8th step (exploring).
+    std::vector<double> dfl_keep_;
+    int64_t dfl_drafted_ = 0;      // drafts of the last dflash_draft
+    int64_t dfl_steps_ = 0;
+    void dflash_observe(int64_t kept_drafts);
     std::vector<float *> state_cur_;  // recurrent layers: the state the next step reads
     std::vector<float *> state_alt_;  // speculation: the buffer a verification writes
     std::vector<int64_t> rec_index_;  // recurrent layer -> 0.. (-1 for attention)

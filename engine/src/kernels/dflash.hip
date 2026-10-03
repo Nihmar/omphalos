@@ -73,127 +73,151 @@ __global__ void ring_put_kernel(const float * __restrict__ src, const long long 
     }
 }
 
-// One block per (query head, token), 256 threads = 8 waves. Scores: one wave per
-// key, lane l on dims 4 l .. 4 l + 3; softmax in LDS; output: thread = (dim,
-// half of the keys).
-__global__ __launch_bounds__(256) void attention_kernel(const float * __restrict__ q,
-                                                        const __half * __restrict__ ring_k,
-                                                        const __half * __restrict__ ring_v,
-                                                        const int32_t * __restrict__ tags, const long long slots,
-                                                        const float * __restrict__ bk, const float * __restrict__ bv,
-                                                        const long long T, const long long pos0,
-                                                        const long long n_swa, const float scale,
-                                                        float * __restrict__ out) {
-    __shared__ float qs[kHd];
-    __shared__ float sc[kMaxKeys];
-    __shared__ float red[8];
-    __shared__ float part[2][kHd];
-    const int h = (int) blockIdx.x;
-    const long long t = blockIdx.y;
-    const int kvh = h / kGqa;
+// Flash-decoding over the virtual key list: positions lo0 .. pos0 - 1 from the
+// ring (when their tag matches), then the T block keys. Pass 1: one block per
+// (KV head, 64-key split) for all T x 4 queries of that KV head, the split's K
+// and V in LDS; partial (max, sum, acc[128]) per query. Pass 2 merges the
+// splits in order.
+constexpr int kSplit = 64;
+constexpr int kMaxQ = 4 * 8;  // T x 4 query heads per KV head, T <= 8 (the block)
+
+__global__ __launch_bounds__(256) void attention_part_kernel(const float * __restrict__ q,
+                                                             const __half * __restrict__ ring_k,
+                                                             const __half * __restrict__ ring_v,
+                                                             const int32_t * __restrict__ tags, const long long slots,
+                                                             const float * __restrict__ bk,
+                                                             const float * __restrict__ bv, const int T,
+                                                             const long long pos0, const long long lo0,
+                                                             const long long n_swa, const float scale,
+                                                             float * __restrict__ ws) {
+    __shared__ __half ks[kSplit][kHd + 2];
+    __shared__ __half vs[kSplit][kHd + 2];
+    __shared__ long long kp[kSplit];  // the key's position, -1: invalid
+    __shared__ float sc[kMaxQ][kSplit + 1];
+    __shared__ float qsh[kMaxQ][kHd + 1];
+    const int kvh = (int) blockIdx.x;
+    const int sp = (int) blockIdx.y;
+    const int nsp = (int) gridDim.y;
     const int tid = (int) threadIdx.x;
-    const int lane = tid & 31;
-    const int wv = tid >> 5;
-    const long long pq = pos0 + t;
-    long long lo = pq - n_swa + 1;
-    lo = lo < 0 ? 0 : lo;
-    lo = lo < pos0 - slots ? pos0 - slots : lo;  // only the ring's last `slots` positions
-    const long long nr = pos0 - lo;              // ring keys
-    const long long nk = nr + T;
-    if (tid < kHd) {
-        qs[tid] = q[(t * 32 + h) * kHd + tid];
-    }
-    __syncthreads();
-    const int rs = kKvHeads * kHd;  // ring / block row: 8 KV heads
-    for (long long j = wv; j < nk; j += 8) {
-        float s;
-        if (j < nr) {
-            const long long p = lo + j;
-            const long long slot = p % slots;
-            const __half * kr = ring_k + slot * rs + kvh * kHd + lane * 4;
-            s = __half2float(kr[0]) * qs[lane * 4] + __half2float(kr[1]) * qs[lane * 4 + 1] +
-                __half2float(kr[2]) * qs[lane * 4 + 2] + __half2float(kr[3]) * qs[lane * 4 + 3];
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                s += __shfl_xor(s, off);
+    const int rs = kKvHeads * kHd;
+    const long long nk = pos0 + T - lo0;
+    const int nq = T * kGqa;
+    // the split's keys and values into LDS (f16; the block's rounded as llama.cpp's cache)
+    for (int i = tid; i < kSplit * kHd; i += 256) {
+        const int k = i / kHd;
+        const int d = i % kHd;
+        const long long j = (long long) sp * kSplit + k;
+        __half kv = __float2half(0.0f);
+        __half vv = kv;
+        long long p = -1;
+        if (j < nk) {
+            p = lo0 + j;
+            if (p < pos0) {
+                const long long slot = p % slots;
+                if (tags[slot] == (int32_t) p) {
+                    kv = ring_k[slot * rs + kvh * kHd + d];
+                    vv = ring_v[slot * rs + kvh * kHd + d];
+                } else {
+                    p = -1;
+                }
+            } else {
+                kv = __float2half(bk[(p - pos0) * rs + kvh * kHd + d]);
+                vv = __float2half(bv[(p - pos0) * rs + kvh * kHd + d]);
             }
-            s = tags[slot] == (int32_t) p ? s * scale : -FLT_MAX;
-        } else {
-            // the block's own keys, rounded to f16 as llama.cpp's cache holds them
-            const float * kr = bk + (j - nr) * rs + kvh * kHd + lane * 4;
-            s = 0.0f;
-#pragma unroll
-            for (int d = 0; d < 4; ++d) {
-                s += __half2float(__float2half(kr[d])) * qs[lane * 4 + d];
-            }
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                s += __shfl_xor(s, off);
-            }
-            s *= scale;
         }
-        if (lane == 0) {
-            sc[j] = s;
+        ks[k][d] = kv;
+        vs[k][d] = vv;
+        if (d == 0) {
+            kp[k] = p;
         }
     }
     __syncthreads();
+    // scores, the queries from LDS: thread = (query tid / 8, keys tid % 8 + 8 i)
+    for (int q0 = 0; q0 < nq; q0 += kMaxQ) {
+        for (int i = tid; i < kMaxQ * kHd; i += 256) {
+            const int qi = q0 + i / kHd;
+            qsh[i / kHd][i % kHd] =
+                qi < nq ? q[((long long) (qi / kGqa) * 32 + kvh * kGqa + qi % kGqa) * kHd + i % kHd] : 0.0f;
+        }
+        __syncthreads();
+        const int ql = tid >> 3;
+        const int qi = q0 + ql;
+        if (qi < nq) {
+            const long long pq = pos0 + qi / kGqa;
+            for (int k = tid & 7; k < kSplit; k += 8) {
+                float s = -FLT_MAX;
+                if (kp[k] >= 0 && pq - kp[k] < n_swa) {
+                    float acc = 0.0f;
+#pragma unroll 16
+                    for (int d = 0; d < kHd; ++d) {
+                        acc = fmaf(qsh[ql][d], __half2float(ks[k][d]), acc);
+                    }
+                    s = acc * scale;
+                }
+                sc[qi][k] = s;
+            }
+        }
+        __syncthreads();
+    }
+    // per query: max, exp, sum and acc over the split; thread = (query qi = tid / 4, dims 32 (tid % 4) ..)
+    for (int qi = tid >> 2; qi < nq; qi += 64) {
+        float m = -FLT_MAX;
+        for (int k = 0; k < kSplit; ++k) {
+            m = fmaxf(m, sc[qi][k]);
+        }
+        float l = 0.0f;
+        float acc[32];
+#pragma unroll
+        for (int e = 0; e < 32; ++e) {
+            acc[e] = 0.0f;
+        }
+        const int d0 = (tid & 3) * 32;
+        if (m > -FLT_MAX) {
+            for (int k = 0; k < kSplit; ++k) {
+                const float p = sc[qi][k] == -FLT_MAX ? 0.0f : expf(sc[qi][k] - m);
+                l += p;
+#pragma unroll
+                for (int e = 0; e < 32; ++e) {
+                    acc[e] = fmaf(p, __half2float(vs[k][d0 + e]), acc[e]);
+                }
+            }
+        }
+        float * w = ws + (((long long) kvh * kMaxQ + qi) * nsp + sp) * (kHd + 2);
+        if ((tid & 3) == 0) {
+            w[0] = m;
+            w[1] = l;
+        }
+#pragma unroll
+        for (int e = 0; e < 32; ++e) {
+            w[2 + d0 + e] = acc[e];
+        }
+    }
+}
+
+// One block per (query head, token), 128 threads: the splits merged in order.
+__global__ __launch_bounds__(kHd) void attention_merge_kernel(const float * __restrict__ ws, const int nsp,
+                                                              float * __restrict__ out) {
+    const int h = (int) blockIdx.x;
+    const int t = (int) blockIdx.y;
+    const int kvh = h / kGqa;
+    const int qi = t * kGqa + h % kGqa;
+    const float * w = ws + ((long long) kvh * kMaxQ + qi) * nsp * (kHd + 2);
     float m = -FLT_MAX;
-    for (long long j = tid; j < nk; j += 256) {
-        m = fmaxf(m, sc[j]);
+    for (int s = 0; s < nsp; ++s) {
+        m = fmaxf(m, w[s * (kHd + 2)]);
     }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        m = fmaxf(m, __shfl_xor(m, off));
-    }
-    if (lane == 0) {
-        red[wv] = m;
-    }
-    __syncthreads();
-    m = red[0];
-    for (int i = 1; i < 8; ++i) {
-        m = fmaxf(m, red[i]);
-    }
-    __syncthreads();
-    float sum = 0.0f;
-    for (long long j = tid; j < nk; j += 256) {
-        const float e = sc[j] == -FLT_MAX ? 0.0f : expf(sc[j] - m);
-        sc[j] = e;
-        sum += e;
-    }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        sum += __shfl_xor(sum, off);
-    }
-    if (lane == 0) {
-        red[wv] = sum;
-    }
-    __syncthreads();
-    sum = 0.0f;
-    for (int i = 0; i < 8; ++i) {
-        sum += red[i];
-    }
-    const int d = tid & (kHd - 1);
-    const int half = tid >> 7;
+    float l = 0.0f;
     float acc = 0.0f;
-    for (long long j = half; j < nk; j += 2) {
-        const float p = sc[j];
-        if (p == 0.0f) {
+    for (int s = 0; s < nsp; ++s) {
+        const float ms = w[s * (kHd + 2)];
+        if (ms == -FLT_MAX) {
             continue;
         }
-        float vv;
-        if (j < nr) {
-            const long long slot = (lo + j) % slots;
-            vv = __half2float(ring_v[slot * rs + kvh * kHd + d]);
-        } else {
-            vv = __half2float(__float2half(bv[(j - nr) * rs + kvh * kHd + d]));
-        }
-        acc = fmaf(p, vv, acc);
+        const float f = expf(ms - m);
+        l = fmaf(f, w[s * (kHd + 2) + 1], l);
+        acc = fmaf(f, w[s * (kHd + 2) + 2 + threadIdx.x], acc);
     }
-    part[half][d] = acc;
-    __syncthreads();
-    if (tid < kHd) {
-        out[(t * 32 + h) * kHd + tid] = (part[0][tid] + part[1][tid]) / sum;
-    }
+    out[((long long) t * 32 + h) * kHd + threadIdx.x] = acc / l;
 }
 
 __global__ void conv_kernel(const float * __restrict__ x, const float * __restrict__ dyn,
@@ -350,14 +374,23 @@ bool dflash_ring_put(const float * src, const int64_t T, const int64_t row, cons
 
 bool dflash_attention(const float * q, const __half * ring_k, const __half * ring_v, const int32_t * tags,
                       const int64_t slots, const float * bk, const float * bv, const int64_t T, const int64_t pos0,
-                      const int64_t n_swa, const float scale, float * out, hipStream_t stream) {
+                      const int64_t n_swa, const float scale, float * ws, float * out, hipStream_t stream) {
     if (q == nullptr || ring_k == nullptr || ring_v == nullptr || tags == nullptr || bk == nullptr ||
-        bv == nullptr || out == nullptr || T <= 0 || T > 64 || slots > 2048 || n_swa <= 0) {
+        bv == nullptr || ws == nullptr || out == nullptr || T <= 0 || T > 8 || slots > 2048 || n_swa <= 0) {
         return false;
     }
-    attention_kernel<<<dim3(32, (unsigned) T), 256, 0, stream>>>(q, ring_k, ring_v, tags, slots, bk, bv, T, pos0,
-                                                                 n_swa, scale, out);
+    long long lo0 = pos0 - n_swa + 1;  // the first query's window; later queries mask a few more
+    lo0 = lo0 < 0 ? 0 : lo0;
+    lo0 = lo0 < pos0 - slots ? pos0 - slots : lo0;
+    const int nsp = (int) ((pos0 + T - lo0 + kSplit - 1) / kSplit);
+    attention_part_kernel<<<dim3(kKvHeads, (unsigned) nsp), 256, 0, stream>>>(q, ring_k, ring_v, tags, slots, bk, bv,
+                                                                              (int) T, pos0, lo0, n_swa, scale, ws);
+    attention_merge_kernel<<<dim3(32, (unsigned) T), kHd, 0, stream>>>(ws, nsp, out);
     return hipGetLastError() == hipSuccess;
+}
+
+int64_t dflash_attention_ws_floats(const int64_t slots) {
+    return (int64_t) kKvHeads * kMaxQ * ((slots + 16 + kSplit - 1) / kSplit) * (kHd + 2);
 }
 
 bool dflash_conv(const float * x, const float * dyn, const float * base, const int64_t T, const int64_t n,

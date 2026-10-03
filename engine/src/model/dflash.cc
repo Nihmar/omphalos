@@ -137,11 +137,20 @@ void Runner::dflash_load() {
     dfl_bv_ = mem_.device((size_t) B * kv * 4);
     dfl_dyn_ = mem_.device((size_t) B * (dfl_ne_ / dfl_group_) * 4 * 4);
     dfl_sgate_ = mem_.device((size_t) B * kRank * 4);
+    dfl_attn_ws_ = mem_.device((size_t) omph::kernels::dflash_attention_ws_floats(dfl_swa_) * 4);
     dfl_logits_ = mem_.device((size_t) (B - 1) * h_.n_vocab * 4, "out of VRAM (drafter logits)");
     dfl_ids_ = static_cast<int32_t *>(mem_.device((size_t) (B - 1) * kTopK * 4));
     dfl_vals_ = static_cast<float *>(mem_.device((size_t) (B - 1) * kTopK * 4));
     dfl_scores_ = static_cast<float *>(mem_.device((size_t) (B - 1) * kTopK * kTopK * 4));
+    dfl_keep_.assign((size_t) B, 1.0);  // optimistic start: every position drafted
     dfl_block_ = B;
+}
+
+void Runner::dflash_observe(const int64_t kept_drafts) {
+    for (int64_t n = 1; n <= dfl_drafted_; ++n) {
+        double & e = dfl_keep_[(size_t) n];
+        e += ((kept_drafts >= n ? 1.0 : 0.0) - e) / 16.0;
+    }
 }
 
 bool Runner::dflash_inject(const int64_t pos0, const int64_t T) {
@@ -201,7 +210,7 @@ bool Runner::dflash_layer(const DflashLayer & L, const int64_t l, const int64_t 
         !dflash_norm_rope(q, B, kHeads, L.q_norm, dfl_eps_, pos, dfl_theta_, nullptr) ||
         !dflash_norm_rope(bk, B, kKvHeads, L.k_norm, dfl_eps_, pos, dfl_theta_, nullptr) ||
         !dflash_attention(q, rk, rv, dfl_tags_, dfl_swa_, bk, bv, B, pos, dfl_swa_, 1.0f / std::sqrt((float) kHd),
-                          att, nullptr) ||
+                          static_cast<float *>(dfl_attn_ws_), att, nullptr) ||
         !cast_f32_to_f16(att, ffn16_, B * nq, nullptr) || !matmul(L.o, ffn16_, c, ne, nq, B) ||
         !dflash_conv(c, dyn, L.attn_conv_base, B, ne, dfl_group_, 1, a, nullptr) ||
         !add_out(a, x, b, B * ne, nullptr)) {  // b = ffn_inp
@@ -227,10 +236,19 @@ bool Runner::dflash_layer(const DflashLayer & L, const int64_t l, const int64_t 
 bool Runner::dflash_draft(const int32_t token, const int64_t pos, const int64_t k, std::vector<int32_t> & drafts) {
     drafts.clear();
     const int64_t B = dfl_block_;
-    const int64_t n = std::min<int64_t>(k, B - 1);
+    int64_t n = std::min<int64_t>(k, B - 1);
     if (!dflash_on() || n <= 0) {
         return dflash_on() || fail("drafter: not loaded");
     }
+    // adaptive length: the positions still worth their verification
+    if (env_.dflash_keep > 0.0f && ++dfl_steps_ % 8 != 0) {
+        int64_t m = 1;
+        while (m < n && dfl_keep_[(size_t) m + 1] >= env_.dflash_keep) {
+            ++m;
+        }
+        n = m;
+    }
+    dfl_drafted_ = n;
     const int64_t ne = dfl_ne_;
     std::vector<int32_t> toks((size_t) B, dfl_mask_);
     toks[0] = token;
@@ -270,6 +288,15 @@ bool Runner::dflash_draft(const int32_t token, const int64_t pos, const int64_t 
         for (int64_t j = 1; j < kTopK; ++j) {
             if (sc[j] > sc[best]) {
                 best = j;
+            }
+        }
+        if (env_.dflash_pmin > 0.0f) {  // softmax of the scores at the best: 1 / sum exp(s - s_best)
+            float sum = 0.0f;
+            for (int64_t j = 0; j < kTopK; ++j) {
+                sum += std::exp(sc[j] - sc[best]);
+            }
+            if (1.0f / sum < env_.dflash_pmin) {
+                break;
             }
         }
         pred = best;

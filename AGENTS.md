@@ -96,7 +96,8 @@ engine/build/omph-capi-demo <model.omph>
 # OpenAI-compatible server (#156): /v1/chat/completions, /v1/completions, /v1/models, /health;
 # streamed or not, reasoning_content / tool_calls; one request at a time on 127.0.0.1:8080.
 # Logs to stderr a progress line every 3 s of decoding (tokens, t/s, drafts accepted) and a summary
-# per request (#231).
+# per request (#231). --dflash FILE: draft with the DFlash2 drafter (#245) instead of the MTP block
+# (convert z-lab/Qwen3.8-27B-DFlash2-GGUF's Q4_K_M with omph-convert; also for omph-generate, omph-run).
 # Options: --host --port --ctx --cache-ram MIB (sequence checkpoints in host RAM, #158; default
 # 2048) --mmproj FILE (images as base64 data: URLs, #160) --alias --api-key --cors ORIGIN, request defaults --temp
 # --top-k --top-p --min-p --max-tokens (default greedy: speculative MTP decoding)
@@ -172,6 +173,7 @@ tools/native/build.sh <llama.cpp-dir> && tools/native/dump_tensors ...   # also 
 | `--last-logits` / `--logits-tail N` | write only the last row / the last N rows of logits (long prompts) |
 | `--tokens N` | use only the first N prompt tokens |
 | `--trace-dir DIR` | dump every layer's output (one-chunk prompts only) |
+| `--dflash FILE` | speculative greedy decode with the DFlash2 drafter .omph (#245): 7 drafts per step, the MTP block not loaded; output identical to plain greedy |
 | `--draft-mtp K` | speculative greedy decode with K MTP drafts per step (#124, #126); output identical to plain greedy, bit for bit (#161). K = 3 is the measured best (1.8-2.4x the plain decode); costs +0.5 GB VRAM (MTP block + alternate delta-net state) |
 | `--mtp` / `--mtp-out FILE` | load the MTP block (needs `--gemv --generate`) / write two chained drafts' logits after the prompt (validation) |
 | `--draft-oracle FILE [--draft-k K] [--draft-corrupt N]` | speculative greedy decode with drafts from a token file (a plain greedy run's `--gen-out`), every N-th draft corrupted: validates the verification + rollback (#122); the output must equal the plain greedy run |
@@ -196,6 +198,8 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_NO_B4` | A/B | no NT = 2..4-token GEMVs (verifications, short `--gemv` prefills): one launch per token |
 | `OMPH_NO_GROUP` | A/B | a verification's sibling GEMVs (one input: gate + up, qkv + gate, q + k + v) as separate launches instead of one grouped launch (#214) |
 | `OMPH_DRAFT_VOCAB=N` | decode | MTP drafts take their argmax over the first N token ids (default 98304; 0 = the whole head) while the recent text stays inside them, the whole head otherwise (#217): output unchanged, ~3-7 % faster speculative decoding in English and code |
+| `OMPH_DFLASH_KEEP=P` | decode | DFlash2 drafts position n only while the measured chance that drafts 1..n are all kept is >= P (default 0.12; 0: always 7; every 8th step drafts all, #245) |
+| `OMPH_DFLASH_PMIN=P` | decode | DFlash2 drafts stop where the selector's best candidate has softmax probability < P (default 0: off; llama.cpp's p_min, measured useless here) |
 | `OMPH_NO_SWIGLU_GEMM` | A/B | prefill: the FFN's up GEMM writes f32 and `swiglu_f16` runs after it, instead of SwiGLU in the up GEMM's epilogue (#221; bit-identical either way) |
 | `OMPH_GEMM_MIN=T` | A/B | `--gemv` runs of T+ tokens (prefill chunks) take the GEMM path (default 16, the measured crossover with the fused GEMM; #129, #141) |
 | `OMPH_NO_FUSED_GEMM` | A/B | dequantize each weight to f16, then the GEMM, instead of the fused dequant + WMMA GEMM (#141) |

@@ -986,6 +986,7 @@ bool Runner::commit(const int64_t accepted) {
                 std::swap(state_cur_[(size_t) il], state_alt_[(size_t) il]);
             }
         }
+        dflash_observe(accepted - 1);
         return (!mtp_ || mtp_fill(accepted)) && dflash_inject(verify_pos0_, accepted);
     }
     const int64_t n_kh = h_.ssm_n_kh;
@@ -1045,6 +1046,7 @@ bool Runner::commit(const int64_t accepted) {
             }
         }
     }
+    dflash_observe(accepted - 1);
     return (!mtp_ || mtp_fill(accepted)) && dflash_inject(verify_pos0_, accepted);
 }
 
