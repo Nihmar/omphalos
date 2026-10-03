@@ -1202,4 +1202,87 @@ struct DecIq2xxsTile {  // GGUF type 16, .omph layout 2 (#253)
     __device__ void decode(const Raw & r, const long long s, float (&v)[32]) const { DecIq2xxs{}.decode(r, s, v); }
 };
 
+// Q6_K tiles (#258): sub-block sb = 4 g + j takes the low (j < 2) or high
+// nibbles of the lane's ql bytes of half g (the first 16 for even j, the second
+// for odd), qh bits 2 j, and the scale byte at 4 g + j; each weight
+// d sc (q - 32) in f32 (DecQ6k's expression), rounded to f16 once.
+struct TileQ6k {  // GGUF type 14
+    static constexpr long long kBytes = omph::format::kQ6kTileBytes;
+    static constexpr int kLds = 16;
+    __device__ static void init(uint8_t *) {}
+    struct Blk {
+        uint4 q0, q1, q2, q3, h0, h1;
+        uint2 scw;
+        float dv;
+    };
+    __device__ static Blk load(const uint8_t * o, const int lane) {
+        Blk k;
+        const uint4 * q = reinterpret_cast<const uint4 *>(o + lane * 64);
+        k.q0 = q[0];
+        k.q1 = q[1];
+        k.q2 = q[2];
+        k.q3 = q[3];
+        const uint4 * qh = reinterpret_cast<const uint4 *>(o + 2048 + lane * 32);
+        k.h0 = qh[0];
+        k.h1 = qh[1];
+        k.scw = *reinterpret_cast<const uint2 *>(o + 3072 + lane * 8);
+        k.dv = __half2float(*reinterpret_cast<const __half *>(o + 3328 + (lane & 15) * 2));
+        return k;
+    }
+    __device__ static tile_h8 frag(const uint8_t *, const Blk & k, const int sb, const int gl, const int) {
+        const int g = sb >> 2;
+        const int j = sb & 3;
+        const uint4 ql = g == 0 ? ((j & 1) ? k.q1 : k.q0) : ((j & 1) ? k.q3 : k.q2);
+        const uint4 qh = g == 0 ? k.h0 : k.h1;
+        const uint32_t l0 = gl == 0 ? ql.x : ql.z;
+        const uint32_t l1 = gl == 0 ? ql.y : ql.w;
+        const uint32_t m0 = gl == 0 ? qh.x : qh.z;
+        const uint32_t m1 = gl == 0 ? qh.y : qh.w;
+        const int ns = j >= 2 ? 4 : 0;
+        const uint32_t c0 = ((l0 >> ns) & 0x0F0F0F0Fu) | (((m0 >> (2 * j)) & 0x03030303u) << 4);
+        const uint32_t c1 = ((l1 >> ns) & 0x0F0F0F0Fu) | (((m1 >> (2 * j)) & 0x03030303u) << 4);
+        const uint32_t scb = ((g == 0 ? k.scw.x : k.scw.y) >> (8 * j)) & 0xFFu;
+        const float ds = k.dv * (float) (int8_t) scb;
+        tile_h8 a;
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            a[m] = (_Float16) (ds * (float) ((int) ((c0 >> (8 * m)) & 0xFFu) - 32));
+            a[4 + m] = (_Float16) (ds * (float) ((int) ((c1 >> (8 * m)) & 0xFFu) - 32));
+        }
+        return a;
+    }
+};
+
+struct DecQ6kTile {  // GGUF type 14, .omph layout 2 (#258)
+    const uint8_t * base;
+    long long blocks;
+    using Raw = DecQ6k::Raw;
+    static DecQ6kTile make(const uint8_t * base, const int64_t, const long long blocks) { return {base, blocks}; }
+    __device__ Raw load(const long long row, const long long s) const {
+        const uint8_t * o = base + ((row >> 4) * blocks + (s >> 3)) * omph::format::kQ6kTileBytes;
+        const int r = (int) (row & 15);
+        const int g = (int) ((s & 7) >> 2);
+        const int j = (int) (s & 3);
+        const uint32_t * a = reinterpret_cast<const uint32_t *>(o + r * 64 + g * 32);         // bytes 0..15 | 32..47
+        const uint32_t * b = reinterpret_cast<const uint32_t *>(o + (r + 16) * 64 + g * 32);  // 16..31 | 48..63
+        const uint32_t * ha = reinterpret_cast<const uint32_t *>(o + 2048 + r * 32 + g * 16);
+        const uint32_t * hb = reinterpret_cast<const uint32_t *>(o + 2048 + (r + 16) * 32 + g * 16);
+        Raw w;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            w.lo[i] = a[i];
+            w.lo[4 + i] = b[i];
+            w.hi[i] = a[4 + i];
+            w.hi[4 + i] = b[4 + i];
+            w.hb[i] = ha[i];
+            w.hb[4 + i] = hb[i];
+        }
+        w.s0 = (float) (int8_t) o[3072 + r * 8 + 4 * g + j];
+        w.s1 = (float) (int8_t) o[3072 + (r + 16) * 8 + 4 * g + j];
+        w.dv = __half2float(*reinterpret_cast<const __half *>(o + 3328 + r * 2));
+        return w;
+    }
+    __device__ void decode(const Raw & r, const long long s, float (&v)[32]) const { DecQ6k{}.decode(r, s, v); }
+};
+
 } // namespace omph::kernels::qd

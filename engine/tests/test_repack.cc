@@ -118,6 +118,8 @@ int main() {
               omph::format::engine_layout_bytes(17, 16, 512) == 2 * 16 * 74 &&
               omph::format::engine_layout_bytes(16, 16, 512) == 2 * 16 * 66 && omph::format::engine_layout(10, 8) == 1,
           "Q2_K / IQ2_XS / IQ2_XXS take the tiles when rows %% 16 == 0");
+    CHECK(omph::format::engine_layout_bytes(14, 16, 512) == 2 * 16 * 210 && omph::format::engine_layout(14, 8) == 1,
+          "Q6_K takes the tiles when rows %% 16 == 0 (#258)");
     std::printf("test_repack: %d failure(s)\n", omph_test::failures);
     return omph_test::failures == 0 ? 0 : 1;
 }
