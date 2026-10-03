@@ -14,6 +14,12 @@ namespace omph::kernels {
 bool gemv_q4k(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
               hipStream_t stream);
 
+// The first `rows` rows of a repacked Q4_K tensor of `total_rows` rows (#217:
+// the MTP drafts' vocabulary prefix of the output head); the repacked layout's
+// sections are the whole tensor's, so a row prefix needs no copy.
+bool gemv_q4k_prefix(const void * packed, const void * x_f16, float * y, int64_t total_rows, int64_t rows,
+                     int64_t k, hipStream_t stream);
+
 // Same contract for a tensor in the repacked IQ4_XS layout.
 bool gemv_iq4_xs(const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
                  hipStream_t stream);
