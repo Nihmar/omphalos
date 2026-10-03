@@ -1,0 +1,29 @@
+# 5..16-token verification GEMVs for every repacked type (#244), 2026-10-03, engine 54d0bcc + this branch.
+# The row-wise types (IQ4_XS, Q4_K, Q6_K, IQ2_XXS / XS / S, Q2_K, IQ1_M) run their 1..4-token bodies back to
+# back in one block on its rows, so every row comes out of the old code: bit-identical to the 1-token GEMV
+# (omph-gemv-bench --all-of-type T --multi: max |d| = 0 for NT 2..16, all 8 types).
+#
+# All tensors of a type, ms (omph-gemv-bench --all-of-type T [--nt N]):
+#   type      MiB    NT 1     NT 4     NT 8     NT 16
+#   IQ3_S     3474   12.80    13.18    13.27    13.14    (WMMA tiles, #178: unchanged)
+#   IQ3_XXS   1979      -      7.70     7.95       -     (tiles, #219)
+#   IQ4_XS    2882   10.55    10.53    15.87    30.09
+#   Q4_K       827    3.14     3.12     4.71     8.90
+#   Q6_K       332    1.20     1.38     2.60     5.05
+#   IQ2_S      375    1.66     2.01     3.98     7.70
+#   Q2_K       230    1.01     1.61     3.45     7.38
+#   IQ2_XS     211    0.84     1.21     2.31     4.62
+#   IQ2_XXS     94    0.43     0.58     1.10     2.21
+#   IQ1_M       19    0.14     0.19     0.42     0.81
+# The later token groups do not come free: the row-wise kernels are near their compute limit, not only
+# bandwidth. Still one launch instead of NT / 4 (IQ4_XS NT 16: 30 ms vs 4 x 10.5).
+#
+# End to end: one verification step of N tokens (omph-run --gemv --generate 257, drafts from a plain greedy
+# run's tokens: --draft-oracle, all accepted; median of 3), golden prompt:
+#   verify tokens   4      8      12     16
+#   ms per step     46.2   62.0   78.1   96.3     (~4.2 ms per extra token; plain step 43.2 ms)
+# Before this branch, 16 tokens took 207 ms: from OMPH_GEMM_MIN = 16 tokens the runner sent the verification
+# to the prefill GEMM path (rows not bit-identical to the GEMVs); verifications now always take the GEMVs,
+# and the verify lm_head reads its 682 MB once for 5..16 tokens.
+# Output identical to plain greedy at 4 / 8 / 12 / 16-token verifications, with corrupted drafts (rollbacks),
+# K8 and K4 caches, OMPH_SPEC_CHECK=1.

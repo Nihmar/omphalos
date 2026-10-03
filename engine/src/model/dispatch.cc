@@ -69,7 +69,7 @@ bool Runner::up_swiglu_ok(const Mat & up, const int64_t n_out, const int64_t k, 
     // matmul's own route to the fused GEMM, without its ablations
     return !env_.no_swiglu_gemm && !env_.no_fused_gemm && !env_.skip_stage && !env_.skip_gemv &&
            env_.skip_gemv_type < 0 && up.t != nullptr && g != nullptr && g->rows == n_out && g->k == k &&
-           (!use_gemv_ || T >= gemm_min_);
+           (!use_gemv_ || !gemv_path(T));
 }
 
 bool Runner::up_swiglu(const Mat & up, const void * x16, const float * gate, void * out16, const int64_t n_out,
@@ -134,7 +134,7 @@ bool Runner::matmul(const Mat & m, const void * x16, float * y, const int64_t n_
     // Long multi-token runs (prefill chunks) take the GEMM path even with
     // --gemv: past gemm_min_ tokens, dequantizing a weight once beats T / 4
     // passes of the NT GEMVs over it (M8).
-    if (use_gemv_ && T > 1 && T < gemm_min_ && g != nullptr && g->rows == n_out && g->k == k) {
+    if (gemv_path(T) && g != nullptr && g->rows == n_out && g->k == k) {
         // the ablations of the single-token path apply here too
         if (env_.skip_gemv ||
             (env_.skip_gemv_type >= 0 && (uint32_t) env_.skip_gemv_type == g->type)) {
