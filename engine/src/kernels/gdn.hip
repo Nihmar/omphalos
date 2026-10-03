@@ -548,8 +548,12 @@ __global__ __launch_bounds__(256) void delta_gate_kernel(const GdnStep a) {
         }
         const float b = 1.0f / (1.0f + expf(-beta_raw));
         const float ar = alpha_raw + a.dt_bias[h];
-        const float decay = expf((log1pf(expf(-fabsf(ar))) + fmaxf(ar, 0.0f)) * a.ssm_a[h]);
+        const float lgd = (log1pf(expf(-fabsf(ar))) + fmaxf(ar, 0.0f)) * a.ssm_a[h];
+        const float decay = expf(lgd);
         const ChunkWork w = chunk_work(a, heads);
+        if (a.wy != nullptr) {
+            a.wy[t * heads + h] = lgd;  // the WY form's log decay (#240)
+        }
         w.g[(t * heads + h) * 2] = b;
         w.g[(t * heads + h) * 2 + 1] = decay;
         if (a.replay != nullptr) {
@@ -616,14 +620,13 @@ __global__ __launch_bounds__(kRecCols) void delta_rec_kernel(
 }
 
 // 3. The gated RMSNorm per (head, token), as f16: grid (heads, tokens), 128 threads.
-__global__ __launch_bounds__(kDeltaS) void delta_post_kernel(const GdnStep a) {
+__global__ __launch_bounds__(kDeltaS) void delta_post_kernel(const GdnStep a, const float * __restrict__ vo) {
     __shared__ float wsq[4];
     const long long h = blockIdx.x;
     const long long t = blockIdx.y;
     const long long heads = gridDim.x;
     const int col = (int) threadIdx.x;
-    const ChunkWork w = chunk_work(a, heads);
-    const float ov = w.vo[(t * heads + h) * kDeltaS + col];
+    const float ov = vo[(t * heads + h) * kDeltaS + col];
     float osq = ov * ov;
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -638,6 +641,358 @@ __global__ __launch_bounds__(kDeltaS) void delta_post_kernel(const GdnStep a) {
     const float zn = a.z[(t * heads + h) * kDeltaS + col];
     a.out16[(t * heads + h) * kDeltaS + col] =
         __float2half(ov * inv * a.norm_w[col] * (zn / (1.0f + expf(-zn))));
+}
+
+
+// --- The chunked WY form of the recurrence (#240, PLAN.md §10.3) ---------------
+//
+// Per 64-token chunk of one head, with h the state at the chunk start (S[i][j]:
+// i the key dim, j the value dim), g_t the cumulative log decay inside the chunk
+// (gamma_t = exp(g_t), inclusive) and Gam_ts = exp(g_t - g_s):
+//   A = strict_lower(beta_t (k_t . k_s) Gam_ts), T = (I + A)^-1
+//   D = T beta (V - gamma K h)                       (the per-token d_t)
+//   o_t = l2_scale (gamma_t q_t h + sum_{s<=t} (q_t . k_s) Gam_ts D_s)
+//   h' = gamma_C h + (K gamma_C / gamma)^T D
+// the per-token delta rule's values (a NumPy check gives 1e-15). Phase A builds
+// T (as two f16: high and low part) and P = (Q K^T) o Gam for every (head,
+// chunk) in parallel, plus K^T per key head; phase B walks the chunks of a head
+// with h in f32 WMMA accumulators, each wave owning 16 value columns, so the
+// waves never talk. Q, K and V come straight from the conv output. The products
+// are f16 WMMAs with f32 accumulation: not bit-identical to gdn_step, prefill
+// only (verifications keep the exact path). KL vs the exact path on 4096-token
+// prompts: 0.0002-0.0005 (the default KV cache's own: 0.0012-0.0015).
+typedef _Float16 wy_h8 __attribute__((ext_vector_type(8)));
+typedef float wy_f8 __attribute__((ext_vector_type(8)));
+constexpr int kWyC = (int) kWyChunk;
+constexpr int kWyAld = kWyC + 4;  // f32 LDS row of A (16-byte aligned rows)
+
+struct WyHead {  // float offsets in a (value head, chunk) block
+    static constexpr int kTh = 0;      // f16 [64][64], T's high part
+    static constexpr int kTl = 2048;   // f16 [64][64], T - Th
+    static constexpr int kP = 4096;    // f16 [64][64], (q_t . k_s) Gam_ts for s <= t
+    static constexpr int kG = 6144;    // g_t
+    static constexpr int kB = 6208;    // beta_t
+};
+static_assert(WyHead::kB + 64 == kWyHeadFloats, "gdn.hh's kWyHeadFloats");
+
+__device__ inline float * wy_head(float * wy, const long long tokens, const long long heads, const long long n_kh,
+                                  const long long h, const long long c) {
+    const long long lg = (tokens * heads + 15) / 16 * 16;
+    const long long per = n_kh * kWyKeyFloats + heads * kWyHeadFloats;
+    return wy + lg + c * per + n_kh * kWyKeyFloats + h * kWyHeadFloats;
+}
+
+// a key head's chunk: f16 K^T [128][64], then K [64][128] and Q [64][128]
+__device__ inline _Float16 * wy_kt(float * wy, const long long tokens, const long long heads, const long long n_kh,
+                                   const long long kh, const long long c) {
+    const long long lg = (tokens * heads + 15) / 16 * 16;
+    const long long per = n_kh * kWyKeyFloats + heads * kWyHeadFloats;
+    return reinterpret_cast<_Float16 *>(wy + lg + c * per + kh * kWyKeyFloats);
+}
+
+// phase B's output: (chunks x 64) rows x heads x 128, the rows past the last token
+// written too (no guard in the loop), read by delta_post_kernel
+__host__ __device__ inline float * wy_out(float * wy, const long long tokens, const long long heads,
+                                          const long long n_kh) {
+    const long long lg = (tokens * heads + 15) / 16 * 16;
+    const long long chunks = (tokens + kWyC - 1) / kWyC;
+    return wy + lg + chunks * (n_kh * kWyKeyFloats + heads * kWyHeadFloats);
+}
+
+__device__ inline wy_f8 wy_mma(const wy_h8 a, const wy_h8 b, const wy_f8 c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+}
+
+// 8 consecutive floats of a conv-output row as f16 (rows past the chunk: 0)
+__device__ inline wy_h8 wy_row8(const float * p, const bool in) {
+    wy_h8 r;
+    if (in) {
+        const float4 a = reinterpret_cast<const float4 *>(p)[0];
+        const float4 b = reinterpret_cast<const float4 *>(p)[1];
+        r = wy_h8{(_Float16) a.x, (_Float16) a.y, (_Float16) a.z, (_Float16) a.w,
+                  (_Float16) b.x, (_Float16) b.y, (_Float16) b.z, (_Float16) b.w};
+    } else {
+        r = wy_h8{};
+    }
+    return r;
+}
+
+// Phase A: grid (heads, chunks), 256 threads.
+__global__ __launch_bounds__(256) void delta_wy_a_kernel(const float * __restrict__ cv,
+                                                        const float * __restrict__ gates, float * __restrict__ wy,
+                                                        const long long tokens, const long long n_kh,
+                                                        const long long channels) {
+    __shared__ __attribute__((aligned(16))) float am[kWyC * kWyAld];  // K^T staging (f16), then A
+    __shared__ float gs[kWyC];
+    __shared__ float bs[kWyC];
+    const long long h = blockIdx.x;
+    const long long heads = gridDim.x;
+    const long long c = blockIdx.y;
+    const long long t0 = c * kWyC;
+    const int n = (int) (tokens - t0 < kWyC ? tokens - t0 : kWyC);
+    const int tid = (int) threadIdx.x;
+    const int lane = tid & 31;
+    const int wv = tid >> 5;
+    const int r16 = lane & 15;
+    const int hk = (lane >> 4) * 8;
+    const long long kh = h % n_kh;
+    const float * qrow = cv + t0 * channels + kh * kDeltaS;
+    const float * krow = qrow + n_kh * kDeltaS;
+    float * blk = wy_head(wy, tokens, heads, n_kh, h, c);
+    if (h < n_kh) {  // this key head's K^T, K and Q in f16, once (K^T staged through LDS)
+        _Float16 * st = reinterpret_cast<_Float16 *>(am);
+        _Float16 * kt = wy_kt(wy, tokens, heads, n_kh, kh, c);
+        for (int e = tid; e < kWyC * kDeltaS; e += 256) {
+            const int t = e / kDeltaS;
+            const int i = e % kDeltaS;
+            const _Float16 k = (_Float16) (t < n ? krow[t * channels + i] : 0.0f);
+            st[t * kDeltaS + i] = k;
+            kt[kWyC * kDeltaS + e] = k;
+            kt[2 * kWyC * kDeltaS + e] = (_Float16) (t < n ? qrow[t * channels + i] : 0.0f);
+        }
+        __syncthreads();
+        for (int e = tid; e < kWyC * kDeltaS; e += 256) {
+            const int i = e / kWyC;
+            const int t = e % kWyC;
+            kt[i * kWyC + t] = st[t * kDeltaS + i];
+        }
+        __syncthreads();
+    }
+    if (tid < kWyC) {  // padded rows: beta 0, no decay, so they add nothing
+        bs[tid] = tid < n ? gates[((t0 + tid) * heads + h) * 2] : 0.0f;
+        gs[tid] = tid < n ? wy[(t0 + tid) * heads + h] : 0.0f;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float acc = 0.0f;
+        for (int t = 0; t < kWyC; ++t) {
+            acc += gs[t];
+            gs[t] = acc;
+        }
+    }
+    __syncthreads();
+    if (tid < kWyC) {
+        blk[WyHead::kG + tid] = gs[tid];
+        blk[WyHead::kB + tid] = bs[tid];
+    }
+    // K K^T -> A (LDS) and Q K^T -> P: the 10 lower 16 x 16 tiles each, 20 jobs over 8 waves,
+    // the operands straight from the conv output
+    _Float16 * pm = reinterpret_cast<_Float16 *>(blk + WyHead::kP);
+    for (int job = wv; job < 20; job += 8) {
+        const bool is_p = job >= 10;
+        int st = job % 10;
+        int rt = 0;
+        while (st > rt) {
+            st -= rt + 1;
+            ++rt;
+        }
+        const int ta = rt * 16 + r16;
+        const int tb = st * 16 + r16;
+        const float * arow = (is_p ? qrow : krow) + (long long) ta * channels + hk;
+        const float * brow = krow + (long long) tb * channels + hk;
+        wy_f8 acc = {};
+#pragma unroll
+        for (int kk = 0; kk < kDeltaS; kk += 16) {
+            acc = wy_mma(wy_row8(arow + kk, ta < n), wy_row8(brow + kk, tb < n), acc);
+        }
+        const int s = tb;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int t = rt * 16 + hk + e;
+            const float gam = expf(gs[t] - gs[s]);
+            if (is_p) {
+                pm[t * kWyC + s] = (_Float16) (s <= t ? acc[e] * gam : 0.0f);
+            } else {
+                am[t * kWyAld + s] = s < t ? bs[t] * acc[e] * gam : 0.0f;
+            }
+        }
+    }
+    __syncthreads();
+    // T = (I + A)^-1 (unit lower) by forward substitution in f32, one column per thread;
+    // A's upper tiles are never read. T can have large entries that cancel, so it goes
+    // out as two f16 (one lost a token's whole distribution at 4k).
+    if (tid < kWyC) {
+        const int col = tid;
+        _Float16 * th = reinterpret_cast<_Float16 *>(blk + WyHead::kTh);
+        _Float16 * tl = reinterpret_cast<_Float16 *>(blk + WyHead::kTl);
+        float tc[kWyC];
+#pragma unroll
+        for (int t = 0; t < kWyC; ++t) {
+            float p0 = t == col ? 1.0f : 0.0f;
+            float p1 = 0.0f;
+            float p2 = 0.0f;
+            float p3 = 0.0f;
+#pragma unroll
+            for (int s = 0; s + 3 < t; s += 4) {
+                const float4 a4 = *reinterpret_cast<const float4 *>(am + t * kWyAld + s);
+                p0 = fmaf(-a4.x, tc[s], p0);
+                p1 = fmaf(-a4.y, tc[s + 1], p1);
+                p2 = fmaf(-a4.z, tc[s + 2], p2);
+                p3 = fmaf(-a4.w, tc[s + 3], p3);
+            }
+#pragma unroll
+            for (int s = t & ~3; s < t; ++s) {
+                p0 = fmaf(-am[t * kWyAld + s], tc[s], p0);
+            }
+            const float v = t < col ? 0.0f : (p0 + p1) + (p2 + p3);
+            tc[t] = v;
+            const _Float16 hi = (_Float16) v;
+            th[t * kWyC + col] = hi;
+            tl[t * kWyC + col] = (_Float16) (v - (float) hi);
+        }
+    }
+}
+
+// One chunk of phase B. Rows past the last token (n < 64, the last chunk) read the
+// last real row of V, which beta = 0 cancels, and store nothing; a second, guarded
+// instance of this body in the loop pushed the kernel past 256 VGPRs (#240).
+__device__ __forceinline__ void wy_b_chunk(wy_f8 (&hs)[8], const float * __restrict__ cv, float * wy,
+                                       float * __restrict__ vo, const long long tokens, const long long heads,
+                                       const long long n_kh, const long long channels, const float l2_scale,
+                                       const long long h, const long long kh, const long long c, const int n,
+                                       const int r16, const int hk, const int j) {
+    const long long t0 = c * kWyC;
+    const float * blk = wy_head(wy, tokens, heads, n_kh, h, c);
+    const _Float16 * th = reinterpret_cast<const _Float16 *>(blk + WyHead::kTh);
+    const _Float16 * tl = reinterpret_cast<const _Float16 *>(blk + WyHead::kTl);
+    const _Float16 * pm = reinterpret_cast<const _Float16 *>(blk + WyHead::kP);
+    const float * gg = blk + WyHead::kG;
+    const float * bb = blk + WyHead::kB;
+    const _Float16 * kt = wy_kt(wy, tokens, heads, n_kh, kh, c);
+    const _Float16 * kr = kt + kWyC * kDeltaS;
+    const _Float16 * qr = kt + 2 * kWyC * kDeltaS;
+    const float * vrow = cv + t0 * channels + 2 * n_kh * kDeltaS + h * kDeltaS;
+    // K h, gamma q h and R = beta (V - gamma K h) per row tile; h as f16 B operands once
+    wy_h8 hb[8];
+#pragma unroll
+    for (int it = 0; it < 8; ++it) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            hb[it][e] = (_Float16) hs[it][e];
+        }
+    }
+    wy_h8 rb[4];
+#pragma unroll
+    for (int rt = 0; rt < 4; ++rt) {
+        wy_f8 kx = {};
+#pragma unroll
+        for (int it = 0; it < 8; ++it) {
+            kx = wy_mma(*reinterpret_cast<const wy_h8 *>(kr + (rt * 16 + r16) * kDeltaS + it * 16 + hk), hb[it], kx);
+        }
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int t = rt * 16 + hk + e;
+            const float v = vrow[(t < n ? t : n - 1) * (int) channels + j];
+            rb[rt][e] = (_Float16) (bb[t] * (v - expf(gg[t]) * kx[e]));
+        }
+        __builtin_amdgcn_sched_barrier(0);  // one row tile's loads at a time (VGPRs)
+    }
+    __builtin_amdgcn_sched_barrier(0);  // keep each phase's loads in it (VGPRs)
+    // D = T R
+    wy_h8 db[4];
+#pragma unroll
+    for (int rt = 0; rt < 4; ++rt) {
+        wy_f8 d = {};
+#pragma unroll
+        for (int st = 0; st <= rt; ++st) {
+            const wy_h8 a = *reinterpret_cast<const wy_h8 *>(th + (rt * 16 + r16) * kWyC + st * 16 + hk);
+            const wy_h8 al = *reinterpret_cast<const wy_h8 *>(tl + (rt * 16 + r16) * kWyC + st * 16 + hk);
+            d = wy_mma(al, rb[st], wy_mma(a, rb[st], d));
+        }
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            db[rt][e] = (_Float16) d[e];
+        }
+    }
+    __builtin_amdgcn_sched_barrier(0);  // keep each phase's loads in it (VGPRs)
+    // o = gamma q h + P D, one row tile at a time
+#pragma unroll
+    for (int rt = 0; rt < 4; ++rt) {
+        wy_f8 o = {};
+#pragma unroll
+        for (int it = 0; it < 8; ++it) {
+            o = wy_mma(*reinterpret_cast<const wy_h8 *>(qr + (rt * 16 + r16) * kDeltaS + it * 16 + hk), hb[it], o);
+        }
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            o[e] *= expf(gg[rt * 16 + hk + e]);
+        }
+#pragma unroll
+        for (int st = 0; st <= rt; ++st) {
+            const wy_h8 a = *reinterpret_cast<const wy_h8 *>(pm + (rt * 16 + r16) * kWyC + st * 16 + hk);
+            o = wy_mma(a, db[st], o);
+        }
+        float * vp = vo + ((t0 + rt * 16 + hk) * heads + h) * kDeltaS + j;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            vp[e * heads * kDeltaS] = l2_scale * o[e];
+        }
+        __builtin_amdgcn_sched_barrier(0);
+    }
+    __builtin_amdgcn_sched_barrier(0);  // keep each phase's loads in it (VGPRs)
+    // h' = gamma_C h + (K gamma_C / gamma)^T D
+    const float gl = gg[kWyC - 1];
+    const float gc = expf(gl);
+#pragma unroll
+    for (int it = 0; it < 8; ++it) {
+        hs[it] *= gc;
+    }
+#pragma unroll
+    for (int st = 0; st < 4; ++st) {
+        float fs[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            fs[e] = expf(gl - gg[st * 16 + hk + e]);
+        }
+#pragma unroll
+        for (int it = 0; it < 8; ++it) {
+            const wy_h8 k8 = *reinterpret_cast<const wy_h8 *>(kt + (it * 16 + r16) * kWyC + st * 16 + hk);
+            wy_h8 a;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                a[e] = (_Float16) ((float) k8[e] * fs[e]);
+            }
+            hs[it] = wy_mma(a, db[st], hs[it]);
+        }
+    }
+    }
+
+// Phase B: grid (heads), 256 threads; wave w owns value columns 16 w .. 16 w + 15.
+__global__ __launch_bounds__(256) void delta_wy_b_kernel(const float * __restrict__ cv, float * __restrict__ wy,
+                                                        const float * state,
+                                                        float * state_out,  // may alias
+                                                        const long long tokens, const long long n_kh,
+                                                        const long long channels, const float l2_scale) {
+    const long long h = blockIdx.x;
+    const long long heads = gridDim.x;
+    const long long kh = h % n_kh;
+    const int lane = threadIdx.x & 31;
+    const int wv = threadIdx.x >> 5;
+    const int r16 = lane & 15;
+    const int hk = (lane >> 4) * 8;
+    const int j = wv * 16 + r16;
+    wy_f8 hs[8];  // h rows it * 16 + hk + e, column j
+    const long long sbase = (h * kDeltaS + hk) * kDeltaS + j;  // + constant offsets (VGPRs)
+#pragma unroll
+    for (int it = 0; it < 8; ++it) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            hs[it][e] = state[sbase + (it * 16 + e) * kDeltaS];
+        }
+    }
+    const long long n_chunks = (tokens + kWyC - 1) / kWyC;
+    for (long long c = 0; c < n_chunks; ++c) {
+        const int n = (int) (tokens - c * kWyC < kWyC ? tokens - c * kWyC : kWyC);
+        wy_b_chunk(hs, cv, wy, wy_out(wy, tokens, heads, n_kh), tokens, heads, n_kh, channels, l2_scale, h, kh, c, n,
+                   r16, hk, j);
+    }
+#pragma unroll
+    for (int it = 0; it < 8; ++it) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            state_out[sbase + (it * 16 + e) * kDeltaS] = hs[it][e];
+        }
+    }
 }
 
 // The rank-1 updates of recorded tokens, on the state of the step before them:
@@ -743,10 +1098,19 @@ bool gdn_chunk(const GdnStep & a, const int64_t heads, hipStream_t stream) {
     }
     float * vo = a.work + a.tokens * a.channels;
     const float * gates = vo + a.tokens * heads * kDeltaS;
+    if (a.wy != nullptr && a.replay == nullptr && a.state_out == nullptr) {
+        const unsigned chunks = (unsigned) ((a.tokens + kWyC - 1) / kWyC);
+        delta_wy_a_kernel<<<dim3((unsigned) heads, chunks), 256, 0, stream>>>(a.work, gates, a.wy, a.tokens, a.n_kh,
+                                                                            a.channels);
+        delta_wy_b_kernel<<<(unsigned) heads, 256, 0, stream>>>(a.work, a.wy, a.state, a.state, a.tokens, a.n_kh,
+                                                                a.channels, a.l2_scale);
+        delta_post_kernel<<<per_token, kDeltaS, 0, stream>>>(a, wy_out(a.wy, a.tokens, heads, a.n_kh));
+        return hipGetLastError() == hipSuccess;
+    }
     delta_rec_kernel<<<dim3((unsigned) heads, kDeltaS / kRecCols), kRecCols, 0, stream>>>(
         a.work, gates, vo, a.replay, a.state, a.state_out != nullptr ? a.state_out : a.state,
         a.tokens, a.n_kh, a.channels, a.l2_scale);
-    delta_post_kernel<<<per_token, kDeltaS, 0, stream>>>(a);
+    delta_post_kernel<<<per_token, kDeltaS, 0, stream>>>(a, vo);
     return hipGetLastError() == hipSuccess;
 }
 

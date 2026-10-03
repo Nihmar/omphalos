@@ -43,6 +43,7 @@ EnvOptions EnvOptions::from_env() {
         }
     }
     o.gdn_serial = flag("OMPH_GDN_SERIAL");
+    o.gdn_exact = flag("OMPH_GDN_EXACT");
     o.attn_scalar = flag("OMPH_ATTN_SCALAR");
     o.attn_dec_scalar = flag("OMPH_ATTN_DEC_SCALAR");
     o.no_fused_gemm = flag("OMPH_NO_FUSED_GEMM");
