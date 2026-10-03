@@ -885,10 +885,135 @@ bool unrepack_iq3_xxs_tiles(const void * tiles, const int64_t rows, const int64_
     return true;
 }
 
+// ---------------------------------------------------- IQ4_XS and Q4_K tiles
+
+namespace {
+
+// The tiles of a repacked type with 16-byte sub-blocks (qs, 8 per block) and a
+// per-block meta record of `mb` bytes; `half` packs a sub-block's 16 bytes into
+// the 8 of half h (untiles_of's `unhalf`: the reverse, from both halves).
+template <class Half>
+bool tiles_of(const uint8_t * qs, const uint8_t * meta, const int64_t mb, const int64_t rows, const int64_t blocks,
+              const int64_t tile_bytes, std::vector<uint8_t> & dst, Half && half) {
+    dst.assign((size_t) (rows / 16 * blocks * tile_bytes), 0);
+    for (int64_t tile = 0; tile < rows / 16; ++tile) {
+        for (int64_t b = 0; b < blocks; ++b) {
+            uint8_t * o = dst.data() + (tile * blocks + b) * tile_bytes;
+            for (int l2 = 0; l2 < 32; ++l2) {
+                const int64_t row = tile * 16 + (l2 & 15);
+                for (int sb = 0; sb < 8; ++sb) {
+                    half(qs + ((row * blocks + b) * 8 + sb) * 16, l2 >> 4, o + l2 * 64 + sb * 8);
+                }
+            }
+            for (int rr = 0; rr < 16; ++rr) {
+                std::memcpy(o + 2048 + rr * mb, meta + ((tile * 16 + rr) * blocks + b) * mb, (size_t) mb);
+            }
+        }
+    }
+    return true;
+}
+
+template <class Unhalf>
+void untiles_of(const uint8_t * in, uint8_t * qs, uint8_t * meta, const int64_t mb, const int64_t rows,
+                const int64_t blocks, const int64_t tile_bytes, Unhalf && unhalf) {
+    for (int64_t tile = 0; tile < rows / 16; ++tile) {
+        for (int64_t b = 0; b < blocks; ++b) {
+            const uint8_t * o = in + (tile * blocks + b) * tile_bytes;
+            for (int r = 0; r < 16; ++r) {
+                const int64_t row = tile * 16 + r;
+                for (int sb = 0; sb < 8; ++sb) {
+                    unhalf(o + r * 64 + sb * 8, o + (r + 16) * 64 + sb * 8, qs + ((row * blocks + b) * 8 + sb) * 16);
+                }
+                std::memcpy(meta + (row * blocks + b) * mb, o + 2048 + r * mb, (size_t) mb);
+            }
+        }
+    }
+}
+
+// IQ4_XS sub-block: byte j holds weight j (low nibble) and j + 16 (high)
+void iq4_half(const uint8_t * src, const int h, uint8_t * out) {
+    for (int m = 0; m < 8; ++m) {
+        const uint8_t a = src[2 * m];
+        const uint8_t c = src[2 * m + 1];
+        out[m] = h == 0 ? (uint8_t) ((a & 0xF) | ((c & 0xF) << 4)) : (uint8_t) ((a >> 4) | (c & 0xF0));
+    }
+}
+
+void iq4_unhalf(const uint8_t * h0, const uint8_t * h1, uint8_t * dst) {
+    for (int j = 0; j < 16; ++j) {
+        const int lo = (h0[j / 2] >> (4 * (j & 1))) & 0xF;
+        const int hi = (h1[j / 2] >> (4 * (j & 1))) & 0xF;
+        dst[j] = (uint8_t) (lo | (hi << 4));
+    }
+}
+
+void q4k_half(const uint8_t * src, const int h, uint8_t * out) { std::memcpy(out, src + 8 * h, 8); }
+
+void q4k_unhalf(const uint8_t * h0, const uint8_t * h1, uint8_t * dst) {
+    std::memcpy(dst, h0, 8);
+    std::memcpy(dst + 8, h1, 8);
+}
+
+} // namespace
+
+int64_t iq4xs_tiles_bytes(const int64_t rows, const int64_t blocks_per_row) {
+    return rows % 16 == 0 ? rows / 16 * blocks_per_row * kIq4xsTileBytes : 0;
+}
+
+bool repack_iq4_xs_tiles(const void * gguf, const int64_t rows, const int64_t blocks, std::vector<uint8_t> & dst) {
+    if (rows % 16 != 0 || blocks <= 0) {
+        return false;
+    }
+    const Iq4Layout l = iq4_layout(rows * blocks);
+    std::vector<uint8_t> r((size_t) l.total);
+    repack_iq4_xs(gguf, rows * blocks, r.data());
+    return tiles_of(r.data() + l.qs_off, r.data() + l.meta_off, 8, rows, blocks, kIq4xsTileBytes, dst, iq4_half);
+}
+
+bool unrepack_iq4_xs_tiles(const void * tiles, const int64_t rows, const int64_t blocks, std::vector<uint8_t> & dst) {
+    if (rows % 16 != 0 || blocks <= 0) {
+        return false;
+    }
+    const Iq4Layout l = iq4_layout(rows * blocks);
+    std::vector<uint8_t> r((size_t) l.total, 0);
+    untiles_of(static_cast<const uint8_t *>(tiles), r.data() + l.qs_off, r.data() + l.meta_off, 8, rows, blocks,
+               kIq4xsTileBytes, iq4_unhalf);
+    dst.assign((size_t) (rows * blocks * 136), 0);
+    unrepack_iq4_xs(r.data(), rows * blocks, dst.data());
+    return true;
+}
+
+int64_t q4k_tiles_bytes(const int64_t rows, const int64_t blocks_per_row) {
+    return rows % 16 == 0 ? rows / 16 * blocks_per_row * kQ4kTileBytes : 0;
+}
+
+bool repack_q4k_tiles(const void * gguf, const int64_t rows, const int64_t blocks, std::vector<uint8_t> & dst) {
+    if (rows % 16 != 0 || blocks <= 0) {
+        return false;
+    }
+    const Q4kLayout l = q4k_layout(rows * blocks);
+    std::vector<uint8_t> r((size_t) l.total);
+    repack_q4k(gguf, rows * blocks, r.data());
+    return tiles_of(r.data() + l.qs_off, r.data() + l.meta_off, 16, rows, blocks, kQ4kTileBytes, dst, q4k_half);
+}
+
+bool unrepack_q4k_tiles(const void * tiles, const int64_t rows, const int64_t blocks, std::vector<uint8_t> & dst) {
+    if (rows % 16 != 0 || blocks <= 0) {
+        return false;
+    }
+    const Q4kLayout l = q4k_layout(rows * blocks);
+    std::vector<uint8_t> r((size_t) l.total, 0);
+    untiles_of(static_cast<const uint8_t *>(tiles), r.data() + l.qs_off, r.data() + l.meta_off, 16, rows, blocks,
+               kQ4kTileBytes, q4k_unhalf);
+    dst.assign((size_t) (rows * blocks * 144), 0);
+    unrepack_q4k(r.data(), rows * blocks, dst.data());
+    return true;
+}
+
 // ------------------------------------------------------- the engine's layout
 
-uint32_t engine_layout(const uint32_t type) {
-    if (type == 21 || type == 18) {
+uint32_t engine_layout(const uint32_t type, const int64_t rows) {
+    if (type == 21 || type == 18 || ((type == 23 || type == 12) && rows % 16 == 0)) {
         return 2;
     }
     return repacked_bytes(type, 1) > 0 ? 1 : 0;
@@ -899,8 +1024,14 @@ int64_t engine_layout_bytes(const uint32_t type, const int64_t rows, const int64
     if (bb <= 0 || k % 256 != 0) {
         return 0;
     }
-    switch (engine_layout(type)) {
-        case 2: return type == 18 ? iq3xxs_tiles_bytes(rows, k / 256) : iq3s_tiles_bytes(rows, k / 256);
+    switch (engine_layout(type, rows)) {
+        case 2:
+            switch (type) {
+                case 18: return iq3xxs_tiles_bytes(rows, k / 256);
+                case 23: return iq4xs_tiles_bytes(rows, k / 256);
+                case 12: return q4k_tiles_bytes(rows, k / 256);
+                default: return iq3s_tiles_bytes(rows, k / 256);
+            }
         case 1: return repacked_bytes(type, rows * (k / 256));
         default: return 0;
     }
@@ -911,10 +1042,14 @@ bool to_engine_layout(const uint32_t type, const void * gguf, const int64_t rows
     if (k % 256 != 0) {
         return false;
     }
-    switch (engine_layout(type)) {
+    switch (engine_layout(type, rows)) {
         case 2:
-            return type == 18 ? repack_iq3_xxs_tiles(gguf, rows, k / 256, dst)
-                              : repack_iq3_s_tiles(gguf, rows, k / 256, dst);
+            switch (type) {
+                case 18: return repack_iq3_xxs_tiles(gguf, rows, k / 256, dst);
+                case 23: return repack_iq4_xs_tiles(gguf, rows, k / 256, dst);
+                case 12: return repack_q4k_tiles(gguf, rows, k / 256, dst);
+                default: return repack_iq3_s_tiles(gguf, rows, k / 256, dst);
+            }
         case 1: return repack_any(type, gguf, rows * (k / 256), dst);
         default: return false;
     }
@@ -925,10 +1060,14 @@ bool from_engine_layout(const uint32_t type, const void * src, const int64_t row
     if (k % 256 != 0) {
         return false;
     }
-    switch (engine_layout(type)) {
+    switch (engine_layout(type, rows)) {
         case 2:
-            return type == 18 ? unrepack_iq3_xxs_tiles(src, rows, k / 256, gguf)
-                              : unrepack_iq3_s_tiles(src, rows, k / 256, gguf);
+            switch (type) {
+                case 18: return unrepack_iq3_xxs_tiles(src, rows, k / 256, gguf);
+                case 23: return unrepack_iq4_xs_tiles(src, rows, k / 256, gguf);
+                case 12: return unrepack_q4k_tiles(src, rows, k / 256, gguf);
+                default: return unrepack_iq3_s_tiles(src, rows, k / 256, gguf);
+            }
         case 1: {
             const int64_t n_blocks = rows * (k / 256);
             gguf.assign((size_t) (n_blocks * quant_block_bytes(type)), 0);

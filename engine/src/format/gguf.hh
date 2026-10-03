@@ -59,10 +59,10 @@ uint64_t type_nbytes(uint32_t type, const std::vector<uint64_t> & ne);
 enum Layout : uint32_t {
     kLayoutGguf = 0,    // the GGUF bytes as they are
     kLayoutRepack = 1,  // format/repack.hh's layout of the type (PLAN.md §8.3)
-    kLayoutTile = 2,    // WMMA tiles (IQ3_S, IQ3_XXS; repack.hh, #178, #219)
+    kLayoutTile = 2,    // WMMA tiles (IQ3_S, IQ3_XXS, IQ4_XS, Q4_K; repack.hh, #178, #219, #244)
 };
-// 2: IQ3_S in kLayoutTile; 3: IQ3_XXS too (format/repack.hh's engine_layout)
-constexpr uint32_t kOmphFormatVersion = 3;
+// 2: IQ3_S in kLayoutTile; 3: IQ3_XXS too; 4: IQ4_XS and Q4_K too (format/repack.hh's engine_layout)
+constexpr uint32_t kOmphFormatVersion = 4;
 
 struct TensorInfo {
     std::string name;

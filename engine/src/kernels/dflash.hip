@@ -13,7 +13,6 @@ constexpr int kGqa = 4;       // query heads per KV head (32 / 8)
 constexpr int kKvHeads = 8;
 constexpr int kTopK = 16;
 constexpr int kRank = 256;    // selector rank
-constexpr int kMaxKeys = 2048 + 64;
 
 __global__ void capture_kernel(const float * __restrict__ x, const long long n, const long long ld_x,
                                __half * __restrict__ feat, const long long ld_f, const long long col) {
@@ -309,7 +308,7 @@ __global__ __launch_bounds__(256) void topk_kernel(const float * __restrict__ x,
 __global__ __launch_bounds__(256) void selector_kernel(const int32_t * __restrict__ cand,
                                                        const float * __restrict__ vals,
                                                        const float * __restrict__ gate, const int32_t anchor,
-                                                       const qd::DecQ4k prev, const qd::DecQ4k next,
+                                                       const qd::DecQ4kTile prev, const qd::DecQ4kTile next,
                                                        float * __restrict__ scores) {
     __shared__ float pr[kTopK][kRank + 1];
     __shared__ float nx[kTopK][kRank + 1];
@@ -323,7 +322,7 @@ __global__ __launch_bounds__(256) void selector_kernel(const int32_t * __restric
         const int s = task & 7;
         const bool is_next = tid >= 128;
         const int32_t id = is_next ? cand[(i - 1) * kTopK + r] : (i == 1 ? anchor : cand[(i - 2) * kTopK + r]);
-        const qd::DecQ4k & dec = is_next ? next : prev;
+        const qd::DecQ4kTile & dec = is_next ? next : prev;
         float v[32];
         dec.decode(dec.load(id, s), s, v);
         float (*dst)[kRank + 1] = is_next ? nx : pr;
@@ -420,8 +419,8 @@ bool dflash_selector(const int32_t * cand, const float * vals, const float * gat
         scores == nullptr || P <= 0) {
         return false;
     }
-    const auto prev = qd::DecQ4k::make(static_cast<const uint8_t *>(prev_tab), vocab, 1);
-    const auto next = qd::DecQ4k::make(static_cast<const uint8_t *>(next_tab), vocab, 1);
+    const auto prev = qd::DecQ4kTile::make(static_cast<const uint8_t *>(prev_tab), vocab, 1);
+    const auto next = qd::DecQ4kTile::make(static_cast<const uint8_t *>(next_tab), vocab, 1);
     selector_kernel<<<(unsigned) P, 256, 0, stream>>>(cand, vals, gate, anchor, prev, next, scores);
     return hipGetLastError() == hipSuccess;
 }

@@ -2332,6 +2332,9 @@ bool gemv_q4k_prefix(const void * packed, const void * x_f16, float * y, const i
         k % 256 != 0 || rows > total_rows) {
         return false;
     }
+    if (total_rows % 16 == 0) {  // the tiles (#244): the first rows are the first tiles
+        return rows % 16 == 0 && launch_tiles<qd::TileQ4k, 1>(packed, x_f16, y, rows, k, stream);
+    }
     const int64_t n_blocks = total_rows * (k / 256);  // the layout is the whole tensor's
     const omph::format::Q4kLayout l = omph::format::q4k_layout(n_blocks);
     const size_t smem = (size_t) kQ4kChunkSub * 64;
@@ -2530,6 +2533,9 @@ bool gemv_iq4_xs(const void * packed, const void * x_f16, float * y, const int64
         k % 256 != 0) {
         return false;
     }
+    if (rows % 16 == 0) {
+        return launch_tiles<qd::TileIq4xs, 1>(packed, x_f16, y, rows, k, stream);  // #244
+    }
     const int64_t n_blocks = rows * (k / 256);
     const omph::format::Iq4Layout l = omph::format::iq4_layout(n_blocks);
     const int64_t n_sub = k / 32;
@@ -2613,10 +2619,12 @@ bool gemv_multi(const uint32_t type, const void * packed, const void * x_f16, fl
         case 18:
             return launch_tiles_n<qd::TileIq3xxs>(nt, packed, x_f16, y, rows, k, stream);
         case 12:
+            if (rows % 16 == 0) return launch_tiles_n<qd::TileQ4k>(nt, packed, x_f16, y, rows, k, stream);
             if (nt == 2) return launch_q4k_ntg<2>(packed, x_f16, y, rows, k, stream);
             if (nt == 3) return launch_q4k_ntg<3>(packed, x_f16, y, rows, k, stream);
             return launch_q4k_ntg<4>(packed, x_f16, y, rows, k, stream);
         case 23:
+            if (rows % 16 == 0) return launch_tiles_n<qd::TileIq4xs>(nt, packed, x_f16, y, rows, k, stream);
             if (nt == 2) return launch_iq4_ntg<2>(packed, x_f16, y, rows, k, stream);
             if (nt == 3) return launch_iq4_ntg<3>(packed, x_f16, y, rows, k, stream);
             return launch_iq4_ntg<4>(packed, x_f16, y, rows, k, stream);
@@ -2655,6 +2663,8 @@ bool gemv_tokens(const uint32_t type, const void * packed, const void * x_f16, f
     }
     if (type == 21) return launch_tiles_n<qd::TileIq3s>(nt, packed, x_f16, y, rows, k, stream);
     if (type == 18) return launch_tiles_n<qd::TileIq3xxs>(nt, packed, x_f16, y, rows, k, stream);
+    if (rows % 16 == 0 && type == 12) return launch_tiles_n<qd::TileQ4k>(nt, packed, x_f16, y, rows, k, stream);
+    if (rows % 16 == 0 && type == 23) return launch_tiles_n<qd::TileIq4xs>(nt, packed, x_f16, y, rows, k, stream);
     if (nt <= 4 || k % 256 != 0) {
         return false;  // 2..4: gemv_multi's kernels (and gemv_group); 5..16 below (#244)
     }
@@ -2754,8 +2764,8 @@ __device__ __forceinline__ void group_body(const GroupItem & t, const __half * _
     switch (t.type) {
         case 21: tiles_body<qd::TileIq3s, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
         case 18: tiles_body<qd::TileIq3xxs, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
-        case 12: q4k_ntg_body<NT, 4>(t.p[0], t.p[1], x, t.y, t.rows, t.n, b, lds); break;
-        case 23: iq4_ntg_body<NT, 4>(t.p[0], t.p[1], x, t.y, t.rows, t.n, b, lds); break;
+        case 12: tiles_body<qd::TileQ4k, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
+        case 23: tiles_body<qd::TileIq4xs, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
         case 17: iq2xs_ntg_body<NT, 4>(t.p[0], t.p[1], t.p[2], x, t.y, t.rows, t.n, b, lds); break;
         case 22: iq2s_ntg_body<NT, 4>(t.p[0], t.p[1], t.p[2], t.p[3], t.p[4], x, t.y, t.rows, t.n, b, lds); break;
         case 10: q2k_ntg_body<NT, 4>(t.p[0], t.p[1], t.p[2], t.p[3], x, t.y, t.rows, t.n, b, lds); break;
@@ -2791,24 +2801,14 @@ bool group_item(const GemvGroupItem & in, GroupItem & o) {
     const auto ntg = [&](const int r) { o.blocks = (unsigned) ((rows + 8 * r - 1) / (8 * r)); };
     switch (in.type) {
         case 21:
-        case 18:  // the WMMA tiles (#178, #219)
+        case 18:  // the WMMA tiles (#178, #219, #244)
+        case 12:
+        case 23:
             if (rows % 16 != 0) return false;
             o.p[0] = base;
             o.n = k / 256;
             o.blocks = (unsigned) ((rows / 16 + kTileTiles - 1) / kTileTiles);
             return true;
-        case 12: {
-            const auto l = omph::format::q4k_layout(nb);
-            o.p[0] = base + l.qs_off; o.p[1] = base + l.meta_off;
-            ntg(4);
-            return true;
-        }
-        case 23: {
-            const auto l = omph::format::iq4_layout(nb);
-            o.p[0] = base + l.qs_off; o.p[1] = base + l.meta_off;
-            ntg(4);
-            return true;
-        }
         case 17: {
             const auto l = omph::format::iq2_xs_layout(nb);
             o.p[0] = base + l.qs_off; o.p[1] = base + l.sc_off; o.p[2] = base + l.d_off;
@@ -2937,8 +2937,14 @@ bool dequant_repacked(const uint32_t type, const void * packed, void * dst_f16,
         case 16: launch(qd::DecIq2xxs::make(base, n_blocks, blocks)); break;
         case 17: launch(qd::DecIq2xs::make(base, n_blocks, blocks)); break;
         case 22: launch(qd::DecIq2s::make(base, n_blocks, blocks)); break;
-        case 23: launch(qd::DecIq4xs::make(base, n_blocks, blocks)); break;
-        case 12: launch(qd::DecQ4k::make(base, n_blocks, blocks)); break;
+        case 23:
+            if (rows % 16 == 0) launch(qd::DecIq4xsTile::make(base, n_blocks, blocks));
+            else launch(qd::DecIq4xs::make(base, n_blocks, blocks));
+            break;
+        case 12:
+            if (rows % 16 == 0) launch(qd::DecQ4kTile::make(base, n_blocks, blocks));
+            else launch(qd::DecQ4k::make(base, n_blocks, blocks));
+            break;
         case 10: launch(qd::DecQ2k::make(base, n_blocks, blocks)); break;
         case 14: launch(qd::DecQ6k::make(base, n_blocks, blocks)); break;
         default: return false;

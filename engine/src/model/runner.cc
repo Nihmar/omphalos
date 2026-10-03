@@ -98,7 +98,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 // the engine's layout of the type (format/repack.hh): IQ3_S tiles, else the repack
                 const int64_t k = (int64_t) t.ne[0];
                 const int64_t rows = t.ne.size() >= 2 ? (int64_t) t.ne[1] : 1;
-                if (t.layout != omph::format::engine_layout(t.type) ||
+                if (t.layout != omph::format::engine_layout(t.type, rows) ||
                     t.stored != (uint64_t) omph::format::engine_layout_bytes(t.type, rows, k)) {
                     throw std::runtime_error(name + ": not in this engine's layout (reconvert with omph-convert)");
                 }

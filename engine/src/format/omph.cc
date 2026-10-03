@@ -89,7 +89,7 @@ ConvertStats convert_to_omph(const std::string & in_path, const std::string & ou
         const int64_t bb = quant_block_bytes(t.type);
         const int64_t k = (int64_t) t.ne[0];
         const int64_t rows = bb > 0 && k % 256 == 0 ? (int64_t) (t.nbytes / (uint64_t) bb) / (k / 256) : 0;
-        const uint32_t layout = rows > 0 ? engine_layout(t.type) : 0;
+        const uint32_t layout = rows > 0 ? engine_layout(t.type, rows) : 0;
         // the token embedding stays as it is: the engine gathers its rows on the host
         if (layout != 0 && t.name != "token_embd.weight") {
             const int64_t bytes = engine_layout_bytes(t.type, rows, k);

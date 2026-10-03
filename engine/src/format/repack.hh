@@ -255,13 +255,36 @@ int64_t iq3xxs_tiles_bytes(int64_t rows, int64_t blocks_per_row);
 bool repack_iq3_xxs_tiles(const void * gguf, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
 bool unrepack_iq3_xxs_tiles(const void * tiles, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
 
+// ---------------------------------------------------- IQ4_XS and Q4_K tiles
+//
+// For the WMMA kernels (#244), built on the repacked layouts above, in 16-row
+// tiles, one 256-weight block each, the 16 GGUF blocks' size; lane l (row
+// l % 16, half h = l / 16) takes weights 16 h .. 16 h + 15 of each sub-block:
+//   IQ4_XS (2176 B): [ qs 2048 ] lane l: 64 B, sub-block sb's codes at 8 sb,
+//                    byte m = weight 16 h + 2 m (low nibble), + 1 (high nibble)
+//                    [ meta 128 ] row r: the block's 8 meta bytes (repacked)
+//   Q4_K   (2304 B): [ qs 2048 ] lane l: 64 B, at 8 sb the repacked sub-block's
+//                    bytes 8 h .. 8 h + 7 (weight v: byte v / 2, nibble v & 1)
+//                    [ meta 256 ] row r: the block's 16 meta bytes (repacked)
+// Rows a multiple of 16. Lossless: unrepack rebuilds the GGUF bytes.
+constexpr int64_t kIq4xsTileBytes = 2176;
+constexpr int64_t kQ4kTileBytes = 2304;
+int64_t iq4xs_tiles_bytes(int64_t rows, int64_t blocks_per_row);
+bool repack_iq4_xs_tiles(const void * gguf, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
+bool unrepack_iq4_xs_tiles(const void * tiles, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
+int64_t q4k_tiles_bytes(int64_t rows, int64_t blocks_per_row);
+bool repack_q4k_tiles(const void * gguf, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
+bool unrepack_q4k_tiles(const void * tiles, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
+
 // ------------------------------------------------------- the engine's layout
 //
-// The layout the engine's kernels read a tensor of `type` in (format version 3,
-// #178, #219): 2 (WMMA tiles) for IQ3_S and IQ3_XXS, 1 (the repacked layout
-// above) for the other types with one, 0 (the GGUF bytes) otherwise; its size,
-// and the conversions both ways (rows x k weights, row-major).
-uint32_t engine_layout(uint32_t type);
+// The layout the engine's kernels read a tensor of `type` in (format version 4,
+// #178, #219, #244): 2 (WMMA tiles) for IQ3_S, IQ3_XXS, IQ4_XS and Q4_K (rows
+// a multiple of 16), 1 (the repacked layout above) for the other types with
+// one, 0 (the GGUF bytes) otherwise; its size, and the conversions both ways
+// (rows x k weights, row-major). Takes the rows: a tensor whose rows are not a
+// multiple of 16 keeps the repacked layout.
+uint32_t engine_layout(uint32_t type, int64_t rows);
 int64_t engine_layout_bytes(uint32_t type, int64_t rows, int64_t k);
 bool to_engine_layout(uint32_t type, const void * gguf, int64_t rows, int64_t k, std::vector<uint8_t> & dst);
 bool from_engine_layout(uint32_t type, const void * src, int64_t rows, int64_t k, std::vector<uint8_t> & gguf);
