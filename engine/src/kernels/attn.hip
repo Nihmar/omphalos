@@ -558,40 +558,108 @@ __global__ __launch_bounds__(kGqaHd) void attention_gqa_kernel(
 
 // --- WMMA prefill attention (#97) ------------------------------------------
 //
-// A workgroup takes kFaRowTiles x 16 query tokens of one KV head: 6 waves per
-// 16-token row tile, wave (rt, g) the query head kvh * 6 + g. Per tile of 32
-// keys, K and V are dequantized to f16 in LDS once for all of them (#173: with
-// one row tile per workgroup the staging served 16 queries and 2 workgroups
-// fit a WGP, 3 waves per SIMD; three row tiles cut a layer's 512-token chunk
-// at 100k from 92 to 59 ms) (V transposed, so both WMMA operands are 16-byte
-// loads), each wave computes its 16 x 32 scores with v_wmma (q in registers,
-// f16, prescaled), updates the online softmax in registers (the score tiles'
-// rows sit in the same lanes as the output accumulators' rows), passes P
-// through LDS into the A layout and accumulates O (16 x 256) += P V. The
-// output goes to `work` as one partial (m, l, acc) per (token, head), which
-// the merge kernel (splits = 1) normalizes, un-rotates and gates.
+// A workgroup takes kFaRowTiles x 16 query tokens of one KV head: 6 computing
+// waves per 16-token row tile, wave (rt, g) the query head kvh * 6 + g, plus
+// kFaProd staging waves (#191). Per tile of 32 keys the staging waves
+// dequantize K and V to f16 in LDS once for all of them (V transposed, so
+// both WMMA operands are 16-byte loads), one tile ahead of the computing
+// waves: V(t + 1) while they compute the scores of t, K(t + 1) while they run
+// its softmax and P V (V double-buffered, K single-buffered; one barrier after
+// each phase). Each computing wave forms S^T = K q^T (q in registers, f16,
+// prescaled), its tokens' online softmax in registers, and O^T += V^T P^T with
+// P kept in registers as the B operand. The output goes to `work` as one
+// partial (m, l, acc) per (token, head), which the merge kernel (splits = 1)
+// normalizes, un-rotates and gates. Two row tiles and eight staging waves
+// measured best (#191: 3 + 2 left the staging behind; the computing waves need
+// 243 VGPRs, 5 waves per SIMD).
 typedef _Float16 wmma_half8 __attribute__((ext_vector_type(8)));
 typedef float wmma_float8 __attribute__((ext_vector_type(8)));
 
 constexpr int kFaTokens = 16;            // query tokens per wave (one WMMA row tile)
-constexpr int kFaRowTiles = 3;           // row tiles per workgroup: one K / V staging for all (#173)
+constexpr int kFaRowTiles = 2;           // row tiles per workgroup: one K / V staging for all (#173, #191)
 constexpr int kFaWgTokens = kFaTokens * kFaRowTiles;
 constexpr int kFaKeys = 32;              // keys per tile (16: slower, 64: over the LDS)
 constexpr int kFaSt = kFaKeys / 16;      // 16-key WMMA tiles per key tile
-constexpr int kFaWaves = kGqaGroup * kFaRowTiles;
-constexpr int kFaThreads = 32 * kFaWaves;
-constexpr int kFaKLd = kGqaHd + 8;       // Ks row stride (halves): conflict-free 16-lane reads
-constexpr int kFaVLd = kFaKeys + 8;      // Vt row stride
+constexpr int kFaWaves = kGqaGroup * kFaRowTiles;  // the computing waves
+constexpr int kFaProd = 8;                          // the staging waves (#191)
+constexpr int kFaThreads = 32 * (kFaWaves + kFaProd);
+constexpr int kFaProdThreads = 32 * kFaProd;
+// The staged tiles (#191). K: key rows padded by 16 bytes (a WMMA operand's 16
+// lanes on 16 different banks with immediate offsets; an XOR swizzle needed a
+// VGPR per address and spilled). V^T: dim rows of 4 16-byte chunks, unpadded,
+// chunk ^ dim / 2 (32 banks of 4 bytes): two of them fit. Offsets in halves of
+// a chunk's first element.
+constexpr int kFaKLd = kGqaHd + 8;
+__device__ inline int ks_at(const int key, const int chunk) {
+    return key * kFaKLd + chunk * 8;
+}
+__device__ inline int vt_at(const int dim, const int chunk) {
+    return dim * kFaKeys + ((chunk ^ (dim >> 1)) & 3) * 8;
+}
 
-// grid: (ceil(tokens / 16), nkv); 192 threads. Scores are in log2 units (q is
+// The staging waves' work (#191): K and V of keys s0 .. s0 + 31 into LDS as f16
+// (positions past n_keys: 0), one 16-dim chunk of one key per job.
+template <bool Q8>
+__device__ inline void fa_stage_k(const KvArgs & kv, _Float16 * ks, const long long s0, const long long n_keys,
+                                  const int kvh, const int nkv, const long long seq, const int ptid) {
+    for (int job = ptid; job < kFaKeys * (kGqaHd / 16); job += kFaProdThreads) {
+        const int key = job / (kGqaHd / 16);
+        const int c = job % (kGqaHd / 16);
+        float kc[16];
+        if (s0 + key < n_keys) {
+            gqa_load_k16<Q8>(kv, s0 + key, kvh, nkv, c, seq - kv.window, kc);
+        } else {
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                kc[i] = 0.0f;
+            }
+        }
+        wmma_half8 k0;
+        wmma_half8 k1;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            k0[i] = (_Float16) kc[i];
+            k1[i] = (_Float16) kc[8 + i];
+        }
+        *reinterpret_cast<wmma_half8 *>(&ks[ks_at(key, 2 * c)]) = k0;
+        *reinterpret_cast<wmma_half8 *>(&ks[ks_at(key, 2 * c + 1)]) = k1;
+    }
+}
+
+// Consecutive lanes take consecutive keys of one dim chunk: their transposed
+// two-byte stores land side by side (key-major jobs put the 32 lanes' stores in
+// one LDS bank: 32-way conflicts).
+template <bool Q8>
+__device__ inline void fa_stage_v(const KvArgs & kv, _Float16 * vb, const long long s0, const long long n_keys,
+                                  const int kvh, const int nkv, const long long seq, const int ptid) {
+    for (int job = ptid; job < kFaKeys * (kGqaHd / 16); job += kFaProdThreads) {
+        const int key = job % kFaKeys;
+        const int c = job / kFaKeys;
+        float vc[16];
+        if (s0 + key < n_keys) {
+            gqa_load_v16<Q8>(kv, s0 + key, kvh, nkv, c, seq - kv.window, vc);
+        } else {
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                vc[i] = 0.0f;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            vb[vt_at(c * 16 + i, key >> 3) + (key & 7)] = (_Float16) vc[i];
+        }
+    }
+}
+
+// grid: (ceil(tokens / 32), nkv); kFaThreads threads. Scores are in log2 units (q is
 // prescaled by scale * log2(e)): with one split the merge only divides by l.
 template <bool Q8>
 __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
     const float * __restrict__ q, const KvArgs kv, float * __restrict__ work,
     const long long tokens, const long long seq, const int nh, const int nkv,
     const float scale) {
-    __shared__ _Float16 ks[kFaKeys * kFaKLd];
-    __shared__ _Float16 vt[kGqaHd * kFaVLd];
+    __shared__ __attribute__((aligned(16))) _Float16 ks[kFaKeys * kFaKLd];
+    __shared__ __attribute__((aligned(16))) _Float16 vt[2][kGqaHd * kFaKeys];
     const int tid = (int) threadIdx.x;
     const int lane = tid & 31;
     const int wv = tid >> 5;
@@ -604,7 +672,41 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
     // this wave's rows (none for a row tile past the end: it only stages)
     const int nt = (int) (tokens - t0 < 0 ? 0 : tokens - t0 < kFaTokens ? tokens - t0 : kFaTokens);
     const long long qpos0 = seq - tokens + t0;  // cache position of the tile's first query
+    // Two staging waves dequantize the next tile while the others compute (#191):
+    // per tile, V(t + 1) during the scores of t, K(t + 1) during its softmax and
+    // P V (K single-buffered, V double-buffered), one barrier after each phase.
+    const bool prod = wv >= kFaWaves;
+    const int ptid = tid - kFaWaves * 32;
 
+    // keys up to the workgroup's last query: tiles past a row tile's own last
+    // query are masked out entirely (corr 1, P 0: its rows are unchanged)
+    const long long n_keys = seq - tokens + (tokens - wg0 < kFaWgTokens ? tokens : wg0 + kFaWgTokens);
+    const long long n_tiles = (n_keys + kFaKeys - 1) / kFaKeys;
+    if (prod) {  // the staging waves' own loop: the same barriers as the computing waves'
+        fa_stage_k<Q8>(kv, ks, 0, n_keys, kvh, nkv, seq, ptid);
+        fa_stage_v<Q8>(kv, vt[0], 0, n_keys, kvh, nkv, seq, ptid);
+        __syncthreads();
+        const auto ptile = [&](const long long kt, _Float16 * vnext) {
+            const long long s1 = (kt + 1) * kFaKeys;
+            if (kt + 1 < n_tiles) {
+                fa_stage_v<Q8>(kv, vnext, s1, n_keys, kvh, nkv, seq, ptid);
+            }
+            __syncthreads();  // K(kt) consumed
+            if (kt + 1 < n_tiles) {
+                fa_stage_k<Q8>(kv, ks, s1, n_keys, kvh, nkv, seq, ptid);
+            }
+            __syncthreads();  // K(kt + 1), V(kt + 1) staged; V(kt) consumed
+        };
+        long long kt = 0;
+        for (; kt + 1 < n_tiles; kt += 2) {
+            ptile(kt, vt[1]);
+            ptile(kt + 1, vt[0]);
+        }
+        if (kt < n_tiles) {
+            ptile(kt, vt[1]);
+        }
+        return;
+    }
     // q as 16 A operands (k16 steps over the 256 dims): lane -> token lane % 16,
     // dims (lane / 16) * 8 .. + 7 of each step; prescaled, rows past the end 0
     wmma_half8 qa[kGqaHd / 16];
@@ -637,62 +739,18 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
     // running max / sum of the lane's token, equal in lanes l and l + 16
     float m_run = -INFINITY;
     float l_run = 0.0f;
-    // keys up to the workgroup's last query: tiles past a row tile's own last
-    // query are masked out entirely (corr 1, P 0: its rows are unchanged)
-    const long long n_keys = seq - tokens + (tokens - wg0 < kFaWgTokens ? tokens : wg0 + kFaWgTokens);
-    const long long n_tiles = (n_keys + kFaKeys - 1) / kFaKeys;
-    for (long long kt = 0; kt < n_tiles; ++kt) {
+    __syncthreads();
+    // one tile; the V buffer as a compile-time LDS address (a buffer picked at
+    // run time put the 32 V operand addresses in registers and spilled)
+    const auto tile = [&](const long long kt, const _Float16 * vcur) {
         const long long s0 = kt * kFaKeys;
-        // K and V of keys s0 .. s0 + 31 into LDS as f16 (positions past n_keys: 0)
-        __syncthreads();  // the previous tile is consumed
-        // (one 16-dim chunk of one key per job; K and V in separate passes keep
-        // the staging registers down)
-        for (int job = tid; job < kFaKeys * (kGqaHd / 16); job += kFaThreads) {
-            const int key = job / (kGqaHd / 16);
-            const int c = job % (kGqaHd / 16);
-            float kc[16];
-            if (s0 + key < n_keys) {
-                gqa_load_k16<Q8>(kv, s0 + key, kvh, nkv, c, seq - kv.window, kc);
-            } else {
-#pragma unroll
-                for (int i = 0; i < 16; ++i) {
-                    kc[i] = 0.0f;
-                }
-            }
-            wmma_half8 k0;
-            wmma_half8 k1;
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                k0[i] = (_Float16) kc[i];
-                k1[i] = (_Float16) kc[8 + i];
-            }
-            *reinterpret_cast<wmma_half8 *>(&ks[key * kFaKLd + c * 16]) = k0;
-            *reinterpret_cast<wmma_half8 *>(&ks[key * kFaKLd + c * 16 + 8]) = k1;
-        }
-        // consecutive lanes take consecutive keys of one dim chunk: their
-        // transposed two-byte stores land side by side (key-major jobs put the
-        // 32 lanes' stores 1280 bytes apart, one LDS bank: 32-way conflicts; #191)
-        for (int job = tid; job < kFaKeys * (kGqaHd / 16); job += kFaThreads) {
-            const int key = job % kFaKeys;
-            const int c = job / kFaKeys;
-            float vc[16];
-            if (s0 + key < n_keys) {
-                gqa_load_v16<Q8>(kv, s0 + key, kvh, nkv, c, seq - kv.window, vc);
-            } else {
-#pragma unroll
-                for (int i = 0; i < 16; ++i) {
-                    vc[i] = 0.0f;
-                }
-            }
-#pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                vt[(c * 16 + i) * kFaVLd + key] = (_Float16) vc[i];
-            }
-        }
-        __syncthreads();
+        // phase 1: the scores of tile kt; V(kt + 1) into the other V buffer
+        wmma_half8 pb[kFaSt];  // P^T as B operands: token tr, keys jt * 16 + hk .. + 7
+        float corr_x = 1.0f;
+        {
+        wmma_float8 st[kFaSt];
         // S^T (32 keys x 16 tokens) = K q^T, two key tiles; lane -> token tr,
         // keys jt * 16 + hk + v
-        wmma_float8 st[kFaSt];
 #pragma unroll
         for (int jt = 0; jt < kFaSt; ++jt) {
             st[jt] = wmma_float8{};
@@ -702,7 +760,7 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
 #pragma unroll
             for (int jt = 0; jt < kFaSt; ++jt) {
                 const wmma_half8 ka = *reinterpret_cast<const wmma_half8 *>(
-                    &ks[(jt * 16 + (lane & 15)) * kFaKLd + s * 16 + (lane >> 4) * 8]);
+                    &ks[ks_at(jt * 16 + (lane & 15), 2 * s + (lane >> 4))]);
                 st[jt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ka, qa[s], st[jt]);
             }
         }
@@ -729,7 +787,6 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
         const float m_use = none ? 0.0f : m_new;
         const float corr = none ? 1.0f : __builtin_amdgcn_exp2f(m_run - m_use);
         float sum = 0.0f;
-        wmma_half8 pb[kFaSt];  // P^T as B operands: token tr, keys jt * 16 + hk .. + 7
 #pragma unroll
         for (int jt = 0; jt < kFaSt; ++jt) {
 #pragma unroll
@@ -742,6 +799,12 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
         sum += half_xor(sum);
         l_run = l_run * corr + sum;
         m_run = m_new;
+        corr_x = corr;
+        }
+        __syncthreads();  // K(kt) consumed
+        // phase 2: P V of tile kt (the staging waves: K(kt + 1))
+        {
+        const float corr = corr_x;
 #pragma unroll
         for (int j = 0; j < kGqaHd / 16; ++j) {
 #pragma unroll
@@ -755,10 +818,20 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
 #pragma unroll
             for (int j = 0; j < kGqaHd / 16; ++j) {
                 const wmma_half8 va = *reinterpret_cast<const wmma_half8 *>(
-                    &vt[(j * 16 + (lane & 15)) * kFaVLd + s * 16 + (lane >> 4) * 8]);
+                    &vcur[vt_at(j * 16 + (lane & 15), 2 * s + (lane >> 4))]);
                 o[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(va, pb[s], o[j]);
             }
         }
+        }
+        __syncthreads();  // K(kt + 1), V(kt + 1) staged; V(kt) consumed
+    };
+    long long kt = 0;
+    for (; kt + 1 < n_tiles; kt += 2) {
+        tile(kt, vt[0]);
+        tile(kt + 1, vt[1]);
+    }
+    if (kt < n_tiles) {
+        tile(kt, vt[0]);
     }
     // the partial of each (token, head), splits = 1: m, l, acc[hd]; the lane's
     // token, dims j * 16 + hk .. + 7 (8-byte aligned: the rows are 258 floats)
