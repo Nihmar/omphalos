@@ -1,0 +1,12 @@
+SwiGLU in the up GEMM's epilogue (#221, P4 of #203), RX 9060 XT, 2026-10-03
+A prefill chunk's FFN: gate GEMM (f32), then the up GEMM writing f16(silu(gate) * up)
+directly (both GEMM kernels: row-wise decode and the WMMA tiles), instead of up in f32
+plus the swiglu_f16 pass (150 ms of a 4k prefill, 1.2 s at 32k, memory traffic only).
+
+Bit-identity: logits (last 64 rows, wiki1000) byte-identical with OMPH_NO_SWIGLU_GEMM=1,
+on the f16 path and on the --gemv path (8 decode tokens identical too).
+
+Prefill wall (OMPH_TIMING, same binary, alternated):
+  4k:  separate 4755.4 4778.0 4775.4 4768.6 4775.8 -> fused 4665.9 4680.8 4694.5 4696.2 4687.9
+       median 4775.4 -> 4687.9 ms (-87.5 ms, -1.8 %)
+  32k: separate 45776.0 45849.7 -> fused 44995.9 45113.5 ms (-0.76 s, -1.7 %)
