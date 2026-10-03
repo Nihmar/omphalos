@@ -95,6 +95,8 @@ engine/build/omph-capi-demo <model.omph>
 
 # OpenAI-compatible server (#156): /v1/chat/completions, /v1/completions, /v1/models, /health;
 # streamed or not, reasoning_content / tool_calls; one request at a time on 127.0.0.1:8080.
+# Logs to stderr a progress line every 3 s of decoding (tokens, t/s, drafts accepted) and a summary
+# per request (#231).
 # Options: --host --port --ctx --cache-ram MIB (sequence checkpoints in host RAM, #158; default
 # 2048) --mmproj FILE (images as base64 data: URLs, #160) --alias --api-key --cors ORIGIN, request defaults --temp
 # --top-k --top-p --min-p --max-tokens (default greedy: speculative MTP decoding)
