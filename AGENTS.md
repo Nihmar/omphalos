@@ -182,6 +182,7 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_PHASES` | diagnostics | per-phase GPU totals; its ~460 events per step add ~2.6 ms, so never measure the step with it (#100) |
 | `OMPH_TEST_BAD_SIDE=N` | diagnostics | swap the side stream the calibration rejected back in after N decode steps: exercises the #144 watchdog |
 | `OMPH_TEST_MROPE=swap\|flat` | ablation | image positions with h and w exchanged, or 1D: must score worse in `check_vision.py` (#160) |
+| `OMPH_TEST_Q8ACT=B` | ablation | every prefill GEMM's input quantized to int8 in blocks of B along k (one amax / 127 scale each, llama.cpp's q8_1 at B = 32) and back: an int8 GEMM's numerics, for its KL (#213) |
 | `OMPH_SPEC_CHECK` | diagnostics | check every speculative rollback: the replay bit-exact against `gdn_step`, the FP16 ring restored (slow) |
 | `OMPH_TRACE_ALLOC` / `OMPH_TRACE_F16` / `OMPH_TRACE_STAGE` | diagnostics | f16-scratch allocations / matmuls falling back to the f16 path / f16 staging and cache hits |
 | `OMPH_KV_F32` | KV | exact f32 cache in VRAM (reference) |

@@ -275,6 +275,9 @@ private:
 
     // Allocates *p on first use (the f16-path buffers, #86).
     void * lazy(void ** p, const size_t bytes);
+    // x16 through OMPH_TEST_Q8ACT's int8 round trip (#213), or x16 itself
+    const void * q8_input(const void * x16, int64_t k, int64_t T);
+    void * q8x_ = nullptr;
 
     // Device pointer to the original GGUF bytes of a tensor that was not
     // repacked (repacked ones are dequantized from their layout).

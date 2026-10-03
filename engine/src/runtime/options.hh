@@ -59,6 +59,8 @@ struct EnvOptions {
     int test_bad_side = 0;      // OMPH_TEST_BAD_SIDE=N: the rejected side stream back after N steps (#144)
     int test_mrope = 0;         // OMPH_TEST_MROPE=swap|flat: image positions with h / w swapped, or
                                 // sequential (validation of the M-RoPE layout, #160)
+    int test_q8act = 0;         // OMPH_TEST_Q8ACT=B: every prefill GEMM's input quantized to int8 in blocks
+                                // of B along k and back: an int8 GEMM's numerics (#213)
 
     static EnvOptions from_env();
 };

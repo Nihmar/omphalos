@@ -45,4 +45,9 @@ int kernel_wave_size();
 // down projection.
 bool swiglu_f16(const float * x, const float * y, void * out_f16, int64_t n, hipStream_t stream);
 
+// rows x k f16 values quantized to int8 in blocks of `block` (32..1024, a
+// multiple of 32) along k with one scale each (amax / 127, as llama.cpp's
+// q8_1), and back to f16: the activations an int8 GEMM would see (#213).
+bool q8_roundtrip_f16(const void * x, void * out, int64_t rows, int64_t k, int block, hipStream_t stream);
+
 } // namespace omph::kernels

@@ -75,8 +75,8 @@ bool Runner::up_swiglu_ok(const Mat & up, const int64_t n_out, const int64_t k, 
 bool Runner::up_swiglu(const Mat & up, const void * x16, const float * gate, void * out16, const int64_t n_out,
                        const int64_t k, const int64_t T) {
     timer_gemm_.start();
-    const bool ok = omph::kernels::gemm_q_swiglu(up.gemv->type, up.dev, x16, gate, out16, n_out, k, T,
-                                                 hipStreamPerThread);
+    const bool ok = omph::kernels::gemm_q_swiglu(up.gemv->type, up.dev, q8_input(x16, k, T), gate, out16, n_out,
+                                                 k, T, hipStreamPerThread);
     timer_gemm_.stop(t_gemm_);
     return ok;
 }
@@ -192,6 +192,7 @@ bool Runner::matmul(const Mat & m, const void * x16, float * y, const int64_t n_
     if (env_.skip_stage) {
         return true;  // ablation only
     }
+    x16 = q8_input(x16, k, T);
     // Repacked weights: one GEMM that decodes the W tiles into LDS itself, no
     // f16 copy of the weight (#141); bit-identical to the path below.
     if (!env_.no_fused_gemm && g != nullptr && g->rows == n_out && g->k == k) {
