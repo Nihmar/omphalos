@@ -1,0 +1,16 @@
+{
+ "run": "omphalos-plain-t1",
+ "engine": "omphalos",
+ "mtp": false,
+ "temperature": 1.0,
+ "tokens": 30526,
+ "thinking_closed": true,
+ "total_s": 1412.4,
+ "prefill_tps": 324.1,
+ "decode_tps": 21.62,
+ "prompt_n": 76,
+ "peak_vram_mib": 13162,
+ "idle_vram_mib": 356,
+ "svg": true,
+ "png": "omphalos-plain-t1.png"
+}

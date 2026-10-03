@@ -1,0 +1,3 @@
+omph-server: Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph on http://127.0.0.1:46225 (context 65536)
+POST /v1/completions: prompt 76 tokens (0 cached) in 228 ms; 34373 tokens in 566289 ms (60.7 t/s); stop: end of generation
+POST /v1/completions: prompt 76 tokens (0 cached) in 238 ms; 20506 tokens in 435808 ms (47.1 t/s); stop: end of generation

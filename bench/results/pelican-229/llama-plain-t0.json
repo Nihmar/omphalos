@@ -1,0 +1,16 @@
+{
+ "run": "llama-plain-t0",
+ "engine": "llama",
+ "mtp": false,
+ "temperature": 0.0,
+ "tokens": 65396,
+ "thinking_closed": false,
+ "total_s": 3938.1,
+ "prefill_tps": 244.5,
+ "decode_tps": 16.61,
+ "prompt_n": 76,
+ "peak_vram_mib": 14054,
+ "idle_vram_mib": 356,
+ "svg": false,
+ "png": ""
+}

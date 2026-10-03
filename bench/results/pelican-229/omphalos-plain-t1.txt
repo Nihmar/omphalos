@@ -1,0 +1,893 @@
+The user is asking for an SVG animation of a pelican riding a bicycle. Let me think about how to build this.
+
+Main elements:
+1. Pelican — a bird with a long beak (pelicans have a distinctive large beak with a gular pouch)
+2. Bicycle — two wheels, frame, handlebars, seat, pedals
+3. Animation — the wheels rotate, the pedals turn, and ideally the background scrolls to give a sense of forward motion, plus a slight bobbing motion of the pelican.
+
+SVG animation techniques:
+- For rotation, use `<animateTransform>` for the wheels (rotate around the wheel center) and the pedals (rotate around the crank center).
+- For the background, use `<animateTransform>` (translate) to scroll it.
+- Subtle up-and-down motion can be done with `<animateTransform>` type="translate" on the pelican group.
+
+Let me plan the layout:
+- Canvas: 800x500 or similar size.
+- Ground line at y ≈ 420.
+- Bicycle:
+  - Rear wheel center: (250, 380), radius 50.
+  - Front wheel center: (550, 380), radius 50.
+  - Bottom bracket (crank center): (370, 380).
+  - Seat: around (300, 270).
+  - Handlebars: around (520, 260).
+  - Frame: lines from bottom bracket to seat tube, top tube, down tube, fork, chain stay, seat stay.
+
+Let me define the geometry of a classic diamond bicycle frame:
+- Rear wheel center R = (250, 385), r=45
+- Front wheel center F = (560, 385), r=45
+- Bottom bracket BB = (375, 385)
+- Seat tube goes from BB upward to the seat S = (330, 280) — the seat post leans back.
+- Top tube: from near the seat to the head tube.
+- Head tube: at (545, 275) connecting down to the fork, going to the front wheel.
+- Down tube: from BB to the head tube (555, 285).
+- Chain stay: from BB to the rear wheel center R.
+- Seat stay: from R to the seat post (335, 295).
+- Seat: small saddle at (330, 270).
+- Handlebars: from top of head tube (545, 270) to (540, 250), with grips.
+- Crank: circle of radius 22 at BB, pedals on opposite ends. Crank arm of length 28.
+
+Pelican sits on the saddle: the body is above the seat, around (330, 250) or so. The pelican faces right (direction of travel).
+- Body: an ellipse around (330, 245), rx 45, ry 35.
+- Neck: curves up from the body to the head, head at (400, 190)? Pelican neck is long. S-curve.
+- Head: a circle at (405, 185), r=14.
+- Beak: long, from (415, 185) to (470, 195), with pouch beneath — a path forming the beak and pouch: an upper beak line and pouch curve.
+- Eye: a small dot.
+- Wing: an ellipse/curved shape over the body, with a slight flapping animation (rotation about the shoulder) possible.
+- Feet: from below the body to the pedals — animation of the feet on rotating pedals is tricky. Simplification: keep the feet stationary and let them move along with the pelican's bobbing. Or animate the feet along a circular path with animateMotion? That's complex. Simple approach: draw the legs from the body to near the crank, and animate the pedal rotation. Since the feet don't perfectly track, draw the feet as two lines that rotate with the cranks… actually we could attach the feet to the pedals: each leg group uses the same animateTransform rotation as the cranks and rotates around BB. But then the feet would go in a big circle (legs from the body would swing widely).
+
+Better approach: use `<animateMotion>` with a small circular path for each foot to simulate pedaling, while the upper legs stay. Or just draw one visible foot as a simple shape on the pedal. In many cartoon versions, one foot is shown on the near-side pedal.
+
+Simplest, most solid approach: animate a small foot/leg shape with animateMotion following a circle of radius 28 around the BB center, and the pelican body bobs up and down in sync. That looks good enough.
+
+Actually, let's do this:
+- The crank group at BB rotates 360 degrees, containing the crank arms and pedals (two pedals on opposite ends).
+- The foot (pelican's webbed foot) uses animateMotion following a circle of radius 28 around BB, same duration, in phase with one of the pedals. The foot path itself is just a flat shape.
+- The upper leg is a line/ellipse from the body to the foot — can't easily follow the motion. Alternative: make the leg a line drawn from a fixed hip point to the moving foot — animating the line's endpoint is possible with `<animate attributeName="x2">`… but for a line element, animating x1/y1/x2/y2 works. So: a leg line from hip (330, 270) to foot position; the foot moves on a circle of radius 28 around (375, 385). Animate x2 from 375+28*cos… that needs keyframes; use values: x2 values "403;393;375;357;347;375" etc. Actually, for a circle: angle t: x = 375 + 28 cos t, y = 385 + 28 sin t. Sampling at 8 points: 0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°:
+cos: 1, .707, 0, -.707, -1, -.707, 0, .707 → x: 403, 394.8, 375, 355.2, 347, 355.2, 375, 394.8
+y: 385, 404.8, 413, 393.2, 385, 365.2, 357, 376.8
+Hmm, but to match the pedal phase we need to know where the pedal is at t=0. We can set both crank rotation and foot motion to start at angle 0 (right side, i.e., x = BB + 28, y = 385). Crank rotate from 0 to 360. Foot animateMotion path: a circle starting at (403,385) going clockwise? In SVG, positive rotate is clockwise (since y is downward). animateTransform rotate 0→360 is clockwise. The pedal at t=0 is at (403,385). After 90° (a quarter), it's at (375, 413) (down). So the foot should follow: start (403, 385) → (375, 413) → (347, 385) → (375, 357) → (403, 385). Use animateMotion with path "M403,385 A28,28 0 1 1 403,384.9" hmm, a closed circle path: "M 403 385 A 28 28 0 1 1 375 413 A 28 28 0 1 1 347 385 A 28 28 0 1 1 375 357 A 28 28 0 1 1 403 385". That's a full circle going clockwise (down first). With calcMode="linear" it's fine — arcs give a circular path.
+
+And the leg line: animate x2/y2 with values matching 4 samples: "403;375;347;375;403" and y2: "385;413;385;357;385", dur 1s, keyTimes "0;.25;.5;.75;1", calcMode linear. Linear interpolation between the 4 quadrant points approximates the circle well enough.
+
+Also add the second (far-side) leg — a pedal on the opposite side, starting from angle 180: (347,385) → (375,357) → (403,385) → (375,413) → (347,385). Draw it in a darker color and put it behind the bicycle frame.
+
+Pelican body bobbing: translate y by ±3 at 2x the crank frequency (the body rises twice per revolution). animateTransform values "0 0; 0 -3; 0 0; 0 -3; 0 0", dur 1s? Actually, with rotation 1s per revolution, 2 bobs per revolution: values "0 0;0 -3;0 0;0 -3;0 0" dur="1s". But the hip point (leg origin) is part of the pelican group and bobs up and down, while the leg endpoint follows the crank — as long as the hip is part of the pelican group with its own transform, animating the x2/y2 of the line drawn in the same group is fine. Since the leg is a child of the pelican group, its coordinates are in the group's local space; the bobbing transform applies to both the hip and the foot endpoint, adding a small offset to the foot — that's visually acceptable (in fact, having the whole body bob slightly while the feet follow the pedals, the legs stretching, is exactly how real cycling looks).
+
+Background: clouds, and moving ground dashes or road markings, moving left at speed matching the wheel rotation. Circumference = 2πr ≈ 2π*45 ≈ 283 units per revolution. If wheels rotate in 1 second (fast), background moves 283 units per second. Let me slow things down: dur 1.2s per revolution → 236 units per second. Hmm, fast but this is an animation demo. Should I set the wheels at 2s per rotation to slow it down? That's very slow for a bike. Let me go with 1.5s per revolution → about 188 units/s. Background: a group of dashes spanning width 800, animate transform translate from 0 to -283 (one circumference) with dur 1.5s, repeatCount indefinite — seamless loop. For simplicity, let me set the wheel radius to 45 and make the background pattern period 283 (≈ 2π×45). Or radius 45, circumference 282.74; make the road pattern period exactly 282.74? Ugly. Alternative: pick a radius such that circumference is 300: r = 47.75. Or r = 50 → circumference 314.16, use 314. Then dash pattern period 314. Let's use r=50 for wheels.
+
+Wheel geometry: r=50. Rear center (240, 380), front (560, 380). Bottom bracket (370, 380)? Distance BB→rear = 130, BB→front = 190. Crank radius 30, circle at BB.
+
+Seat post top (330, 280); saddle at (330, 272). Head tube top (548, 272); fork from (552, 285) to front wheel center (560,380). Handlebar stem from (548, 272) to (545, 250), grip curving back toward rider: (545,250) to (520, 245)? Pelican wings/hands — pelicans don't have hands; the wings grip the handlebars. Draw one wing extending from the body to the handlebars (like an arm).
+
+Pelican:
+- Body: ellipse center (320, 250), rx 42, ry 30, slightly rotated.
+- Tail: small feathers at the back (285, 255).
+- Neck: path curving up from the front of the body (350, 235) to the head (410, 180). Use a thick stroke or filled shape. Easier: a path with stroke width ~16? A filled shape looks better: draw the neck as a curved quad strip.
+- Head: circle at (415, 178), r 13.
+- Beak: upper beak is (425, 172) to (490, 180), thin triangle; pouch: a path curving down from (426, 180) to (487, 184) then back to (426, 180)… Pelican beak with pouch:
+  - Upper line: M 425 170 L 495 182 (slight curve)
+  - Pouch: M 425 170 C 455 178, 480 180, 495 182 C 478 205, 440 205, 428 184 Z — forming the pouch under the beak.
+  Let me design: beak tip at (500, 183). Upper beak from (427, 168) to (500, 183). Pouch: curve from (427,172) down to (470, 200) and up to (500,183). Fill with yellow-orange.
+- Eye: white circle r 3.5 at (418, 172), pupil r 1.8.
+- Wing: ellipse-like path from the shoulder (345, 235) to the handlebar (540, 250): a curved arm. The wing as a filled shape: M 340 235 C 380 230, 470 245, 535 250 C 470 262, 380 258, 335 250 Z — like a slightly tapered arm reaching to the handlebar. Add a small hand/flipper circle at the end (537, 250).
+- Legs: hip (330, 272) to the foot.
+
+Feet: webbed, small yellow shape (triangle-ish). animateMotion foot: circle r=30 around (370,380): starting angle 0: (400, 380) → down (370,410) → left (340,380) → up (370,350). Path: M400 380 A30 30 0 1 1 370 410 A30 30 0 1 1 340 380 A30 30 0 1 1 370 350 A30 30 0 1 1 400 380.
+
+Crank group: rotates about (370,380), contains:
+- Crank arm: line from (370,380) to (400,380), and its opposite side to (340,380).
+- Pedal: small rectangle at (398,376), width 14, height 6 (near side) and at (328,376)… the pedal should be roughly horizontal even as it rotates — in real bikes the pedals stay horizontal (pedal axle spins), but in cartoons rotating pedals are fine. For simplicity: pedals rotate with the crank (as small rectangles). It's a standard cartoon.
+- Chainring circle at BB: circle r 12 stroke.
+- Chain: from chainring to the rear wheel hub: two lines from (370,380) area to (240,380) — approximate as an ellipse-ish path: chain: M 370 368 L 252 372 … simpler: line from (370,371) to (245,375) and (370,389) to (245,385), or a small path. Draw the chain as a path: M 370 370 L 244 374 M 370 390 L 244 386, with dashes to suggest links. Could add a dashed animation to suggest the chain moving (stroke-dashoffset animation). Nice touch: animate stroke-dashoffset to give the chain motion. Dash period 8, animate dashoffset from 0 to -16 per… The chain speed matches the wheel surface: circumference 2π*50 = 314 per 1.5s; the chainring has smaller radius (r=12) but same linear speed: dash offset change per 1.5s = 314. That's a lot of dashes; visually fine (fast). Maybe I should skip it; keep the chain static or lightly dashed and animate the offset 0→32 over 1.5s? The chain loop length = 2*π*12 + 2*distance(126) ≈ 75+252=327 ≈ almost 314. Let me use 0 to 327? dashoffset animation values 0;327 with dur 1.5s. Hmm, if the pattern length is 16, then 327 isn't a multiple — there's a seam in the loop. The dash period should evenly divide the total offset to make it seamless: 320 over 1.5s? Close enough visually; small jump. Or 327/16 = 20.4 periods — the seam is small. Honestly, nobody will notice; but to be safe, use dash pattern 8+8=16, offset 0 → -320 (20 periods) over 1.5s, speed ≈ 213/s vs. wheel 209/s — negligible.
+
+Wheel rotation: spokes. Each wheel: circle rim (r50, thick stroke), inner rim circle r 44?, hub r 6, spokes: lines from hub to rim at 0, 45, …, 315. Group centered at wheel center, animateTransform rotate 0→360, dur 1.5s.
+
+Background: sky gradient rectangle, sun, clouds (2–3 groups animated to move left and wrap), a road: rectangle for asphalt from y=430 to 470, a dashed center line at y=450 with period 314: dashes of width 80, gap 234. Group of dashes with translate x 0 to -314 with dur 1.5s repeat. Also a grass area and small bushes/trees that scroll? A moving ground line below the wheels: the wheels touch the ground at y = 380+50 = 430. So road top edge is y=430. The road rectangle from 430 to 500. Dashed line at 465.
+
+Also add motion lines behind the pelican for effect, maybe animate opacity.
+
+Bobbing: the pelican+bicycle frame? The bike frame stays fixed; the pelican bobs slightly. Also animate the beak? No, keep it simple.
+
+Wing flap? The wing grips the handlebar; a subtle rotation of the wing (±3°) about the shoulder is possible. Optional; add a small rotation animation for a sense of life: animateTransform rotate values "-2 340 235; 2 340 235; -2 340 235" dur 1.5s.
+
+Also head bobbing: subtle.
+
+Clouds: 3 clouds, each a group of circles/ellipses; animate translate from 850 to -200 with different dur (parallax, slower than ground): dur 18s, 25s, 30s, repeatCount indefinite, begin offsets for distribution (e.g., begin="-5s"). Use negative begin to distribute initially.
+
+Sun with slowly rotating rays? Sun is stationary, fine.
+
+Also a few distant birds? Skip.
+
+Let me also add title/desc for accessibility.
+
+Now, exact coordinates:
+
+viewBox="0 0 800 500".
+
+Sky: rect 0 0 800 500 fill url(#sky).
+Sun: circle (700, 80) r 38, fill #FFD54F; maybe a halo circle r 50 with opacity .3.
+Clouds:
+Cloud shape: group of ellipses: e.g.
+  <g id="cloud"><ellipse cx="0" cy="0" rx="40" ry="18"/><ellipse cx="30" cy="-10" rx="30" ry="16"/><ellipse cx="-30" cy="-8" rx="28" ry="14"/></g> fill white opacity .9.
+Use <use> 3 times with different y and animation. Each use can't have its own animateTransform child? An animateTransform inside a <use> is possible — the animation is a child of use and applies to it. Yes, we can put an <animateTransform> inside a <use> element. Or wrap each use in a g and animate the g. Wrap in g for clarity.
+
+Ground/road: rect 0 430 800 70 fill #4E4E58? Road #555. Grass strip: rect 0 415 800 15 fill #7CB868? Actually the wheels touch at 430; grass between the horizon and the road: rect y 400..430 green, and above that is sky. Let's do: sky 0..400, distant hills? Simple: grass rectangle 0 396 800 34 (#8BC34A darker #6B9E4F), road rectangle 0 430 800 70 (#4A4A55), and a road line at the top edge of the road: rect 0 430 800 4 white dashed? Center dashes: a group of white rects of width 90 height 6, y 462, with x offsets 0,314,628, 942 (extra for wrap), animate group translate 0 → -314, dur 1.5s.
+
+Wheel contact: cy=380, r=50 → bottom at 430 = road top edge. Good.
+
+Bicycle (frame color #E63946 or teal #2A9D8F; let me pick a red frame #D62828 and dark gray details):
+- Rear wheel group at (240,380); front at (560,380).
+- Tires: circle r 50, stroke #222 width 8, fill none? Then rim circle r 43, stroke #999 width 3; spokes: 6 lines (12 ends) from center to r 43, stroke #777 width 2; hub circle r 5 fill #333.
+- Spoke lines at angles 0, 60, ..., 300: endpoints: for r 43: 0°: (43,0); 60°: (21.5, 37.2); etc. Just write 6 <line> elements with computed coords, or simpler: use a path with lines through center: line from (-43,0) to (43,0), (−21.5,−37.2) to (21.5,37.2), (−21.5,37.2) to (21.5,−37.2). 3 lines through the hub = 6 spokes.
+
+animateTransform: type rotate, from "0 0 0" to "360 0 0" (group local coords centered at 0,0 since we wrap the group with a translate), dur 1.5s, repeat indefinite. Wrap: <g transform="translate(240 380)"> <g> ...wheel... <animateTransform .../> </g> </g>.
+
+Frame lines (stroke #D62828, width 7, stroke-linecap round):
+- Chain stay: 240,380 → 370,380
+- Seat tube: 370,380 → 332,272
+- Down tube: 370,380 → 549,282
+- Top tube: 335,278 → 549,282 (nearly horizontal)
+- Fork: 555,270 → 560,380 (stroke gray #555, width 6)
+- Head tube: 549,282 → 555,270 (part of the frame red)
+- Seat post: 332,272 → 328,252 (width 5 gray); saddle: rotated path/ellipse: a path M 306 252 Q 328 244 352 252 Q 330 260 306 252 Z fill #222. Or a rounded rectangle: rect x 304 y 248 width 50 height 8 rx 4 fill #333, slightly rotated -5 about (329,252).
+- Handlebars: stem 555,270 → 548,246 (gray 5); bar: path M 548 246 C 540 238, 528 236, 518 240 (curving back toward the rider) gray width 5; grip: line from (518,240) to (508,238), width 7, black.
+
+Crank group at (370,380):
+- Chainring: circle r 12, stroke #333, width 3, fill none (inside the crank group so it rotates — the chainring rotation isn't visible with no teeth, fine).
+- Crank arm: line 0,0 → 30,0 and 0,0 → -30,0, stroke #222 width 5.
+- Pedal: rect x 26 y -4 width 16 height 8 rx 2 fill #333 (near-side pedal at +30) and rect x -42 y -4 width 16 height 8 (opposite side at -30).
+- Rotate 0→360, dur 1.5s.
+
+Chain: path M 370 368 L 252 372 … simpler: line from (370,371) to (245,375) and (370,389) to (245,385), or a small path. Draw the chain as a path: M 370 370 L 244 374 M 370 390 L 244 386, with dashes to suggest links. Could add a dashed animation to suggest the chain moving (stroke-dashoffset animation). Nice touch: animate stroke-dashoffset to give the chain motion.
+
+Order (drawing): far-side pedal/leg (dark, behind frame), rear wheel, front wheel, frame, chain, crank (crank is above the frame), pelican (above frame, below? wings above frame), near-side leg + foot in front of the crank.
+
+Pelican colors: body white/#F8F9FA, wing #DEE2E6 / #CED4DA, beak orange #F4A261 or #FF9E1B, pouch #FFB627, leg/feet yellow #FFC94D, eye white/black.
+
+Pelican group with bobbing animation:
+<g id="pelican">
+  Bobbing: <animateTransform attributeName="transform" type="translate" values="0 0;0 -3;0 0;0 -3;0 0" keyTimes="0;0.25;0.5;0.75;1" dur="1.5s" repeatCount="indefinite"/>
+  Contents:
+  - Tail: path M 288 252 q -18 -4 -26 -14 q 12 2 20 8 q -10 -14 -6 -22 q 10 6 14 16 q 4 -12 12 -16 … too fiddly; simpler tail: two small triangles: path M 285 245 L 258 232 L 268 248 L 252 244 L 264 256 Z fill #E9ECEF.
+  - Far leg (drawn before body, in front of frame? Actually the far leg is visible through/behind the frame; draw the far leg in front of the pelican body, with darker yellow, with its own animateMotion and hip line).
+  
+  Hmm, hip-to-foot line for the far leg: hip is approximately (322, 268) (slightly behind). The far foot motion path is opposite phase: starting angle 180: (340,380) → up (370,350) → right (400,380) → down (370,410) → back.
+  
+  - Body: ellipse cx 318 cy 248 rx 44 ry 32, fill #F8F9FA, maybe rotate -8 about center: transform="rotate(-8 318 248)".
+  - Belly shading: ellipse cx 315 cy 258 rx 30 ry 18 fill #E9ECEF opacity .8? Optional.
+  - Neck: path: M 344 232 C 368 218, 384 206, 398 190 C 404 182, 404 172, 412 170 … let me draw the neck as a stroke: path M 342 234 C 372 222 392 204 404 186, stroke #F8F9FA, width 16, linecap round. Then the head circle covers the end. Stroke neck is easy and looks smooth.
+  - Head: circle 412 176 r 14 fill #F8F9FA.
+  - Eye: circle 417 171 r 3.2 white? The head is already whitish; eye: white circle r 3.5, pupil r 1.8 #222, at (418, 171).
+  - Beak:
+    Upper: path M 423 166 L 498 181 Q 500 184 496 184 L 428 176 Z fill #FFB627? Let me design a cleaner pelican beak:
+      - Upper beak (sharp, thin): M 424 165 L 500 181 C 502 183 500 185 497 184 L 426 174 Z — a long wedge from (424,165) to tip (500,182).
+      - Pouch (lower, sagging): M 427 176 L 498 184 C 492 202 470 208 452 202 C 438 197 429 188 426 178 Z fill #F4A261 (a bit darker).
+    Simpler alternative: whole beak as one orange shape + a pouch path overlaid in darker orange.
+  - Wing/arm to handlebars: path M 336 236 C 380 230 470 240 536 246 L 536 252 C 480 258 390 256 338 250 Z fill #DEE2E6; hand: circle 537 249 r 7 fill #DEE2E6. Add a wing flap animation: rotate -2..2 about (340, 243). The wing must reach the grip at (518,240); handle the grip position — the grip is around (510, 239). Hand at (518, 240)? Let me place the handlebar grip end at (512, 238) and the hand circle at (516, 240) r 7. Adjust the wing path end to (516, 244).
+
+  Let me fix the handlebars: stem from head tube (555,272) to (548,244). Bar path M 548 244 C 542 236 530 233 518 237 stroke #444 width 5. Grip: line (518,237)-(508,239) width 8 #222. Hand at (512, 240) r 7. Wing goes from shoulder (340,240) to (512,240): path M 338 234 C 390 228 460 232 512 238 L 512 246 C 460 252 390 252 340 250 Z.
+
+  - Near leg: line from hip (330, 272) to foot, stroke #FFC94D width 6, with animating x2/y2. Foot: a webbed foot shape — group with animateMotion: path M -8 0 L 10 -2 L 6 6 L -8 4 Z? Let's make the foot: path "M0 0 L14 -3 L16 4 L2 6 Z" fill #FFC94D, with the ankle point as the motion point. The animateMotion moves the element along a path; the element's (0,0) is at the motion point. So define the foot path around the origin: e.g., M -2 -3 L 16 -2 L 12 6 L -2 5 Z (toes pointing down-right). The leg line endpoint should coincide with the motion point: the leg's x2/y2 animation values match the same circle points as the motion keyTimes.
+
+Near leg values (hip 330 272): x2: 400;370;340;370;400, y2: 380;410;380;350;380, keyTimes 0;.25;.5;.75;1, dur 1.5s.
+Near foot animateMotion path: M 400 380 A 30 30 0 1 1 370 410 A 30 30 0 1 1 340 380 A 30 30 0 1 1 370 350 A 30 30 0 1 1 400 380, dur 1.5s, rotate="0"? No, no rotation.
+
+Wait: the crank's starting position is pedal +30 → (400,380). The crank rotates 0→360 (clockwise, since in SVG y is down positive angles are clockwise). At t=.25: pedal at 90° clockwise from +x: (0, +30) → (370, 410). Matches the foot path going down first. Good.
+
+Far leg: hip (322, 268) [behind], foot starting opposite: at angle 180: (340, 380) → next 90° cw: 270° position = (0,-30) → (370, 350) → (400, 380) → (370, 410) → (340, 380). Far leg x2: 340;370;400;370;340; y2: 380;350;380;410;380. Far foot motion: M 340 380 A 30 30 0 1 1 370 350 A 30 30 0 1 1 400 380 A 30 30 0 1 1 370 410 A 30 30 0 1 1 340 380. Far foot/leg drawn before the frame (behind), in a darker color #E8A93C.
+
+The far leg/foot is in front of the rear wheel/frame — order: sky, sun, clouds, road, chain dashes, far leg + far foot, rear wheel, front wheel, frame + forks + seat + handlebars, chain, crank, pelican body group (with bobbing) including the near leg and foot.
+
+Note: the near foot should be drawn on top of the crank (foot above the pedal). So near leg + foot after the crank group. Good.
+
+The pelican's bobbing animation applies to the whole pelican group including the near leg line and the hip — the foot endpoint animates in local coords and gets translated by the bobbing; the offset is small, so fine.
+
+But note: the near foot's animateMotion is inside the bobbing group — the motion path is also in local coords, and the whole thing bobs; fine.
+
+The far leg should also bob? The far leg belongs to the pelican; put the far leg in its own group with the same bobbing animation (values are the same). Or put the far leg before the bicycle, in a group with the same bobbing animation. Add the same bobbing animation to the far leg group so both move together.
+
+Chain: path M 370 368 L 252 372 … simpler: line from (370,371) to (245,375) and (370,389) to (245,385), or a small path. Draw the chain as a path: M 370 370 L 244 374 M 370 390 L 244 386, with dashes to suggest links. Could add a dashed animation to suggest the chain moving (stroke-dashoffset animation). Nice touch: animate stroke-dashoffset to give the chain motion. Dash period 8, animate dashoffset from 0 to -16 per… The chain speed matches the wheel surface: circumference 2π*50 = 314 per 1.5s; the chainring has smaller radius (r=12) but same linear speed: dash offset change per 1.5s = 314. That's a lot of dashes; visually fine (fast). Maybe I should skip it; keep the chain static or lightly dashed and animate the offset 0→32 over 1.5s? The chain loop length = 2*π*12 + 2*distance(126) ≈ 75+252=327 ≈ almost 314. Let me use 0 to 327? dashoffset animation values 0;327 with dur 1.5s. Hmm, if the pattern length is 16, then 327 isn't a multiple — there's a seam in the loop. The dash period should evenly divide the total offset to make it seamless: 320 over 1.5s? Close enough visually; small jump. Or 327/16 = 20.4 periods — the seam is small. Honestly, nobody will notice; but to be safe, use dash pattern 8+8=16, offset 0 → -320 (20 periods) over 1.5s, speed ≈ 213/s vs. wheel 209/s — negligible.
+
+Wheels: rotate 0→360, dur 1.5s.
+
+Background: sky gradient rectangle, sun, clouds (2–3 groups animated to move left and wrap), a road: rectangle for asphalt from y=430 to 470, a dashed center line at y=450 with period 314: dashes of width 80, gap 234. Group of dashes with translate x 0 to -314 with dur 1.5s repeat. Also a grass area and small bushes/trees that scroll? A moving ground line below the wheels: the wheels touch the ground at y = 380+50 = 430. So road top edge is y=430. The road rectangle from 430 to 500. Dashed line at 465.
+
+Also add motion lines behind the pelican for effect, maybe animate opacity.
+
+Let me also add title/desc for accessibility.
+
+Now, exact coordinates:
+
+viewBox="0 0 800 500".
+
+Sky: rect 0 0 800 500 fill url(#sky).
+Sun: circle (700, 80) r 38, fill #FFD54F; maybe a halo circle r 50 with opacity .3.
+Clouds:
+Cloud shape: group of ellipses: e.g.
+  <g id="cloud"><ellipse cx="0" cy="0" rx="40" ry="18"/><ellipse cx="30" cy="-10" rx="30" ry="16"/><ellipse cx="-30" cy="-8" rx="28" ry="14"/></g> fill white opacity .9.
+Use <use> 3 times with different y and animation. Each use can't have its own animateTransform child? An animateTransform inside a <use> is possible — the animation is a child of use and applies to it. Yes, we can put an <animateTransform> inside a <use> element. Or wrap each use in a g and animate the g. Wrap in g for clarity.
+
+Ground/road: rect 0 430 800 70 fill #4E4E58? Road #555. Grass strip: rect 0 415 800 15 fill #7CB868? Actually the wheels touch at 430; grass between the horizon and the road: rect y 400..430 green, and above that is sky. Let's do: sky 0..400, distant hills? Simple: grass rectangle 0 396 800 34 (#8BC34A darker #6B9E4F), road rectangle 0 430 800 70 (#4A4A55), and a road line at the top edge of the road: rect 0 430 800 4 white dashed? Center dashes: a group of white rects of width 90 height 6, y 462, with x offsets 0,314,628, 942 (extra for wrap), animate group translate 0 → -314, dur 1.5s.
+
+Wheel contact: cy=380, r=50 → bottom at 430 = road top edge. Good.
+
+Bicycle (frame color #E63946 or teal #2A9D8F; let me pick a red frame #D62828 and dark gray details):
+- Rear wheel group at (240,380); front at (560,380).
+- Tires: circle r 50, stroke #222 width 8, fill none? Then rim circle r 43, stroke #999 width 3; spokes: 6 lines (12 ends) from center to r 43, stroke #777 width 2; hub circle r 5 fill #333.
+- Spoke lines at angles 0, 60, ..., 300: endpoints: for r 43: 0°: (43,0); 60°: (21.5, 37.2); etc. Just write 6 <line> elements with computed coords, or simpler: use a path with lines through center: line from (-43,0) to (43,0), (−21.5,−37.2) to (21.5,37.2), (−21.5,37.2) to (21.5,−37.2). 3 lines through the hub = 6 spokes.
+
+animateTransform: type rotate, from "0 0 0" to "360 0 0" (group local coords centered at 0,0 since we wrap the group with a translate), dur 1.5s, repeat indefinite. Wrap: <g transform="translate(240 380)"> <g> ...wheel... <animateTransform .../> </g> </g>.
+
+Frame lines (stroke #D62828, width 7, stroke-linecap round):
+- Chain stay: 240,380 → 370,380
+- Seat tube: 370,380 → 332,272
+- Down tube: 370,380 → 549,282
+- Top tube: 335,278 → 549,282 (nearly horizontal)
+- Fork: 555,270 → 560,380 (stroke gray #555, width 6)
+- Head tube: 549,282 → 555,270 (part of the frame red)
+- Seat post: 332,272 → 328,252 (width 5 gray); saddle: rotated path/ellipse: a path M 306 252 Q 328 244 352 252 Q 330 260 306 252 Z fill #222. Or a rounded rectangle: rect x 304 y 248 width 50 height 8 rx 4 fill #333, slightly rotated -5 about (329,252).
+- Handlebars: stem 555,270 → 548,246 (gray 5); bar: path M 548 246 C 540 238, 528 236, 518 240 (curving back toward the rider) gray width 5; grip: line from (518,240) to (508,238), width 7, black.
+
+Crank group at (370,380):
+- Chainring: circle r 12, stroke #333, width 3, fill none (inside the crank group so it rotates — the chainring rotation isn't visible with no teeth, fine).
+- Crank arm: line 0,0 → 30,0 and 0,0 → -30,0, stroke #222 width 5.
+- Pedal: rect x 26 y -4 width 16 height 8 rx 2 fill #333 (near-side pedal at +30) and rect x -42 y -4 width 16 height 8 (opposite side at -30).
+- Rotate 0→360, dur 1.5s.
+
+Chain: path M 370 368 L 252 372 … simpler: line from (370,371) to (245,375) and (370,389) to (245,385), or a small path. Draw the chain as a path: M 370 370 L 244 374 M 370 390 L 244 386, with dashes to suggest links. Could add a dashed animation to suggest the chain moving (stroke-dashoffset animation). Nice touch: animate stroke-dashoffset to give the chain motion. Dash period 8, animate dashoffset from 0 to -16 per… The chain speed matches the wheel surface: circumference 2π*50 = 314 per 1.5s; the chainring has smaller radius (r=12) but same linear speed: dash offset change per 1.5s = 314. That's a lot of dashes; visually fine (fast). Maybe I should skip it; keep the chain static or lightly dashed and animate the offset 0→32 over 1.5s? The chain loop length = 2*π*12 + 2*distance(126) ≈ 75+252=327 ≈ almost 314. Let me use 0 to 327? dashoffset animation values 0;327 with dur 1.5s. Hmm, if the pattern length is 16, then 327 isn't a multiple — there's a seam in the loop. The dash period should evenly divide the total offset to make it seamless: 320 over 1.5s? Close enough visually; small jump. Or 327/16 = 20.4 periods — the seam is small. Honestly, nobody will notice; but to be safe, use dash pattern 8+8=16, offset 0 → -320 (20 periods) over 1.5s, speed ≈ 213/s vs. wheel 209/s — negligible.
+
+Let me also double-check that the top tube and seat junction look right: seat post top (328, 252), saddle is y ~ 250. Pelican body center (318, 248) — the body is over the saddle (saddle y 250, body bottom 248+32=280). Hmm, body bottom 280 is below the saddle top 250 — the body overlaps the saddle; a sitting pelican's body should rest on top of the saddle: body bottom ≈ saddle top (250). Let me raise the pelican: body center (315, 218), rx 40, ry 30 → bottom 248. Hip (322, 240). Neck goes up to head at (405, 160)? Let me recompute: shoulder (345, 208). Head at (408, 162) r 13. Neck path: M 340 214 C 368 200 388 184 398 168, stroke 15, round.
+Beak: upper M 419 152 L 494 167 …; pouch M 421 164 L 492 172 C 484 192 462 198 445 191 C 431 185 422 174 420 164 Z.
+Wing/handlebar: handlebar grip end (512, 238)? Body front is (355, 215); arm goes from shoulder (348, 212) to grip (512, 238): wing path M 344 206 C 400 202 470 216 512 232 L 512 240 C 470 248 395 240 346 234 Z, hand circle (514, 236) r 7.
+
+Wait, the handlebar: the stem top is (548, 244); the bar curves back to grip (508–518, 237). Hand at (514, 236). The wing goes to the hand. Good.
+
+Saddle is (306–354, 250). Body bottom is 248 — sits nicely on top of the saddle.
+
+Pelican bobbing values "0 0;0 -3;0 0;0 -3;0 0".
+
+Head: subtle rotation? Skip.
+
+Eye: head center (408, 162); eye at (414, 157): white circle r 3.4? The head fill is #F8F9FA (almost white), so white eye is invisible; use a thin stroke: eye: circle (414,157) r 3.2 fill #fff stroke #999 .5, pupil r 1.7 #222. Fine.
+
+Neck stroke color same as body #F8F9FA, width 15.
+
+Small orange cheek? Skip.
+
+Tail: from body rear (278, 214): path M 282 210 L 254 200 L 262 214 L 246 214 L 262 226 L 272 224 Z fill #DEE2E6. Rough but okay. Simpler: path M 284 208 L 252 198 L 260 216 L 248 222 L 280 228 Z.
+
+Let me be careful to keep the shape clean.
+
+Motion lines behind the bike: 3 lines at x 60–180, y 300/330/360, animate translate x from 0 to -120 and opacity? Simpler: lines that fade: <line> with animate on x1/x2? Use a group that translates from 0 to -140 with dur 0.9s, with opacity animation 0;1;0 over same dur, repeat. Two such groups offset in time. Keep it light: skip the motion lines to reduce clutter? It adds a sense of speed. Add a few small speed lines with looping animation.
+
+Also add a subtle wheel rotation "whoosh" — skip.
+
+Timing consistency: 1.5s per wheel revolution → speed 314/1.5 ≈ 209 units/s. Road dashes translate -314 over 1.5s ✓. Clouds: slower (parallax): cloud1 dur 24s (from 850 to -250, i.e., translate values "0 0" to "-1100 0"? Wrap: move from x=850 start to -250 then jump. With animateTransform from "0 0" to "-1100 0", dur 24s, begin "-12s", repeat: cloud jumps from -250 back to 850 — a jump is visible only if the cloud is on screen at that time; the cloud at -250 is fully off-screen (cloud width ~90, so fully hidden), and at 850 fully off-screen (cloud x>800). So it's seamless ✓. The cloud initial position is set via the use's x/y: place the cloud at (0, y) and let the translate animate from 850? Simpler: put the cloud group at translate start "850 0" → end "-250 0". Use values "850 110; -250 110"? animateTransform values must be the complete transform list: values "850 110; -250 110". ✓.
+
+Cloud1: y 90, values "860 90; -260 90", dur 22s, begin 0s.
+Cloud2: y 150, values "860 150; -260 150", dur 30s, begin -14s (starting mid-way).
+Cloud3: y 60, values "860 60; -260 60", dur 26s, begin -20s.
+Negative begin for repeatCount indefinite works (spec: the begin offset may be negative) ✓.
+
+Sun rays: static circle + a subtle pulse in radius? Skip.
+
+Also small flying gulls in the background? Skip.
+
+Road dashes: a group with rectangles at x = -62, 252, 566, 880? Period 314: place rectangles at x = 0, 314, 628, 942 (width 90, y 460, height 7, rx 3, fill #F2F2F2, opacity .9). Animate translate 0 → -314, dur 1.5s, repeat. At translate -314, rectangle 314→0 ✓ seamless. ✓ But the leftmost rectangle at x=0 is partially visible; the rectangle at 942 comes into view. ✓.
+
+Also a curb/road-edge stripe: a solid white line at y 434? Add a rectangle 0 432 800 4 white — static (a solid line doesn't show motion). Fine.
+
+Also a distant green hedge at y 396-430, and maybe a moving fence? A static hedge is enough (distant objects move slowly; static is acceptable… but inconsistent. Slight parallax: hedge pattern translate -314*0.3? Keep it static; fine).
+
+Actually, for better cohesion: a row of small bushes scrolling at 0.5 speed: skip, keep it simple.
+
+Wheel spoke animation: animateTransform inside the inner group: from "0" to "360" — need type rotate and values "0 0 0; 360 0 0"? In the local group centered at 0,0: from "0 0 0" to "360 0 0". dur 1.5s ✓.
+
+Chain animation: path: chainring r 12, at (370,380); rear sprocket r 8, at (240,380). Chain top: from (370, 368) to (240, 372)? Tangent approximation: M 370 368 L 240 372 M 370 392 L 240 388. stroke #333 width 2.5 dasharray 6 4 (period 10), animate stroke-dashoffset 0 → 310 dur 1.5s? Direction: the chain moves: the top strand moves rearward (left) because the wheels rotate clockwise (forward right → in this side view, do the wheels rotate clockwise? Bike moving right: wheels rotate clockwise (top moves right). Hmm: moving right, contact patch at bottom; top of the wheel moves forward (right). That's clockwise when viewed from this side (from a left-side view, does the wheel rotate clockwise as the bike moves right? Let me think: from a left-side view, the bike moves to the right. The wheel rotates clockwise? Take a point at the top of the wheel: it moves in the direction of travel (right). Clockwise rotation (screen: x right, y down): angular velocity positive clockwise: the velocity of the top point under clockwise rotation = ω × r: for clockwise, the top point moves right. Yes, clockwise.)
+So the top of the chain moves right (forward)? The chainring rotates clockwise → the top of the chainring moves right → the chain top strand moves forward (right). The rear sprocket also rotates clockwise → its top moves right, but the chain wraps: the chain top runs from chainring (370) to sprocket (240): the motion at the top is… both pulleys rotate clockwise, the chain top strand moves left? Think of a belt: both pulleys rotate in the same direction (clockwise). The belt's top strand moves from the right pulley to the left pulley? For two identical pulleys with a belt: the top strand's motion is opposite to the bottom strand. The top of the right pulley moves right (clockwise); a belt tangent at the top of the right pulley: the belt must move with the surface: at the top of the right pulley, the surface moves right — but the belt's top strand heads left toward the left pulley. Contradiction? No: belt: both pulleys rotate clockwise (right pulley clockwise, left pulley also clockwise). Top strand: from the top of the left pulley to the top of the right pulley. The surface velocity at the top of the right pulley = rightward… wait, the belt doesn't slip: the belt's top strand velocity equals the surface velocity: at the top of the right pulley, clockwise surface velocity points in the -x direction? Let me compute: clockwise rotation on screen coordinates (y down). Angular velocity vector ω points into the screen (negative z by right-hand rule? In y-down coordinates, positive rotation (mathematically counterclockwise with y up) appears clockwise…). Ugh. Simple: clock face: 12 is up. Clock hands move 12→3: the hand tip moves right at the 12 position? At 12, the tip moves toward 1-2-3, so right. Yes, at the top, clockwise motion is rightward. So the top of a rotating wheel moves right (direction of travel) ✓.
+Belt top strand: at the top of the right pulley, the belt surface moves right — so the belt's top strand moves right at that point, meaning from the left pulley to the right pulley? The belt top strand connects the tops of both pulleys; its velocity is uniform: rightward. So the top strand moves forward (right), toward the bike's front?? That means the chain's top goes from the rear sprocket to the chainring. Hmm, but in a real bike, the top strand goes from chainring to rear cog… the direction of motion: the chainring spins clockwise (as viewed from this side) — no wait, let me actually check: a bike moves right, viewed from the left side. Pedals: the right pedal (far side in our view? We see the left side; the left pedal is near). Chainring clockwise: near-side crank starts pointing right (4 o'clock?)… well, whatever. Both pulleys spin clockwise; belt top strand: at the top of the right pulley, the surface moves right → the belt moves right there → the top strand goes left to right, i.e., from the rear (left) sprocket to the chainring? The top strand runs horizontally between the pulleys; rightward motion = from x=240 to x=370 = from rear to front. Actually in a real bike, the top of the chain moves forward? Let me physically verify with a bicycle: crank forward, right pedal moves forward-and-down… the top strand of the chain: the chainring rotates clockwise (as viewed from left… no, actually a bike's wheels viewed from the left rotate clockwise? Standing facing the front of the bike (from the right side), the wheel rotates clockwise. Viewed from the left side, it rotates counterclockwise. Our side view: let me define the bike moving to the right; we look from the left of the bike. Bike moves right on screen. Wheels rotate: top moves right → from a left side view (our view), that's clockwise (as computed, at the top the clockwise tip moves right). Wait, I think I was wrong earlier: facing a car moving right from its left side, the wheel's top moves right, and the wheel appears to rotate clockwise. Yes. So both pulleys are clockwise; belt top strand moves right (forward) — consistent with reality: the top strand moves forward, and the bottom strand moves backward (left) toward the rear cog.
+
+So chain top strand: rightward = increasing x direction: along the path M 240 372 L 370 368, the direction of travel is +x. For stroke-dashoffset animation: increasing dashoffset shifts dashes backward along the path direction; decreasing (negative) shifts them forward. Path is drawn from 240 to 370 (+x), so we want to move dashes in the +x direction → animate stroke-dashoffset from 0 to -10*n (pattern 10): per revolution, chain linear displacement = wheel circumference 314 → over 1.5s, offset -314? Pattern 10: -314 over 1.5s; a seam? 314/10 = 31.4 cycles — a tiny 0.4*? Jump at the loop = 0.4 pattern units ≈ 0.4 px? Actually a residual offset of 314 mod 10 = 4 → dashes jump 4 px every 1.5s. Slightly visible. Use pattern period 15.7? Choose dasharray "7.85 7.85" period 15.7 → 314/15.7 = exactly 20 ✓ (15.7*20 = 314). dasharray "7.85 7.85", offset 0 → -314, dur 1.5s.
+
+Bottom strand: drawn from 370 to 240, moving left (+ direction of path since path is 370→240) → animate that path's dashoffset 0 → -314 too (direction of travel = along the path direction). Same.
+
+Good detail; include it.
+
+Pedal: rotating pedals look weird (they go vertical). Cartoons often have them rotate; acceptable. Alternatively, animate the pedal rectangle's own rotation opposite to the crank so the pedal stays horizontal: a nested animateTransform on the pedal rectangle: rotate 0→-360 around the pedal center (30,0)/(-30,0). This is a nice touch: the pedal stays level while rotating around the crank. Let me do it: a near pedal group at (30,0), a rectangle x 24 y -3.5 w 14 h 7; an animateTransform rotate from "0 30 0" to "-360 30 0" dur 1.5s. Far pedal similarly around (-30, 0).
+
+And the foot tracks the circle — the foot rests on the level pedal ✓.
+
+Now, the bobbing frequency: the body rises twice per crank revolution (every half-turn the hip reaches its highest point at 180° intervals). Bobbing values "0 0;0 -3;0 0;0 -3;0 0" over 1.5s = 2 cycles per 1.5s ✓ matches.
+
+Phase check: the body is highest when the near crank is at the top? Doesn't need to be perfect.
+
+Slight pelican head bobbing too: skip.
+
+Handlebar bag? Skip.
+
+Basket with fish? A pelican… a basket with a fish would be cute but adds complexity; skip, maybe add a fish in the pouch? A small fish in the pouch: a small fish shape inside the pouch: ellipse (455, 186) rx 8 ry 3.5 fill #4A7C9E + tail triangle. The pouch region is between y ~ 172-195, x 430-490. Fish at (458, 188). Cute. Include: <ellipse cx="458" cy="187" rx="9" ry="3.5" fill="#5B8DBE"/><path d="M449 187 l-6 -4 v8 z" fill="#5B8DBE"/> — wait, the fish tail should be on the rear (left): tail at the left end: path M 449 187 L 442 183 L 442 191 Z. Fish faces right (in the beak). ✓. But the pouch fill is above the fish? Draw the fish after the pouch, and it appears inside the pouch area — but the pouch is closed; the fish would be visible "inside". Fine, cartoonish.
+
+Actually, keep the fish subtle; include it — it's charming.
+
+Beak geometry (head at (408,162) r13 → front of head is x 421, y ~ 162):
+Upper beak: M 420 156 L 496 168 C 499 169 498 172 495 172 L 422 164 Z — wedge; top edge from (420,156) to (496,168); bottom edge from (495,172) to (422,164). Fill #FFB627? Orange-yellow #F9A03F? Let's use #F5A623.
+Pouch: M 422 164 L 495 172 C 488 190 466 198 448 192 C 433 187 424 177 421 165 Z fill #F08A24 (a bit darker). Fish at (456, 186): inside the pouch region (pouch extends y ~165-195, x ~422-495, deepest around (455, 193)). Fish at (455, 187) rx 9: x 446-464, y 183.5-190.5 — roughly inside. ✓ Draw order: pouch, then fish, then a bit of pouch front on top? Skip overlaying.
+
+Upper beak is drawn after the pouch so its line is crisp.
+
+Wing shape: from shoulder (346, 210) to hand (512, 234):
+M 342 204 C 400 198 462 210 510 228 L 512 240 C 462 250 396 246 344 238 Z fill #DDE3E8. Add wing flap animation: animateTransform rotate values "-1.5 346 222; 1.5 346 222; -1.5 346 222" dur 1.5s. Slight.
+
+Hand: circle (513, 234) r 7 fill #DDE3E8 — gripping the handlebar: the grip line is at (508,237)-(518,235)? Set the bar path: M 548 244 C 544 236 532 232 520 234; grip: line (520,234)-(508,236) width 7 #2b2b2b. Hand circle at (513, 235).
+
+Front fork: head tube: frame line (549, 282)→(556, 268)? Fork from (556, 268) to front hub (560, 380): stroke #6b6b6b width 6. Stem (554, 272)→(548, 244).
+
+Let me finalize the frame red lines (stroke #D94F3D? Let me pick #E63946 a nice red):
+- Chain stay: M 240 380 L 370 380
+- Seat tube: M 370 380 L 332 274
+- Down tube: M 370 380 L 549 284
+- Top tube: M 335 280 L 549 284
+- Head tube: M 549 284 L 556 266
+Width 7.
+
+Saddle: path M 304 252 C 312 246 344 246 354 250 C 344 258 314 258 304 252 Z fill #262626. Seat post: line 330 252 → 334 274 #444 width 5.
+
+The pelican sits with body bottom at 248: overlaps saddle top 246-252 ✓.
+
+Hip (324, 240).
+
+Near leg: line (324, 240) → (400, 380)?? Wait, the near foot circle is centered at BB (370,380) with r30: points (400,380), (370,410), (340,380), (370,350). Line from hip (324,240) to those. Leg length ≈ 140-170; fine.
+
+Near foot path around origin (ankle 0,0): webbed foot: M -3 -2 L 15 -1 L 13 5 L -3 4 Z fill #F5A623. Slightly pointing down-right. Ankle joint: leg line endpoint at the motion point (0,0) — the foot extends +x (forward). OK.
+
+Foot scale ~18px wide — small but fine.
+
+Far foot darker #D98E1F.
+
+The far leg is drawn in front of the wheels (behind), with the bobbing animation, darker.
+
+Also, does the far foot go behind the crank? It's behind everything bike-related — fine.
+
+Sun: circle (702, 84) r 36 fill #FFD34D; halo circle r 52 fill #FFD34D opacity 0.25.
+
+Sky gradient: linearGradient id="sky" x1 0 y1 0 x2 0 y2 1: #7EC8E3? Let me do: 0% #8ED0F0? Nice: #86C9F2 → #E8F6FD at horizon.
+
+Grass: rect 0 398 800 32 fill #7FBF6A; darker strip rect 0 398 800 6 #69A857? Keep to one.
+
+Road: rect 0 430 800 70 fill #4D4F57. Curb line: rect 0 430 800 5 fill #F5F5F5 opacity .85? Solid white line at the top of the road ✓.
+
+Dashes at y 462 h 7.
+
+Shadow under bike: ellipse (400, 432) rx 190 ry 8 fill #000 opacity .12 — subtle, static.
+
+Speed lines: group: lines at (90,300)-(150,300), (60,332)-(140,332), (95,364)-(155,364) stroke #fff opacity .7 width 4 linecap round; animateTransform translate values "0 0; -160 0" dur .8s; opacity "0;.9;0" dur .8s; repeat. Second set begin -0.4s, slightly different y? One set is enough.
+
+Title/desc: "Pelican riding a bicycle".
+
+Now let me write the SVG. Use xmlns. Width/height 800/500 with viewBox.
+
+Double-check animateMotion: <animateMotion path="M400 380 A30 30 0 1 1 370 410 A30 30 0 1 1 340 380 A30 30 0 1 1 370 350 A30 30 0 1 1 400 380" dur="1.5s" repeatCount="indefinite"/>. Arc sweep flag: from (400,380) to (370,410): going clockwise (right → down). SVG arc: sweep-flag 1 = positive angle direction = clockwise in screen coordinates (y down)? Positive angles are clockwise on screen (x right, y down). In an arc, sweep=1 draws in the "positive angle" direction, which appears clockwise on screen. From (400,380) to (370,410) around center (370,380): start angle 0° (pointing +x from center), end angle 90° (pointing +y, i.e., down on screen). 0° to 90° positive = clockwise on screen = sweep 1 ✓. With large-arc 0, 90° arc ✓. All 4 arcs use sweep 1 ✓.
+
+animateTransform on the leg? No, use animate x2/y2:
+Near:
+<line x1="324" y1="240" x2="400" y2="380" stroke...>
+  <animate attributeName="x2" values="400;370;340;370;400" keyTimes="0;0.25;0.5;0.75;1" dur="1.5s" repeatCount="indefinite"/>
+  <animate attributeName="y2" values="380;410;380;350;380" ... />
+The foot path's motion point equals these ✓ (linear approximation vs. arc — slight mismatch where the foot is on the arc and the leg is on the chord; the 30px chord-sag is minimal. The foot's animateMotion follows the arc while the leg follows the linear keyframes — a small offset of ~1.4px mid-interval (30*(1-cos(22.5°)) ≈ 1.35). Fine.
+
+Pedal stays horizontal: near pedal group:
+<g>
+ <rect x="23" y="-3.5" width="16" height="7" rx="1.5" fill="#222"/>
+ <animateTransform attributeName="transform" type="rotate" from="0 30 0" to="-360 30 0" dur="1.5s" repeatCount="indefinite"/>
+</g>
+Inside the crank group (which itself rotates 0→360 around the origin) — net pedal rotation = 360-360 = 0 ✓ stays horizontal.
+
+Crank arms: line (0,0)-(30,0) and (0,0)-(-30,0), stroke #333 width 5. Chainring circle r 12 stroke #333 width 3 fill none — rotates (invisible). Hub dot circle r 3 #111.
+
+Order inside the crank group: chainring, arms, pedals, hub.
+
+Crank group placement: <g transform="translate(370 380)"> <g> … <animateTransform rotate 0→360 around (0,0)> </g></g>.
+
+The far leg and far foot group needs the bobbing animation identical to the pelican's bobbing:
+<g> bobbing animation <line far leg with x2/y2 animation/> <far foot g with animateMotion/></g>
+Same values/timing/dur → synchronized (SMIL starts both at document start; with the same dur and keyTimes, both start at t=0 and stay synchronized ✓).
+
+Pelican group content order:
+1. Far leg + far foot group (with bobbing) — but these should be drawn behind the bike wheels/frame. So they need to be before the bike in document order. But the pelican group (bobbing) comes after. So two separate groups with the same bobbing animation: far leg group before the wheels; pelican body group after the crank. ✓ Both have identical bobbing animations.
+
+2. Pelican (near) group:
+ - Tail
+ - Body ellipse
+ - Neck stroke
+ - Head
+ - Eye
+ - Beak pouch, fish, upper beak
+ - Wing (with flap animation) + hand
+ - Near leg (line with x2/y2 animation)
+ - Near foot g with animateMotion
+ The near leg is drawn on top of the crank? Drawn inside the pelican group after the crank in document order ✓.
+
+Wait — the far foot is also behind the rear wheel: the far foot's circle (r30 around (370,380)) overlaps the rear wheel region (rear wheel spans x 190-290; the foot's circle spans x 340-400) — actually no overlap (the rear wheel's right edge is 290 < 340) ✓ no visual conflict; but behind the chainstay/frame — draw in front of the frame ✓.
+
+Bobbing values: "0 0; 0 -3; 0 0; 0 -3; 0 0", keyTimes "0;0.25;0.5;0.75;1", dur 1.5s. calcMode linear (default) is fine.
+
+Wing flap: animateTransform type rotate values "-2 346 222; 2 346 222; -2 346 222" keyTimes "0;0.5;1" dur 1.5s repeat. Subtle ✓.
+
+Speed lines: place at x 60-160 to the left of the rear wheel (wheel left edge 190) ✓ behind the bike.
+
+Road dashes: rectangles at x = 0, 314, 628, 942, y 460 w 90 h 7 rx 3.
+
+Cloud definition in <defs> as <g id="cloud">, 3 <use> wrapped in a g? animateTransform on <use> directly works (targets the parent element). <use href="#cloud" ...><animateTransform .../></use> — animation as a child of use: allowed; animates the use's transform. ✓. Use href (SVG2) plus xlink? Modern browsers support href. Add both? To be safe, include the xlink namespace and xlink:href… modern browsers handle href fine. Use href only (cleaner), no need for xmlns:xlink.
+
+Cloud fill: white, opacity .92.
+
+Sun: static.
+
+Distant hills? Add two soft hills at the horizon: path at y ~ 400: M 0 400 Q 200 352 420 400 L 0 400 Z fill #A8D8A0? And another one on the right. Static (distant). Place behind the grass: draw the hills before the grass rectangle (hills sit on the horizon 400, grass covers 400-430). Hills: fill #9CCB86 opacity? Let me do: path M 0 400 C 120 356 260 356 400 400 Z fill #A9D69A; path M 300 400 C 460 344 660 348 800 400 L 800 400 Z fill #93C883. Subtle.
+
+OK, also double-check that the head/beak don't collide with the handlebars (bar y 232-244, x 508-556; the beak tip is at (496,172) — well above ✓).
+
+The neck stroke goes from (340, 212) to (398, 168): head center (408,162) r13: the neck end (398,168) is inside the head ✓.
+
+Body ellipse (315,218) rx40 ry30 rotate(-10 315 218): front edge ~ (353, 210). The wing shoulder (342,204) is on the body ✓.
+
+Saddle x 304-354, under the body center 315 ✓.
+
+The pelican's center-of-mass vibe is fine.
+
+Now, far hip (316, 236) vs. near hip (324, 240).
+
+Write final code with comments. Ensure no syntax errors: all elements closed, attribute quotes.
+
+Let me carefully assemble the full SVG.
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" width="800" height="500">
+  <title>Pelican riding a bicycle</title>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7FC4EE"/>
+      <stop offset="1" stop-color="#EAF7FD"/>
+    </linearGradient>
+    <g id="cloud">
+      <ellipse cx="0" cy="0" rx="42" ry="17" />
+      <ellipse cx="30" cy="-11" rx="28" ry="14" />
+      <ellipse cx="-28" cy="-8" rx="26" ry="13" />
+    </g>
+  </defs>
+
+  <rect width="800" height="500" fill="url(#sky)"/>
+  <circle cx="702" cy="84" r="52" fill="#FFD34D" opacity="0.25"/>
+  <circle cx="702" cy="84" r="36" fill="#FFD34D"/>
+
+  <use href="#cloud" fill="#ffffff" opacity="0.95">
+    <animateTransform attributeName="transform" type="translate" values="860 92; -260 92" dur="26s" repeatCount="indefinite"/>
+  </use>
+  <use href="#cloud" fill="#ffffff" opacity="0.85" transform="scale(0.8)">
+    ... hmm, scale + animated translate conflict: animateTransform replaces the transform attribute (unless additive). If we put a base transform on the use and then an animateTransform (non-additive), the animation overrides it. So bake scale into the values? Use additive="sum" to combine: base transform scale(.8) then the animated translate added after? additive sum: animation is added after the base: T = scale(0.8) * translate(860,92) → effectively scale*860. Messy. Simpler: define a second cloud, or just use the same cloud at a different y with no scale. Skip scale — keep 3 clouds with same size at different y and timing. Fine.
+
+Clouds:
+Cloud1: values "880 92; -240 92" dur 24s begin 0
+Cloud2: values "880 150; -240 150" dur 32s begin -15s
+Cloud3: values "880 58; -240 58" dur 28s begin -8s
+Range: cloud half-width ~ 70 (42+28… extends from -54 to +58). At start x=880: leftmost 826 > 800 ✓ off-screen. At end -240: rightmost -182 < 0 ✓ off-screen. Seamless ✓.
+
+Hills:
+<path d="M0 400 C 120 352 280 352 420 400 Z" fill="#A9D69A"/>
+<path d="M330 400 C 480 342 680 346 800 400 L 800 400 Z" fill="#93C883"/>
+Grass: <rect y="398" width="800" height="32" fill="#7FBF6A"/> — wait, grass is 398-430 covering the hill bases (hills are above 400). Order: sky, sun, clouds, hills, grass, road. Grass covers y 398-430: hill bases 398-400 get covered ✓.
+
+Road: <rect y="430" width="800" height="70" fill="#4D4F57"/>
+Top line: <rect y="431" width="800" height="4" fill="#F4F4F4" opacity="0.9"/>
+Dashes:
+<g fill="#F4F4F4" opacity="0.9">
+  <rect x="0" y="460" width="90" height="7" rx="3"/>
+  <rect x="314" y="460" width="90" height="7" rx="3"/>
+  <rect x="628" y="460" width="90" height="7" rx="3"/>
+  <rect x="942" y="460" width="90" height="7" rx="3"/>
+  <animateTransform attributeName="transform" type="translate" from="0 0" to="-314 0" dur="1.5s" repeatCount="indefinite"/>
+</g>
+A g's child animateTransform: animation as a child of g animates the g ✓.
+
+Shadow: <ellipse cx="400" cy="434" rx="200" ry="7" fill="#000" opacity="0.15"/> — after the road, before the bike.
+
+Speed lines:
+<g stroke="#FFFFFF" stroke-width="4" stroke-linecap="round" opacity="0.8">
+  <line x1="70" y1="306" x2="140" y2="306"/>
+  <line x1="50" y1="338" x2="130" y2="338"/>
+  <line x1="80" y1="370" x2="150" y2="370"/>
+  <animateTransform attributeName="transform" type="translate" from="0 0" to="-150 0" dur="0.9s" repeatCount="indefinite"/>
+  <animate attributeName="opacity" values="0;0.85;0" keyTimes="0;0.5;1" dur="0.9s" repeatCount="indefinite"/>
+</g>
+Both animations on the g ✓.
+
+Far leg group (in front of the wheels):
+<g>
+  <animateTransform attributeName="transform" type="translate" values="0 0; 0 -3; 0 0; 0 -3; 0 0" keyTimes="0;0.25;0.5;0.75;1" dur="1.5s" repeatCount="indefinite"/>
+  <line x1="316" y1="236" x2="340" y2="380" stroke="#D98E1F" stroke-width="5" stroke-linecap="round">
+    <animate attributeName="x2" values="340;370;400;370;340" keyTimes="0;0.25;0.5;0.75;1" dur="1.5s" repeatCount="indefinite"/>
+    <animate attributeName="y2" values="380;350;380;410;380" keyTimes="0;0.25;0.5;0.75;1" dur="1.5s" repeatCount="indefinite"/>
+  </line>
+  <path d="M -3 -2 L 14 -1 L 12 5 L -3 4 Z" fill="#D98E1F">
+    <animateMotion path="M 340 380 A 30 30 0 1 1 370 350 A 30 30 0 1 1 400 380 A 30 30 0 1 1 370 410 A 30 30 0 1 1 340 380" dur="1.5s" repeatCount="indefinite"/>
+  </path>
+</g>
+
+Wheels:
+<g transform="translate(240 380)">
+  <g>
+    <circle r="50" fill="none" stroke="#22252A" stroke-width="9"/>
+    <circle r="43" fill="none" stroke="#9AA0A6" stroke-width="2.5"/>
+    <g stroke="#7A8087" stroke-width="2.5">
+      <line x1="-43" y1="0" x2="43" y2="0"/>
+      <line x1="-21.5" y1="-37.2" x2="21.5" y2="37.2"/>
+      <line x1="-21.5" y1="37.2" x2="21.5" y2="-37.2"/>
+    </g>
+    <circle r="5" fill="#22252A"/>
+    <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="1.5s" repeatCount="indefinite"/>
+  </g>
+</g>
+from="0" to="360" — a single-value rotate is a rotation around the origin of the local system (0,0), i.e., the translated center ✓.
+
+Front wheel is the same, at translate(560 380).
+
+Frame:
+<g stroke="#E63946" stroke-width="7" stroke-linecap="round" fill="none">
+  <line x1="240" y1="380" x2="370" y2="380"/>  chain stay
+  <line x1="370" y1="380" x2="332" y2="274"/>  seat tube
+  <line x1="370" y1="380" x2="549" y2="284"/>  down tube
+  <line x1="335" y1="280" x2="549" y2="284"/>  top tube
+  <line x1="549" y1="284" x2="556" y2="266"/>  head tube
+</g>
+Fork: <line x1="556" y1="266" x2="560" y2="380" stroke="#6B7076" stroke-width="6" stroke-linecap="round"/>
+Stem: <line x1="554" y1="272" x2="548" y2="244" stroke="#6B7076" stroke-width="5" stroke-linecap="round"/>
+Bar: <path d="M 548 244 C 544 236 532 232 520 234" stroke="#444" stroke-width="5" fill="none" stroke-linecap="round"/>
+Grip: <line x1="520" y1="234" x2="508" y2="236" stroke="#26262B" stroke-width="8" stroke-linecap="round"/>
+Seat post: <line x1="330" y1="252" x2="334" y2="274" stroke="#6B7076" stroke-width="5"/>
+Saddle: <path d="M 304 252 C 314 245 344 245 354 250 C 344 258 314 259 304 252 Z" fill="#26262B"/>
+
+Chain:
+<g stroke="#33363B" stroke-width="2.5" fill="none" stroke-dasharray="7.85 7.85">
+  <path d="M 370 368 L 240 372">
+    <animate attributeName="stroke-dashoffset" from="0" to="-314" dur="1.5s" repeatCount="indefinite"/>
+  </path>
+  <path d="M 370 392 L 240 388">
+    <animate attributeName="stroke-dashoffset" from="0" to="-314" dur="1.5s" repeatCount="indefinite"/>
+  </path>
+</g>
+Wait, the bottom strand's direction of travel is leftward (from 370 to 240 = path direction) → dashes advance in the path direction with negative dashoffset ✓.
+Top strand direction: rightward; path is 370→240 (leftward); we want rightward motion = opposite of the path direction → dashoffset positive 314. Hmm, fix: top path from 240 to 370, animate to -314. Let me rewrite:
+Top: <path d="M 240 372 L 370 368"> animate to -314 (forward along path = rightward ✓).
+Bottom: <path d="M 370 392 L 240 388"> animate to -314 (along path = leftward ✓).
+✓.
+
+Hmm, wait, earlier I derived the top moves forward (rightward) ✓.
+
+Crank:
+<g transform="translate(370 380)">
+  <g>
+    <circle r="12" fill="none" stroke="#33363B" stroke-width="3"/>
+    <line x1="0" y1="0" x2="30" y2="0" stroke="#26262B" stroke-width="5" stroke-linecap="round"/>
+    <line x1="0" y1="0" x2="-30" y2="0" stroke="#26262B" stroke-width="5" stroke-linecap="round"/>
+    <g>
+      <rect x="23" y="-3.5" width="16" height="7" rx="1.5" fill="#26262B"/>
+      <animateTransform attributeName="transform" type="rotate" from="0 30 0" to="-360 30 0" dur="1.5s" repeatCount="indefinite"/>
+    </g>
+    <g>
+      <rect x="-39" y="-3.5" width="16" height="7" rx="1.5" fill="#26262B"/>
+      <animateTransform attributeName="transform" type="rotate" from="0 -30 0" to="-360 -30 0" dur="1.5s" repeatCount="indefinite"/>
+    </g>
+    <circle r="3.5" fill="#111214"/>
+    <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="1.5s" repeatCount="indefinite"/>
+  </g>
+</g>
+Far pedal rectangle: centered at -30: x from -38 to -22 → x=-38 width 16: "-38" y -3.5 w 16 ✓ (I wrote -39 earlier; use -38).
+
+Pelican group:
+<g>
+  <animateTransform attributeName="transform" type="translate" values="0 0; 0 -3; 0 0; 0 -3; 0 0" keyTimes="0;0.25;0.5;0.75;1" dur="1.5s" repeatCount="indefinite"/>
+
+  <!-- tail -->
+  <path d="M 284 210 L 252 200 L 262 214 L 248 218 L 264 230 L 282 226 Z" fill="#DDE3E8"/>
+  <!-- body -->
+  <ellipse cx="315" cy="218" rx="40" ry="30" fill="#F8F9FA" transform="rotate(-10 315 218)"/>
+  <!-- neck -->
+  <path d="M 340 212 C 366 202 386 188 398 170" stroke="#F8F9FA" stroke-width="15" stroke-linecap="round" fill="none"/>
+  <!-- head -->
+  <circle cx="408" cy="162" r="13" fill="#F8F9FA"/>
+  <!-- eye -->
+  <circle cx="414" cy="157" r="3.2" fill="#FFFFFF" stroke="#8A8F98" stroke-width="0.6"/>
+  <circle cx="414.6" cy="157.4" r="1.6" fill="#22252A"/>
+  <!-- pouch -->
+  <path d="M 422 164 L 495 172 C 488 190 466 198 448 192 C 433 187 424 177 421 165 Z" fill="#F08A24"/>
+  <!-- fish -->
+  <ellipse cx="456" cy="187" rx="9" ry="3.4" fill="#5B8DBE"/>
+  <path d="M 448 187 L 441 183 L 441 191 Z" fill="#5B8DBE"/>
+  <!-- upper beak -->
+  <path d="M 420 156 L 496 168 C 499 169 498 172 495 172 L 422 164 Z" fill="#F5A623"/>
+  <!-- wing to handlebar -->
+  <g>
+    <path d="M 342 204 C 400 198 462 210 510 228 L 512 240 C 462 250 396 246 344 238 Z" fill="#DDE3E8"/>
+    <circle cx="513" cy="234" r="7" fill="#DDE3E8"/>
+    <animateTransform attributeName="transform" type="rotate" values="-2 346 222; 2 346 222; -2 346 222" keyTimes="0;0.5;1" dur="1.5s" repeatCount="indefinite"/>
+  </g>
+  <!-- near leg -->
+  <line x1="324" y1="240" x2="400" y2="380" stroke="#F5A623" stroke-width="5" stroke-linecap="round">
+    <animate attributeName="x2" values="400;370;340;370;400" keyTimes="0;0.25;0.5;0.75;1" dur="1.5s" repeatCount="indefinite"/>
+    <animate attributeName="y2" values="380;410;380;350;380" keyTimes="0;0.25;0.5;0.75;1" dur="1.5s" repeatCount="indefinite"/>
+  </line>
+  <!-- near foot -->
+  <path d="M -3 -2 L 15 -1 L 13 5 L -3 4 Z" fill="#F5A623">
+    <animateMotion path="M 400 380 A 30 30 0 1 1 370 410 A 30 30 0 1 1 340 380 A 30 30 0 1 1 370 350 A 30 30 0 1 1 400 380" dur="1.5s" repeatCount="indefinite"/>
+  </path>
+</g>
+
+Verify: the pouch path's start (422,164) is below the upper beak's bottom edge (422,164)-(495,172) — same line, so no gap. The upper beak covers the seam ✓. The upper beak's top edge starts at (420,156) near the head (head front is 421,162; the beak attaches at the upper front of the head ✓).
+
+The wing path covers x 342-512, y ~198-250; the head/beak at y ≤ 172 is above the wing ✓ no overlap issues.
+
+The near leg from hip (324,240) — inside the lower body ✓.
+
+The far leg group is drawn before the far wheel: it's behind the wheel/frame, but the far foot circle (340-400 x) doesn't overlap the wheel; it overlaps the chainstay and down tube region — drawn behind ✓.
+
+One more: the far foot/leg should also be below the shadow? The shadow is under everything (drawn in front of the bike) ✓.
+
+Verify that the saddle is below the body: body bottom is (315, 248) rotated; saddle top y≈245-250 ✓ overlap looks like it's sitting ✓.
+
+The bobbing animation moves the pelican up 3px; the saddle stays — a 3px lift is fine.
+
+SMIL details: animateMotion's default calcMode is "paced" → constant speed around the circle; the crank rotate is linear in angle → same constant angular speed ✓ they match (circle at constant speed = same as linear rotation ✓ paced gives uniform arc length speed = uniform angle ✓). The leg line uses linear interpolation between the quadrant points — slight speed ripple, negligible.
+
+All dur=1.5s, begin default 0 → all synchronized.
+
+animateTransform with from/to for rotate: "from" "0" "to" "360" — rotate with a single value is valid ✓.
+
+use element with animateTransform child: valid.
+
+One concern: <use href> — older Safari required xlink. For maximum compatibility, include xlink:href too:
+<use xlink:href="#cloud" href="#cloud" .../> and add xmlns:xlink="http://www.w3.org/1999/xlink". Add the xlink namespace and both attributes. A bit redundant but safe.
+
+Also, cloud fill: fill on the use is inherited into the g's ellipses (no fill specified in defs) ✓.
+
+Road dashes group: g with animateTransform as child ✓.
+
+Re-verify the dash pattern math: dasharray "7.85 7.85" → period 15.7; offset -314 → 314/15.7 = 20 exactly ✓ seamless.
+
+Wheel circumference: 2π*50 = 314.16 ≈ 314 — the dashes use 314 ✓ consistent.
+
+Speed lines: at y 306/338/370 near the bike — they're behind the bike (drawn before the far leg group) ✓ placed at x 50-150, visible to the left of the rear wheel (wheel left edge 240-54.5 = 185.5) ✓.
+
+I think the code is solid. Also a subtle note: <ellipse ... transform="rotate(-10 315 218)"/> ✓.
+
+Eye position: head center (408,162), eye (414,157) is forward-up ✓.
+
+Add <desc>. Fine.
+
+Format: provide the SVG code block with a short intro and a list of features. Keep it concise — the code is the deliverable. Minimal headers; a short bullet list of animations included is nice. Length: the code is long (~120 lines) as expected.
+</think>
+
+Here's a self-contained animated SVG (SMIL animations — just open it in a browser). The wheels and pedals spin, the chain moves, the pelican's feet track the pedals, and the road/clouds scroll to sell the motion:
+
+```svg
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     viewBox="0 0 800 500" width="800" height="500">
+  <title>Pelican riding a bicycle</title>
+  <desc>A cartoon pelican pedals a bicycle down a scrolling road.</desc>
+
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7FC4EE"/>
+      <stop offset="1" stop-color="#EAF7FD"/>
+    </linearGradient>
+    <g id="cloud">
+      <ellipse cx="0" cy="0" rx="42" ry="17"/>
+      <ellipse cx="30" cy="-11" rx="28" ry="14"/>
+      <ellipse cx="-28" cy="-8" rx="26" ry="13"/>
+    </g>
+  </defs>
+
+  <!-- sky, sun, clouds -->
+  <rect width="800" height="500" fill="url(#sky)"/>
+  <circle cx="702" cy="84" r="52" fill="#FFD34D" opacity="0.25"/>
+  <circle cx="702" cy="84" r="36" fill="#FFD34D"/>
+
+  <use xlink:href="#cloud" href="#cloud" fill="#FFFFFF" opacity="0.95">
+    <animateTransform attributeName="transform" type="translate"
+      values="880 92; -240 92" dur="24s" repeatCount="indefinite"/>
+  </use>
+  <use xlink:href="#cloud" href="#cloud" fill="#FFFFFF" opacity="0.85">
+    <animateTransform attributeName="transform" type="translate"
+      values="880 150; -240 150" dur="32s" begin="-15s" repeatCount="indefinite"/>
+  </use>
+  <use xlink:href="#cloud" href="#cloud" fill="#FFFFFF" opacity="0.9">
+    <animateTransform attributeName="transform" type="translate"
+      values="880 58; -240 58" dur="28s" begin="-8s" repeatCount="indefinite"/>
+  </use>
+
+  <!-- hills and ground -->
+  <path d="M 0 400 C 120 352 280 352 420 400 Z" fill="#A9D69A"/>
+  <path d="M 330 400 C 480 342 680 346 800 400 L 800 400 Z" fill="#93C883"/>
+  <rect y="398" width="800" height="32" fill="#7FBF6A"/>
+  <rect y="430" width="800" height="70" fill="#4D4F57"/>
+  <rect y="431" width="800" height="4" fill="#F4F4F4" opacity="0.9"/>
+
+  <!-- scrolling road dashes (one wheel circumference per rotation) -->
+  <g fill="#F4F4F4" opacity="0.9">
+    <rect x="0"   y="460" width="90" height="7" rx="3"/>
+    <rect x="314" y="460" width="90" height="7" rx="3"/>
+    <rect x="628" y="460" width="90" height="7" rx="3"/>
+    <rect x="942" y="460" width="90" height="7" rx="3"/>
+    <animateTransform attributeName="transform" type="translate"
+      from="0 0" to="-314 0" dur="1.5s" repeatCount="indefinite"/>
+  </g>
+
+  <ellipse cx="400" cy="434" rx="200" ry="7" fill="#000000" opacity="0.15"/>
+
+  <!-- speed lines -->
+  <g stroke="#FFFFFF" stroke-width="4" stroke-linecap="round">
+    <line x1="70" y1="306" x2="140" y2="306"/>
+    <line x1="50" y1="338" x2="130" y2="338"/>
+    <line x1="80" y1="370" x2="150" y2="370"/>
+    <animateTransform attributeName="transform" type="translate"
+      from="0 0" to="-150 0" dur="0.9s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0;0.85;0" keyTimes="0;0.5;1"
+      dur="0.9s" repeatCount="indefinite"/>
+  </g>
+
+  <!-- far leg + far foot (behind the bike) -->
+  <g>
+    <animateTransform attributeName="transform" type="translate"
+      values="0 0; 0 -3; 0 0; 0 -3; 0 0" keyTimes="0;0.25;0.5;0.75;1"
+      dur="1.5s" repeatCount="indefinite"/>
+    <line x1="316" y1="236" x2="340" y2="380" stroke="#D98E1F" stroke-width="5" stroke-linecap="round">
+      <animate attributeName="x2" values="340;370;400;370;340" keyTimes="0;0.25;0.5;0.75;1"
+        dur="1.5s" repeatCount="indefinite"/>
+      <animate attributeName="y2" values="380;350;380;410;380" keyTimes="0;0.25;0.5;0.75;1"
+        dur="1.5s" repeatCount="indefinite"/>
+    </line>
+    <path d="M -3 -2 L 14 -1 L 12 5 L -3 4 Z" fill="#D98E1F">
+      <animateMotion path="M 340 380 A 30 30 0 1 1 370 350 A 30 30 0 1 1 400 380
+                          A 30 30 0 1 1 370 410 A 30 30 0 1 1 340 380"
+        dur="1.5s" repeatCount="indefinite"/>
+    </path>
+  </g>
+
+  <!-- rear wheel -->
+  <g transform="translate(240 380)">
+    <g>
+      <circle r="50" fill="none" stroke="#22252A" stroke-width="9"/>
+      <circle r="43" fill="none" stroke="#9AA0A6" stroke-width="2.5"/>
+      <g stroke="#7A8087" stroke-width="2.5">
+        <line x1="-43" y1="0" x2="43" y2="0"/>
+        <line x1="-21.5" y1="-37.2" x2="21.5" y2="37.2"/>
+        <line x1="-21.5" y1="37.2" x2="21.5" y2="-37.2"/>
+      </g>
+      <circle r="5" fill="#22252A"/>
+      <animateTransform attributeName="transform" type="rotate"
+        from="0" to="360" dur="1.5s" repeatCount="indefinite"/>
+    </g>
+  </g>
+
+  <!-- front wheel -->
+  <g transform="translate(560 380)">
+    <g>
+      <circle r="50" fill="none" stroke="#22252A" stroke-width="9"/>
+      <circle r="43" fill="none" stroke="#9AA0A6" stroke-width="2.5"/>
+      <g stroke="#7A8087" stroke-width="2.5">
+        <line x1="-43" y1="0" x2="43" y2="0"/>
+        <line x1="-21.5" y1="-37.2" x2="21.5" y2="37.2"/>
+        <line x1="-21.5" y1="37.2" x2="21.5" y2="-37.2"/>
+      </g>
+      <circle r="5" fill="#22252A"/>
+      <animateTransform attributeName="transform" type="rotate"
+        from="0" to="360" dur="1.5s" repeatCount="indefinite"/>
+    </g>
+  </g>
+
+  <!-- frame -->
+  <g stroke="#E63946" stroke-width="7" stroke-linecap="round" fill="none">
+    <line x1="240" y1="380" x2="370" y2="380"/>
+    <line x1="370" y1="380" x2="332" y2="274"/>
+    <line x1="370" y1="380" x2="549" y2="284"/>
+    <line x1="335" y1="280" x2="549" y2="284"/>
+    <line x1="549" y1="284" x2="556" y2="266"/>
+  </g>
+  <line x1="556" y1="266" x2="560" y2="380" stroke="#6B7076" stroke-width="6" stroke-linecap="round"/>
+  <line x1="554" y1="272" x2="548" y2="244" stroke="#6B7076" stroke-width="5" stroke-linecap="round"/>
+  <path d="M 548 244 C 544 236 532 232 520 234" stroke="#444447" stroke-width="5" fill="none" stroke-linecap="round"/>
+  <line x1="520" y1="234" x2="508" y2="236" stroke="#26262B" stroke-width="8" stroke-linecap="round"/>
+  <line x1="330" y1="252" x2="334" y2="274" stroke="#6B7076" stroke-width="5" stroke-linecap="round"/>
+  <path d="M 304 252 C 314 245 344 245 354 250 C 344 258 314 259 304 252 Z" fill="#26262B"/>
+
+  <!-- moving chain -->
+  <g stroke="#33363B" stroke-width="2.5" fill="none" stroke-dasharray="7.85 7.85">
+    <path d="M 240 372 L 370 368">
+      <animate attributeName="stroke-dashoffset" from="0" to="-314" dur="1.5s" repeatCount="indefinite"/>
+    </path>
+    <path d="M 370 392 L 240 388">
+      <animate attributeName="stroke-dashoffset" from="0" to="-314" dur="1.5s" repeatCount="indefinite"/>
+    </path>
+  </g>
+
+  <!-- crank + pedals (pedals counter-rotate to stay level) -->
+  <g transform="translate(370 380)">
+    <g>
+      <circle r="12" fill="none" stroke="#33363B" stroke-width="3"/>
+      <line x1="0" y1="0" x2="30" y2="0" stroke="#26262B" stroke-width="5" stroke-linecap="round"/>
+      <line x1="0" y1="0" x2="-30" y2="0" stroke="#26262B" stroke-width="5" stroke-linecap="round"/>
+      <g>
+        <rect x="22" y="-3.5" width="16" height="7" rx="1.5" fill="#26262B"/>
+        <animateTransform attributeName="transform" type="rotate"
+          from="0 30 0" to="-360 30 0" dur="1.5s" repeatCount="indefinite"/>
+      </g>
+      <g>
+        <rect x="-38" y="-3.5" width="16" height="7" rx="1.5" fill="#26262B"/>
+        <animateTransform attributeName="transform" type="rotate"
+          from="0 -30 0" to="-360 -30 0" dur="1.5s" repeatCount="indefinite"/>
+      </g>
+      <circle r="3.5" fill="#111214"/>
+      <animateTransform attributeName="transform" type="rotate"
+        from="0" to="360" dur="1.5s" repeatCount="indefinite"/>
+    </g>
+  </g>
+
+  <!-- pelican -->
+  <g>
+    <animateTransform attributeName="transform" type="translate"
+      values="0 0; 0 -3; 0 0; 0 -3; 0 0" keyTimes="0;0.25;0.5;0.75;1"
+      dur="1.5s" repeatCount="indefinite"/>
+
+    <path d="M 284 210 L 252 200 L 262 214 L 248 218 L 264 230 L 282 226 Z" fill="#DDE3E8"/>
+    <ellipse cx="315" cy="218" rx="40" ry="30" fill="#F8F9FA" transform="rotate(-10 315 218)"/>
+    <path d="M 340 212 C 366 202 386 188 398 170" stroke="#F8F9FA" stroke-width="15"
+          stroke-linecap="round" fill="none"/>
+    <circle cx="408" cy="162" r="13" fill="#F8F9FA"/>
+    <circle cx="414" cy="157" r="3.2" fill="#FFFFFF" stroke="#8A8F98" stroke-width="0.6"/>
+    <circle cx="414.6" cy="157.4" r="1.6" fill="#22252A"/>
+
+    <!-- gular pouch with a snack -->
+    <path d="M 422 164 L 495 172 C 488 190 466 198 448 192 C 433 187 424 177 421 165 Z" fill="#F08A24"/>
+    <ellipse cx="456" cy="187" rx="9" ry="3.4" fill="#5B8DBE"/>
+    <path d="M 448 187 L 441 183 L 441 191 Z" fill="#5B8DBE"/>
+    <path d="M 420 156 L 496 168 C 499 169 498 172 495 172 L 422 164 Z" fill="#F5A623"/>
+
+    <!-- wing reaching the handlebars -->
+    <g>
+      <path d="M 342 204 C 400 198 462 210 510 228 L 512 240 C 462 250 396 246 344 238 Z" fill="#DDE3E8"/>
+      <circle cx="513" cy="234" r="7" fill="#DDE3E8"/>
+      <animateTransform attributeName="transform" type="rotate"
+        values="-2 346 222; 2 346 222; -2 346 222" keyTimes="0;0.5;1"
+        dur="1.5s" repeatCount="indefinite"/>
+    </g>
+
+    <!-- near leg and webbed foot, tracking the pedal circle -->
+    <line x1="324" y1="240" x2="400" y2="380" stroke="#F5A623" stroke-width="5" stroke-linecap="round">
+      <animate attributeName="x2" values="400;370;340;370;400" keyTimes="0;0.25;0.5;0.75;1"
+        dur="1.5s" repeatCount="indefinite"/>
+      <animate attributeName="y2" values="380;410;380;350;380" keyTimes="0;0.25;0.5;0.75;1"
+        dur="1.5s" repeatCount="indefinite"/>
+    </line>
+    <path d="M -3 -2 L 15 -1 L 13 5 L -3 4 Z" fill="#F5A623">
+      <animateMotion path="M 400 380 A 30 30 0 1 1 370 410 A 30 30 0 1 1 340 380
+                          A 30 30 0 1 1 370 350 A 30 30 0 1 1 400 380"
+        dur="1.5s" repeatCount="indefinite"/>
+    </path>
+  </g>
+</svg>
+```
+
+Details worth noting:
+
+- **Synchronized timing:** everything cycles on a 1.5 s period. Wheel radius is 50, so one revolution = 2π·50 ≈ 314 units — the road dashes scroll exactly 314 units and the chain's dash offset shifts 314 per loop, keeping ground speed consistent.
+- **Feet track pedals:** each foot follows an `animateMotion` circle (radius 30, the crank throw) in phase with its pedal, while the leg line's endpoints animate to the same four quadrant points. The far leg/foot is drawn behind the frame in a darker shade for depth.
+- **Level pedals:** pedals counter-rotate at the same rate as the crank, so they stay horizontal while orbiting — like a real bike.
+- **Body bob:** the pelican rises twice per crank revolution (matching how a rider actually pumps up and down), and the wing sways slightly.
+- **Parallax clouds** drift at different speeds, and fading speed lines add a sense of pace.

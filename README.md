@@ -37,6 +37,7 @@ Measured on the RX 9060 XT (details and conditions in `bench/results/`):
 | decode, plain | 45.8 ms/token (21.8 t/s; llama.cpp: 48.5 ms) |
 | prefill | ~860 t/s at 512 tokens, ~875 t/s at 2k, ~745 t/s at 16k (llama.cpp pp512: 622 t/s) |
 | VRAM | 12.0 GiB of the 16 in use after load with an 8k context and the MTP head, 11.7 without it (device total, ~0.15 GiB of desktop included) |
+| a long reasoning task (#229: an animated SVG, 15-65k tokens of thinking, 64K context) | speculative 60.7 / 47.0 t/s at temperature 0 / 1 vs llama.cpp's MTP 30.1 / 27.4, peak VRAM 13.8 vs 15.5 GB; greedy MTP output byte-identical to plain greedy over 34k tokens ([bench/results/pelican-229](bench/results/pelican-229/README.md)) |
 | model load | <1 s from the `.omph` file (in the page cache): a 3-token run takes 0.89 s |
 | an image (640x488, 300 tokens) | 2.8 s to encode on the CPU, then a normal prefill |
 
