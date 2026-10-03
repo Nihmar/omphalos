@@ -1,0 +1,40 @@
+# N-gram (prompt lookup) drafts vs MTP, offline on real outputs (#199), 2026-10-03, engine 059b75c.
+# tools/ngram_coverage.py: each scenario through omph-server (greedy, MTP 3 drafts, default KV), the output
+# re-tokenized; the #229 pelican outputs as they are (their MTP tokens/step assumed 3.4). The simulation walks
+# each output: the longest earlier n-gram (n_min..8 tokens) ending at the last token proposes the tokens that
+# followed it (up to K, only known ones); used when it proposes >= 4 tokens, else an MTP step worth the
+# scenario's measured tokens/step. "share": output tokens supplied by n-gram drafts; "x": verification steps
+# of the combined policy / steps of MTP alone (lower is better).
+#
+scenario         tokens MTP t/step  K8/n2: share steps-vs-MTP  K8/n3: share steps-vs-MTP  K8/n4: share steps-vs-MTP  K16/n2: share steps-vs-MTP  K16/n3: share steps-vs-MTP  K16/n4: share steps-vs-MTP
+edit-cc            1062       3.98                  87%  0.50x                  87%  0.50x                  86%  0.49x                  92%  0.29x                  92%  0.29x                  92%  0.28x
+edit-py-think     12000       2.97                  48%  1.05x                  43%  0.87x                  39%  0.81x                  50%  0.98x                  45%  0.81x                  41%  0.75x
+edit-py            4048       3.92                  83%  0.57x                  81%  0.55x                  80%  0.54x                  88%  0.38x                  86%  0.36x                  84%  0.36x
+he-0                458       3.02                  34%  0.99x                  30%  0.86x                  28%  0.85x                  36%  0.94x                  32%  0.81x                  29%  0.80x
+he-112              268       3.06                  15%  1.19x                   9%  1.07x                   7%  1.01x                  16%  1.17x                  10%  1.06x                   7%  1.00x
+he-128              601       3.36                  40%  1.08x                  35%  0.94x                  32%  0.86x                  43%  1.01x                  37%  0.86x                  34%  0.79x
+he-144             1244       2.89                  28%  1.14x                  23%  0.98x                  20%  0.92x                  29%  1.11x                  24%  0.94x                  21%  0.89x
+he-16               192       3.27                  37%  0.96x                  33%  0.87x                  32%  0.82x                  40%  0.86x                  36%  0.77x                  35%  0.73x
+he-160             4096       2.65                  23%  1.22x                  17%  1.04x                  12%  0.99x                  23%  1.21x                  18%  1.03x                  13%  0.98x
+he-32              4096       2.82                  34%  1.14x                  29%  0.97x                  25%  0.90x                  36%  1.10x                  30%  0.93x                  26%  0.87x
+he-48               158       3.18                  45%  0.87x                  42%  0.82x                  41%  0.77x                  48%  0.77x                  44%  0.74x                  43%  0.69x
+he-64               529       2.88                  30%  0.98x                  26%  0.88x                  24%  0.85x                  32%  0.93x                  28%  0.84x                  26%  0.81x
+he-80               380       3.26                  36%  0.99x                  33%  0.86x                  30%  0.86x                  38%  0.92x                  35%  0.79x                  32%  0.79x
+he-96               977       3.09                  38%  1.05x                  33%  0.93x                  29%  0.89x                  40%  0.99x                  34%  0.88x                  30%  0.85x
+pelican-t0        34372       3.40                  52%  1.24x                  47%  1.05x                  43%  0.93x                  54%  1.16x                  49%  0.98x                  45%  0.86x
+pelican-t1        20505       3.40                  34%  1.57x                  29%  1.25x                  24%  1.07x                  35%  1.54x                  30%  1.22x                  25%  1.05x
+prose               939       2.18                   4%  1.14x                   2%  1.02x                   1%  1.01x                   4%  1.14x                   2%  1.02x                   1%  1.01x
+quote               232       3.82                  77%  0.63x                  73%  0.65x                  69%  0.65x                  81%  0.47x                  77%  0.48x                  73%  0.50x
+#
+# Reading (n_min 4 is the safe choice: n_min 2 proposes from short coincidental matches and loses to MTP):
+#   code edits returning the file: MTP already accepts 97-99 % (3.9-4.0 tokens/step), but 16-token n-gram
+#     drafts cut the steps to 0.28-0.36x (84-92 % of the tokens copied)
+#   quoting summary 0.50x; HumanEval with thinking 0.69-1.00x (median ~0.82x); reasoning-only edit 0.75x;
+#   pelican (thinking + SVG rewrites) 0.86x / 1.05x; prose 1.01x (nothing to copy, no harm)
+#
+# Verification cost per token count (omph-gemv-bench --all-of-type T --nt N, all tensors of the type):
+#   IQ3_S (3474 MiB):   NT 1 12.80 ms, 4 13.18, 8 13.27, 16 13.14   (bandwidth-bound: 16 tokens cost one)
+#   IQ3_XXS (1979 MiB): NT 4 7.70 ms, 8 7.95
+#   IQ4_XS, Q4_K, Q6_K, IQ2_XXS / XS / S, Q2_K, IQ1_M (~5 GB): no kernel beyond NT = 4 today
+# -> steps become time once every type verifies 16 tokens in one pass (rows bit-identical to the 1-token
+#    GEMV, #161); without that, a 16-token verification reads those ~5 GB four times.
