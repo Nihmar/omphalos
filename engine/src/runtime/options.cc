@@ -48,6 +48,9 @@ EnvOptions EnvOptions::from_env() {
     o.no_fused_gemm = flag("OMPH_NO_FUSED_GEMM");
     o.no_b4 = flag("OMPH_NO_B4");
     o.no_group = flag("OMPH_NO_GROUP");
+    if (const char * v = std::getenv("OMPH_DRAFT_VOCAB")) {
+        o.draft_vocab = std::atoll(v);
+    }
     o.no_bf16_gemv = flag("OMPH_NO_BF16_GEMV");
     o.no_f16_cache = flag("OMPH_NO_F16_CACHE");
     o.host_argmax = flag("OMPH_HOST_ARGMAX");

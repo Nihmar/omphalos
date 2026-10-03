@@ -70,6 +70,9 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
              const std::string & trace_dir, const int64_t start_pos,
              const bool want_logits, int32_t * greedy, const ForwardInputs * in) {
     const int64_t T = (int64_t) toks.size();
+    if (!verifying_) {
+        observe_draft(toks.data(), T);  // a prompt or a plain step: real tokens (#217)
+    }
     // the inputs stay visible to the layers (M-RoPE) and the MTP fill until
     // this forward returns
     struct Scope {
