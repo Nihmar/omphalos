@@ -174,10 +174,38 @@ __global__ __launch_bounds__(kThreads) void gemm_f16_kernel(
 // bit-identical to dequantizing to f16 and calling gemm_f16. No f16 copy of
 // W is written anywhere (the round trip through the cache cost ~23 % of a
 // 512-token prefill, #135 / #140).
-template <class Dec, int BN>
+// The output of 8 rows of one token (acc, rows r .. r + 7 at y + off): f32 by
+// default, or with SWI (#221) the FFN's f16(silu(gate) * up) where the GEMM
+// computes up: the gate rows read at the same offset, swiglu_f16's expression,
+// so the result is bit-identical to writing up and running swiglu_f16.
+struct Epi {
+    const float * gate;
+    __half * out;
+};
+
+template <bool SWI>
+__device__ inline void store8(const float8 & a, float * __restrict__ y, const Epi & e, const long long off) {
+    if constexpr (SWI) {
+        const float4 g0 = reinterpret_cast<const float4 *>(e.gate + off)[0];
+        const float4 g1 = reinterpret_cast<const float4 *>(e.gate + off)[1];
+        const float g[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w};
+        __half h[8];
+#pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            h[v] = __float2half((g[v] / (1.0f + expf(-g[v]))) * a[v]);
+        }
+        *reinterpret_cast<uint4 *>(e.out + off) = *reinterpret_cast<const uint4 *>(h);
+    } else {
+        float4 * dst = reinterpret_cast<float4 *>(y + off);
+        dst[0] = make_float4(a[0], a[1], a[2], a[3]);
+        dst[1] = make_float4(a[4], a[5], a[6], a[7]);
+    }
+}
+
+template <class Dec, int BN, bool SWI>
 __global__ __launch_bounds__(kThreads) void gemm_q_kernel(
     const Dec dec, const _Float16 * __restrict__ x, float * __restrict__ y, const int n_out,
-    const int k, const int tokens, const long long ldy) {
+    const int k, const int tokens, const long long ldy, const Epi epi) {
     static_assert(kBM * kBK / 32 == kThreads, "one sub-block per thread per k-step");
     // (the codebooks stay in global memory: an LDS copy measured slower, #141)
     __shared__ _Float16 as[kBM * kLDK];
@@ -292,9 +320,7 @@ __global__ __launch_bounds__(kThreads) void gemm_q_kernel(
         for (int j = 0; j < TN; ++j) {
             const int t = n0 + wn * TN * 16 + j * 16 + (lane & 15);
             if (t < tokens && r < n_out) {
-                float4 * dst = reinterpret_cast<float4 *>(y + t * ldy + r);
-                dst[0] = make_float4(acc[i][j][0], acc[i][j][1], acc[i][j][2], acc[i][j][3]);
-                dst[1] = make_float4(acc[i][j][4], acc[i][j][5], acc[i][j][6], acc[i][j][7]);
+                store8<SWI>(acc[i][j], y, epi, t * ldy + r);
             }
         }
     }
@@ -309,11 +335,11 @@ __global__ __launch_bounds__(kThreads) void gemm_q_kernel(
 // tokens (bench/gemv/iq3s_wil.hip).
 constexpr int kGtTok = 256;   // tokens per workgroup
 constexpr int kGtXLd = 40;    // halves per staged token row (32 + 8 pad)
-template <class TD>
+template <class TD, bool SWI>
 __global__ __launch_bounds__(256) void gemm_tiles_kernel(const uint8_t * __restrict__ wt,
                                                         const _Float16 * __restrict__ x, float * __restrict__ y,
                                                         const long long blocks, const int tokens,
-                                                        const long long ldy) {
+                                                        const long long ldy, const Epi epi) {
     __shared__ __attribute__((aligned(16))) uint8_t tab[TD::kLds];
     __shared__ _Float16 xs[2][kGtTok * kGtXLd];
     const int tid = (int) threadIdx.x;
@@ -369,9 +395,7 @@ __global__ __launch_bounds__(256) void gemm_tiles_kernel(const uint8_t * __restr
     for (int j = 0; j < 16; ++j) {
         const long long t = n0 + j * 16 + (lane & 15);
         if (t < tokens) {
-            float * dst = y + t * ldy + tile * 16 + h * 8;
-            reinterpret_cast<float4 *>(dst)[0] = make_float4(acc[j][0], acc[j][1], acc[j][2], acc[j][3]);
-            reinterpret_cast<float4 *>(dst)[1] = make_float4(acc[j][4], acc[j][5], acc[j][6], acc[j][7]);
+            store8<SWI>(acc[j], y, epi, t * ldy + tile * 16 + h * 8);
         }
     }
 }
@@ -393,9 +417,11 @@ bool gemm_f16(const void * w, const void * x, float * y, const int64_t n_out, co
     return hipGetLastError() == hipSuccess;
 }
 
-bool gemm_q(const uint32_t type, const void * packed, const void * x, float * y,
-            const int64_t n_out, const int64_t k, const int64_t tokens, const int64_t ldy,
-            hipStream_t stream) {
+namespace {
+
+template <bool SWI>
+bool gemm_q_impl(const uint32_t type, const void * packed, const void * x, float * y, const int64_t n_out,
+                 const int64_t k, const int64_t tokens, const int64_t ldy, const Epi epi, hipStream_t stream) {
     const auto aligned = [](const void * p) { return ((uintptr_t) p & 15) == 0; };
     if (packed == nullptr || x == nullptr || y == nullptr || n_out <= 0 || tokens <= 0 ||
         k <= 0 || k % 256 != 0 || n_out % 16 != 0 || ldy < n_out || ldy % 4 != 0 ||
@@ -413,18 +439,18 @@ bool gemm_q(const uint32_t type, const void * packed, const void * x, float * y,
         const auto * xh = static_cast<const _Float16 *>(x);
         if (tokens > 256) {
             const dim3 grid((unsigned) ((tokens + 255) / 256), (unsigned) ((n_out + kBM - 1) / kBM));
-            gemm_q_kernel<decltype(dec), 256><<<grid, kThreads, 0, stream>>>(
-                dec, xh, y, (int) n_out, (int) k, (int) tokens, (long long) ldy);
+            gemm_q_kernel<decltype(dec), 256, SWI><<<grid, kThreads, 0, stream>>>(
+                dec, xh, y, (int) n_out, (int) k, (int) tokens, (long long) ldy, epi);
         } else {
             const dim3 grid((unsigned) ((tokens + 127) / 128), (unsigned) ((n_out + kBM - 1) / kBM));
-            gemm_q_kernel<decltype(dec), 128><<<grid, kThreads, 0, stream>>>(
-                dec, xh, y, (int) n_out, (int) k, (int) tokens, (long long) ldy);
+            gemm_q_kernel<decltype(dec), 128, SWI><<<grid, kThreads, 0, stream>>>(
+                dec, xh, y, (int) n_out, (int) k, (int) tokens, (long long) ldy, epi);
         }
     };
     const auto tiles = [&](const auto td) {
         const dim3 grid((unsigned) ((tokens + kGtTok - 1) / kGtTok), (unsigned) (n_out / 128));
-        gemm_tiles_kernel<decltype(td)><<<grid, 256, 0, stream>>>(base, static_cast<const _Float16 *>(x), y, blocks,
-                                                                (int) tokens, (long long) ldy);
+        gemm_tiles_kernel<decltype(td), SWI><<<grid, 256, 0, stream>>>(
+            base, static_cast<const _Float16 *>(x), y, blocks, (int) tokens, (long long) ldy, epi);
     };
     switch (type) {
         case 21:
@@ -452,6 +478,24 @@ bool gemm_q(const uint32_t type, const void * packed, const void * x, float * y,
         default: return false;
     }
     return hipGetLastError() == hipSuccess;
+}
+
+} // namespace
+
+bool gemm_q(const uint32_t type, const void * packed, const void * x, float * y, const int64_t n_out,
+            const int64_t k, const int64_t tokens, const int64_t ldy, hipStream_t stream) {
+    return gemm_q_impl<false>(type, packed, x, y, n_out, k, tokens, ldy, Epi{nullptr, nullptr}, stream);
+}
+
+bool gemm_q_swiglu(const uint32_t type, const void * packed, const void * x, const float * gate, void * out_f16,
+                   const int64_t n_out, const int64_t k, const int64_t tokens, hipStream_t stream) {
+    const auto aligned = [](const void * p) { return ((uintptr_t) p & 15) == 0; };
+    if (gate == nullptr || out_f16 == nullptr || !aligned(gate) || !aligned(out_f16) || n_out % 8 != 0) {
+        return false;
+    }
+    // y only passes the shared checks: the SWI stores go to out_f16
+    return gemm_q_impl<true>(type, packed, x, const_cast<float *>(gate), n_out, k, tokens, n_out,
+                             Epi{gate, static_cast<__half *>(out_f16)}, stream);
 }
 
 } // namespace omph::kernels

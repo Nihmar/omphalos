@@ -21,4 +21,11 @@ bool gemm_f16(const void * w, const void * x, float * y, int64_t n_out, int64_t 
 bool gemm_q(uint32_t type, const void * packed, const void * x, float * y, int64_t n_out,
             int64_t k, int64_t tokens, int64_t ldy, hipStream_t stream);
 
+// gemm_q for an FFN's up projection with SwiGLU in its epilogue (#221):
+// out_f16[t][r] = f16(silu(gate[t][r]) * up[t][r]), up never written; both
+// T x n_out row-major (stride n_out). Bit-identical to gemm_q into up, then
+// swiglu_f16(gate, up).
+bool gemm_q_swiglu(uint32_t type, const void * packed, const void * x, const float * gate, void * out_f16,
+                   int64_t n_out, int64_t k, int64_t tokens, hipStream_t stream);
+
 } // namespace omph::kernels
