@@ -1,0 +1,31 @@
+# int8 prefill GEMM on IQ3_S tiles (#213), 2026-10-03, engine 5ae098c + this branch; card overclocked by the
+# maintainer that morning. RX 9060 XT (gfx1200).
+#
+# 1. Numerics (OMPH_TEST_Q8ACT=B: every prefill GEMM input quantized to int8 in blocks of B along k and back,
+#    the int8 GEMM's numerics). KL vs the default engine, last 512 positions of a 2048-token wikitext-2 test
+#    prompt (omph-run --gemv --generate 2 --logits-tail 512, compare_logits.py):
+#    blocks   KL mean   median    p99      max     top-1
+#    32       0.00069   0.00037   0.0042   0.024   98.4 %     (llama.cpp's q8_1, its MMQ numerics)
+#    256      0.00214   0.00115   0.0189   0.038   96.1 %
+#    For scale, the KV cache vs exact f32 (#175): default mix 0.0012-0.0015, K8 0.0007-0.0009, K4 0.0017-0.0028.
+#
+# 2. Speed (bench/gemm/int8_tiles.hip): the engine's tile GEMM structure (8 waves x 16 rows x 256 tokens, x one
+#    32-weight sub-block at a time through LDS) with the iu8 WMMA; weights as exact integers, x as q8 blocks of
+#    32; each sub-block's int32 products rescaled into f32 by d (1 + 2 sc) x the token's x scale. ffn_up shape
+#    17408 x 5120, 512 tokens, random tiles, median of 7 x 20 launches after a 1 s warm-up.
+#    rel. RMS error vs gemm_q on the same int8 x: 3.4e-4 (gemm_q's f16-rounded weights)
+#    variant                                      ms      T(FL)OPS
+#    engine gemm_q, f16                           1.62    56.2
+#    int8                                         2.14    42.8
+#    int8, 2 / 4 token tiles' WMMAs grouped       2.05 / 1.98   44.5 / 46.1
+#    int8, groups of 4, no rescale (wrong y)      1.87    48.7     (only cvt + add per output: the floor)
+#    quantizing x (once per input)                0.013
+#
+# Reading: the iu8 units are 1.9x the f16 ones (168.6 vs 88.7 TOPS, ceilings-203.txt), but IQ3_S scales every
+# 32 weights per row, so an int8 GEMM must convert and rescale every output element every 2 WMMAs. The
+# compiled loop carries ~28 VALU instructions per WMMA (128 cvt + 128 mul + 128 fma + zeroed accumulators per
+# 32 WMMAs), against the f16 kernel whose scales are applied once per A fragment and reused over 16 token
+# tiles. Even the cheapest rescale (cvt + add, no scales at all) stops at 48.7 TOPS, below the f16 kernel's 56.
+# Folding the sub-block scale into the integers is impossible (|q| (1 + 2 sc) reaches 465, beyond int8), and a
+# per-token x scale would leave the same cvt + fma per element. Verdict: no int8 GEMM for IQ3_S on gfx1200;
+# llama.cpp's MMQ takes this route (pp512 622 t/s vs omphalos ~950).
