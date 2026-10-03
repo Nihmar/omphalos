@@ -698,17 +698,20 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
                 sc[jt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(qa[s], kb, sc[jt]);
             }
         }
-        // causal mask and the online softmax of this lane's 8 rows
+        // causal mask and the online softmax of this lane's 8 rows. A tile whose
+        // last key no query of the row tile is before, with every row a token,
+        // needs no mask (all but the last tiles; #191): the comparisons run in
+        // 32 bits relative to the tile.
+        const bool open = nt == kFaTokens && s0 + kFaKeys - 1 <= qpos0;
+        const int rel = (int) (qpos0 - s0) - (lane & 15);  // query row r sees key jt * 16 + lane % 16 iff rel + r >= jt * 16
         float corr[8];
 #pragma unroll
         for (int v = 0; v < 8; ++v) {
             const int r = (lane >> 4) * 8 + v;
-            const long long qpos = qpos0 + r;
             float x[kFaSt];
 #pragma unroll
             for (int jt = 0; jt < kFaSt; ++jt) {
-                const long long key = s0 + jt * 16 + (lane & 15);
-                x[jt] = (r < nt && key <= qpos) ? sc[jt][v] : -INFINITY;
+                x[jt] = open || (r < nt && rel + r >= jt * 16) ? sc[jt][v] : -INFINITY;
             }
             float mx = x[0];
 #pragma unroll
@@ -721,11 +724,11 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
             // corr = 1 and weights 0
             const bool none = m_new == -INFINITY;
             const float m_use = none ? 0.0f : m_new;
-            corr[v] = none ? 1.0f : exp2f(m_run[v] - m_use);
+            corr[v] = none ? 1.0f : __builtin_amdgcn_exp2f(m_run[v] - m_use);
             float sum = 0.0f;
 #pragma unroll
             for (int jt = 0; jt < kFaSt; ++jt) {
-                const float w = exp2f(x[jt] - m_use);  // exp2(-inf) = 0
+                const float w = __builtin_amdgcn_exp2f(x[jt] - m_use);  // exp2(-inf) = 0
                 sc[jt][v] = w;
                 sum += w;
             }
