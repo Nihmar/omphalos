@@ -110,6 +110,14 @@ int main() {
           "Q4_K takes the tiles");
     CHECK(omph::format::engine_layout(12, 8) == 1 && omph::format::engine_layout(23, 24) == 1,
           "IQ4_XS / Q4_K with rows %% 16 != 0 keep the repacked layout");
+    // #253: IQ2_S in tiles of the 16 GGUF blocks' size
+    CHECK(omph::format::engine_layout(22, 16) == 2 && omph::format::iq2s_tiles_bytes(16, 2) == 2 * 16 * 82 &&
+              omph::format::engine_layout(22, 8) == 1,
+          "IQ2_S takes the tiles when rows %% 16 == 0");
+    CHECK(omph::format::engine_layout_bytes(10, 16, 512) == 2 * 16 * 84 &&
+              omph::format::engine_layout_bytes(17, 16, 512) == 2 * 16 * 74 &&
+              omph::format::engine_layout_bytes(16, 16, 512) == 2 * 16 * 66 && omph::format::engine_layout(10, 8) == 1,
+          "Q2_K / IQ2_XS / IQ2_XXS take the tiles when rows %% 16 == 0");
     std::printf("test_repack: %d failure(s)\n", omph_test::failures);
     return omph_test::failures == 0 ? 0 : 1;
 }

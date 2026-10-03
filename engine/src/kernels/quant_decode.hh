@@ -900,4 +900,306 @@ struct DecQ4kTile {  // GGUF type 12, .omph layout 2 (#244)
     __device__ void decode(const Raw & r, const long long s, float (&v)[32]) const { DecQ4k{}.decode(r, s, v); }
 };
 
+// IQ2_S tiles (#253): the grid's 1024 eight-byte entries in LDS; a lane's
+// group g = 2 h + gl takes its index byte (+ 2 qh bits), the pair-ordered
+// sign bits of its half (as TileIq3s) and the scale nibble h, the block scale
+// applied in f16.
+struct TileIq2s {  // GGUF type 22
+    static constexpr long long kBytes = omph::format::kIq2sTileBytes;
+    static constexpr int kLds = 8192;
+    __device__ static void init(uint8_t * lds) {
+        uint2 * grid = reinterpret_cast<uint2 *>(lds);
+        for (int i = (int) threadIdx.x; i < 1024; i += blockDim.x) {
+            const uint64_t g = omph::quant::kIq2sGrid[i];
+            grid[i] = make_uint2((uint32_t) g, (uint32_t) (g >> 32));
+        }
+    }
+    struct Blk {
+        uint4 q, s4;
+        uint2 scw;
+        uint32_t qhw;
+        float dv;
+    };
+    __device__ static Blk load(const uint8_t * o, const int lane) {
+        const int r = lane & 15;
+        Blk k;
+        k.q = *reinterpret_cast<const uint4 *>(o + lane * 16);
+        k.s4 = *reinterpret_cast<const uint4 *>(o + 512 + lane * 16);
+        k.qhw = *reinterpret_cast<const uint32_t *>(o + 1024 + lane * 4);
+        k.scw = *reinterpret_cast<const uint2 *>(o + 1152 + r * 8);
+        k.dv = __half2float(*reinterpret_cast<const __half *>(o + 1280 + r * 2));
+        return k;
+    }
+    __device__ static tile_h8 frag(const uint8_t * lds, const Blk & k, const int sb, const int gl, const int h) {
+        const uint2 * grid = reinterpret_cast<const uint2 *>(lds);
+        const uint32_t qw[4] = {k.q.x, k.q.y, k.q.z, k.q.w};
+        const uint32_t sw[4] = {k.s4.x, k.s4.y, k.s4.z, k.s4.w};
+        const uint32_t lo = (qw[sb >> 1] >> (16 * (sb & 1) + 8 * gl)) & 0xFFu;
+        const uint32_t hi = ((k.qhw >> (4 * sb + 2 * gl)) & 3u) << 8;
+        const uint2 gr = grid[lo | hi];
+        const uint32_t s16 = (sw[sb >> 1] >> (16 * (sb & 1))) & 0xFFFFu;
+        const uint32_t sg = h == 0 ? (((s16 & 0xFFu) << 8) | ((s16 >> 8) << 24)) : ((s16 & 0xFFu) | ((s16 >> 8) << 16));
+        const uint32_t sc = ((sb < 4 ? k.scw.x : k.scw.y) >> (8 * (sb & 3))) & 0xFFu;
+        const float db = (k.dv * (0.5f + (float) (h ? (sc >> 4) : (sc & 0xF)))) * 0.25f;
+        const half2_v d2 = {(_Float16) db, (_Float16) db};
+        const int g = 2 * h + gl;
+        constexpr uint32_t kSign2 = 0x80008000u;
+        const uint32_t wv4[4] = {((sg << (4 * g)) & kSign2) | grid_pair_to_half2<0x04010400u>(gr.x),
+                                 ((sg << (4 * g + 1)) & kSign2) | grid_pair_to_half2<0x04030402u>(gr.x),
+                                 ((sg << (4 * g + 2)) & kSign2) | grid_pair_to_half2<0x04010400u>(gr.y),
+                                 ((sg << (4 * g + 3)) & kSign2) | grid_pair_to_half2<0x04030402u>(gr.y)};
+        tile_h8 a;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const half2_v p = __builtin_bit_cast(half2_v, wv4[i]) * d2;
+            a[2 * i] = p[0];
+            a[2 * i + 1] = p[1];
+        }
+        return a;
+    }
+};
+
+struct DecIq2sTile {  // GGUF type 22, .omph layout 2 (#253)
+    const uint8_t * base;
+    long long blocks;
+    using Raw = DecIq2s::Raw;
+    static DecIq2sTile make(const uint8_t * base, const int64_t /*n_blocks*/, const long long blocks) {
+        return {base, blocks};
+    }
+    __device__ Raw load(const long long row, const long long s) const {
+        const uint8_t * o = base + ((row >> 4) * blocks + (s >> 3)) * omph::format::kIq2sTileBytes;
+        const int r = (int) (row & 15);
+        const int sb = (int) (s & 7);
+        const uint32_t q0 = *reinterpret_cast<const uint16_t *>(o + r * 16 + sb * 2);
+        const uint32_t q1 = *reinterpret_cast<const uint16_t *>(o + (r + 16) * 16 + sb * 2);
+        const uint32_t s0 = *reinterpret_cast<const uint16_t *>(o + 512 + r * 16 + sb * 2);  // bytes 1, 3
+        const uint32_t s1 = *reinterpret_cast<const uint16_t *>(o + 512 + (r + 16) * 16 + sb * 2);  // 0, 2
+        const uint32_t h0 = *reinterpret_cast<const uint32_t *>(o + 1024 + r * 4);
+        const uint32_t h1 = *reinterpret_cast<const uint32_t *>(o + 1024 + (r + 16) * 4);
+        Raw w;
+        w.qsw = q0 | (q1 << 16);
+        w.sgw = (s1 & 0xFFu) | ((s0 & 0xFFu) << 8) | ((s1 >> 8) << 16) | ((s0 >> 8) << 24);
+        w.qhb = ((h0 >> (4 * sb)) & 0xFu) | (((h1 >> (4 * sb)) & 0xFu) << 4);
+        w.scb = o[1152 + r * 8 + sb];
+        w.dv = __half2float(*reinterpret_cast<const __half *>(o + 1280 + r * 2));
+        return w;
+    }
+    __device__ void decode(const Raw & r, const long long s, float (&v)[32]) const { DecIq2s{}.decode(r, s, v); }
+};
+
+// Q2_K tiles (#253): sub-block sb's 2-bit codes at bits 2 (sb % 4) of the
+// lane's bytes of half sb / 4; each weight d sc q - dmin m in f32, rounded to
+// f16 once (DecQ2k's values).
+struct TileQ2k {  // GGUF type 10
+    static constexpr long long kBytes = omph::format::kQ2kTileBytes;
+    static constexpr int kLds = 16;
+    __device__ static void init(uint8_t *) {}
+    struct Blk {
+        uint4 q0, q1;
+        uint2 scw;
+        float d, m;
+    };
+    __device__ static Blk load(const uint8_t * o, const int lane) {
+        Blk k;
+        const uint4 * q = reinterpret_cast<const uint4 *>(o + lane * 32);
+        k.q0 = q[0];
+        k.q1 = q[1];
+        k.scw = *reinterpret_cast<const uint2 *>(o + 1024 + lane * 8);
+        const uint32_t dm = *reinterpret_cast<const uint32_t *>(o + 1280 + (lane & 15) * 4);
+        k.d = half_lo(dm);
+        k.m = half_hi(dm);
+        return k;
+    }
+    __device__ static tile_h8 frag(const uint8_t *, const Blk & k, const int sb, const int gl, const int) {
+        const uint4 v = sb < 4 ? k.q0 : k.q1;
+        const uint32_t w0 = gl == 0 ? v.x : v.z;
+        const uint32_t w1 = gl == 0 ? v.y : v.w;
+        const int shift = 2 * (sb & 3);
+        const uint32_t c0 = (w0 >> shift) & 0x03030303u;
+        const uint32_t c1 = (w1 >> shift) & 0x03030303u;
+        const uint32_t sc = ((sb < 4 ? k.scw.x : k.scw.y) >> (8 * (sb & 3))) & 0xFFu;
+        const float dl = k.d * (float) (sc & 15);
+        const float ml = k.m * (float) (sc >> 4);
+        tile_h8 a;
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            a[m] = (_Float16) (dl * (float) ((c0 >> (8 * m)) & 0xFFu) - ml);
+            a[4 + m] = (_Float16) (dl * (float) ((c1 >> (8 * m)) & 0xFFu) - ml);
+        }
+        return a;
+    }
+};
+
+// IQ2_XS tiles (#253): entry = 9-bit grid index + 7 pair-ordered sign bits
+// (the 8th the parity), scale nibble h; grid (512 x 8 bytes) in LDS.
+struct TileIq2xs {  // GGUF type 17
+    static constexpr long long kBytes = omph::format::kIq2xsTileBytes;
+    static constexpr int kLds = 4096;
+    __device__ static void init(uint8_t * lds) {
+        uint2 * grid = reinterpret_cast<uint2 *>(lds);
+        for (int i = (int) threadIdx.x; i < 512; i += blockDim.x) {
+            const uint64_t g = omph::quant::kIq2xsGrid[i];
+            grid[i] = make_uint2((uint32_t) g, (uint32_t) (g >> 32));
+        }
+    }
+    struct Blk {
+        uint4 q0, q1;
+        uint2 scw;
+        float dv;
+    };
+    __device__ static Blk load(const uint8_t * o, const int lane) {
+        const int r = lane & 15;
+        Blk k;
+        const uint4 * q = reinterpret_cast<const uint4 *>(o + lane * 32);
+        k.q0 = q[0];
+        k.q1 = q[1];
+        k.scw = *reinterpret_cast<const uint2 *>(o + 1024 + r * 8);
+        k.dv = __half2float(*reinterpret_cast<const __half *>(o + 1152 + r * 2));
+        return k;
+    }
+    __device__ static tile_h8 frag(const uint8_t * lds, const Blk & k, const int sb, const int gl, const int h) {
+        const uint2 * grid = reinterpret_cast<const uint2 *>(lds);
+        const uint4 v = sb < 4 ? k.q0 : k.q1;
+        const int e = sb & 3;
+        const uint32_t w = e == 0 ? v.x : e == 1 ? v.y : e == 2 ? v.z : v.w;
+        const uint32_t en = (w >> (16 * gl)) & 0xFFFFu;
+        const uint2 gr = grid[en & 511u];
+        const uint32_t f = en >> 9;
+        const uint32_t par = (uint32_t) __builtin_popcount(f) & 1u;
+        const uint32_t sgn = ((f & 0xFu) << 12) | ((f >> 4) << 29) | (par << 28);
+        const uint32_t sc = ((sb < 4 ? k.scw.x : k.scw.y) >> (8 * (sb & 3))) & 0xFFu;
+        const float db = (k.dv * (0.5f + (float) (h ? (sc >> 4) : (sc & 0xF)))) * 0.25f;
+        const half2_v d2 = {(_Float16) db, (_Float16) db};
+        const uint32_t wv4[4] = {(sgn & kSignBits) | grid_pair_to_half2<0x04010400u>(gr.x),
+                                 ((sgn << 1) & kSignBits) | grid_pair_to_half2<0x04030402u>(gr.x),
+                                 ((sgn << 2) & kSignBits) | grid_pair_to_half2<0x04010400u>(gr.y),
+                                 ((sgn << 3) & kSignBits) | grid_pair_to_half2<0x04030402u>(gr.y)};
+        tile_h8 a;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const half2_v p = __builtin_bit_cast(half2_v, wv4[i]) * d2;
+            a[2 * i] = p[0];
+            a[2 * i + 1] = p[1];
+        }
+        return a;
+    }
+};
+
+// IQ2_XXS tiles (#253): index byte per group, the row's scale + sign word per
+// sub-block (IQ3_XXS's sign order); grid (256 x 8 bytes) in LDS.
+struct TileIq2xxs {  // GGUF type 16
+    static constexpr long long kBytes = omph::format::kIq2xxsTileBytes;
+    static constexpr int kLds = 2048;
+    __device__ static void init(uint8_t * lds) {
+        uint2 * grid = reinterpret_cast<uint2 *>(lds);
+        for (int i = (int) threadIdx.x; i < 256; i += blockDim.x) {
+            const uint64_t g = omph::quant::kIq2xxsGrid[i];
+            grid[i] = make_uint2((uint32_t) g, (uint32_t) (g >> 32));
+        }
+    }
+    struct Blk {
+        uint4 q, a0, a1;
+        float dv;
+    };
+    __device__ static Blk load(const uint8_t * o, const int lane) {
+        const int r = lane & 15;
+        Blk k;
+        k.q = *reinterpret_cast<const uint4 *>(o + lane * 16);
+        k.a0 = *reinterpret_cast<const uint4 *>(o + 512 + r * 32);
+        k.a1 = *reinterpret_cast<const uint4 *>(o + 512 + r * 32 + 16);
+        k.dv = __half2float(*reinterpret_cast<const __half *>(o + 1024 + r * 2));
+        return k;
+    }
+    __device__ static tile_h8 frag(const uint8_t * lds, const Blk & k, const int sb, const int gl, const int h) {
+        const uint2 * grid = reinterpret_cast<const uint2 *>(lds);
+        const uint32_t qw[4] = {k.q.x, k.q.y, k.q.z, k.q.w};
+        const uint4 av = sb < 4 ? k.a0 : k.a1;
+        const int e = sb & 3;
+        const uint32_t a = e == 0 ? av.x : e == 1 ? av.y : e == 2 ? av.z : av.w;
+        const uint32_t idx = (qw[sb >> 1] >> (16 * (sb & 1) + 8 * gl)) & 0xFFu;
+        const uint2 gr = grid[idx];
+        const float db = (k.dv * (0.5f + (float) (a >> 28))) * 0.25f;
+        const half2_v d2 = {(_Float16) db, (_Float16) db};
+        const uint32_t sgn = iq3xxs_group_signs(a, 2 * h + gl);
+        const uint32_t wv4[4] = {(sgn & kSignBits) | grid_pair_to_half2<0x04010400u>(gr.x),
+                                 ((sgn << 1) & kSignBits) | grid_pair_to_half2<0x04030402u>(gr.x),
+                                 ((sgn << 2) & kSignBits) | grid_pair_to_half2<0x04010400u>(gr.y),
+                                 ((sgn << 3) & kSignBits) | grid_pair_to_half2<0x04030402u>(gr.y)};
+        tile_h8 v;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const half2_v p = __builtin_bit_cast(half2_v, wv4[i]) * d2;
+            v[2 * i] = p[0];
+            v[2 * i + 1] = p[1];
+        }
+        return v;
+    }
+};
+
+// Row-wise decoders over the Q2_K / IQ2_XS / IQ2_XXS tiles (the GEMM for rows
+// % 128 != 0, the f16 dequant): the row-wise Raw rebuilt from the row's lanes.
+struct DecQ2kTile {  // GGUF type 10, .omph layout 2 (#253)
+    const uint8_t * base;
+    long long blocks;
+    using Raw = DecQ2k::Raw;
+    static DecQ2kTile make(const uint8_t * base, const int64_t, const long long blocks) { return {base, blocks}; }
+    __device__ Raw load(const long long row, const long long s) const {
+        const uint8_t * o = base + ((row >> 4) * blocks + (s >> 3)) * omph::format::kQ2kTileBytes;
+        const int r = (int) (row & 15);
+        const int g = (int) ((s & 7) >> 2);  // the 128-weight half
+        Raw w;
+        w.qa = *reinterpret_cast<const uint4 *>(o + r * 32 + g * 16);         // bytes 0..15
+        w.qb = *reinterpret_cast<const uint4 *>(o + (r + 16) * 32 + g * 16);  // 16..31
+        const uint32_t s0 = *reinterpret_cast<const uint32_t *>(o + 1024 + r * 8 + g * 4);
+        const uint32_t s1 = *reinterpret_cast<const uint32_t *>(o + 1024 + (r + 16) * 8 + g * 4);
+        // scale bytes 8 g + 2 j (+ 1 for half 1): interleave the two lanes' bytes
+        w.scw.x = __builtin_amdgcn_perm(s1, s0, 0x05010400u);
+        w.scw.y = __builtin_amdgcn_perm(s1, s0, 0x07030602u);
+        const uint32_t dm = *reinterpret_cast<const uint32_t *>(o + 1280 + r * 4);
+        w.dv = half_lo(dm);
+        w.mv = half_hi(dm);
+        return w;
+    }
+    __device__ void decode(const Raw & r, const long long s, float (&v)[32]) const { DecQ2k{}.decode(r, s, v); }
+};
+
+struct DecIq2xsTile {  // GGUF type 17, .omph layout 2 (#253)
+    const uint8_t * base;
+    long long blocks;
+    using Raw = DecIq2xs::Raw;
+    static DecIq2xsTile make(const uint8_t * base, const int64_t, const long long blocks) { return {base, blocks}; }
+    __device__ Raw load(const long long row, const long long s) const {
+        const uint8_t * o = base + ((row >> 4) * blocks + (s >> 3)) * omph::format::kIq2xsTileBytes;
+        const int r = (int) (row & 15);
+        const int sb = (int) (s & 7);
+        Raw w;
+        w.ent[0] = *reinterpret_cast<const uint32_t *>(o + r * 32 + sb * 4);
+        w.ent[1] = *reinterpret_cast<const uint32_t *>(o + (r + 16) * 32 + sb * 4);
+        w.scb = o[1024 + r * 8 + sb];
+        w.dv = __half2float(*reinterpret_cast<const __half *>(o + 1152 + r * 2));
+        return w;
+    }
+    __device__ void decode(const Raw & r, const long long s, float (&v)[32]) const { DecIq2xs{}.decode(r, s, v); }
+};
+
+struct DecIq2xxsTile {  // GGUF type 16, .omph layout 2 (#253)
+    const uint8_t * base;
+    long long blocks;
+    using Raw = DecIq2xxs::Raw;
+    static DecIq2xxsTile make(const uint8_t * base, const int64_t, const long long blocks) { return {base, blocks}; }
+    __device__ Raw load(const long long row, const long long s) const {
+        const uint8_t * o = base + ((row >> 4) * blocks + (s >> 3)) * omph::format::kIq2xxsTileBytes;
+        const int r = (int) (row & 15);
+        const int sb = (int) (s & 7);
+        Raw w;
+        const uint32_t i0 = *reinterpret_cast<const uint16_t *>(o + r * 16 + sb * 2);
+        const uint32_t i1 = *reinterpret_cast<const uint16_t *>(o + (r + 16) * 16 + sb * 2);
+        w.aux0 = i0 | (i1 << 16);
+        w.aux1 = *reinterpret_cast<const uint32_t *>(o + 512 + r * 32 + sb * 4);
+        w.dv = __half2float(*reinterpret_cast<const __half *>(o + 1024 + r * 2));
+        return w;
+    }
+    __device__ void decode(const Raw & r, const long long s, float (&v)[32]) const { DecIq2xxs{}.decode(r, s, v); }
+};
+
 } // namespace omph::kernels::qd
