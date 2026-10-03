@@ -1,8 +1,8 @@
 # n-gram (prompt lookup) drafts in the engine (#199), engine commit d71eaec
-# RX 9060 XT, 160 W cap; omph-generate greedy, Qwen3.8-27B IQ3_S .omph (format 4), K4/V4 default mix,
-# scenarios of bench/results/ngram-199 (quote, edit-cc, edit-py, prose, HumanEval 0/80/144);
-# t/s = decode tokens / decode time, median of 5 runs; every output identical to plain greedy.
-# dflash: --dflash models/Qwen3.8-27B-DFlash2-Q4_K_M.omph; mtp: --draft-mtp 3.
+# RX 9060 XT, 160 W cap; omph-server greedy /v1/completions (--ctx 32768 --cache-ram 0), Qwen3.8-27B IQ3_S
+# .omph (format 4), default KV mix; scenarios of bench/results/ngram-199 (quote, edit-cc, edit-py, prose,
+# HumanEval 0/80/144); t/s = predicted_n / predicted_ms, one run per cell (not the §17 median);
+# the four configurations' outputs are identical text for text. dflash: --dflash DFlash2-Q4_K_M.omph; mtp: the server default (K = 3).
 drafter ngram  quote  he-80  he-0  prose  edit-cc  he-144  edit-py
 dflash  0      104.9   87.0  76.1   41.8    121.9    65.8     85.8
 dflash  1      132.6   91.3  79.3   41.7    193.5    67.8    169.3
