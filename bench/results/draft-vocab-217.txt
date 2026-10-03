@@ -1,0 +1,27 @@
+MTP drafts over a vocabulary prefix (#217, D2 of #203), RX 9060 XT, 2026-10-03
+
+A draft computes the 248320-row output head (682 MiB Q4_K, ~2.3 ms) for its argmax only;
+a speculative round drafts 3 times. The drafts now read the first OMPH_DRAFT_VOCAB rows
+(default 98304: 270 MiB) through gemv_q4k_prefix (the repacked layout of the whole
+tensor: a row prefix needs no copy, no VRAM), while the recent tokens stay inside them:
+an average over ~64 tokens of the share outside the prefix (the prompt, the kept
+tokens) under 5 %; above it the drafts read the whole head. Greedy output unchanged;
+sampled speculation keeps the draft as a point mass (#197), so its distribution holds.
+
+Share of real tokens with id < N (the BPE ids: low = frequent):
+                      <32k   <64k   <96k
+  prose (wiki)        91 %   97 %   99 %
+  code (HumanEval)    96 %   98 %   100 %
+  Italian prose       67 %   74 %   79 %   (a fixed prefix loses: below)
+
+Prefix size sweep, fixed prefix (no fallback), 256 tokens, ms per generated token:
+            full    32k     48k     64k     96k     112k    128k    160k
+  prose     17.25   17.73   17.45   17.16   16.75   16.88   17.02   17.06
+  code      18.92   18.18   17.67   17.60   17.64   17.78   17.92   18.20
+  Italian   14.83   -       -       -       18.92   -       -       19.32  (repetitive continuation)
+
+Final (adaptive, default 98304) vs full head, 300 tokens, 3 runs each, output identical:
+  prose continuation  16.85 16.90 16.90 -> 16.31 16.34 16.33   (-3.4 %)
+  code continuation   19.58 19.58 19.58 -> 18.26 18.27 18.25   (-6.7 %)
+  English chat        21.04 21.03 21.01 -> 19.68 19.68 19.65   (-6.4 %)
+  Italian chat        24.13 24.13 24.11 -> 24.13 24.12 24.12   (parity: the fallback)

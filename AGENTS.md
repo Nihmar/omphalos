@@ -190,6 +190,7 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_OVERLAP` | A/B | a side stream for sibling GEMVs (#71); off by default since #189 (the persistent-warp GEMVs fill the GPU alone: 44.2 vs 44.9 ms per step, and a side stream the calibration keeps could cost ~9 ms). With it on, the runner times the overlap at load and drops a side stream that loses to running in order (#132), and re-times it when single-token steps turn 1.35x slower during the run (#144; `OMPH_TIMING` prints both) |
 | `OMPH_NO_B4` | A/B | no NT = 2..4-token GEMVs (verifications, short `--gemv` prefills): one launch per token |
 | `OMPH_NO_GROUP` | A/B | a verification's sibling GEMVs (one input: gate + up, qkv + gate, q + k + v) as separate launches instead of one grouped launch (#214) |
+| `OMPH_DRAFT_VOCAB=N` | decode | MTP drafts take their argmax over the first N token ids (default 98304; 0 = the whole head) while the recent text stays inside them, the whole head otherwise (#217): output unchanged, ~3-7 % faster speculative decoding in English and code |
 | `OMPH_GEMM_MIN=T` | A/B | `--gemv` runs of T+ tokens (prefill chunks) take the GEMM path (default 16, the measured crossover with the fused GEMM; #129, #141) |
 | `OMPH_NO_FUSED_GEMM` | A/B | dequantize each weight to f16, then the GEMM, instead of the fused dequant + WMMA GEMM (#141) |
 | `OMPH_STAGE_MIB=N` | A/B | f16 weights staged for the GEMM in row slices of ~N MiB (default 20, cache-resident; 0 = whole tensors; #129, #132) |
