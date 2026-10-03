@@ -665,9 +665,12 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
             *reinterpret_cast<wmma_half8 *>(&ks[key * kFaKLd + c * 16]) = k0;
             *reinterpret_cast<wmma_half8 *>(&ks[key * kFaKLd + c * 16 + 8]) = k1;
         }
+        // consecutive lanes take consecutive keys of one dim chunk: their
+        // transposed two-byte stores land side by side (key-major jobs put the
+        // 32 lanes' stores 1280 bytes apart, one LDS bank: 32-way conflicts; #191)
         for (int job = tid; job < kFaKeys * (kGqaHd / 16); job += kFaThreads) {
-            const int key = job / (kGqaHd / 16);
-            const int c = job % (kGqaHd / 16);
+            const int key = job % kFaKeys;
+            const int c = job / kFaKeys;
             float vc[16];
             if (s0 + key < n_keys) {
                 gqa_load_v16<Q8>(kv, s0 + key, kvh, nkv, c, seq - kv.window, vc);
