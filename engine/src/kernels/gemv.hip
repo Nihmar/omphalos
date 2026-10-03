@@ -2421,6 +2421,9 @@ bool gemv_q6k(const void * packed, const void * x_f16, float * y, const int64_t 
         k % 256 != 0) {
         return false;
     }
+    if (rows % 16 == 0) {
+        return launch_tiles<qd::TileQ6k, 1>(packed, x_f16, y, rows, k, stream);  // #258
+    }
     const int64_t n_blocks = rows * (k / 256);
     const omph::format::Q6kLayout l = omph::format::q6k_layout(n_blocks);
     const int64_t n_sub = k / 32;
@@ -2661,6 +2664,7 @@ bool gemv_multi(const uint32_t type, const void * packed, const void * x_f16, fl
             if (nt == 3) return launch_q2k_ntg<3>(packed, x_f16, y, rows, k, stream);
             return launch_q2k_ntg<4>(packed, x_f16, y, rows, k, stream);
         case 14:
+            if (rows % 16 == 0) return launch_tiles_n<qd::TileQ6k>(nt, packed, x_f16, y, rows, k, stream);
             if (nt == 2) return launch_q6k_ntg<2>(packed, x_f16, y, rows, k, stream);
             if (nt == 3) return launch_q6k_ntg<3>(packed, x_f16, y, rows, k, stream);
             return launch_q6k_ntg<4>(packed, x_f16, y, rows, k, stream);
@@ -2685,6 +2689,7 @@ bool gemv_tokens(const uint32_t type, const void * packed, const void * x_f16, f
     if (rows % 16 == 0 && type == 10) return launch_tiles_n<qd::TileQ2k>(nt, packed, x_f16, y, rows, k, stream);
     if (rows % 16 == 0 && type == 17) return launch_tiles_n<qd::TileIq2xs>(nt, packed, x_f16, y, rows, k, stream);
     if (rows % 16 == 0 && type == 16) return launch_tiles_n<qd::TileIq2xxs>(nt, packed, x_f16, y, rows, k, stream);
+    if (rows % 16 == 0 && type == 14) return launch_tiles_n<qd::TileQ6k>(nt, packed, x_f16, y, rows, k, stream);
     if (nt <= 4 || k % 256 != 0) {
         return false;  // 2..4: gemv_multi's kernels (and gemv_group); 5..16 below (#244)
     }
@@ -2748,14 +2753,13 @@ bool gemv_tokens(const uint32_t type, const void * packed, const void * x_f16, f
 // --- sibling GEMVs in one launch (#214) ------------------------------------
 //
 // The 2-3 GEMVs a layer runs on one input (ffn_gate + ffn_up, attn_qkv +
-// attn_gate, attn_q + attn_k + attn_v) as one launch of NT = 2..4 tokens:
-// each launch costs ~10 us of fill / drain plus the gap to the next
-// (omph-gemv-bench --merge-type). The grid is the members' grids back to back;
-// a block finds its member and runs that type's body (the same code as the
-// type's own kernel, so the outputs are bit-identical), with one LDS buffer
-// sized for the largest body (the IQ3_S tiles). Carrying every body costs
-// occupancy (~184 VGPRs: 8 waves per SIMD), which the NT kernels absorb
-// (#214: no loss down to 8 waves per SIMD).
+// attn_gate, attn_q + attn_k + attn_v) as one launch of 1..16 tokens (#214,
+// #255): each launch costs ~6-10 us of fill / drain plus the gap to the next
+// (omph-gemv-bench --group). The grid is the members' grids back to back; a
+// block finds its member and runs that type's tile body (the same code as the
+// type's own tile kernel, so the outputs are bit-identical), with one LDS
+// buffer sized for the largest (the IQ2_S grid). Carrying every body costs
+// occupancy (8 waves per SIMD), which the tile GEMVs absorb (#214).
 namespace {
 
 constexpr int kGroupLds = qd::TileIq2s::kLds + 8704;  // the IQ2_S tiles (the largest grid) + reduction
@@ -2763,10 +2767,10 @@ constexpr int kGroupLds = qd::TileIq2s::kLds + 8704;  // the IQ2_S tiles (the la
 struct GroupItem {
     uint32_t type;
     unsigned blocks;          // this member's blocks
-    const uint8_t * p[5];     // the layout's sections, in the body's order
+    const uint8_t * w;        // the tiles
     float * y;
     long long rows;
-    long long n;              // k / 32 (the tiles: k / 256)
+    long long n;              // k / 256
 };
 
 struct GroupArgs {
@@ -2782,17 +2786,15 @@ template <int NT>
 __device__ __forceinline__ void group_body(const GroupItem & t, const __half * __restrict__ x, const long long b,
                                         uint8_t * __restrict__ lds) {
     switch (t.type) {
-        case 21: tiles_body<qd::TileIq3s, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
-        case 18: tiles_body<qd::TileIq3xxs, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
-        case 12: tiles_body<qd::TileQ4k, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
-        case 23: tiles_body<qd::TileIq4xs, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
-        case 17: tiles_body<qd::TileIq2xs, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
-        case 16: tiles_body<qd::TileIq2xxs, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
-        case 22: tiles_body<qd::TileIq2s, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
-        case 10: tiles_body<qd::TileQ2k, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
-        case 14:
-            if constexpr (NT == 4) q6k_ntg_body<NT, 2>(t.p[0], t.p[1], t.p[2], t.p[3], x, t.y, t.rows, t.n, b, lds);
-            break;
+        case 21: tiles_body<qd::TileIq3s, NT>(t.w, x, t.y, t.rows, t.n, b, lds); break;
+        case 18: tiles_body<qd::TileIq3xxs, NT>(t.w, x, t.y, t.rows, t.n, b, lds); break;
+        case 12: tiles_body<qd::TileQ4k, NT>(t.w, x, t.y, t.rows, t.n, b, lds); break;
+        case 23: tiles_body<qd::TileIq4xs, NT>(t.w, x, t.y, t.rows, t.n, b, lds); break;
+        case 17: tiles_body<qd::TileIq2xs, NT>(t.w, x, t.y, t.rows, t.n, b, lds); break;
+        case 16: tiles_body<qd::TileIq2xxs, NT>(t.w, x, t.y, t.rows, t.n, b, lds); break;
+        case 22: tiles_body<qd::TileIq2s, NT>(t.w, x, t.y, t.rows, t.n, b, lds); break;
+        case 10: tiles_body<qd::TileQ2k, NT>(t.w, x, t.y, t.rows, t.n, b, lds); break;
+        case 14: tiles_body<qd::TileQ6k, NT>(t.w, x, t.y, t.rows, t.n, b, lds); break;
         default: break;
     }
 }
@@ -2809,44 +2811,23 @@ __global__ __launch_bounds__(256, 8) void gemv_group_kernel(const GroupArgs g, c
     group_body<NT>(g.it[m], x, b, lds);
 }
 
-// One member's device record (the launch helpers' layout arithmetic); false
-// for a type without an NT body: the tiles take any token count, Q6_K only 4.
-bool group_item(const GemvGroupItem & in, GroupItem & o, const int nt) {
-    const int64_t rows = in.rows;
-    const int64_t k = in.k;
-    const int64_t nb = rows * (k / 256);
-    const auto * base = static_cast<const uint8_t *>(in.packed);
-    o = GroupItem{};
-    o.type = in.type;
-    o.y = in.y;
-    o.rows = rows;
-    o.n = k / 32;
-    const auto ntg = [&](const int r) { o.blocks = (unsigned) ((rows + 8 * r - 1) / (8 * r)); };
+// One member's device record; false for a type without a tile body (the tiles
+// take any token count; IQ1_M is left out: its 16 KiB codebook in the shared
+// LDS cost the grouped launch more than the one launch it saves, #226).
+bool group_item(const GemvGroupItem & in, GroupItem & o) {
     switch (in.type) {
-        case 21:
-        case 18:  // the WMMA tiles (#178, #219, #244)
-        case 12:
-        case 23:
-        case 22:
-        case 10:
-        case 17:
-        case 16:
-            if (rows % 16 != 0) return false;
-            o.p[0] = base;
-            o.n = k / 256;
-            o.blocks = (unsigned) ((rows / 16 + kTileTiles - 1) / kTileTiles);
-            return true;
-        // IQ1_M (#226) is left out: its 16 KiB codebook in the shared LDS cost
-        // the grouped launch more than the one launch it saves
-        case 14: {
-            if (nt != 4) return false;
-            const auto l = omph::format::q6k_layout(nb);
-            o.p[0] = base + l.ql_off; o.p[1] = base + l.qh_off; o.p[2] = base + l.sc_off; o.p[3] = base + l.d_off;
-            ntg(2);
-            return true;
-        }
+        case 21: case 18: case 12: case 23: case 22: case 10: case 17: case 16: case 14: break;
         default: return false;
     }
+    if (in.rows % 16 != 0) return false;
+    o = GroupItem{};
+    o.type = in.type;
+    o.w = static_cast<const uint8_t *>(in.packed);
+    o.y = in.y;
+    o.rows = in.rows;
+    o.n = in.k / 256;
+    o.blocks = (unsigned) ((in.rows / 16 + kTileTiles - 1) / kTileTiles);
+    return true;
 }
 
 } // namespace
@@ -2863,7 +2844,7 @@ bool gemv_group(const GemvGroupItem * items, const int n, const void * x_f16, co
     for (int i = 0; i < n; ++i) {
         const GemvGroupItem & in = items[i];
         if (in.packed == nullptr || in.y == nullptr || in.rows <= 0 || in.k <= 0 || in.k % 256 != 0 ||
-            in.k != items[0].k || !group_item(in, g.it[i], nt)) {
+            in.k != items[0].k || !group_item(in, g.it[i])) {
             return false;
         }
         total += g.it[i].blocks;
@@ -2972,7 +2953,10 @@ bool dequant_repacked(const uint32_t type, const void * packed, void * dst_f16,
             if (rows % 16 == 0) launch(qd::DecQ2kTile::make(base, n_blocks, blocks));
             else launch(qd::DecQ2k::make(base, n_blocks, blocks));
             break;
-        case 14: launch(qd::DecQ6k::make(base, n_blocks, blocks)); break;
+        case 14:
+            if (rows % 16 == 0) launch(qd::DecQ6kTile::make(base, n_blocks, blocks));
+            else launch(qd::DecQ6k::make(base, n_blocks, blocks));
+            break;
         default: return false;
     }
     return hipGetLastError() == hipSuccess;

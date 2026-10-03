@@ -497,7 +497,11 @@ bool gemm_q_impl(const uint32_t type, const void * packed, const void * x, float
             else if (n_out % 16 == 0) launch(qd::DecQ2kTile::make(base, n_blocks, blocks));
             else launch(qd::DecQ2k::make(base, n_blocks, blocks));
             break;
-        case 14: launch(qd::DecQ6k::make(base, n_blocks, blocks)); break;
+        case 14:  // #258
+            if (n_out % 128 == 0) tiles(qd::TileQ6k{});
+            else if (n_out % 16 == 0) launch(qd::DecQ6kTile::make(base, n_blocks, blocks));
+            else launch(qd::DecQ6k::make(base, n_blocks, blocks));
+            break;
         case 29: launch(qd::DecIq1m::make(base, n_blocks, blocks)); break;
         default: return false;
     }

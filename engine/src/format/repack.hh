@@ -314,12 +314,19 @@ bool unrepack_iq2_s_tiles(const void * tiles, int64_t rows, int64_t blocks_per_r
 constexpr int64_t kQ2kTileBytes = 1344;
 constexpr int64_t kIq2xsTileBytes = 1184;
 constexpr int64_t kIq2xxsTileBytes = 1056;
+// Q6_K (3360 B, #258): [ ql 2048 ] lane l: 64 B, per 128-weight half g at 32 g its
+//                     bytes 16 h .. 16 h + 15 and 32 + 16 h .. (sub-blocks j, j + 1 of 4
+//                     j / 2 .. : low nibbles for j < 2, high for j >= 2)
+//                     [ qh 1024 ] lane l: 32 B, per half g at 16 g its bytes 16 h .. 16 h + 15
+//                     [ sc  256 ] lane l: 8 B, at 4 g + j the scale byte 8 g + 2 j + h
+//                     [ d    32 ] row r: f16
+constexpr int64_t kQ6kTileBytes = 3360;
 
 // ------------------------------------------------------- the engine's layout
 //
 // The layout the engine's kernels read a tensor of `type` in (format version 5,
 // #178, #219, #244, #253): 2 (WMMA tiles) for IQ3_S, IQ3_XXS and, rows a multiple of 16, IQ4_XS, Q4_K, IQ2_S, Q2_K,
-// IQ2_XS and IQ2_XXS (rows
+// IQ2_XS, IQ2_XXS and Q6_K (rows
 // a multiple of 16), 1 (the repacked layout above) for the other types with
 // one, 0 (the GGUF bytes) otherwise; its size, and the conversions both ways
 // (rows x k weights, row-major). Takes the rows: a tensor whose rows are not a

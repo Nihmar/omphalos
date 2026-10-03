@@ -1152,6 +1152,7 @@ void untiles_generic(const uint8_t * in, const int64_t rows, const int64_t block
 constexpr TileSec kQ2kSecs[] = {{true, 32}, {true, 8}, {false, 4}};
 constexpr TileSec kIq2xsSecs[] = {{true, 32}, {false, 8}, {false, 2}};
 constexpr TileSec kIq2xxsSecs[] = {{true, 16}, {false, 32}, {false, 2}};
+constexpr TileSec kQ6kSecs[] = {{true, 64}, {true, 32}, {true, 8}, {false, 2}};
 
 // Q2_K / IQ2_XS / IQ2_XXS record <-> repacked layout: one function both ways
 // (out = true: layout -> record)
@@ -1192,6 +1193,23 @@ void iq2xxs_rec(const Iq2Layout & l, uint8_t * r, const int i, const int64_t blk
     }
 }
 
+void q6k_rec(const Q6kLayout & l, uint8_t * r, const int i, const int64_t blk, const int h, uint8_t * rec,
+             const bool out) {
+    const auto mv = [out](uint8_t * a, uint8_t * b, const size_t n) { out ? std::memcpy(b, a, n) : std::memcpy(a, b, n); };
+    for (int g = 0; g < 2; ++g) {
+        if (i == 0) {
+            mv(r + l.ql_off + blk * 128 + 64 * g + 16 * h, rec + 32 * g, 16);
+            mv(r + l.ql_off + blk * 128 + 64 * g + 32 + 16 * h, rec + 32 * g + 16, 16);
+        } else if (i == 1) {
+            mv(r + l.qh_off + blk * 64 + 32 * g + 16 * h, rec + 16 * g, 16);
+        } else if (i == 2) {
+            for (int j = 0; j < 4; ++j) mv(r + l.sc_off + blk * 16 + 8 * g + 2 * j + h, rec + 4 * g + j, 1);
+        } else if (g == 0) {
+            mv(r + l.d_off + blk * 2, rec, 2);
+        }
+    }
+}
+
 // repack -> tiles and back for one of the three types
 template <class L, int N, class Rec, class Repack>
 bool tiles_via(const void * gguf, const int64_t rows, const int64_t blocks, const L & l, const TileSec (&secs)[N],
@@ -1224,7 +1242,8 @@ bool untiles_via(const void * tiles, const int64_t rows, const int64_t blocks, c
 
 uint32_t engine_layout(const uint32_t type, const int64_t rows) {
     if (type == 21 || type == 18 ||
-        ((type == 23 || type == 12 || type == 22 || type == 10 || type == 17 || type == 16) && rows % 16 == 0)) {
+        ((type == 23 || type == 12 || type == 22 || type == 10 || type == 17 || type == 16 || type == 14) &&
+         rows % 16 == 0)) {
         return 2;
     }
     return repacked_bytes(type, 1) > 0 ? 1 : 0;
@@ -1245,6 +1264,7 @@ int64_t engine_layout_bytes(const uint32_t type, const int64_t rows, const int64
                 case 10: return rows / 16 * (k / 256) * kQ2kTileBytes;
                 case 17: return rows / 16 * (k / 256) * kIq2xsTileBytes;
                 case 16: return rows / 16 * (k / 256) * kIq2xxsTileBytes;
+                case 14: return rows / 16 * (k / 256) * kQ6kTileBytes;
                 default: return iq3s_tiles_bytes(rows, k / 256);
             }
         case 1: return repacked_bytes(type, rows * (k / 256));
@@ -1267,6 +1287,7 @@ bool to_engine_layout(const uint32_t type, const void * gguf, const int64_t rows
                 case 10: return tiles_via(gguf, rows, k / 256, q2k_layout(rows * (k / 256)), kQ2kSecs, q2k_rec, repack_q2k, dst);
                 case 17: return tiles_via(gguf, rows, k / 256, iq2_xs_layout(rows * (k / 256)), kIq2xsSecs, iq2xs_rec, repack_iq2_xs, dst);
                 case 16: return tiles_via(gguf, rows, k / 256, iq2_xxs_layout(rows * (k / 256)), kIq2xxsSecs, iq2xxs_rec, repack_iq2_xxs, dst);
+                case 14: return tiles_via(gguf, rows, k / 256, q6k_layout(rows * (k / 256)), kQ6kSecs, q6k_rec, repack_q6k, dst);
                 default: return repack_iq3_s_tiles(gguf, rows, k / 256, dst);
             }
         case 1: return repack_any(type, gguf, rows * (k / 256), dst);
@@ -1289,6 +1310,7 @@ bool from_engine_layout(const uint32_t type, const void * src, const int64_t row
                 case 10: return untiles_via(src, rows, k / 256, q2k_layout(rows * (k / 256)), kQ2kSecs, q2k_rec, unrepack_q2k, 84, gguf);
                 case 17: return untiles_via(src, rows, k / 256, iq2_xs_layout(rows * (k / 256)), kIq2xsSecs, iq2xs_rec, unrepack_iq2_xs, 74, gguf);
                 case 16: return untiles_via(src, rows, k / 256, iq2_xxs_layout(rows * (k / 256)), kIq2xxsSecs, iq2xxs_rec, unrepack_iq2_xxs, 66, gguf);
+                case 14: return untiles_via(src, rows, k / 256, q6k_layout(rows * (k / 256)), kQ6kSecs, q6k_rec, unrepack_q6k, 210, gguf);
                 default: return unrepack_iq3_s_tiles(src, rows, k / 256, gguf);
             }
         case 1: {
