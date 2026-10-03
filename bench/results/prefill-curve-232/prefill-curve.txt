@@ -1,0 +1,6 @@
+Prefill curve (#232): omphalos 230d3f5, llama.cpp RX9060XT fork build-hip; 2026-10-03, card overclocked by the maintainer. Raw wikitext-2 token ids, one generated token, prompt caching off, each repeat from another corpus offset; the servers' own prefill time (timings.prompt_ms); 2k-token warm-up per server; context 106496 (llama.cpp K8/V4 + MTP: 69632, it cannot allocate 106k). Median of 5.
+
+median prefill t/s (runs)
+
+kv    engine    mtp           512         2048         8192        16384        32768        65536       100000
+k4q4  omphalos  on        957 (5)      950 (5)      920 (5)      885 (5)      821 (5)      720 (5)      636 (5)
