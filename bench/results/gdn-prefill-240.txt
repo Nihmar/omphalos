@@ -11,3 +11,28 @@
 #   delta_post_kernel        42           44    (8 tokens per block tried: no gain, bandwidth-bound; reverted)
 #   total                   459          418
 # Prefill wall (OMPH_TIMING, 5 alternating runs, median): main 4329.1 ms, part 1 4286.4 ms (-1.0 %).
+#
+# Part 2, the chunked WY form for prefill chunks (OMPH_GDN_EXACT=1: the part 1 path, same binary).
+# Kernel totals, 4096 tokens (rocprofv3):
+#   delta_rec_kernel 284 ms -> delta_wy_a_kernel 47 + delta_wy_b_kernel 71 = 118 ms
+#   (iterations, kept for the record: U - W h form with U, W, gamma Q, K'^T per value head in
+#   scratch: A 197 + B 78, phase A bound by ~100 MB of scratch traffic per 512 tokens; the T R form
+#   with f32 Q/K operands: B spilled 900+ bytes/lane, 238-262 ms; LDS staging of K/Q/K^T in B:
+#   slower, 110 vs 71 ms without it; one guarded + one unguarded chunk body: spills again)
+# Prefill wall (OMPH_TIMING, 5 alternating runs, median):
+#   prompt   exact (part 1)   WY        change
+#   4096     4287.5 ms        4151.8    -3.2 %
+#   16384    18162.3 ms       17603.1   -3.1 %
+# KL vs the exact path, last 512 positions (compare_logits.py):
+#   prompt                 cache   KL mean   p99      max     top-1
+#   wiki train @ offset 0  K8/V4   0.00029   0.0022   0.015   99.61 %
+#   wiki train @ offset 0  K4/V4   0.0032    0.0105   1.18    99.41 %   (pos 3656; mean without it 0.00089)
+#   wiki test              K8/V4   0.00025   0.0024   0.0053  99.80 %
+#   wiki test              K4/V4   0.00050   0.0044   0.012   99.02 %
+#   Position 3656 of the first prompt is fragile: the K4-vs-K8 cache switch on the exact path moves
+#   it 0.254 nats (its maximum too), and every WY precision variant tried moved it 0.9-1.2.
+#   For scale: the default KV cache vs exact f32 KV costs 0.0012-0.0015 (#175).
+# Speculative greedy == plain greedy after a 4096-token WY prefill (OMPH_SPEC_CHECK=1).
+# Fresh vs checkpoint-resumed (server, 3000-token prefix then the 4096 prompt, 64 greedy tokens):
+#   wiki train: WY differs from char 133, the exact path from char 140 (not identical before either);
+#   wiki test: both identical.

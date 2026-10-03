@@ -53,6 +53,11 @@ struct GdnStep {
     // gdn_chunk only: gdn_work_floats(tokens, heads, n_kh) floats of scratch, which
     // selects the token-parallel form (#96).
     float * work = nullptr;
+    // gdn_chunk with work, prefill only (no replay / state_out): gdn_wy_floats(tokens,
+    // heads) floats of scratch, which selects the chunked WY form of the recurrence
+    // (#240): 64-token chunks, the intra-chunk work as f16 WMMAs with f32
+    // accumulation, the state in f32 accumulators. Not bit-identical to gdn_step.
+    float * wy = nullptr;
 };
 bool gdn_step(const GdnStep & a, int64_t heads, hipStream_t stream);
 
@@ -72,6 +77,18 @@ bool gdn_chunk(const GdnStep & a, int64_t heads, hipStream_t stream);
 // output (heads * 128) and (beta, decay) per head.
 inline int64_t gdn_work_floats(const int64_t tokens, const int64_t heads, const int64_t n_kh) {
     return tokens * (n_kh * 256 + heads * 256 + heads * 2);
+}
+
+// Scratch floats of the WY form (#240): each token's log decay, then per
+// 64-token chunk K^T, K, Q (f16) per key head and T, P (f16), g, beta per value head;
+// then the delta rule's output with the last chunk's rows padded to 64.
+constexpr int64_t kWyChunk = 64;
+constexpr int64_t kWyKeyFloats = 12288;
+constexpr int64_t kWyHeadFloats = 6272;
+inline int64_t gdn_wy_floats(const int64_t tokens, const int64_t heads, const int64_t n_kh) {
+    const int64_t lg = (tokens * heads + 15) / 16 * 16;
+    const int64_t chunks = (tokens + kWyChunk - 1) / kWyChunk;
+    return lg + chunks * (n_kh * kWyKeyFloats + heads * kWyHeadFloats) + chunks * kWyChunk * heads * 128;
 }
 
 // Floats of one token's replay record: decay (heads), k (n_kh x 128), d (heads x 128).

@@ -211,6 +211,12 @@ bool Runner::gdn_layer(const int64_t il, const LayerWeights & L, const int64_t T
         if (!env_.gdn_serial &&
             omph::kernels::gdn_work_floats(T, n_vh, n_kh) <= T * h_.n_ff) {
             step.work = static_cast<float *>(ffn1_);
+            // a prefill chunk: the chunked WY form (#240), its scratch in ffn2_ (also
+            // free until the FFN); verifications keep the exact per-token rule
+            if (!verifying_ && !env_.gdn_exact &&
+                omph::kernels::gdn_wy_floats(T, n_vh, n_kh) <= max_tokens_ * h_.n_ff) {
+                step.wy = static_cast<float *>(ffn2_);
+            }
         }
         if (!omph::kernels::gdn_chunk(step, n_vh, nullptr)) {
             return fail("delta rule (chunk) failed");
