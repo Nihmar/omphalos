@@ -64,6 +64,23 @@ bool Runner::grouped(const void * x16, const int64_t k, const int64_t T, std::in
     return ok;
 }
 
+bool Runner::up_swiglu_ok(const Mat & up, const int64_t n_out, const int64_t k, const int64_t T) const {
+    const GemvEntry * g = up.gemv;
+    // matmul's own route to the fused GEMM, without its ablations
+    return !env_.no_swiglu_gemm && !env_.no_fused_gemm && !env_.skip_stage && !env_.skip_gemv &&
+           env_.skip_gemv_type < 0 && up.t != nullptr && g != nullptr && g->rows == n_out && g->k == k &&
+           (!use_gemv_ || T >= gemm_min_);
+}
+
+bool Runner::up_swiglu(const Mat & up, const void * x16, const float * gate, void * out16, const int64_t n_out,
+                       const int64_t k, const int64_t T) {
+    timer_gemm_.start();
+    const bool ok = omph::kernels::gemm_q_swiglu(up.gemv->type, up.dev, x16, gate, out16, n_out, k, T,
+                                                 hipStreamPerThread);
+    timer_gemm_.stop(t_gemm_);
+    return ok;
+}
+
 // One matmul: the fused GEMV for single-token steps when it is available for
 // this tensor, the small-batch GEMV for a few tokens, otherwise the f16
 // dequant + GEMM path.

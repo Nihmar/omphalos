@@ -250,6 +250,13 @@ private:
     };
     bool grouped(const void * x16, int64_t k, int64_t T, std::initializer_list<Sibling> s);
 
+    // An FFN whose up projection takes the fused GEMM (a prefill chunk): up's
+    // GEMM writes f16(silu(gate) * up) into out16 directly, bit-identical to
+    // up in f32 then swiglu_f16 (#221). up_swiglu_ok says whether it applies.
+    bool up_swiglu_ok(const Mat & up, int64_t n_out, int64_t k, int64_t T) const;
+    bool up_swiglu(const Mat & up, const void * x16, const float * gate, void * out16, int64_t n_out, int64_t k,
+                   int64_t T);
+
     // One fused GEMV launch for a single token, dispatched on the GGUF type.
     static bool gemv_one(const int type, const void * w, const void * x, float * y,
                          const int64_t n_out, const int64_t k, hipStream_t st);
