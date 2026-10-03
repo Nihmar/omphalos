@@ -321,6 +321,10 @@ private:
     std::vector<void *> states_;  // per layer, into state_pool_; null for attention
     void * state_pool_ = nullptr;
     void * embd_host_ = nullptr;   // token_embd, raw GGUF bytes, pinned host memory
+    // embed()'s token ids and gathered rows on the device, grown on demand (#223)
+    int32_t * embd_ids_ = nullptr;
+    void * embd_stage_ = nullptr;
+    int64_t embd_cap_ = 0;
     bool last_logits_only_ = false;
     static constexpr int64_t kHeadRows = 32;  // logits_ rows (multiple of 4)
     std::vector<int64_t> kv_index_;

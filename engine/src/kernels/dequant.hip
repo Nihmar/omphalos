@@ -436,6 +436,40 @@ bool launch(const uint32_t type, const void * src, void * dst, const int64_t n,
 
 } // namespace
 
+namespace {
+
+// Rows ids[t] of a table (row_bytes each, host-mapped or device) to dst back
+// to back, one workgroup per row (#223).
+__global__ void gather_rows_kernel(const uint8_t * __restrict__ table, const long long row_bytes,
+                                   const int32_t * __restrict__ ids, uint8_t * __restrict__ dst) {
+    const long long t = blockIdx.x;
+    const uint8_t * s = table + (long long) ids[t] * row_bytes;
+    uint8_t * d = dst + t * row_bytes;
+    if (row_bytes % 4 == 0) {
+        for (long long i = threadIdx.x; i < row_bytes / 4; i += blockDim.x) {
+            reinterpret_cast<uint32_t *>(d)[i] = reinterpret_cast<const uint32_t *>(s)[i];
+        }
+    } else {
+        for (long long i = threadIdx.x; i < row_bytes; i += blockDim.x) {
+            d[i] = s[i];
+        }
+    }
+}
+
+} // namespace
+
+bool dequantize_rows(const uint32_t type, const void * table, const int64_t row_bytes, const int32_t * ids,
+                     const int64_t n_rows, const int64_t ne, void * staging, float * dst, hipStream_t stream) {
+    if (table == nullptr || ids == nullptr || staging == nullptr || dst == nullptr || n_rows <= 0 ||
+        row_bytes <= 0 || ne <= 0) {
+        return false;
+    }
+    gather_rows_kernel<<<(unsigned) n_rows, 256, 0, stream>>>(static_cast<const uint8_t *>(table),
+                                                              (long long) row_bytes, ids,
+                                                              static_cast<uint8_t *>(staging));
+    return hipGetLastError() == hipSuccess && dequantize(type, staging, dst, n_rows * ne, false, stream);
+}
+
 bool dequantize(const uint32_t type, const void * src, void * dst, const int64_t n,
                 const bool out_f16, hipStream_t stream) {
     if (src == nullptr || dst == nullptr || n <= 0) {
