@@ -1,0 +1,42 @@
+# IQ2_S, Q2_K, IQ2_XS and IQ2_XXS in WMMA tiles (#253, .omph format 5), 2026-10-03.
+# RX 9060 XT, 160 W cap. base: main 19a19c8 (format 4); tiles: perf/253-iq2-tiles b8a9e3b.
+#
+# GEMVs, all tensors of the type back to back (omph-gemv-bench --all-of-type T [--nt N]), ms per pass:
+#   type      tensors  MiB     1 token        4 tokens       8 tokens       16 tokens
+#                              base   tiles   base   tiles   base   tiles   base   tiles
+#   IQ2_S     16       374.8   1.657  1.569   2.014  1.618   3.966  1.661   7.706  1.625
+#   Q2_K      13       229.7   0.996  0.869   1.607  0.899   3.466  0.947   7.399  0.929
+#   IQ2_XS     9       211.0   0.838  0.952   1.206  0.980   2.303  1.010   4.620  0.988
+#   IQ2_XXS    5        94.1   0.431  0.493   0.580  0.506   1.095  0.522   2.217  0.509
+#   total     43       909.6   3.922  3.883   5.407  4.003   10.83  4.140   21.94  4.051
+# Every row of a 2..16-token call equals the 1-token call bit for bit (--multi), all four types.
+#
+# Prefill GEMM at 512 tokens (--gemm 512), TFLOPS: IQ2_S 53.1 -> 56.6, Q2_K 57.2 -> 57.7,
+#   IQ2_XS 55.7 -> 54.7, IQ2_XXS 57.4 -> 55.8 (sum 57.7 -> 56.6 ms).
+#
+# End to end, 5 runs alternating base / tiles, median (omph-run --gemv; plain: golden prompt, 65 tokens,
+# OMPH_TIMING step gpu; MTP --draft-mtp 3 and DFlash2 --dflash: 3k wikitext prompt, 200 tokens, ms per
+# verification step = ms per token x 200 / steps, since the tiles' numerics change the text and with it
+# the acceptance; prefill: 4k prompt, prefill wall):
+#              base      tiles
+#   plain      42.34     42.20 ms per token
+#   MTP step   54.51     52.84 ms   (-3.1 %)
+#   DFlash2    62.43     57.62 ms   (-7.7 %)
+#   prefill 4k 4191.8    4183.4 ms
+#
+# Scenarios of bench/results/ngram-199 through omph-server (--ctx 32768 --cache-ram 0, default KV), t/s, one
+# run per cell; every output identical to plain greedy (--no-mtp). Format 4 numbers from
+# bench/results/ngram-199-engine.txt in brackets.
+#   config           quote          he-80         he-0          prose        edit-cc         he-144        edit-py
+#   plain            23.5           23.5          23.5          23.5         23.4            23.5          23.3
+#   dflash           116.5 (104.9)  95.5 (87.0)   85.3 (76.1)   45.3 (41.8)  139.2 (121.9)   73.7 (65.8)   95.0 (85.8)
+#   dflash + ngram   162.2 (132.6)  103.7 (91.3)  90.5 (79.3)   45.0 (41.7)  262.1 (193.5)   75.1 (67.8)   216.2 (169.3)
+#   mtp              73.9 (71.8)    62.5 (60.6)   57.9 (56.2)   44.2 (40.3)  77.5 (75.2)     58.4 (51.1)   75.3 (73.1)
+#   mtp + ngram      135.2 (112.4)  75.0 (70.1)   66.9 (62.6)   43.7 (40.0)  260.2 (195.8)   64.5 (54.4)   200.6 (159.5)
+#
+# Decode KL (128 steps after the 3k prompt, tokens forced to base's f32-KV greedy run): vs the exact f32 KV
+#   base 0.000468, tiles 0.000484 (top-1 99.21 % both); tiles vs base 0.000097 (top-1 100 %).
+#
+# Checks: oracle drafts of 3, 8, 9, 12, 15 tokens with --draft-corrupt 4 and OMPH_SPEC_CHECK=1, K8 and
+# OMPH_KV_K4=1: identical to plain greedy; check_gpu_run --layers, check_gpu_decode --gemv, check_gpu_mtp,
+# check_server, the CPU tests pass. VRAM unchanged (the tiles keep the GGUF blocks' size).

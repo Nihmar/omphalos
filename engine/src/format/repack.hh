@@ -276,10 +276,50 @@ int64_t q4k_tiles_bytes(int64_t rows, int64_t blocks_per_row);
 bool repack_q4k_tiles(const void * gguf, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
 bool unrepack_q4k_tiles(const void * tiles, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
 
+// ------------------------------------------------------------- IQ2_S tiles
+//
+// For the WMMA kernels (#253), built on the repacked layout above (pair-ordered
+// signs), in 16-row tiles. Per tile and 256-weight block, 1312 bytes (the 16
+// GGUF blocks' size); lane l (row l % 16, half h = l / 16) takes weights
+// 16 h .. 16 h + 15 of each sub-block, its 8-weight groups 2 h and 2 h + 1:
+//   [ qs     ]  512 B  lane l: 16 B, sub-block sb's index bytes 2 h, 2 h + 1 at 2 sb
+//   [ signs  ]  512 B  lane l: 16 B, sub-block sb's sign bytes (h = 0: bytes
+//                      1, 3; h = 1: bytes 0, 2 of the pair-ordered word) at 2 sb
+//   [ qh     ]  128 B  lane l: 4 B, sub-block sb's qh nibble h at bits 4 sb
+//   [ scales ]  128 B  row r: the block's 8 scale bytes
+//   [ d      ]   32 B  row r: the block's f16 scale
+// Rows a multiple of 16. Lossless: unrepack rebuilds the GGUF bytes.
+constexpr int64_t kIq2sTileBytes = 1312;
+int64_t iq2s_tiles_bytes(int64_t rows, int64_t blocks_per_row);
+bool repack_iq2_s_tiles(const void * gguf, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
+bool unrepack_iq2_s_tiles(const void * tiles, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
+
+// -------------------------------------------- Q2_K, IQ2_XS and IQ2_XXS tiles
+//
+// For the WMMA kernels (#253), built on the repacked layouts above, in 16-row
+// tiles of the 16 GGUF blocks' size; lane l (row l % 16, half h = l / 16)
+// takes weights 16 h .. 16 h + 15 of each sub-block:
+//   Q2_K    (1344 B): [ qs 1024 ] lane l: 32 B, the bytes 16 h .. 16 h + 15 of
+//                     each 128-weight half's 32 (sub-block sb: bits 2 (sb % 4)
+//                     of half sb / 4's bytes)
+//                     [ sc  256 ] lane l: 8 B, sub-block sb's scale byte 2 sb + h
+//                     [ d    64 ] row r: d, dmin (f16)
+//   IQ2_XS  (1184 B): [ qs 1024 ] lane l: 32 B, sub-block sb's entries 2 h, 2 h + 1 at 4 sb
+//                     [ sc  128 ] row r: the block's 8 scale bytes
+//                     [ d    32 ] row r: f16
+//   IQ2_XXS (1056 B): [ qs  512 ] lane l: 16 B, sub-block sb's index bytes 2 h, 2 h + 1 at 2 sb
+//                     [ aux 512 ] row r: the 8 sub-blocks' scale + sign words
+//                     [ d    32 ] row r: f16
+// Rows a multiple of 16. Lossless: unrepack rebuilds the GGUF bytes.
+constexpr int64_t kQ2kTileBytes = 1344;
+constexpr int64_t kIq2xsTileBytes = 1184;
+constexpr int64_t kIq2xxsTileBytes = 1056;
+
 // ------------------------------------------------------- the engine's layout
 //
-// The layout the engine's kernels read a tensor of `type` in (format version 4,
-// #178, #219, #244): 2 (WMMA tiles) for IQ3_S, IQ3_XXS, IQ4_XS and Q4_K (rows
+// The layout the engine's kernels read a tensor of `type` in (format version 5,
+// #178, #219, #244, #253): 2 (WMMA tiles) for IQ3_S, IQ3_XXS and, rows a multiple of 16, IQ4_XS, Q4_K, IQ2_S, Q2_K,
+// IQ2_XS and IQ2_XXS (rows
 // a multiple of 16), 1 (the repacked layout above) for the other types with
 // one, 0 (the GGUF bytes) otherwise; its size, and the conversions both ways
 // (rows x k weights, row-major). Takes the rows: a tensor whose rows are not a

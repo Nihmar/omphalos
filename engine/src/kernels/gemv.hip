@@ -2353,6 +2353,9 @@ bool gemv_iq2_s(const void * packed, const void * x_f16, float * y, const int64_
         k % 256 != 0) {
         return false;
     }
+    if (rows % 16 == 0) {
+        return launch_tiles<qd::TileIq2s, 1>(packed, x_f16, y, rows, k, stream);  // #253
+    }
     const int64_t n_blocks = rows * (k / 256);
     const omph::format::Iq2sLayout l = omph::format::iq2s_layout(n_blocks);
     const int64_t n_sub = k / 32;
@@ -2373,6 +2376,9 @@ bool gemv_iq2_xs(const void * packed, const void * x_f16, float * y, const int64
         k % 256 != 0) {
         return false;
     }
+    if (rows % 16 == 0) {
+        return launch_tiles<qd::TileIq2xs, 1>(packed, x_f16, y, rows, k, stream);  // #253
+    }
     const int64_t n_blocks = rows * (k / 256);
     const omph::format::Iq2Layout l = omph::format::iq2_xs_layout(n_blocks);
     const int64_t n_sub = k / 32;
@@ -2392,6 +2398,9 @@ bool gemv_iq2_xxs(const void * packed, const void * x_f16, float * y, const int6
     if (packed == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
         k % 256 != 0) {
         return false;
+    }
+    if (rows % 16 == 0) {
+        return launch_tiles<qd::TileIq2xxs, 1>(packed, x_f16, y, rows, k, stream);  // #253
     }
     const int64_t n_blocks = rows * (k / 256);
     const omph::format::Iq2Layout l = omph::format::iq2_xxs_layout(n_blocks);
@@ -2431,6 +2440,9 @@ bool gemv_q2k(const void * packed, const void * x_f16, float * y, const int64_t 
     if (packed == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
         k % 256 != 0) {
         return false;
+    }
+    if (rows % 16 == 0) {
+        return launch_tiles<qd::TileQ2k, 1>(packed, x_f16, y, rows, k, stream);  // #253
     }
     const int64_t n_blocks = rows * (k / 256);
     const omph::format::Q2kLayout l = omph::format::q2k_layout(n_blocks);
@@ -2629,18 +2641,22 @@ bool gemv_multi(const uint32_t type, const void * packed, const void * x_f16, fl
             if (nt == 3) return launch_iq4_ntg<3>(packed, x_f16, y, rows, k, stream);
             return launch_iq4_ntg<4>(packed, x_f16, y, rows, k, stream);
         case 17:
+            if (rows % 16 == 0) return launch_tiles_n<qd::TileIq2xs>(nt, packed, x_f16, y, rows, k, stream);
             if (nt == 2) return launch_iq2xs_ntg<2>(packed, x_f16, y, rows, k, stream);
             if (nt == 3) return launch_iq2xs_ntg<3>(packed, x_f16, y, rows, k, stream);
             return launch_iq2xs_ntg<4>(packed, x_f16, y, rows, k, stream);
         case 16:
+            if (rows % 16 == 0) return launch_tiles_n<qd::TileIq2xxs>(nt, packed, x_f16, y, rows, k, stream);
             if (nt == 2) return launch_iq2xxs_ntg<2>(packed, x_f16, y, rows, k, stream);
             if (nt == 3) return launch_iq2xxs_ntg<3>(packed, x_f16, y, rows, k, stream);
             return launch_iq2xxs_ntg<4>(packed, x_f16, y, rows, k, stream);
         case 22:
+            if (rows % 16 == 0) return launch_tiles_n<qd::TileIq2s>(nt, packed, x_f16, y, rows, k, stream);
             if (nt == 2) return launch_iq2s_ntg<2>(packed, x_f16, y, rows, k, stream);
             if (nt == 3) return launch_iq2s_ntg<3>(packed, x_f16, y, rows, k, stream);
             return launch_iq2s_ntg<4>(packed, x_f16, y, rows, k, stream);
         case 10:
+            if (rows % 16 == 0) return launch_tiles_n<qd::TileQ2k>(nt, packed, x_f16, y, rows, k, stream);
             if (nt == 2) return launch_q2k_ntg<2>(packed, x_f16, y, rows, k, stream);
             if (nt == 3) return launch_q2k_ntg<3>(packed, x_f16, y, rows, k, stream);
             return launch_q2k_ntg<4>(packed, x_f16, y, rows, k, stream);
@@ -2665,6 +2681,10 @@ bool gemv_tokens(const uint32_t type, const void * packed, const void * x_f16, f
     if (type == 18) return launch_tiles_n<qd::TileIq3xxs>(nt, packed, x_f16, y, rows, k, stream);
     if (rows % 16 == 0 && type == 12) return launch_tiles_n<qd::TileQ4k>(nt, packed, x_f16, y, rows, k, stream);
     if (rows % 16 == 0 && type == 23) return launch_tiles_n<qd::TileIq4xs>(nt, packed, x_f16, y, rows, k, stream);
+    if (rows % 16 == 0 && type == 22) return launch_tiles_n<qd::TileIq2s>(nt, packed, x_f16, y, rows, k, stream);
+    if (rows % 16 == 0 && type == 10) return launch_tiles_n<qd::TileQ2k>(nt, packed, x_f16, y, rows, k, stream);
+    if (rows % 16 == 0 && type == 17) return launch_tiles_n<qd::TileIq2xs>(nt, packed, x_f16, y, rows, k, stream);
+    if (rows % 16 == 0 && type == 16) return launch_tiles_n<qd::TileIq2xxs>(nt, packed, x_f16, y, rows, k, stream);
     if (nt <= 4 || k % 256 != 0) {
         return false;  // 2..4: gemv_multi's kernels (and gemv_group); 5..16 below (#244)
     }
@@ -2738,7 +2758,7 @@ bool gemv_tokens(const uint32_t type, const void * packed, const void * x_f16, f
 // (#214: no loss down to 8 waves per SIMD).
 namespace {
 
-constexpr int kGroupLds = qd::TileIq3s::kLds + 8704;  // the IQ3_S tiles: grid + reduction
+constexpr int kGroupLds = qd::TileIq2s::kLds + 8704;  // the IQ2_S tiles (the largest grid) + reduction
 
 struct GroupItem {
     uint32_t type;
@@ -2766,9 +2786,10 @@ __device__ __forceinline__ void group_body(const GroupItem & t, const __half * _
         case 18: tiles_body<qd::TileIq3xxs, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
         case 12: tiles_body<qd::TileQ4k, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
         case 23: tiles_body<qd::TileIq4xs, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
-        case 17: iq2xs_ntg_body<NT, 4>(t.p[0], t.p[1], t.p[2], x, t.y, t.rows, t.n, b, lds); break;
-        case 22: iq2s_ntg_body<NT, 4>(t.p[0], t.p[1], t.p[2], t.p[3], t.p[4], x, t.y, t.rows, t.n, b, lds); break;
-        case 10: q2k_ntg_body<NT, 4>(t.p[0], t.p[1], t.p[2], t.p[3], x, t.y, t.rows, t.n, b, lds); break;
+        case 17: tiles_body<qd::TileIq2xs, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
+        case 16: tiles_body<qd::TileIq2xxs, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
+        case 22: tiles_body<qd::TileIq2s, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
+        case 10: tiles_body<qd::TileQ2k, NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
         case 14: q6k_ntg_body<NT, 2>(t.p[0], t.p[1], t.p[2], t.p[3], x, t.y, t.rows, t.n, b, lds); break;
         default: break;
     }
@@ -2804,32 +2825,15 @@ bool group_item(const GemvGroupItem & in, GroupItem & o) {
         case 18:  // the WMMA tiles (#178, #219, #244)
         case 12:
         case 23:
+        case 22:
+        case 10:
+        case 17:
+        case 16:
             if (rows % 16 != 0) return false;
             o.p[0] = base;
             o.n = k / 256;
             o.blocks = (unsigned) ((rows / 16 + kTileTiles - 1) / kTileTiles);
             return true;
-        case 17: {
-            const auto l = omph::format::iq2_xs_layout(nb);
-            o.p[0] = base + l.qs_off; o.p[1] = base + l.sc_off; o.p[2] = base + l.d_off;
-            ntg(4);
-            return true;
-        }
-        // IQ2_XXS (in ~5 groups) is left out: its body made the others spill
-        // (192 VGPRs with 22 spilled; 190 and none without it)
-        case 22: {
-            const auto l = omph::format::iq2s_layout(nb);
-            o.p[0] = base + l.qs_off; o.p[1] = base + l.signs_off; o.p[2] = base + l.qh_off;
-            o.p[3] = base + l.sc_off; o.p[4] = base + l.d_off;
-            ntg(4);
-            return true;
-        }
-        case 10: {
-            const auto l = omph::format::q2k_layout(nb);
-            o.p[0] = base + l.sc_off; o.p[1] = base + l.qs_off; o.p[2] = base + l.d_off; o.p[3] = base + l.dmin_off;
-            ntg(4);
-            return true;
-        }
         // IQ1_M (#226) is left out: its 16 KiB codebook in the shared LDS cost
         // the grouped launch more than the one launch it saves
         case 14: {
@@ -2934,9 +2938,18 @@ bool dequant_repacked(const uint32_t type, const void * packed, void * dst_f16,
     switch (type) {
         case 21: launch(qd::DecIq3sTile::make(base, n_blocks, blocks)); break;
         case 18: launch(qd::DecIq3xxsTile::make(base, n_blocks, blocks)); break;
-        case 16: launch(qd::DecIq2xxs::make(base, n_blocks, blocks)); break;
-        case 17: launch(qd::DecIq2xs::make(base, n_blocks, blocks)); break;
-        case 22: launch(qd::DecIq2s::make(base, n_blocks, blocks)); break;
+        case 16:
+            if (rows % 16 == 0) launch(qd::DecIq2xxsTile::make(base, n_blocks, blocks));
+            else launch(qd::DecIq2xxs::make(base, n_blocks, blocks));
+            break;
+        case 17:
+            if (rows % 16 == 0) launch(qd::DecIq2xsTile::make(base, n_blocks, blocks));
+            else launch(qd::DecIq2xs::make(base, n_blocks, blocks));
+            break;
+        case 22:
+            if (rows % 16 == 0) launch(qd::DecIq2sTile::make(base, n_blocks, blocks));
+            else launch(qd::DecIq2s::make(base, n_blocks, blocks));
+            break;
         case 23:
             if (rows % 16 == 0) launch(qd::DecIq4xsTile::make(base, n_blocks, blocks));
             else launch(qd::DecIq4xs::make(base, n_blocks, blocks));
@@ -2945,7 +2958,10 @@ bool dequant_repacked(const uint32_t type, const void * packed, void * dst_f16,
             if (rows % 16 == 0) launch(qd::DecQ4kTile::make(base, n_blocks, blocks));
             else launch(qd::DecQ4k::make(base, n_blocks, blocks));
             break;
-        case 10: launch(qd::DecQ2k::make(base, n_blocks, blocks)); break;
+        case 10:
+            if (rows % 16 == 0) launch(qd::DecQ2kTile::make(base, n_blocks, blocks));
+            else launch(qd::DecQ2k::make(base, n_blocks, blocks));
+            break;
         case 14: launch(qd::DecQ6k::make(base, n_blocks, blocks)); break;
         default: return false;
     }
