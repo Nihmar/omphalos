@@ -2096,6 +2096,106 @@ __global__ void gemv_iq1_m_kernel(const uint8_t * __restrict__ blocks_in,
     }
 }
 
+// IQ1_M for NT = 2..4 tokens (#226): the one-token kernel's lanes, sub-blocks
+// and float operations per row (x read from global memory instead of LDS),
+// so every token's result is the one-token call's bit for bit.
+template <int NT, int R>
+__device__ __forceinline__ void iq1m_ntg_body(const uint8_t * __restrict__ blocks_in, const __half * __restrict__ x,
+                                              float * __restrict__ y, const long long rows, const long long n_sub,
+                                              const long long blk, uint8_t * __restrict__ lds) {
+    uint64_t * grid = reinterpret_cast<uint64_t *>(lds);  // 2048 x 8 int8
+    for (int i = threadIdx.x; i < 2048; i += blockDim.x) {
+        grid[i] = omph::quant::kIq1sGrid[i];
+    }
+    __syncthreads();
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const long long row0 = ((long long) blk * (blockDim.x / 32) + warp) * R;
+    const long long nblk = n_sub / 8;
+    const long long rlast = rows - 1;
+    const long long k = n_sub * 32;
+
+    float acc[R][NT] = {};
+    if (row0 < rows) {
+        for (long long s = lane; s < n_sub; s += 32) {
+            const long long bk = s / 8;
+            const int ib = (int) (s % 8);
+            __half xv[NT][32];
+            float xsum[NT][4];
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                const uint4 * src = reinterpret_cast<const uint4 *>(x + t * k + s * 32);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    *reinterpret_cast<uint4 *>(&xv[t][8 * i]) = src[i];
+                }
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    float u = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        u += __half2float(xv[t][8 * l + j]);
+                    }
+                    xsum[t][l] = u;
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const long long row = row0 + r <= rlast ? row0 + r : rlast;
+                const uint8_t * b = blocks_in + (row * nblk + bk) * 56;
+                const uint32_t qs4 = *reinterpret_cast<const uint32_t *>(b + 4 * ib);
+                const uint32_t qh2 = *reinterpret_cast<const uint16_t *>(b + 32 + 2 * ib);
+                const uint64_t sc = *reinterpret_cast<const uint64_t *>(b + 48);
+                const uint16_t s0 = (uint16_t) sc;
+                const uint16_t s1 = (uint16_t) (sc >> 16);
+                const uint16_t s2 = (uint16_t) (sc >> 32);
+                const uint16_t s3 = (uint16_t) (sc >> 48);
+                const uint16_t dbits = (uint16_t) ((s0 >> 12) | ((s1 >> 8) & 0x00F0) | ((s2 >> 4) & 0x0F00) |
+                                                   (s3 & 0xF000));
+                const float d = __half2float(__builtin_bit_cast(__half, dbits));
+                const uint16_t scw = (uint16_t) (sc >> (16 * (ib >> 1)));
+                const int sh = 6 * (ib & 1);
+                const float dl1 = d * (2.0f * (float) ((scw >> sh) & 7) + 1.0f);
+                const float dl2 = d * (2.0f * (float) ((scw >> (sh + 3)) & 7) + 1.0f);
+                float p12[NT] = {};
+                float p34[NT] = {};
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    const uint32_t qh = (qh2 >> (8 * (l >> 1))) & 0xFFu;
+                    const uint32_t idx = ((qs4 >> (8 * l)) & 0xFFu) | ((qh << ((l & 1) ? 4 : 8)) & 0x700u);
+                    const float delta = (qh & ((l & 1) ? 0x80u : 0x08u)) ? -0.125f : 0.125f;
+                    const uint64_t g = grid[idx];
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        float u = delta * xsum[t][l];
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            u = fmaf((float) (int8_t) (g >> (8 * j)), __half2float(xv[t][8 * l + j]), u);
+                        }
+                        if (l < 2) {
+                            p12[t] += u;
+                        } else {
+                            p34[t] += u;
+                        }
+                    }
+                }
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    acc[r][t] = fmaf(dl1, p12[t], fmaf(dl2, p34[t], acc[r][t]));
+                }
+            }
+        }
+    }
+    store_acc<NT, R>(acc, y, row0, rows, lane);
+}
+
+template <int NT, int R>
+__global__ void gemv_iq1m_ntg_kernel(const uint8_t * __restrict__ blocks_in, const __half * __restrict__ x,
+                                     float * __restrict__ y, const long long rows, const long long n_sub) {
+    __shared__ __attribute__((aligned(16))) uint8_t lds[2048 * 8];
+    iq1m_ntg_body<NT, R>(blocks_in, x, y, rows, n_sub, (long long) blockIdx.x, lds);
+}
+
 } // namespace
 
 // Workgroups of `kernel` (256 threads, `smem` bytes of LDS) the GPU holds at
@@ -2414,6 +2514,14 @@ bool launch_q6k_ntg(const void * packed, const void * x_f16, float * y, const in
     return hipGetLastError() == hipSuccess;
 }
 
+template <int NT, int R = 4>
+bool launch_iq1m_ntg(const void * blocks, const void * x_f16, float * y, const int64_t rows, const int64_t k,
+                     hipStream_t stream) {
+    gemv_iq1m_ntg_kernel<NT, R><<<(unsigned) ((rows + 8 * R - 1) / (8 * R)), 256, 0, stream>>>(
+        static_cast<const uint8_t *>(blocks), static_cast<const __half *>(x_f16), y, rows, k / 32);
+    return hipGetLastError() == hipSuccess;
+}
+
 bool gemv_multi(const uint32_t type, const void * packed, const void * x_f16, float * y,
                 const int64_t rows, const int64_t k, const int nt, hipStream_t stream) {
     if (packed == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
@@ -2453,6 +2561,10 @@ bool gemv_multi(const uint32_t type, const void * packed, const void * x_f16, fl
             if (nt == 2) return launch_q6k_ntg<2>(packed, x_f16, y, rows, k, stream);
             if (nt == 3) return launch_q6k_ntg<3>(packed, x_f16, y, rows, k, stream);
             return launch_q6k_ntg<4>(packed, x_f16, y, rows, k, stream);
+        case 29:  // #226
+            if (nt == 2) return launch_iq1m_ntg<2>(packed, x_f16, y, rows, k, stream);
+            if (nt == 3) return launch_iq1m_ntg<3>(packed, x_f16, y, rows, k, stream);
+            return launch_iq1m_ntg<4>(packed, x_f16, y, rows, k, stream);
         default: return false;
     }
 }
@@ -2582,6 +2694,8 @@ bool group_item(const GemvGroupItem & in, GroupItem & o) {
             ntg(4);
             return true;
         }
+        // IQ1_M (#226) is left out: its 16 KiB codebook in the shared LDS cost
+        // the grouped launch more than the one launch it saves
         case 14: {
             const auto l = omph::format::q6k_layout(nb);
             o.p[0] = base + l.ql_off; o.p[1] = base + l.qh_off; o.p[2] = base + l.sc_off; o.p[3] = base + l.d_off;
