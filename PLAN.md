@@ -539,7 +539,11 @@ Codebook tables (**[verify]** sizes): IQ2_XS grid 512 × 8 B, IQ2_S grid 1024 ×
   - GEMM 57.9 -> 57.2 and 58.9 -> 57.0 TFLOPS; prefill 4k +0.6 %.
   - Decode KL vs the exact f32 KV: 0.000445 -> 0.000416.
   - End to end: plain step 43.2 -> 42.4 ms, MTP -4.9 %, DFlash2 -20 % per token (`bench/results/tiles-iq4-q4k-244.txt`).
-- **Next, by the profile (#203):** the 2-bit types (compute-bound at 4 tokens, ~5x at 16 tokens).
+- **IQ2_S, Q2_K, IQ2_XS and IQ2_XXS (#253, format 5) are done.** The DFlash2 step profile (#245) put them at 10.7 of 65 ms: two passes of `_ntw` kernels per 8-token verification at 16-33 % of the bandwidth. Tiles are the 16 GGUF blocks' size (1312 / 1344 / 1184 / 1056 B); Q2_K, IQ2_XS and IQ2_XXS share a generic section tiler.
+  - All 43 tensors: 1 token 3.92 -> 3.88 ms, 4 tokens 5.41 -> 4.00, 8 tokens 10.83 -> 4.14, 16 tokens 21.94 -> 4.05.
+  - GEMM at 512 tokens 57.7 -> 56.6 ms over the four types. Decode KL vs the exact f32 KV: 0.000468 -> 0.000484.
+  - End to end: plain step 42.34 -> 42.20 ms, MTP step -3.1 %, DFlash2 step -7.7 %; DFlash2 + n-gram 193.5 -> 262.1 t/s on edit-cc (`bench/results/tiles-iq2-253.txt`).
+- **Left row-wise:** IQ1_M (one 18.6 MiB tensor) and Q6_K (the MTP block, and the DFlash2 drafter's 148 MiB: ~0.8 ms per DFlash2 step).
 
 ---
 
