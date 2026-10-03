@@ -18,3 +18,12 @@
 #
 # Checks: oracle drafts of 3, 8, 15 tokens, --draft-corrupt 4, OMPH_SPEC_CHECK=1, K8 and OMPH_KV_K4=1:
 # identical to plain greedy; check_gpu_decode --gemv, check_server, the CPU tests pass.
+#
+# Rollback in one launch (#255, second item): after a partly rejected verification, gdn_replay + gdn_conv_select
+# per recurrent layer (96 launches) became one gdn_rollback_kernel over all layers, bit-identical
+# (OMPH_SPEC_CHECK=1, oracle drafts of 1..15 tokens, K8 and K4). Per step vs main 34389c0, 5 runs alternated,
+# median: MTP 52.86 -> 52.68 ms, DFlash2 56.92 -> 56.73 ms.
+#
+# Launch-count items left, each measured at <1 % of a step (~3.5 us of gap + the kernel's fill per launch):
+#   delta-net verification: conv + gate in one launch, the gated norm inside the recurrence (96 launches)
+#   swiglu into the down GEMV's x loads (65-69), add_rms_norm into its neighbours (129)
