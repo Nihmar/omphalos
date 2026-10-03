@@ -16,6 +16,11 @@ the program run is the problem's prompt, the completion, the tests and
 check(entry_point). Every program runs in a bubblewrap sandbox: no network,
 the filesystem read-only except a private /tmp, a --timeout per problem.
 
+--spec picks the decoding: default (omphalos: MTP speculation, llama.cpp:
+none) or dflash (both: the DFlash2 drafter of --drafter, 7 drafts, #245); --kv
+the KV cache: k8q4 (omphalos' default mix, llama.cpp q8_0 / q4_0) or k4q4
+(omphalos OMPH_KV_K4=1, llama.cpp q4_0 / q4_0).
+
     uv run python humaneval.py --engine omphalos --out he-omph.jsonl
     uv run python humaneval.py --engine llama --out he-llama.jsonl \\
         --llama-server <llama.cpp>/build-hip/bin/llama-server
@@ -123,6 +128,10 @@ def main() -> None:
     ap.add_argument("--omph", default=str(ROOT / "engine/build"))
     ap.add_argument("--omph-env", default="", help="extra environment for omph-server, e.g. OMPH_KV_K4_LAYERS=none")
     ap.add_argument("--llama-server", default="")
+    ap.add_argument("--spec", default="default", choices=["default", "dflash"])
+    ap.add_argument("--drafter", default=str(ROOT / "models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"),
+                    help="the DFlash2 drafter GGUF (omphalos reads the .omph next to it)")
+    ap.add_argument("--kv", default="k8q4", choices=["k8q4", "k4q4"])
     ap.add_argument("--data", default=str(ROOT / "models/datasets/human-eval/data/HumanEval.jsonl.gz"))
     args = ap.parse_args()
 
@@ -146,11 +155,18 @@ def main() -> None:
             name, _, value = args.omph_env.partition("=")
             env[name] = value
         cmd = [f"{args.omph}/omph-server", omph_file(args.model), "--port", str(port), "--ctx", str(args.ctx)]
+        if args.spec == "dflash":
+            cmd += ["--dflash", omph_file(args.drafter)]
+        if args.kv == "k4q4":
+            env["OMPH_KV_K4"] = "1"
     else:
         if not args.llama_server:
             sys.exit("--llama-server is required for --engine llama")
         cmd = [args.llama_server, "-m", args.model, "--port", str(port), "-c", str(args.ctx), "-ngl", "999",
-               "-fa", "on", "-ctk", "q8_0", "-ctv", "q4_0", "-np", "1", "--no-webui"]
+               "-fa", "on", "-ctk", "q4_0" if args.kv == "k4q4" else "q8_0", "-ctv", "q4_0", "-np", "1",
+               "--no-webui"]
+        if args.spec == "dflash":
+            cmd += ["-md", args.drafter, "--spec-type", "draft-dflash", "--spec-draft-n-max", "7"]
     log = open(f"{args.out}.server.log", "w")  # noqa: SIM115 (open while the server runs)
     proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
     try:
