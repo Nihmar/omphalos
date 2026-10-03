@@ -17,6 +17,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -2196,6 +2197,119 @@ __global__ void gemv_iq1m_ntg_kernel(const uint8_t * __restrict__ blocks_in, con
     iq1m_ntg_body<NT, R>(blocks_in, x, y, rows, n_sub, (long long) blockIdx.x, lds);
 }
 
+// --- 5..16 tokens per launch for the row-wise types (#244) --------------------
+//
+// The NT = 1..4 bodies run back to back in one block on its rows, token
+// groups of 4 (and the remainder): every token's row comes out of the same
+// code as before, so it stays bit-identical to the single-token GEMV, and only
+// the first group reads the weights from DRAM; the next groups find the
+// block's rows in L2 / the Infinity Cache. (Bodies widened to 16 tokens would
+// need 16 x 16 VGPRs of activations alone.)
+template <class F>
+__device__ __forceinline__ void nt_groups(const int nt, F && f) {
+    for (int t0 = 0; t0 < nt; t0 += 4) {
+        const int g = nt - t0 < 4 ? nt - t0 : 4;
+        if (g == 4) {
+            f(std::integral_constant<int, 4>{}, t0);
+        } else if (g == 3) {
+            f(std::integral_constant<int, 3>{}, t0);
+        } else if (g == 2) {
+            f(std::integral_constant<int, 2>{}, t0);
+        } else {
+            f(std::integral_constant<int, 1>{}, t0);
+        }
+    }
+}
+
+template <int R>
+__global__ void gemv_q4k_ntw_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ meta,
+                                    const __half * __restrict__ x, float * __restrict__ y, const long long rows,
+                                    const long long n_sub, const int nt) {
+    nt_groups(nt, [&](auto g, const int t0) {
+        q4k_ntg_body<decltype(g)::value, R>(qs, meta, x + t0 * n_sub * 32, y + t0 * rows, rows, n_sub,
+                                            (long long) blockIdx.x, nullptr);
+    });
+}
+
+template <int R>
+__global__ void gemv_iq4_ntw_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ meta,
+                                    const __half * __restrict__ x, float * __restrict__ y, const long long rows,
+                                    const long long n_sub, const int nt) {
+    nt_groups(nt, [&](auto g, const int t0) {
+        iq4_ntg_body<decltype(g)::value, R>(qs, meta, x + t0 * n_sub * 32, y + t0 * rows, rows, n_sub,
+                                            (long long) blockIdx.x, nullptr);
+    });
+}
+
+template <int R>
+__global__ void gemv_iq2xs_ntw_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ sc,
+                                      const uint8_t * __restrict__ d, const __half * __restrict__ x,
+                                      float * __restrict__ y, const long long rows, const long long n_sub,
+                                      const int nt) {
+    __shared__ __attribute__((aligned(16))) uint8_t lds[4096];
+    nt_groups(nt, [&](auto g, const int t0) {
+        iq2xs_ntg_body<decltype(g)::value, R>(qs, sc, d, x + t0 * n_sub * 32, y + t0 * rows, rows, n_sub,
+                                              (long long) blockIdx.x, lds);
+    });
+}
+
+template <int R>
+__global__ void gemv_iq2xxs_ntw_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ d,
+                                       const __half * __restrict__ x, float * __restrict__ y,
+                                       const long long rows, const long long n_sub, const int nt) {
+    __shared__ __attribute__((aligned(16))) uint8_t lds[2048];
+    nt_groups(nt, [&](auto g, const int t0) {
+        iq2xxs_ntg_body<decltype(g)::value, R>(qs, d, x + t0 * n_sub * 32, y + t0 * rows, rows, n_sub,
+                                               (long long) blockIdx.x, lds);
+    });
+}
+
+template <int R>
+__global__ void gemv_iq2s_ntw_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ sg,
+                                     const uint8_t * __restrict__ qh, const uint8_t * __restrict__ sc,
+                                     const uint8_t * __restrict__ d, const __half * __restrict__ x,
+                                     float * __restrict__ y, const long long rows, const long long n_sub,
+                                     const int nt) {
+    __shared__ __attribute__((aligned(16))) uint8_t lds[8192];
+    nt_groups(nt, [&](auto g, const int t0) {
+        iq2s_ntg_body<decltype(g)::value, R>(qs, sg, qh, sc, d, x + t0 * n_sub * 32, y + t0 * rows, rows,
+                                             n_sub, (long long) blockIdx.x, lds);
+    });
+}
+
+template <int R>
+__global__ void gemv_q2k_ntw_kernel(const uint8_t * __restrict__ sc, const uint8_t * __restrict__ qs,
+                                    const uint8_t * __restrict__ d, const uint8_t * __restrict__ dmin,
+                                    const __half * __restrict__ x, float * __restrict__ y, const long long rows,
+                                    const long long n_sub, const int nt) {
+    nt_groups(nt, [&](auto g, const int t0) {
+        q2k_ntg_body<decltype(g)::value, R>(sc, qs, d, dmin, x + t0 * n_sub * 32, y + t0 * rows, rows, n_sub,
+                                            (long long) blockIdx.x, nullptr);
+    });
+}
+
+template <int R>
+__global__ void gemv_q6k_ntw_kernel(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
+                                    const uint8_t * __restrict__ sc, const uint8_t * __restrict__ d,
+                                    const __half * __restrict__ x, float * __restrict__ y, const long long rows,
+                                    const long long n_sub, const int nt) {
+    nt_groups(nt, [&](auto g, const int t0) {
+        q6k_ntg_body<decltype(g)::value, R>(ql, qh, sc, d, x + t0 * n_sub * 32, y + t0 * rows, rows, n_sub,
+                                            (long long) blockIdx.x, nullptr);
+    });
+}
+
+template <int R>
+__global__ void gemv_iq1m_ntw_kernel(const uint8_t * __restrict__ blocks_in, const __half * __restrict__ x,
+                                     float * __restrict__ y, const long long rows, const long long n_sub,
+                                     const int nt) {
+    __shared__ __attribute__((aligned(16))) uint8_t lds[2048 * 8];
+    nt_groups(nt, [&](auto g, const int t0) {
+        iq1m_ntg_body<decltype(g)::value, R>(blocks_in, x + t0 * n_sub * 32, y + t0 * rows, rows, n_sub,
+                                             (long long) blockIdx.x, lds);
+    });
+}
+
 } // namespace
 
 // Workgroups of `kernel` (256 threads, `smem` bytes of LDS) the GPU holds at
@@ -2576,7 +2690,64 @@ bool gemv_tokens(const uint32_t type, const void * packed, const void * x_f16, f
     }
     if (type == 21) return launch_tiles_n<qd::TileIq3s>(nt, packed, x_f16, y, rows, k, stream);
     if (type == 18) return launch_tiles_n<qd::TileIq3xxs>(nt, packed, x_f16, y, rows, k, stream);
-    return false;
+    if (nt <= 4 || k % 256 != 0) {
+        return false;  // 2..4: gemv_multi's kernels (and gemv_group); 5..16 below (#244)
+    }
+    const auto * base = static_cast<const uint8_t *>(packed);
+    const auto * x = static_cast<const __half *>(x_f16);
+    const long long n_sub = k / 32;
+    const int64_t nb = rows * (k / 256);
+    constexpr int R = 4;
+    const unsigned grid = (unsigned) ((rows + 8 * R - 1) / (8 * R));
+    switch (type) {
+        case 12: {
+            const omph::format::Q4kLayout l = omph::format::q4k_layout(nb);
+            gemv_q4k_ntw_kernel<R><<<grid, 256, 0, stream>>>(base + l.qs_off, base + l.meta_off, x, y, rows, n_sub,
+                                                             nt);
+            break;
+        }
+        case 23: {
+            const omph::format::Iq4Layout l = omph::format::iq4_layout(nb);
+            gemv_iq4_ntw_kernel<R><<<grid, 256, 0, stream>>>(base + l.qs_off, base + l.meta_off, x, y, rows, n_sub,
+                                                             nt);
+            break;
+        }
+        case 17: {
+            const omph::format::Iq2Layout l = omph::format::iq2_xs_layout(nb);
+            gemv_iq2xs_ntw_kernel<R><<<grid, 256, 0, stream>>>(base + l.qs_off, base + l.sc_off, base + l.d_off, x,
+                                                               y, rows, n_sub, nt);
+            break;
+        }
+        case 16: {
+            const omph::format::Iq2Layout l = omph::format::iq2_xxs_layout(nb);
+            gemv_iq2xxs_ntw_kernel<R><<<grid, 256, 0, stream>>>(base + l.qs_off, base + l.d_off, x, y, rows, n_sub,
+                                                                nt);
+            break;
+        }
+        case 22: {
+            const omph::format::Iq2sLayout l = omph::format::iq2s_layout(nb);
+            gemv_iq2s_ntw_kernel<R><<<grid, 256, 0, stream>>>(base + l.qs_off, base + l.signs_off, base + l.qh_off,
+                                                              base + l.sc_off, base + l.d_off, x, y, rows, n_sub, nt);
+            break;
+        }
+        case 10: {
+            const omph::format::Q2kLayout l = omph::format::q2k_layout(nb);
+            gemv_q2k_ntw_kernel<R><<<grid, 256, 0, stream>>>(base + l.sc_off, base + l.qs_off, base + l.d_off,
+                                                             base + l.dmin_off, x, y, rows, n_sub, nt);
+            break;
+        }
+        case 14: {  // R = 2, as launch_q6k_ntg
+            const omph::format::Q6kLayout l = omph::format::q6k_layout(nb);
+            gemv_q6k_ntw_kernel<2><<<(unsigned) ((rows + 15) / 16), 256, 0, stream>>>(
+                base + l.ql_off, base + l.qh_off, base + l.sc_off, base + l.d_off, x, y, rows, n_sub, nt);
+            break;
+        }
+        case 29:  // #226
+            gemv_iq1m_ntw_kernel<R><<<grid, 256, 0, stream>>>(base, x, y, rows, n_sub, nt);
+            break;
+        default: return false;
+    }
+    return hipGetLastError() == hipSuccess;
 }
 
 // --- sibling GEMVs in one launch (#214) ------------------------------------
