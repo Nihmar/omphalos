@@ -66,13 +66,15 @@ int main() {
               "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
           "sha256(56-byte message)");
 
-    // IQ3_S (110 B / 256 weights), Q4_K (144 B), an f32 vector, an IQ3_S token embedding
-    const uint64_t iq3s = 110, q4k = 144;
+    // IQ3_S (110 B / 256 weights), Q4_K (144 B), an f32 vector, an IQ3_S token embedding,
+    // IQ3_XXS (98 B)
+    const uint64_t iq3s = 110, q4k = 144, iq3xxs = 98;
     const std::vector<T> ts = {
         {"blk.0.ffn_up.weight", {512, 16}, 21, 16 * 2 * iq3s},
         {"output_norm.weight", {512}, 0, 512 * 4},
         {"blk.0.attn_k.weight", {256, 4}, 12, 4 * 1 * q4k},
         {"token_embd.weight", {256, 3}, 21, 3 * 1 * iq3s},
+        {"blk.0.ffn_down.weight", {512, 32}, 18, 32 * 2 * iq3xxs},
     };
     std::mt19937 rng(178);
     std::vector<std::vector<uint8_t>> data;
@@ -118,7 +120,7 @@ int main() {
     }
     try {
         const auto st = omph::format::convert_to_omph(in, out);
-        CHECK(st.tensors == 4 && st.repacked == 2, "tensors %llu repacked %llu", (unsigned long long) st.tensors,
+        CHECK(st.tensors == 5 && st.repacked == 3, "tensors %llu repacked %llu", (unsigned long long) st.tensors,
               (unsigned long long) st.repacked);
         CHECK(st.source_sha256 == omph::format::sha256_hex(w.b.data(), w.b.size()), "source sha256");
         const omph::gguf::File o(out);
@@ -129,7 +131,7 @@ int main() {
         CHECK(o.find("test.count") && o.find("test.count")->as_u64(v) && v == 7, "metadata copied (u32)");
         CHECK(o.find("omph.source_sha256") && o.find("omph.source_sha256")->as_str(s) && s == st.source_sha256,
               "sha256 recorded");
-        const uint32_t want_layout[4] = {2, 0, 1, 0};  // IQ3_S tiles, f32, Q4_K repack, the embedding
+        const uint32_t want_layout[5] = {2, 0, 1, 0, 2};  // IQ3_S tiles, f32, Q4_K repack, the embedding, IQ3_XXS tiles
         for (size_t i = 0; i < ts.size(); ++i) {
             const omph::gguf::TensorInfo * t = o.tensor(ts[i].name);
             CHECK(t != nullptr, "tensor %s present", ts[i].name.c_str());
