@@ -993,24 +993,29 @@ bool Runner::commit(const int64_t accepted) {
     const int64_t n_vh = h_.ssm_n_vh;
     const int64_t channels = 2 * n_kh * h_.ssm_s + h_.ssm_inner;
     const int64_t n_conv_f = (h_.ssm_conv_k - 1) * channels;
+    // every recurrent layer's state replay and conv tail in one launch (#255)
+    omph::kernels::GdnRollback rb;
     for (int64_t il = 0; il < h_.n_layer; ++il) {
         const int64_t r = rec_index_[(size_t) il];
         if (r < 0) {
             continue;
         }
-        const float * rec = static_cast<const float *>(replay_pool_) +
-                            r * spec_max_ * omph::kernels::gdn_replay_floats(n_vh, n_kh);
-        const float * hist = static_cast<const float *>(conv_hist_pool_) +
-                             r * (h_.ssm_conv_k - 1 + spec_max_) * channels;
+        if (rb.layers == omph::kernels::kGdnRollbackMax) {
+            return fail("commit: too many recurrent layers");
+        }
         // the verification flipped the conv buffers: the current one is its tail
         auto * conv_a = static_cast<float *>(states_[(size_t) il]);
-        float * conv_now = conv_flip_[(size_t) il] ? conv_a + n_conv_f : conv_a;
-        if (!omph::kernels::gdn_replay(state_cur_[(size_t) il], rec, accepted, n_vh, n_kh,
-                                       nullptr) ||
-            !omph::kernels::gdn_conv_select(hist, conv_now, accepted, h_.ssm_conv_k, channels,
-                                            nullptr)) {
-            return fail("commit: delta-net rollback failed");
-        }
+        rb.state[rb.layers] = state_cur_[(size_t) il];
+        rb.replay[rb.layers] = static_cast<const float *>(replay_pool_) +
+                               r * spec_max_ * omph::kernels::gdn_replay_floats(n_vh, n_kh);
+        rb.conv_hist[rb.layers] = static_cast<const float *>(conv_hist_pool_) +
+                                  r * (h_.ssm_conv_k - 1 + spec_max_) * channels;
+        rb.conv_dst[rb.layers] = conv_flip_[(size_t) il] ? conv_a + n_conv_f : conv_a;
+        ++rb.layers;
+    }
+    if (rb.layers > 0 &&
+        !omph::kernels::gdn_rollback(rb, accepted, n_vh, n_kh, h_.ssm_conv_k, channels, nullptr)) {
+        return fail("commit: delta-net rollback failed");
     }
     if (ring_backup_k_ != nullptr) {
         const int64_t n_kv = (int64_t) std::count_if(kv_index_.begin(), kv_index_.end(),
