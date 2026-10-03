@@ -45,9 +45,40 @@ void write_f32(const std::string & path, const std::vector<float> & data) {
 // the row over PCIe), image rows copied from `in`.
 bool Runner::embed(const int32_t * toks, const int64_t T, const ForwardInputs * in, float * dst) {
     const int64_t ne = h_.n_embd;
+    // a decode step or a verification: a dequant per row is cheaper than the
+    // id upload plus the gather
+    const bool gather = T > 4;
+    if (gather && T > embd_cap_) {  // grown geometrically; the old buffers stay with mem_
+        embd_cap_ = std::max<int64_t>(T, 2 * embd_cap_);
+        embd_ids_ = static_cast<int32_t *>(mem_.device((size_t) embd_cap_ * 4, "out of VRAM (embedding ids)"));
+        embd_stage_ = mem_.device((size_t) (embd_cap_ * embd_row_bytes_), "out of VRAM (embedding rows)");
+    }
+    // (pageable source: copied to staging before the call returns, no wait on the GPU)
+    if (gather && hipMemcpyAsync(embd_ids_, toks, (size_t) T * 4, hipMemcpyHostToDevice, nullptr) != hipSuccess) {
+        return fail("embedding ids upload failed");
+    }
+    // the token rows of [t0, t): one gather + one dequant (#223), or one dequant per row
+    const auto rows = [&](const int64_t t0, const int64_t t) {
+        if (gather) {
+            return t == t0 || omph::kernels::dequantize_rows(embd_type_, embd_host_, embd_row_bytes_,
+                                                             embd_ids_ + t0, t - t0, ne, embd_stage_,
+                                                             dst + t0 * ne, nullptr);
+        }
+        for (int64_t i = t0; i < t; ++i) {
+            const uint8_t * src = static_cast<const uint8_t *>(embd_host_) + (size_t) toks[i] * embd_row_bytes_;
+            if (!omph::kernels::dequantize(embd_type_, src, dst + i * ne, ne, false, nullptr)) {
+                return false;
+            }
+        }
+        return true;
+    };
     size_t next = 0;  // the next image row of `in`
+    int64_t run0 = 0;  // the first token row not yet embedded
     for (int64_t t = 0; t < T; ++t) {
         if (in != nullptr && next < in->rows.size() && in->rows[next] == t) {
+            if (!rows(run0, t)) {
+                return fail("embedding dequant failed");
+            }
             size_t run = 1;  // a run of consecutive image rows: one copy
             while (next + run < in->rows.size() && in->rows[next + run] == t + (int64_t) run) ++run;
             if (hipMemcpyAsync(dst + t * ne, in->embd + next * ne, run * ne * 4, hipMemcpyHostToDevice,
@@ -56,14 +87,11 @@ bool Runner::embed(const int32_t * toks, const int64_t T, const ForwardInputs * 
             }
             t += (int64_t) run - 1;
             next += run;
+            run0 = t + 1;
             continue;
         }
-        const uint8_t * src = static_cast<const uint8_t *>(embd_host_) + (size_t) toks[t] * embd_row_bytes_;
-        if (!omph::kernels::dequantize(embd_type_, src, dst + t * ne, ne, false, nullptr)) {
-            return fail("embedding dequant failed");
-        }
     }
-    return true;
+    return rows(run0, T) || fail("embedding dequant failed");
 }
 
 bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & logits,

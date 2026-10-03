@@ -1,0 +1,15 @@
+Prompt embedding in one gather + one dequant (#223, P5 of #203), RX 9060 XT, 2026-10-03
+Runner::embed dequantized the token embedding one row per launch (from the pinned host
+table): 4096 launches for a 4k prompt, 32768 at 32k. Forwards of more than 4 tokens
+now upload the ids (async), gather the rows into a device buffer (one kernel) and
+dequantize them in one launch; decode steps and verifications keep a dequant per row.
+
+Identity: logits (last 64 rows, wiki1000) and 8 decode tokens byte-identical.
+Prefill wall vs main (24a266b, its own library), alternated:
+  4k:  main 4717 4743 4677 4768 4695 / gather 4646 4667 4691 4695 4764 (medians 4717 / 4691,
+       inside the ~+-35 ms run-to-run noise)
+  32k: main 44983 45086 45102 / gather 44968 45026 45050 ms (-42 ms, 3 of 3)
+Decode step unchanged (44.06-44.12 ms).
+Note: the first A/B copied the executable only; omph-run loads libomphalos.so from the
+build tree, so both sides ran the new code (the "-70 ms" it showed was noise). A/B runs
+need the other build's library: /var/tmp/omphalos-base holds main.
