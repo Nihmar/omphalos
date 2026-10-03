@@ -74,6 +74,8 @@ public:
         int64_t chunk = 512;     // prefill chunk (activation buffers)
         bool mtp = true;         // load the MTP block for speculative decoding
         int64_t draft_k = 3;     // drafts per speculative step (#126: 3 is the best)
+        std::string dflash;      // a DFlash2 drafter .omph (#245): its drafts (block - 1 per step)
+                                 // instead of the MTP block's, which is then not loaded
         int64_t cache_mib = 2048;  // host RAM for sequence checkpoints (#158); 0: none
     };
     Generator(const Config & config, const omph::runtime::EnvOptions & env);

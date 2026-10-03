@@ -10,6 +10,7 @@
 //   --top-k K, --top-p P, --min-p M, --seed S
 //   --no-spec         no MTP speculative decoding (greedy, and sampling since #197)
 //   --no-mtp          do not load the MTP block (-352 MiB of VRAM)
+//   --dflash FILE     draft with a DFlash2 drafter .omph instead of the MTP block (#245)
 //   --ctx N           KV capacity (default 8192)
 //   --cache-mib N     host RAM for sequence checkpoints (default 2048, 0: none)
 //   --repeat N        run the same request N times (the second and later
@@ -69,6 +70,7 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--ids")) out_ids = true;
         else if (!std::strcmp(argv[i], "--no-spec")) req.speculative = false;
         else if (!std::strcmp(argv[i], "--no-mtp")) cfg.mtp = false;
+        else if (!std::strcmp(argv[i], "--dflash")) cfg.dflash = val();
         else if (!std::strcmp(argv[i], "--max")) req.max_tokens = std::atoll(val());
         else if (!std::strcmp(argv[i], "--temp")) req.sampling.temperature = (float) std::atof(val());
         else if (!std::strcmp(argv[i], "--top-k")) req.sampling.top_k = std::atoi(val());
