@@ -64,6 +64,7 @@ struct GenerateResult {
     double decode_ms = 0.0;
     int64_t drafted = 0;
     int64_t accepted = 0;
+    int64_t ngram_steps = 0;      // verifications whose drafts came from n-gram lookup (#199)
 };
 
 class Generator {

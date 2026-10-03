@@ -3,10 +3,63 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <unordered_map>
 
 #include "runtime/timing.hh"
 
 namespace omph::model {
+
+namespace {
+
+// Prompt lookup (#199): for n = kMin .. kMax, the latest position that follows
+// each n-gram of the sequence, so the n-gram ending the sequence proposes the
+// tokens that followed it last time (hash collisions excluded by comparing).
+class NgramIndex {
+public:
+    static constexpr int kMin = 4;
+    static constexpr int kMax = 8;
+
+    // Indexes the n-grams of c that end before its last token, then proposes up
+    // to k tokens after the longest earlier match of c's tail.
+    void propose(const std::vector<int32_t> & c, const int64_t k, std::vector<int32_t> & out) {
+        out.clear();
+        const int64_t len = (int64_t) c.size();
+        for (int64_t e = std::max<int64_t>(done_, kMin); e < len; ++e) {  // continuation c[e] known
+            for (int n = kMin; n <= kMax && n <= e; ++n) {
+                map_[n][hash(c, e - n, n)] = e;
+            }
+        }
+        done_ = std::max(done_, len);
+        for (int n = kMax; n >= kMin; --n) {
+            if (len <= n) {
+                continue;
+            }
+            const auto it = map_[n].find(hash(c, len - n, n));
+            if (it == map_[n].end()) {
+                continue;
+            }
+            const int64_t p = it->second;
+            if (!std::equal(c.begin() + (p - n), c.begin() + p, c.begin() + (len - n))) {
+                continue;
+            }
+            out.assign(c.begin() + p, c.begin() + std::min<int64_t>(p + k, len));
+            return;
+        }
+    }
+
+private:
+    static uint64_t hash(const std::vector<int32_t> & c, const int64_t at, const int n) {
+        uint64_t h = 0xcbf29ce484222325ull ^ (uint64_t) n;
+        for (int i = 0; i < n; ++i) {
+            h = (h ^ (uint32_t) c[(size_t) (at + i)]) * 0x100000001b3ull;
+        }
+        return h;
+    }
+    std::unordered_map<uint64_t, int64_t> map_[kMax + 1];
+    int64_t done_ = 0;  // n-grams ending (exclusive) before this index are in
+};
+
+} // namespace
 
 Generator::Generator(const Config & config, const omph::runtime::EnvOptions & env)
     : config_(config), env_(env) {
@@ -27,7 +80,8 @@ Generator::Generator(const Config & config, const omph::runtime::EnvOptions & en
         config_.draft_k = runner_->dflash_block() - 1;
     }
     if (config_.mtp || runner_->dflash_on()) {
-        runner_->enable_speculation(config_.draft_k + 1);
+        // n-gram drafts (#199) verify up to 16 tokens
+        runner_->enable_speculation(env_.ngram ? std::max<int64_t>(config_.draft_k + 1, 16) : config_.draft_k + 1);
     }
     for (const char * t : {"<|im_end|>", "<|endoftext|>"}) {
         const int32_t id = tokenizer_->find(t);
@@ -418,20 +472,35 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
         std::vector<float> rows;
         Dist dist;
         std::uniform_real_distribution<double> unit(0.0, 1.0);
+        // n-gram drafts (#199): when the text so far repeats, the tokens that
+        // followed it last time (up to 15) replace the model's drafts
+        NgramIndex ngram;
+        std::vector<int32_t> hist(seq_);
         while (go) {
             const int64_t pos = (int64_t) seq_.size();
             const int64_t k = std::min<int64_t>(config_.draft_k, config_.context - pos - 1);
             std::vector<int32_t> batch{next};
-            if (k > 0) {
-                std::vector<int32_t> drafts;
-                if (!(runner_->dflash_on() ? runner_->dflash_draft(next, pos, k, drafts)
-                                           : runner_->mtp_draft(next, pos, k, drafts))) {
-                    res.stop = GenerateResult::Stop::Error;
-                    break;
+            std::vector<int32_t> drafts;
+            const int64_t kn = std::min<int64_t>(runner_->spec_max() - 1, config_.context - pos - 1);
+            if (env_.ngram && kn > 0) {
+                hist.push_back(next);
+                ngram.propose(hist, kn, drafts);
+                hist.pop_back();
+                if ((int64_t) drafts.size() < std::max(1, env_.ngram_min)) {
+                    drafts.clear();
+                } else {
+                    runner_->dflash_no_draft();
+                    ++res.ngram_steps;
                 }
-                res.drafted += (int64_t) drafts.size();
-                batch.insert(batch.end(), drafts.begin(), drafts.end());
             }
+            if (drafts.empty() && k > 0 &&
+                !(runner_->dflash_on() ? runner_->dflash_draft(next, pos, k, drafts)
+                                       : runner_->mtp_draft(next, pos, k, drafts))) {
+                res.stop = GenerateResult::Stop::Error;
+                break;
+            }
+            res.drafted += (int64_t) drafts.size();
+            batch.insert(batch.end(), drafts.begin(), drafts.end());
             std::vector<int32_t> am;
             if (!runner_->verify(batch, pos, am, greedy ? nullptr : &rows)) {
                 res.stop = GenerateResult::Stop::Error;
@@ -484,6 +553,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
                 break;
             }
             seq_.insert(seq_.end(), batch.begin(), batch.begin() + keep);
+            hist.insert(hist.end(), batch.begin(), batch.begin() + keep);
             if (go) {
                 next = after;
                 go = emit(next);

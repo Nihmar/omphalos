@@ -199,6 +199,8 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_NO_B4` | A/B | no NT = 2..4-token GEMVs (verifications, short `--gemv` prefills): one launch per token |
 | `OMPH_NO_GROUP` | A/B | a verification's sibling GEMVs (one input: gate + up, qkv + gate, q + k + v) as separate launches instead of one grouped launch (#214) |
 | `OMPH_DRAFT_VOCAB=N` | decode | MTP drafts take their argmax over the first N token ids (default 98304; 0 = the whole head) while the recent text stays inside them, the whole head otherwise (#217): output unchanged, ~3-7 % faster speculative decoding in English and code |
+| `OMPH_NGRAM=0` | decode | no n-gram (prompt lookup) drafts: by default, when the 4..8-gram ending at the next token occurred before, the tokens that followed it (up to 15) are the step's drafts instead of MTP / DFlash2's (#199): output unchanged, 1.3-2.6x faster on edits and quotes of the context |
+| `OMPH_NGRAM_MIN=N` | decode | the fewest n-gram drafts that replace the model drafter's (default 4) |
 | `OMPH_DFLASH_KEEP=P` | decode | DFlash2 drafts position n only while the measured chance that drafts 1..n are all kept is >= P (default 0.12; 0: always 7; every 8th step drafts all, #245) |
 | `OMPH_DFLASH_PMIN=P` | decode | DFlash2 drafts stop where the selector's best candidate has softmax probability < P (default 0: off; llama.cpp's p_min, measured useless here) |
 | `OMPH_NO_SWIGLU_GEMM` | A/B | prefill: the FFN's up GEMM writes f32 and `swiglu_f16` runs after it, instead of SwiGLU in the up GEMM's epilogue (#221; bit-identical either way) |

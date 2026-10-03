@@ -77,6 +77,12 @@ EnvOptions EnvOptions::from_env() {
     if (const char * m = std::getenv("OMPH_TEST_MROPE")) {
         o.test_mrope = std::string(m) == "swap" ? 1 : std::string(m) == "flat" ? 2 : 0;
     }
+    if (const char * p = std::getenv("OMPH_NGRAM")) {
+        o.ngram = std::atoi(p);
+    }
+    if (const char * p = std::getenv("OMPH_NGRAM_MIN")) {
+        o.ngram_min = std::atoi(p);
+    }
     if (const char * p = std::getenv("OMPH_DFLASH_KEEP")) {
         o.dflash_keep = (float) std::atof(p);
     }

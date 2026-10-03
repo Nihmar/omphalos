@@ -163,6 +163,9 @@ public:
     bool dflash_on() const { return dfl_block_ > 0; }
     int64_t dflash_block() const { return dfl_block_; }
     bool dflash_draft(int32_t token, int64_t pos, int64_t k, std::vector<int32_t> & drafts);
+    // The next verification's drafts came from elsewhere (n-gram, #199): no length statistics.
+    void dflash_no_draft() { dfl_drafted_ = 0; }
+    int64_t spec_max() const { return spec_max_; }
 
 private:
     bool checkpoint_copy(void * host, bool save);
