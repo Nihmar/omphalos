@@ -262,6 +262,26 @@ Runner::QuantKv Runner::quant_kv(const int64_t il) const {
 bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T) {
     const int64_t kv_out = h_.n_head_kv * h_.head_dim;
     const float scale = 1.0f / std::sqrt((float) h_.head_dim);
+    // A verification runs its queries in groups of up to 8 (#251): past 8 tokens
+    // attention_gqa leaves the decode kernel's fixed key chunks (9..15: splits
+    // by token count; 16+: the prefill kernel), and its rows would no longer
+    // be the decode step's bit for bit (#161).
+    const int64_t group = verifying_ ? 8 : T;
+    const int64_t qrow = h_.n_head * h_.head_dim;
+    const auto attend = [&](const omph::kernels::KvCache & kv, const bool q8) {
+        for (int64_t t0 = 0; t0 < T; t0 += group) {
+            const int64_t n = std::min(group, T - t0);
+            if (!omph::kernels::attention_gqa(static_cast<const float *>(q_) + t0 * qrow, kv,
+                                              static_cast<const float *>(gate_) + t0 * qrow, nullptr, n,
+                                              pos0 + t0 + n, h_.n_head, h_.n_head_kv, h_.head_dim, scale, q8,
+                                              attn_work_, attn_work_bytes_, nullptr,
+                                              static_cast<__half *>(ffn16_) + t0 * qrow, !env_.attn_scalar,
+                                              key_chunk_, !env_.attn_dec_scalar)) {
+                return false;
+            }
+        }
+        return true;
+    };
     if (kv_in.quant) {
         omph::kernels::KvCache kv;
         kv.k_q8 = kv_in.q.kq;
@@ -273,11 +293,7 @@ bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T
         kv.window = kv_in.window;
         kv.ring = kv_in.ring;
         kv.k_q4 = kv_in.k_q4;
-        return omph::kernels::attention_gqa(
-            static_cast<const float *>(q_), kv, static_cast<const float *>(gate_),
-            nullptr, T, pos0 + T, h_.n_head, h_.n_head_kv, h_.head_dim, scale, true,
-            attn_work_, attn_work_bytes_, nullptr, ffn16_, !env_.attn_scalar, key_chunk_,
-            !env_.attn_dec_scalar);
+        return attend(kv, true);
     }
     float * k_cache = kv_in.k_f32;
     float * v_cache = kv_in.v_f32;
@@ -304,12 +320,7 @@ bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T
     omph::kernels::KvCache kv;
     kv.k_f32 = k_cache;
     kv.v_f32 = v_cache;
-    return omph::kernels::attention_gqa(static_cast<const float *>(q_), kv,
-                                        static_cast<const float *>(gate_),
-                                        nullptr, T, pos0 + T, h_.n_head, h_.n_head_kv,
-                                        h_.head_dim, scale, false, attn_work_,
-                                        attn_work_bytes_, nullptr, ffn16_, !env_.attn_scalar,
-                                        key_chunk_, !env_.attn_dec_scalar);
+    return attend(kv, false);
 }
 
 } // namespace omph::model
