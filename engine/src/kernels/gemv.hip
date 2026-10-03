@@ -33,6 +33,8 @@ using qd::grid_pair_to_half2;
 using qd::iq3xxs_group_signs;
 using qd::iq4_meta;
 using qd::q4k_meta;
+using qd::iq4_lookup;
+using qd::iq4_pair_to_half2;
 
 __device__ inline float dot2(const uint32_t w, const uint32_t x, const float acc) {
     return __builtin_amdgcn_fdot2(__builtin_bit_cast(half2_v, w), __builtin_bit_cast(half2_v, x),
@@ -212,43 +214,6 @@ __global__ void gemv_q4k_kernel(const uint8_t * __restrict__ qs,
             y[row0 + r] = a;
         }
     }
-}
-
-// The IQ4_NL codebook (omph::quant::kKvaluesIq4nl) + 128 as bytes, in four
-// words: entries 0-3, 4-7, 8-11, 12-15.
-constexpr uint32_t kIq4B0 = 0x3F2D1801u;
-constexpr uint32_t kIq4B1 = 0x766A5D4Fu;
-constexpr uint32_t kIq4B2 = 0xA6998D81u;
-constexpr uint32_t kIq4B3 = 0xF1D9C5B5u;
-constexpr uint32_t iq4_biased_word(const int w) {
-    uint32_t v = 0;
-    for (int j = 0; j < 4; ++j) {
-        v |= (uint32_t) (uint8_t) (omph::quant::kKvaluesIq4nl[4 * w + j] + 128) << (8 * j);
-    }
-    return v;
-}
-static_assert(kIq4B0 == iq4_biased_word(0) && kIq4B1 == iq4_biased_word(1) &&
-                  kIq4B2 == iq4_biased_word(2) && kIq4B3 == iq4_biased_word(3),
-              "kIq4B* must be the IQ4_NL codebook + 128");
-
-// Four 4-bit codes (one per byte) to their codebook values + 128, one per byte:
-// two byte permutes look the low three bits up in each half of the table and a
-// third picks the half by bit 3.
-__device__ inline uint32_t iq4_lookup(const uint32_t codes) {
-    const uint32_t idx = codes & 0x07070707u;
-    const uint32_t lo = __builtin_amdgcn_perm(kIq4B1, kIq4B0, idx);
-    const uint32_t hi = __builtin_amdgcn_perm(kIq4B3, kIq4B2, idx);
-    return __builtin_amdgcn_perm(hi, lo, 0x03020100u | ((codes & 0x08080808u) >> 1));
-}
-
-// Two biased codebook bytes (the bytes Sel picks) as a half2 of the values:
-// 1024 + (v + 128) from the byte permute, minus 1152 (exact, |v| <= 127).
-template <uint32_t Sel>
-__device__ inline uint32_t iq4_pair_to_half2(const uint32_t g) {
-    const uint32_t biased = __builtin_amdgcn_perm(0x64646464u, g, Sel);
-    const half2_v v =
-        __builtin_bit_cast(half2_v, biased) - half2_v{(_Float16) 1152, (_Float16) 1152};
-    return __builtin_bit_cast(uint32_t, v);
 }
 
 constexpr long long kIq4ChunkSub = 256;  // 8192 weights staged per LDS refill
