@@ -534,7 +534,12 @@ Codebook tables (**[verify]** sizes): IQ2_XS grid 512 × 8 B, IQ2_S grid 1024 ×
   - The GEMM reaches 50.3 -> 52.8 TFLOPS.
   - End to end: plain 44.17 -> 44.04 ms and speculative 16.88 -> 16.62 ms per token (`bench/results/iq3s-tiles-178.txt`).
 - **IQ3_XXS (#219, format 3) is done.** The tile kernels became one skeleton over a tile decoder (`quant_decode.hh`). 4-token GEMVs 8.81 -> 7.99 ms, GEMM 51.7 -> 53.7 TFLOPS, speculative ~-0.4 ms per round; the 1-token GEMV is 0.27 ms slower (`bench/results/iq3xxs-tiles-219.txt`).
-- **Next, by the profile (#203):** the 2-bit types (compute-bound at 4 tokens). IQ4_XS and Q4_K stay row-wise: their 4-token GEMVs are already at the 1-token cost.
+- **IQ4_XS and Q4_K (#244, format 4) are done.** They were row-wise until 8- and 16-token verifications (DFlash2, #245; n-gram drafts, #199) made the rows past 4 tokens cost 3x. Tiles are 2176 / 2304 B, the 16 GGUF blocks' size.
+  - All tensors at 16 tokens: IQ4_XS 30.1 -> 10.4 ms, Q4_K 8.9 -> 3.0 ms. The 1-token GEMVs are faster too (10.55 -> 10.01, 3.14 -> 2.92).
+  - GEMM 57.9 -> 57.2 and 58.9 -> 57.0 TFLOPS; prefill 4k +0.6 %.
+  - Decode KL vs the exact f32 KV: 0.000445 -> 0.000416.
+  - End to end: plain step 43.2 -> 42.4 ms, MTP -4.9 %, DFlash2 -20 % per token (`bench/results/tiles-iq4-q4k-244.txt`).
+- **Next, by the profile (#203):** the 2-bit types (compute-bound at 4 tokens, ~5x at 16 tokens).
 
 ---
 

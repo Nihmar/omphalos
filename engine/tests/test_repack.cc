@@ -82,7 +82,7 @@ int main() {
     }
     std::vector<uint8_t> out;
     CHECK(!omph::format::repack_any(0, nullptr, 1, out), "F32 has no repacked layout");
-    // the engine's layouts (#178): IQ3_S tiles round trip, rows a multiple of 16
+    // the engine's layouts (#178, #244): the tiles round trip, rows a multiple of 16
     for (const uint32_t type : types) {
         for (const int64_t rows : {16, 48}) {
             const int64_t k = 512;
@@ -97,12 +97,19 @@ int main() {
                   "%s (%lld rows): engine layout round trip", name_of(type), (long long) rows);
         }
     }
-    CHECK(omph::format::engine_layout(21) == 2 && omph::format::iq3s_tiles_bytes(16, 2) == 2 * 1760,
+    CHECK(omph::format::engine_layout(21, 16) == 2 && omph::format::iq3s_tiles_bytes(16, 2) == 2 * 1760,
           "IQ3_S takes the tiles, 1760 bytes per tile and block");
     CHECK(omph::format::engine_layout_bytes(21, 8, 512) == 0, "IQ3_S tiles need rows %% 16 == 0");
-    CHECK(omph::format::engine_layout(18) == 2 && omph::format::iq3xxs_tiles_bytes(16, 2) == 2 * 1568,
+    CHECK(omph::format::engine_layout(18, 16) == 2 && omph::format::iq3xxs_tiles_bytes(16, 2) == 2 * 1568,
           "IQ3_XXS takes the tile layout");
     CHECK(omph::format::engine_layout_bytes(18, 8, 512) == 0, "IQ3_XXS tiles need rows %% 16 == 0");
+    // #244: IQ4_XS and Q4_K in tiles of the 16 GGUF blocks' size; other row counts keep the repack
+    CHECK(omph::format::engine_layout(23, 16) == 2 && omph::format::iq4xs_tiles_bytes(16, 2) == 2 * 16 * 136,
+          "IQ4_XS takes the tiles");
+    CHECK(omph::format::engine_layout(12, 16) == 2 && omph::format::q4k_tiles_bytes(16, 2) == 2 * 16 * 144,
+          "Q4_K takes the tiles");
+    CHECK(omph::format::engine_layout(12, 8) == 1 && omph::format::engine_layout(23, 24) == 1,
+          "IQ4_XS / Q4_K with rows %% 16 != 0 keep the repacked layout");
     std::printf("test_repack: %d failure(s)\n", omph_test::failures);
     return omph_test::failures == 0 ? 0 : 1;
 }

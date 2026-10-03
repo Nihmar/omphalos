@@ -48,7 +48,7 @@ bool dflash_topk(const float * x, int64_t rows, int64_t n, int32_t * ids, float 
 // DFlash2's selector lattice for block positions 1 .. P: position i's scores
 // score[a][b] = vals_i[b] + sum_r prev(a)[r] * gate_i[r] * next(cand_i[b])[r],
 // prev(a) the predecessor table's row of cand_{i-1}[a] (the anchor at i = 1),
-// both tables repacked Q4_K with one 256-weight block per row (rank 256).
+// both tables Q4_K tiles (#244) with one 256-weight block per row (rank 256).
 // cand / vals: P x 16 (positions 1 .. P); gate: (P + 1) x 256 (position 0
 // first); scores: P x 16 x 16 ([pred][succ]).
 bool dflash_selector(const int32_t * cand, const float * vals, const float * gate, int32_t anchor,

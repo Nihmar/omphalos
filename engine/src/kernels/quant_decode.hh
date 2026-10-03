@@ -58,6 +58,43 @@ __device__ inline float iq4_meta(const uint2 m, const int ib) {
     return __half2float(__ushort_as_half((unsigned short) (m.y >> 16))) * (float) ((int) sc - 32);
 }
 
+// The IQ4_NL codebook (omph::quant::kKvaluesIq4nl) + 128 as bytes, in four
+// words: entries 0-3, 4-7, 8-11, 12-15.
+constexpr uint32_t kIq4B0 = 0x3F2D1801u;
+constexpr uint32_t kIq4B1 = 0x766A5D4Fu;
+constexpr uint32_t kIq4B2 = 0xA6998D81u;
+constexpr uint32_t kIq4B3 = 0xF1D9C5B5u;
+constexpr uint32_t iq4_biased_word(const int w) {
+    uint32_t v = 0;
+    for (int j = 0; j < 4; ++j) {
+        v |= (uint32_t) (uint8_t) (omph::quant::kKvaluesIq4nl[4 * w + j] + 128) << (8 * j);
+    }
+    return v;
+}
+static_assert(kIq4B0 == iq4_biased_word(0) && kIq4B1 == iq4_biased_word(1) &&
+                  kIq4B2 == iq4_biased_word(2) && kIq4B3 == iq4_biased_word(3),
+              "kIq4B* must be the IQ4_NL codebook + 128");
+
+// Four 4-bit codes (one per byte) to their codebook values + 128, one per byte:
+// two byte permutes look the low three bits up in each half of the table and a
+// third picks the half by bit 3.
+__device__ inline uint32_t iq4_lookup(const uint32_t codes) {
+    const uint32_t idx = codes & 0x07070707u;
+    const uint32_t lo = __builtin_amdgcn_perm(kIq4B1, kIq4B0, idx);
+    const uint32_t hi = __builtin_amdgcn_perm(kIq4B3, kIq4B2, idx);
+    return __builtin_amdgcn_perm(hi, lo, 0x03020100u | ((codes & 0x08080808u) >> 1));
+}
+
+// Two biased codebook bytes (the bytes Sel picks) as a half2 of the values:
+// 1024 + (v + 128) from the byte permute, minus 1152 (exact, |v| <= 127).
+template <uint32_t Sel>
+__device__ inline uint32_t iq4_pair_to_half2(const uint32_t g) {
+    const uint32_t biased = __builtin_amdgcn_perm(0x64646464u, g, Sel);
+    const half2_v v =
+        __builtin_bit_cast(half2_v, biased) - half2_v{(_Float16) 1152, (_Float16) 1152};
+    return __builtin_bit_cast(uint32_t, v);
+}
+
 // --- one 32-weight sub-block to f32 (#141) ----------------------------------
 //
 // One decoder per repacked type: load() reads the sub-block's words (row, s:
@@ -724,6 +761,143 @@ struct TileIq3xxs {  // GGUF type 18 (#219)
         }
         return v;
     }
+};
+
+// IQ4_XS tiles (#244): lane words = the codes of its half, two per byte (even
+// weight low); the frag looks the codes up (iq4_lookup), pairs (even, odd) with
+// two byte permutes and scales by f16(d (scale - 32)).
+struct TileIq4xs {  // GGUF type 23
+    static constexpr long long kBytes = omph::format::kIq4xsTileBytes;
+    static constexpr int kLds = 16;
+    __device__ static void init(uint8_t *) {}
+    struct Blk {
+        uint4 q0, q1, q2, q3;
+        uint2 mt;
+    };
+    __device__ static Blk load(const uint8_t * o, const int lane) {
+        Blk k;
+        const uint4 * q = reinterpret_cast<const uint4 *>(o + lane * 64);
+        k.q0 = q[0];
+        k.q1 = q[1];
+        k.q2 = q[2];
+        k.q3 = q[3];
+        k.mt = *reinterpret_cast<const uint2 *>(o + 2048 + (lane & 15) * 8);
+        return k;
+    }
+    __device__ static tile_h8 frag(const uint8_t *, const Blk & k, const int sb, const int gl, const int) {
+        const uint32_t qw[16] = {k.q0.x, k.q0.y, k.q0.z, k.q0.w, k.q1.x, k.q1.y, k.q1.z, k.q1.w,
+                                 k.q2.x, k.q2.y, k.q2.z, k.q2.w, k.q3.x, k.q3.y, k.q3.z, k.q3.w};
+        const uint32_t w = qw[2 * sb + gl];
+        const uint32_t ve = iq4_lookup(w & 0x0F0F0F0Fu);         // weights 0, 2, 4, 6 (+ 128)
+        const uint32_t vo = iq4_lookup((w >> 4) & 0x0F0F0F0Fu);  // 1, 3, 5, 7
+        const uint32_t p01 = __builtin_amdgcn_perm(vo, ve, 0x05010400u);  // e0 o0 e1 o1
+        const uint32_t p23 = __builtin_amdgcn_perm(vo, ve, 0x07030602u);  // e2 o2 e3 o3
+        const float dl = iq4_meta(k.mt, sb);
+        const half2_v d2 = {(_Float16) dl, (_Float16) dl};
+        const uint32_t hv[4] = {iq4_pair_to_half2<0x04010400u>(p01), iq4_pair_to_half2<0x04030402u>(p01),
+                                iq4_pair_to_half2<0x04010400u>(p23), iq4_pair_to_half2<0x04030402u>(p23)};
+        tile_h8 a;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const half2_v p = __builtin_bit_cast(half2_v, hv[i]) * d2;
+            a[2 * i] = p[0];
+            a[2 * i + 1] = p[1];
+        }
+        return a;
+    }
+};
+
+// Q4_K tiles (#244): lane words = its half's repacked bytes; each weight
+// d sc q - dmin m in f32, rounded to f16 once (the GEMM's dequant values).
+struct TileQ4k {  // GGUF type 12
+    static constexpr long long kBytes = omph::format::kQ4kTileBytes;
+    static constexpr int kLds = 16;
+    __device__ static void init(uint8_t *) {}
+    struct Blk {
+        uint4 q0, q1, q2, q3;
+        uint4 mt;
+    };
+    __device__ static Blk load(const uint8_t * o, const int lane) {
+        Blk k;
+        const uint4 * q = reinterpret_cast<const uint4 *>(o + lane * 64);
+        k.q0 = q[0];
+        k.q1 = q[1];
+        k.q2 = q[2];
+        k.q3 = q[3];
+        k.mt = *reinterpret_cast<const uint4 *>(o + 2048 + (lane & 15) * 16);
+        return k;
+    }
+    __device__ static tile_h8 frag(const uint8_t *, const Blk & k, const int sb, const int gl, const int) {
+        // the word by selects: an indexed 16-word array went to scratch in the GEMM's sb loop
+        const int idx = 2 * sb + gl;
+        const uint4 v = idx < 4 ? k.q0 : idx < 8 ? k.q1 : idx < 12 ? k.q2 : k.q3;
+        const int e = idx & 3;
+        const uint32_t w = e == 0 ? v.x : e == 1 ? v.y : e == 2 ? v.z : v.w;
+        float ds;
+        float ms;
+        q4k_meta(k.mt, sb, ds, ms);
+        tile_h8 a;
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            const uint32_t byte = (w >> (8 * m)) & 0xFFu;
+            a[2 * m] = (_Float16) (ds * (float) (byte & 0xFu) - ms);
+            a[2 * m + 1] = (_Float16) (ds * (float) (byte >> 4) - ms);
+        }
+        return a;
+    }
+};
+
+// The row-wise decoders over these tiles (the GEMM for rows % 128 != 0, the f16
+// dequant): DecIq4xs's / DecQ4k's Raw rebuilt from the row's two lanes.
+struct DecIq4xsTile {  // GGUF type 23, .omph layout 2 (#244)
+    const uint8_t * base;
+    long long blocks;
+    using Raw = DecIq4xs::Raw;
+    static DecIq4xsTile make(const uint8_t * base, const int64_t /*n_blocks*/, const long long blocks) {
+        return {base, blocks};
+    }
+    __device__ Raw load(const long long row, const long long s) const {
+        const uint8_t * o = base + ((row >> 4) * blocks + (s >> 3)) * omph::format::kIq4xsTileBytes;
+        const int r = (int) (row & 15);
+        const int sb = (int) (s & 7);
+        const uint2 h0 = *reinterpret_cast<const uint2 *>(o + r * 64 + sb * 8);
+        const uint2 h1 = *reinterpret_cast<const uint2 *>(o + (r + 16) * 64 + sb * 8);
+        const uint32_t a[2] = {h0.x, h0.y};
+        const uint32_t b[2] = {h1.x, h1.y};
+        uint32_t q[4] = {0, 0, 0, 0};
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {  // byte j: weight j (low), j + 16 (high)
+            const uint32_t lo = (a[j / 8] >> (4 * (j % 8))) & 0xFu;
+            const uint32_t hi = (b[j / 8] >> (4 * (j % 8))) & 0xFu;
+            q[j / 4] |= (lo | (hi << 4)) << (8 * (j % 4));
+        }
+        Raw w;
+        w.q = make_uint4(q[0], q[1], q[2], q[3]);
+        w.mt = *reinterpret_cast<const uint2 *>(o + 2048 + r * 8);
+        return w;
+    }
+    __device__ void decode(const Raw & r, const long long s, float (&v)[32]) const { DecIq4xs{}.decode(r, s, v); }
+};
+
+struct DecQ4kTile {  // GGUF type 12, .omph layout 2 (#244)
+    const uint8_t * base;
+    long long blocks;
+    using Raw = DecQ4k::Raw;
+    static DecQ4kTile make(const uint8_t * base, const int64_t /*n_blocks*/, const long long blocks) {
+        return {base, blocks};
+    }
+    __device__ Raw load(const long long row, const long long s) const {
+        const uint8_t * o = base + ((row >> 4) * blocks + (s >> 3)) * omph::format::kQ4kTileBytes;
+        const int r = (int) (row & 15);
+        const int sb = (int) (s & 7);
+        const uint2 h0 = *reinterpret_cast<const uint2 *>(o + r * 64 + sb * 8);
+        const uint2 h1 = *reinterpret_cast<const uint2 *>(o + (r + 16) * 64 + sb * 8);
+        Raw w;
+        w.q = make_uint4(h0.x, h0.y, h1.x, h1.y);
+        w.mt = *reinterpret_cast<const uint4 *>(o + 2048 + r * 16);
+        return w;
+    }
+    __device__ void decode(const Raw & r, const long long s, float (&v)[32]) const { DecQ4k{}.decode(r, s, v); }
 };
 
 } // namespace omph::kernels::qd

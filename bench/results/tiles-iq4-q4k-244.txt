@@ -1,0 +1,29 @@
+# IQ4_XS and Q4_K in WMMA tiles (#244), .omph format 4, 2026-10-03; RX 9060 XT, card overclocked by the
+# maintainer that morning. Base: main ad90a1c (format 3); new: perf/244-iq4-q4k-tiles.
+# Layouts (format/repack.hh): 16-row tiles x one 256-weight block, IQ4_XS 2176 B, Q4_K 2304 B (the 16 GGUF
+# blocks' size); omph-convert rebuilds the GGUF bytes from every tile (866 tensors verified).
+#
+# All tensors of the type (omph-gemv-bench --all-of-type T [--nt N] [--gemm 512]):
+#   type     row-wise NT 1 / 4 / 8 / 16 (ms)       tiles NT 1 / 4 / 8 / 16 (ms)      GEMM 512 (TFLOPS)
+#   IQ4_XS   10.55 / 10.53 / 15.87 / 30.09         10.01 / 10.09 / 10.17 / 10.42     57.9 -> 57.2
+#   Q4_K      3.14 /  3.12 /  4.71 /  8.90          2.92 /  2.93 /  2.95 /  3.03     58.9 -> 57.0
+# --multi: every token of a 2..16-token call equals the 1-token call bit for bit (max |d| 0), both types.
+# (Q4_K's frag picks its word with selects: an indexed 16-word array went to scratch in the GEMM, 48.4 TFLOPS.)
+#
+# End to end, 5 alternating runs, median:
+#   plain decode step (golden prompt, OMPH_TIMING step gpu)   43.21 -> 42.39 ms   (-1.9 %)
+#   MTP k=3, 3k-token prose prompt, ms per token               23.78 -> 22.62      (-4.9 %)
+#   DFlash2, same prompt, ms per token                         32.75 -> 26.18      (-20.1 %)
+#   prefill 4096 tokens (wall)                                 4158.9 -> 4182.2 ms (+0.6 %)
+#
+# Scenario speeds (omph-server, greedy, #199 prompts), t/s:
+#               quote   he-80   he-0    prose   edit-cc  he-144
+#   DFlash2     104.9   87.0    76.1    41.8    121.9    65.8     (before the tiles: 89.3 72.6 65.5 37.8 105.0 56.9)
+#   MTP          71.8   60.7    56.2    40.3     75.2    51.2
+#   ratio        1.46   1.43    1.35    1.04     1.62     1.29
+#
+# Decode quality: 64 decode steps on the 3k prompt with the f32-KV run's greedy tokens forced in, KL
+# (compare_logits.py): exact-KV ref vs base 0.000445, vs new 0.000416, base vs new 0.000101, new with
+# f32 KV vs ref 0.000001; top-1 100 % everywhere.
+# Checks: check_gpu_decode --gemv, check_gpu_run --layers, check_gpu_mtp, check_server PASS; MTP and DFlash2
+# greedy identical to plain greedy (K8 and K4, OMPH_SPEC_CHECK=1); CPU tests (tile round trips) pass.
