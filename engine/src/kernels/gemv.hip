@@ -602,19 +602,20 @@ __global__ void gemv_iq3_kernel(const uint8_t * __restrict__ qs, const uint8_t *
 
 // IQ3_XXS for NT = 2..4 tokens (#126): the IQ3_S NT scheme (see there).
 template <int NT, int R>
-__global__ void gemv_iq3_ntg_kernel(const uint8_t * __restrict__ qs,
+__device__ __forceinline__ void iq3_ntg_body(const uint8_t * __restrict__ qs,
                                     const uint8_t * __restrict__ aux,
                                     const uint8_t * __restrict__ d, const __half * __restrict__ x,
                                     float * __restrict__ y, const long long rows,
-                                    const long long n_sub) {
-    __shared__ uint32_t grid[256];
+                                    const long long n_sub, const long long blk,
+        uint8_t * __restrict__ lds) {
+    uint32_t * grid = reinterpret_cast<uint32_t *>(lds);
     for (int i = threadIdx.x; i < 256; i += blockDim.x) {
         grid[i] = omph::quant::kIq3xxsGrid[i];
     }
     __syncthreads();
     const int warp = (int) threadIdx.x / 32;
     const int lane = (int) threadIdx.x % 32;
-    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * R;
+    const long long row0 = ((long long) blk * (blockDim.x / 32) + warp) * R;
     const long long blocks = n_sub / 8;
     const long long rlast = rows - 1;
     const long long k = n_sub * 32;
@@ -690,19 +691,30 @@ __global__ void gemv_iq3_ntg_kernel(const uint8_t * __restrict__ qs,
     }
 }
 
+template <int NT, int R>
+__global__ void gemv_iq3_ntg_kernel(const uint8_t * __restrict__ qs,
+                                    const uint8_t * __restrict__ aux,
+                                    const uint8_t * __restrict__ d, const __half * __restrict__ x,
+                                    float * __restrict__ y, const long long rows,
+                                    const long long n_sub) {
+    __shared__ __attribute__((aligned(16))) uint8_t lds[1024];
+    iq3_ntg_body<NT, R>(qs, aux, d, x, y, rows, n_sub, (long long) blockIdx.x, lds);
+}
+
 // Q4_K and IQ4_XS for NT = 2..4 tokens (#126): the IQ3_S NT scheme. The
 // activations come in their natural order from global memory; for Q4_K the
 // (even, odd) half2 pairs the single-token kernel stages in LDS are built
 // with two byte permutes per pair, so the products and their order (and the
 // results) are the single-token kernel's.
 template <int NT, int R>
-__global__ void gemv_q4k_ntg_kernel(const uint8_t * __restrict__ qs,
+__device__ __forceinline__ void q4k_ntg_body(const uint8_t * __restrict__ qs,
                                     const uint8_t * __restrict__ meta,
                                     const __half * __restrict__ x, float * __restrict__ y,
-                                    const long long rows, const long long n_sub) {
+                                    const long long rows, const long long n_sub, const long long blk,
+        uint8_t * __restrict__ /* lds: none */) {
     const int warp = (int) threadIdx.x / 32;
     const int lane = (int) threadIdx.x % 32;
-    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * R;
+    const long long row0 = ((long long) blk * (blockDim.x / 32) + warp) * R;
     const long long blocks = n_sub / 8;
     const long long rlast = rows - 1;
     const long long k = n_sub * 32;
@@ -782,13 +794,22 @@ __global__ void gemv_q4k_ntg_kernel(const uint8_t * __restrict__ qs,
 }
 
 template <int NT, int R>
-__global__ void gemv_iq4_ntg_kernel(const uint8_t * __restrict__ qs,
+__global__ void gemv_q4k_ntg_kernel(const uint8_t * __restrict__ qs,
                                     const uint8_t * __restrict__ meta,
                                     const __half * __restrict__ x, float * __restrict__ y,
                                     const long long rows, const long long n_sub) {
+    q4k_ntg_body<NT, R>(qs, meta, x, y, rows, n_sub, (long long) blockIdx.x, nullptr);
+}
+
+template <int NT, int R>
+__device__ __forceinline__ void iq4_ntg_body(const uint8_t * __restrict__ qs,
+                                    const uint8_t * __restrict__ meta,
+                                    const __half * __restrict__ x, float * __restrict__ y,
+                                    const long long rows, const long long n_sub, const long long blk,
+        uint8_t * __restrict__ /* lds: none */) {
     const int warp = (int) threadIdx.x / 32;
     const int lane = (int) threadIdx.x % 32;
-    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * R;
+    const long long row0 = ((long long) blk * (blockDim.x / 32) + warp) * R;
     const long long blocks = n_sub / 8;
     const long long rlast = rows - 1;
     const long long k = n_sub * 32;
@@ -858,6 +879,14 @@ __global__ void gemv_iq4_ntg_kernel(const uint8_t * __restrict__ qs,
     }
 }
 
+template <int NT, int R>
+__global__ void gemv_iq4_ntg_kernel(const uint8_t * __restrict__ qs,
+                                    const uint8_t * __restrict__ meta,
+                                    const __half * __restrict__ x, float * __restrict__ y,
+                                    const long long rows, const long long n_sub) {
+    iq4_ntg_body<NT, R>(qs, meta, x, y, rows, n_sub, (long long) blockIdx.x, nullptr);
+}
+
 // The IQ2 family's 8 weights against NT activation groups, with the two
 // dot2 chains of the single-token kernels in their order: out[t] += pa + pb.
 template <int NT>
@@ -905,19 +934,20 @@ __device__ inline void store_acc(float (&acc)[R][NT], float * y, const long long
 
 // IQ2_XS / IQ2_XXS / IQ2_S for NT = 2..4 tokens (#126): the IQ3_S NT scheme.
 template <int NT, int R>
-__global__ void gemv_iq2xs_ntg_kernel(const uint8_t * __restrict__ qs,
+__device__ __forceinline__ void iq2xs_ntg_body(const uint8_t * __restrict__ qs,
                                       const uint8_t * __restrict__ sc,
                                       const uint8_t * __restrict__ d,
                                       const __half * __restrict__ x, float * __restrict__ y,
-                                      const long long rows, const long long n_sub) {
-    __shared__ uint64_t grid[512];
+                                      const long long rows, const long long n_sub, const long long blk,
+        uint8_t * __restrict__ lds) {
+    uint64_t * grid = reinterpret_cast<uint64_t *>(lds);
     for (int i = threadIdx.x; i < 512; i += blockDim.x) {
         grid[i] = omph::quant::kIq2xsGrid[i];
     }
     __syncthreads();
     const int warp = (int) threadIdx.x / 32;
     const int lane = (int) threadIdx.x % 32;
-    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * R;
+    const long long row0 = ((long long) blk * (blockDim.x / 32) + warp) * R;
     const long long blocks = n_sub / 8;
     const long long rlast = rows - 1;
     const long long k = n_sub * 32;
@@ -977,18 +1007,29 @@ __global__ void gemv_iq2xs_ntg_kernel(const uint8_t * __restrict__ qs,
 }
 
 template <int NT, int R>
-__global__ void gemv_iq2xxs_ntg_kernel(const uint8_t * __restrict__ qs,
+__global__ void gemv_iq2xs_ntg_kernel(const uint8_t * __restrict__ qs,
+                                      const uint8_t * __restrict__ sc,
+                                      const uint8_t * __restrict__ d,
+                                      const __half * __restrict__ x, float * __restrict__ y,
+                                      const long long rows, const long long n_sub) {
+    __shared__ __attribute__((aligned(16))) uint8_t lds[4096];
+    iq2xs_ntg_body<NT, R>(qs, sc, d, x, y, rows, n_sub, (long long) blockIdx.x, lds);
+}
+
+template <int NT, int R>
+__device__ __forceinline__ void iq2xxs_ntg_body(const uint8_t * __restrict__ qs,
                                        const uint8_t * __restrict__ d,
                                        const __half * __restrict__ x, float * __restrict__ y,
-                                       const long long rows, const long long n_sub) {
-    __shared__ uint64_t grid[256];
+                                       const long long rows, const long long n_sub, const long long blk,
+        uint8_t * __restrict__ lds) {
+    uint64_t * grid = reinterpret_cast<uint64_t *>(lds);
     for (int i = threadIdx.x; i < 256; i += blockDim.x) {
         grid[i] = omph::quant::kIq2xxsGrid[i];
     }
     __syncthreads();
     const int warp = (int) threadIdx.x / 32;
     const int lane = (int) threadIdx.x % 32;
-    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * R;
+    const long long row0 = ((long long) blk * (blockDim.x / 32) + warp) * R;
     const long long blocks = n_sub / 8;
     const long long rlast = rows - 1;
     const long long k = n_sub * 32;
@@ -1042,19 +1083,29 @@ __global__ void gemv_iq2xxs_ntg_kernel(const uint8_t * __restrict__ qs,
 }
 
 template <int NT, int R>
-__global__ void gemv_iq2s_ntg_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ sg,
+__global__ void gemv_iq2xxs_ntg_kernel(const uint8_t * __restrict__ qs,
+                                       const uint8_t * __restrict__ d,
+                                       const __half * __restrict__ x, float * __restrict__ y,
+                                       const long long rows, const long long n_sub) {
+    __shared__ __attribute__((aligned(16))) uint8_t lds[2048];
+    iq2xxs_ntg_body<NT, R>(qs, d, x, y, rows, n_sub, (long long) blockIdx.x, lds);
+}
+
+template <int NT, int R>
+__device__ __forceinline__ void iq2s_ntg_body(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ sg,
                                      const uint8_t * __restrict__ qh, const uint8_t * __restrict__ sc,
                                      const uint8_t * __restrict__ d, const __half * __restrict__ x,
                                      float * __restrict__ y, const long long rows,
-                                     const long long n_sub) {
-    __shared__ uint64_t grid[1024];
+                                     const long long n_sub, const long long blk,
+        uint8_t * __restrict__ lds) {
+    uint64_t * grid = reinterpret_cast<uint64_t *>(lds);
     for (int i = threadIdx.x; i < 1024; i += blockDim.x) {
         grid[i] = omph::quant::kIq2sGrid[i];
     }
     __syncthreads();
     const int warp = (int) threadIdx.x / 32;
     const int lane = (int) threadIdx.x % 32;
-    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * R;
+    const long long row0 = ((long long) blk * (blockDim.x / 32) + warp) * R;
     const long long blocks = n_sub / 8;
     const long long rlast = rows - 1;
     const long long k = n_sub * 32;
@@ -1115,16 +1166,27 @@ __global__ void gemv_iq2s_ntg_kernel(const uint8_t * __restrict__ qs, const uint
     store_acc<NT, R>(acc, y, row0, rows, lane);
 }
 
+template <int NT, int R>
+__global__ void gemv_iq2s_ntg_kernel(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ sg,
+                                     const uint8_t * __restrict__ qh, const uint8_t * __restrict__ sc,
+                                     const uint8_t * __restrict__ d, const __half * __restrict__ x,
+                                     float * __restrict__ y, const long long rows,
+                                     const long long n_sub) {
+    __shared__ __attribute__((aligned(16))) uint8_t lds[8192];
+    iq2s_ntg_body<NT, R>(qs, sg, qh, sc, d, x, y, rows, n_sub, (long long) blockIdx.x, lds);
+}
+
 // Q2_K for NT = 2..4 tokens (#126): the single-token kernel's 128-weight groups
 // with the activations read from global memory (natural order) per token.
 template <int NT, int R>
-__global__ void gemv_q2k_ntg_kernel(const uint8_t * __restrict__ sc, const uint8_t * __restrict__ qs,
+__device__ __forceinline__ void q2k_ntg_body(const uint8_t * __restrict__ sc, const uint8_t * __restrict__ qs,
                                     const uint8_t * __restrict__ d, const uint8_t * __restrict__ dmin,
                                     const __half * __restrict__ x, float * __restrict__ y,
-                                    const long long rows, const long long n_sub) {
+                                    const long long rows, const long long n_sub, const long long blk,
+        uint8_t * __restrict__ /* lds: none */) {
     const int warp = (int) threadIdx.x / 32;
     const int lane = (int) threadIdx.x % 32;
-    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * R;
+    const long long row0 = ((long long) blk * (blockDim.x / 32) + warp) * R;
     const long long blocks = n_sub / 8;
     const long long rlast = rows - 1;
     const long long k = n_sub * 32;
@@ -1212,6 +1274,14 @@ __global__ void gemv_q2k_ntg_kernel(const uint8_t * __restrict__ sc, const uint8
     store_acc<NT, R>(acc, y, row0, rows, lane);
 }
 
+template <int NT, int R>
+__global__ void gemv_q2k_ntg_kernel(const uint8_t * __restrict__ sc, const uint8_t * __restrict__ qs,
+                                    const uint8_t * __restrict__ d, const uint8_t * __restrict__ dmin,
+                                    const __half * __restrict__ x, float * __restrict__ y,
+                                    const long long rows, const long long n_sub) {
+    q2k_ntg_body<NT, R>(sc, qs, d, dmin, x, y, rows, n_sub, (long long) blockIdx.x, nullptr);
+}
+
 // IQ3_S on WMMA tiles (#178, M9 stage C): the tensor is stored in 16-row tiles
 // (format/repack.hh's IQ3_S tiles) where each of a wave's 32 lanes (row
 // l % 16, half h = l / 16) finds its bytes for a 256-weight block contiguous.
@@ -1232,12 +1302,13 @@ constexpr int kTileTiles = 8 / kTileKW;     // tiles per 8-wave workgroup
 constexpr int kTileMaxTokens = 16;
 
 template <int NT>
-__global__ __launch_bounds__(256) void gemv_iq3s_tiles_kernel(const uint8_t * __restrict__ wt,
+__device__ __forceinline__ void iq3s_tiles_body(const uint8_t * __restrict__ wt,
                                                              const __half * __restrict__ x,
                                                              float * __restrict__ y, const long long rows,
-                                                             const long long blocks) {
-    __shared__ uint2 grid[512];  // as half2 pairs
-    __shared__ float red[8][16][17];
+                                                             const long long blocks, const long long blk,
+        uint8_t * __restrict__ lds) {
+    uint2 * grid = reinterpret_cast<uint2 *>(lds);  // as half2 pairs
+    float (*red)[16][17] = reinterpret_cast<float (*)[16][17]>(lds + 4096);
     const int tid = (int) threadIdx.x;
     for (int i = tid; i < 512; i += blockDim.x) {
         const uint32_t g = omph::quant::kIq3sGrid[i];
@@ -1251,7 +1322,7 @@ __global__ __launch_bounds__(256) void gemv_iq3s_tiles_kernel(const uint8_t * __
     const int h = lane >> 4;
     const int r = lane & 15;
     const int t = lane & 15;  // B column: the token
-    const long long tile = (long long) blockIdx.x * kTileTiles + tl;
+    const long long tile = (long long) blk * kTileTiles + tl;
     const bool valid = tile < rows / 16;
     const long long k = blocks * 256;
     const long long per = (blocks + kTileKW - 1) / kTileKW;
@@ -1323,11 +1394,20 @@ __global__ __launch_bounds__(256) void gemv_iq3s_tiles_kernel(const uint8_t * __
         for (int i = 1; i < kTileKW; ++i) {
             sum += red[tt2 * kTileKW + i][m][tt];
         }
-        const long long row = ((long long) blockIdx.x * kTileTiles + tt2) * 16 + m;
+        const long long row = ((long long) blk * kTileTiles + tt2) * 16 + m;
         if (row < rows) {
             y[tt * rows + row] = sum;
         }
     }
+}
+
+template <int NT>
+__global__ __launch_bounds__(256) void gemv_iq3s_tiles_kernel(const uint8_t * __restrict__ wt,
+                                                             const __half * __restrict__ x,
+                                                             float * __restrict__ y, const long long rows,
+                                                             const long long blocks) {
+    __shared__ __attribute__((aligned(16))) uint8_t lds[12800];
+    iq3s_tiles_body<NT>(wt, x, y, rows, blocks, (long long) blockIdx.x, lds);
 }
 
 template <int NT>
@@ -1803,13 +1883,14 @@ __global__ void gemv_q6k_kernel(const uint8_t * __restrict__ ql, const uint8_t *
 // the activations read from global memory (L1 / L2), as the other NT kernels.
 // Before it, a multi-token Q6_K matmul ran one launch per token.
 template <int NT, int R>
-__global__ void gemv_q6k_ntg_kernel(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
+__device__ __forceinline__ void q6k_ntg_body(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
                                     const uint8_t * __restrict__ sc, const uint8_t * __restrict__ d,
                                     const __half * __restrict__ x, float * __restrict__ y,
-                                    const long long rows, const long long n_sub) {
+                                    const long long rows, const long long n_sub, const long long blk,
+        uint8_t * __restrict__ /* lds: none */) {
     const int warp = (int) threadIdx.x / 32;
     const int lane = (int) threadIdx.x % 32;
-    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * R;
+    const long long row0 = ((long long) blk * (blockDim.x / 32) + warp) * R;
     if (row0 >= rows) {
         return;
     }
@@ -1894,6 +1975,14 @@ __global__ void gemv_q6k_ntg_kernel(const uint8_t * __restrict__ ql, const uint8
             }
         }
     }
+}
+
+template <int NT, int R>
+__global__ void gemv_q6k_ntg_kernel(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
+                                    const uint8_t * __restrict__ sc, const uint8_t * __restrict__ d,
+                                    const __half * __restrict__ x, float * __restrict__ y,
+                                    const long long rows, const long long n_sub) {
+    q6k_ntg_body<NT, R>(ql, qh, sc, d, x, y, rows, n_sub, (long long) blockIdx.x, nullptr);
 }
 
 
@@ -2731,6 +2820,160 @@ bool gemv_tokens(const uint32_t type, const void * packed, const void * x_f16, f
         return false;
     }
     return type == 21 && launch_iq3s_tiles_n(nt, packed, x_f16, y, rows, k, stream);
+}
+
+// --- sibling GEMVs in one launch (#214) ------------------------------------
+//
+// The 2-3 GEMVs a layer runs on one input (ffn_gate + ffn_up, attn_qkv +
+// attn_gate, attn_q + attn_k + attn_v) as one launch of NT = 2..4 tokens:
+// each launch costs ~10 us of fill / drain plus the gap to the next
+// (omph-gemv-bench --merge-type). The grid is the members' grids back to back;
+// a block finds its member and runs that type's body (the same code as the
+// type's own kernel, so the outputs are bit-identical), with one LDS buffer
+// sized for the largest body (the IQ3_S tiles). Carrying every body costs
+// occupancy (~184 VGPRs: 8 waves per SIMD), which the NT kernels absorb
+// (#214: no loss down to 8 waves per SIMD).
+namespace {
+
+constexpr int kGroupLds = 12800;  // iq3s_tiles_body: grid 4096 + reduction 8704
+
+struct GroupItem {
+    uint32_t type;
+    unsigned blocks;          // this member's blocks
+    const uint8_t * p[5];     // the layout's sections, in the body's order
+    float * y;
+    long long rows;
+    long long n;              // k / 32 (the tiles: k / 256)
+};
+
+struct GroupArgs {
+    GroupItem it[kGemvGroupMax];
+    int n;
+};
+
+// The type's body, inlined. Left alone the allocator gave the switch more
+// registers than any one body needs (NT = 4: 230 VGPRs; NT = 2, 3: 256 with
+// spills), and non-inlined calls cost more still (256 VGPRs plus scratch); the
+// kernel asks for 8 waves per SIMD instead (<= 192 VGPRs, no spills).
+template <int NT>
+__device__ __forceinline__ void group_body(const GroupItem & t, const __half * __restrict__ x, const long long b,
+                                        uint8_t * __restrict__ lds) {
+    switch (t.type) {
+        case 21: iq3s_tiles_body<NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
+        case 18: iq3_ntg_body<NT, 4>(t.p[0], t.p[1], t.p[2], x, t.y, t.rows, t.n, b, lds); break;
+        case 12: q4k_ntg_body<NT, 4>(t.p[0], t.p[1], x, t.y, t.rows, t.n, b, lds); break;
+        case 23: iq4_ntg_body<NT, 4>(t.p[0], t.p[1], x, t.y, t.rows, t.n, b, lds); break;
+        case 17: iq2xs_ntg_body<NT, 4>(t.p[0], t.p[1], t.p[2], x, t.y, t.rows, t.n, b, lds); break;
+        case 22: iq2s_ntg_body<NT, 4>(t.p[0], t.p[1], t.p[2], t.p[3], t.p[4], x, t.y, t.rows, t.n, b, lds); break;
+        case 10: q2k_ntg_body<NT, 4>(t.p[0], t.p[1], t.p[2], t.p[3], x, t.y, t.rows, t.n, b, lds); break;
+        case 14: q6k_ntg_body<NT, 2>(t.p[0], t.p[1], t.p[2], t.p[3], x, t.y, t.rows, t.n, b, lds); break;
+        default: break;
+    }
+}
+
+template <int NT>
+__global__ __launch_bounds__(256, 8) void gemv_group_kernel(const GroupArgs g, const __half * __restrict__ x) {
+    __shared__ __attribute__((aligned(16))) uint8_t lds[kGroupLds];
+    long long b = blockIdx.x;
+    int m = 0;
+    while (m + 1 < g.n && b >= (long long) g.it[m].blocks) {
+        b -= g.it[m].blocks;
+        ++m;
+    }
+    group_body<NT>(g.it[m], x, b, lds);
+}
+
+// One member's device record (the launch helpers' layout arithmetic); false
+// for a type without an NT body.
+bool group_item(const GemvGroupItem & in, GroupItem & o) {
+    const int64_t rows = in.rows;
+    const int64_t k = in.k;
+    const int64_t nb = rows * (k / 256);
+    const auto * base = static_cast<const uint8_t *>(in.packed);
+    o = GroupItem{};
+    o.type = in.type;
+    o.y = in.y;
+    o.rows = rows;
+    o.n = k / 32;
+    const auto ntg = [&](const int r) { o.blocks = (unsigned) ((rows + 8 * r - 1) / (8 * r)); };
+    switch (in.type) {
+        case 21:
+            if (rows % 16 != 0) return false;
+            o.p[0] = base;
+            o.n = k / 256;
+            o.blocks = (unsigned) ((rows / 16 + kTileTiles - 1) / kTileTiles);
+            return true;
+        case 18: {
+            const auto l = omph::format::iq3_xxs_layout(nb);
+            o.p[0] = base + l.qs_off; o.p[1] = base + l.aux_off; o.p[2] = base + l.d_off;
+            ntg(4);
+            return true;
+        }
+        case 12: {
+            const auto l = omph::format::q4k_layout(nb);
+            o.p[0] = base + l.qs_off; o.p[1] = base + l.meta_off;
+            ntg(4);
+            return true;
+        }
+        case 23: {
+            const auto l = omph::format::iq4_layout(nb);
+            o.p[0] = base + l.qs_off; o.p[1] = base + l.meta_off;
+            ntg(4);
+            return true;
+        }
+        case 17: {
+            const auto l = omph::format::iq2_xs_layout(nb);
+            o.p[0] = base + l.qs_off; o.p[1] = base + l.sc_off; o.p[2] = base + l.d_off;
+            ntg(4);
+            return true;
+        }
+        // IQ2_XXS (in ~5 groups) is left out: its body made the others spill
+        // (192 VGPRs with 22 spilled; 190 and none without it)
+        case 22: {
+            const auto l = omph::format::iq2s_layout(nb);
+            o.p[0] = base + l.qs_off; o.p[1] = base + l.signs_off; o.p[2] = base + l.qh_off;
+            o.p[3] = base + l.sc_off; o.p[4] = base + l.d_off;
+            ntg(4);
+            return true;
+        }
+        case 10: {
+            const auto l = omph::format::q2k_layout(nb);
+            o.p[0] = base + l.sc_off; o.p[1] = base + l.qs_off; o.p[2] = base + l.d_off; o.p[3] = base + l.dmin_off;
+            ntg(4);
+            return true;
+        }
+        case 14: {
+            const auto l = omph::format::q6k_layout(nb);
+            o.p[0] = base + l.ql_off; o.p[1] = base + l.qh_off; o.p[2] = base + l.sc_off; o.p[3] = base + l.d_off;
+            ntg(2);
+            return true;
+        }
+        default: return false;
+    }
+}
+
+} // namespace
+
+bool gemv_group(const GemvGroupItem * items, const int n, const void * x_f16, const int nt, hipStream_t stream) {
+    // NT = 4 only: at 2 and 3 tokens the grouped kernel is no faster (2) or
+    // slower (3: -1.5 ms over the model's groups, spills), #214
+    if (items == nullptr || x_f16 == nullptr || n < 2 || n > kGemvGroupMax || nt != 4) {
+        return false;
+    }
+    GroupArgs g{};
+    g.n = n;
+    unsigned total = 0;
+    for (int i = 0; i < n; ++i) {
+        const GemvGroupItem & in = items[i];
+        if (in.packed == nullptr || in.y == nullptr || in.rows <= 0 || in.k <= 0 || in.k % 256 != 0 ||
+            in.k != items[0].k || !group_item(in, g.it[i])) {
+            return false;
+        }
+        total += g.it[i].blocks;
+    }
+    const auto * x = static_cast<const __half *>(x_f16);
+    gemv_group_kernel<4><<<total, 256, 0, stream>>>(g, x);
+    return hipGetLastError() == hipSuccess;
 }
 
 // --- dequantization from the repacked layouts (M8) --------------------------

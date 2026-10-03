@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -235,6 +236,19 @@ private:
         return ok_side && ok_main && hipEventRecord(ev_join_, side_) == hipSuccess &&
                hipStreamWaitEvent(nullptr, ev_join_, 0) == hipSuccess;
     }
+
+    // The GEMVs of one input (a layer's siblings: ffn_gate + ffn_up, attn_qkv +
+    // attn_gate, attn_q + attn_k + attn_v) in one launch for a verification's
+    // 4 tokens (#214): bit-identical to the members' own launches, ~6.6 us less
+    // per launch removed. False, with nothing issued, when it does not apply
+    // (another token count, a member without a grouped body, OMPH_NO_GROUP or
+    // an ablation); the caller then runs the members itself.
+    struct Sibling {
+        const Mat * m;
+        void * y;
+        int64_t n_out;
+    };
+    bool grouped(const void * x16, int64_t k, int64_t T, std::initializer_list<Sibling> s);
 
     // One fused GEMV launch for a single token, dispatched on the GGUF type.
     static bool gemv_one(const int type, const void * w, const void * x, float * y,

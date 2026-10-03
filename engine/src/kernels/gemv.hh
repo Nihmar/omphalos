@@ -84,6 +84,20 @@ bool gemv_tokens(uint32_t type, const void * packed, const void * x_f16, float *
 bool gemv_multi(uint32_t type, const void * packed, const void * x_f16, float * y, int64_t rows,
                 int64_t k, int nt, hipStream_t stream);
 
+// The sibling GEMVs of one input (2..kGemvGroupMax tensors, the same k) for
+// NT = 4 tokens (a speculative verification) in one launch (#214): each
+// member's results as gemv_multi / gemv_tokens give them, bit for bit. False
+// (nothing issued) for another token count or a member type without a body.
+constexpr int kGemvGroupMax = 3;
+struct GemvGroupItem {
+    uint32_t type;
+    const void * packed;
+    float * y;
+    int64_t rows;
+    int64_t k;
+};
+bool gemv_group(const GemvGroupItem * items, int n, const void * x_f16, int nt, hipStream_t stream);
+
 // f16 rows (rows x k, row-major) of a tensor in its repacked layout, for the
 // GEMM path of a --gemv runner (M8). Bit-identical to dequantize() on the
 // GGUF bytes. False for a type without a repacked layout (IQ1_M's is the GGUF

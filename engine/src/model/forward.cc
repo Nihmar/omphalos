@@ -153,7 +153,9 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
                                              T, ne, (float) h_.eps, nullptr)) {
             return fail("residual/norm failed");
         }
-        const bool gate_up_ok = fork_join(
+        const bool gate_up_ok =
+            grouped(h16_, ne, T, {{&L.ffn_up, ffn2_, h_.n_ff}, {&L.ffn_gate, ffn1_, h_.n_ff}}) ||
+            fork_join(
             T,
             [&] {
                 return matmul(L.ffn_up, h16_, static_cast<float *>(ffn2_), h_.n_ff, ne, T);

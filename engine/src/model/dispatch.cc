@@ -41,6 +41,29 @@ bool Runner::gemv_one(const int type, const void * w, const void * x, float * y,
     }
 }
 
+bool Runner::grouped(const void * x16, const int64_t k, const int64_t T, std::initializer_list<Sibling> s) {
+    if (!use_gemv_ || T != 4 || T >= gemm_min_ || env_.no_b4 || env_.no_group || env_.skip_gemv ||
+        env_.skip_gemv_type >= 0 || s.size() < 2 || s.size() > (size_t) omph::kernels::kGemvGroupMax) {
+        return false;
+    }
+    omph::kernels::GemvGroupItem it[omph::kernels::kGemvGroupMax];
+    int n = 0;
+    for (const Sibling & e : s) {
+        const GemvEntry * g = e.m->gemv;
+        if (e.m->t == nullptr || g == nullptr || g->rows != e.n_out || g->k != k) {
+            return false;
+        }
+        it[n++] = {g->type, e.m->dev, static_cast<float *>(e.y), e.n_out, k};
+    }
+    timer_gemv_.start(gemv_stream_);
+    const bool ok = omph::kernels::gemv_group(it, n, x16, (int) T, gemv_stream_);
+    timer_gemv_.stop(t_gemv_, gemv_stream_);
+    if (!ok) {
+        (void) hipGetLastError();
+    }
+    return ok;
+}
+
 // One matmul: the fused GEMV for single-token steps when it is available for
 // this tensor, the small-batch GEMV for a few tokens, otherwise the f16
 // dequant + GEMM path.

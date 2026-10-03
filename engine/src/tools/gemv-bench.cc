@@ -207,7 +207,7 @@ int main(int argc, char ** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: %s <model.gguf> [tensor] [--iters N] [--iq4-all] "
-                     "[--all-of-type T] [--multi] [--nt N] [--gemm T] [--merge-type T] [--repack-only T]\n",
+                     "[--all-of-type T] [--multi] [--nt N] [--gemm T] [--merge-type T] [--group] [--repack-only T]\n",
                      argv[0]);
         return 2;
     }
@@ -219,6 +219,7 @@ int main(int argc, char ** argv) {
     int all_type = -1;
     int repack_only = -1;
     int merge_type = -1;
+    bool group = false;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
             iters = std::atoi(argv[++i]);
@@ -234,6 +235,8 @@ int main(int argc, char ** argv) {
             multi = true;
         } else if (std::strcmp(argv[i], "--dequant") == 0) {
             deq = true;
+        } else if (std::strcmp(argv[i], "--group") == 0) {
+            group = true;
         } else if (std::strcmp(argv[i], "--merge-type") == 0 && i + 1 < argc) {
             merge_type = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--repack-only") == 0 && i + 1 < argc) {
@@ -247,6 +250,122 @@ int main(int argc, char ** argv) {
             return fail("kernels not built for wave32");
         }
         omph::gguf::File file(model);
+        if (group) {
+            // #214: every sibling group of the model (any types) at --nt N tokens,
+            // as separate launches (gemv_tokens / gemv_multi per member) and as
+            // one gemv_group launch; outputs compared bit for bit
+            const int nt = std::max(2, std::min(4, g_nt));
+            const char * names[3][3] = {{"ffn_gate", "ffn_up", nullptr},
+                                        {"attn_qkv", "attn_gate", nullptr},
+                                        {"attn_q", "attn_k", "attn_v"}};
+            struct G {
+                std::vector<Case> m;
+            };
+            std::vector<G> gs;
+            int64_t kmax = 0, rmax = 0;
+            for (int l = 0; l < 64; ++l) {
+                for (const auto & nm : names) {
+                    G g;
+                    for (const char * n : nm) {
+                        if (n == nullptr) break;
+                        const auto * t = file.tensor("blk." + std::to_string(l) + "." + n + ".weight");
+                        if (t == nullptr) continue;
+                        Case c;
+                        if (!prepare(file, t, c)) return fail("repack failed");
+                        g.m.push_back(c);
+                        kmax = std::max(kmax, c.k);
+                        rmax = std::max(rmax, c.rows);
+                    }
+                    if (g.m.size() >= 2) gs.push_back(g);
+                }
+            }
+            void * x = nullptr;
+            std::vector<_Float16> hx((size_t) kmax * 4);
+            for (size_t i = 0; i < hx.size(); ++i) hx[i] = (_Float16) (((int) (i * 7919 % 2001) - 1000) / 1000.0f);
+            std::vector<float *> ya(3, nullptr), yb(3, nullptr);
+            if (hipMalloc(&x, hx.size() * 2) != hipSuccess ||
+                hipMemcpy(x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice) != hipSuccess) {
+                return fail("out of VRAM (group)");
+            }
+            for (int i = 0; i < 3; ++i) {
+                if (hipMalloc(&ya[i], (size_t) rmax * 4 * 4) != hipSuccess ||
+                    hipMalloc(&yb[i], (size_t) rmax * 4 * 4) != hipSuccess) {
+                    return fail("out of VRAM (group)");
+                }
+            }
+            const auto one = [&](const Case & c, float * y) {
+                return omph::kernels::gemv_tokens(c.t->type, c.dev, x, y, c.rows, c.k, nt, nullptr) ||
+                       omph::kernels::gemv_multi(c.t->type, c.dev, x, y, c.rows, c.k, nt, nullptr);
+            };
+            const auto grouped = [&](const G & g, const std::vector<float *> & y) {
+                omph::kernels::GemvGroupItem it[3];
+                for (size_t i = 0; i < g.m.size(); ++i) {
+                    it[i] = {g.m[i].t->type, g.m[i].dev, y[i], g.m[i].rows, g.m[i].k};
+                }
+                return omph::kernels::gemv_group(it, (int) g.m.size(), x, nt, nullptr);
+            };
+            // identity, and which groups the grouped launch takes
+            int taken = 0, launches = 0, differ = 0;
+            std::vector<bool> ok(gs.size(), false);
+            for (size_t gi = 0; gi < gs.size(); ++gi) {
+                const G & g = gs[gi];
+                bool sep_ok = true;
+                for (size_t i = 0; i < g.m.size(); ++i) sep_ok = sep_ok && one(g.m[i], ya[i]);
+                ok[gi] = sep_ok && grouped(g, yb);
+                (void) hipGetLastError();
+                if (!ok[gi]) continue;
+                ++taken;
+                launches += (int) g.m.size() - 1;
+                (void) hipDeviceSynchronize();
+                for (size_t i = 0; i < g.m.size(); ++i) {
+                    std::vector<float> a((size_t) g.m[i].rows * nt), b(a.size());
+                    (void) hipMemcpy(a.data(), ya[i], a.size() * 4, hipMemcpyDeviceToHost);
+                    (void) hipMemcpy(b.data(), yb[i], b.size() * 4, hipMemcpyDeviceToHost);
+                    differ += std::memcmp(a.data(), b.data(), a.size() * 4) != 0;
+                }
+            }
+            const auto run = [&](const bool grp) {
+                hipEvent_t e0, e1;
+                (void) hipEventCreate(&e0);
+                (void) hipEventCreate(&e1);
+                const auto pass = [&]() {
+                    for (size_t gi = 0; gi < gs.size(); ++gi) {
+                        if (!ok[gi]) continue;
+                        if (grp) {
+                            (void) grouped(gs[gi], yb);
+                        } else {
+                            for (size_t i = 0; i < gs[gi].m.size(); ++i) (void) one(gs[gi].m[i], ya[i]);
+                        }
+                    }
+                };
+                float spent = 0;
+                while (spent < 1000.0f) {  // ~1 s warm-up
+                    (void) hipEventRecord(e0);
+                    pass();
+                    (void) hipEventRecord(e1);
+                    (void) hipEventSynchronize(e1);
+                    float ms = 0;
+                    (void) hipEventElapsedTime(&ms, e0, e1);
+                    spent += ms;
+                }
+                (void) hipEventRecord(e0);
+                for (int i = 0; i < iters; ++i) pass();
+                (void) hipEventRecord(e1);
+                (void) hipEventSynchronize(e1);
+                float ms = 0;
+                (void) hipEventElapsedTime(&ms, e0, e1);
+                return (double) ms / iters;
+            };
+            std::printf("nt %d: %d of %zu sibling groups grouped (%d launches fewer), %d member outputs differ\n", nt,
+                        taken, gs.size(), launches, differ);
+            for (int rep = 0; rep < 3; ++rep) {
+                const double ts = run(false);
+                const double tg = run(true);
+                std::printf("  separate %.3f ms, grouped %.3f ms: %.3f ms saved, %.1f us per launch removed\n", ts, tg,
+                            ts - tg, (ts - tg) * 1e3 / launches);
+            }
+            return differ == 0 ? 0 : 1;
+        }
         if (merge_type >= 0) {
             // #203 D1: the sibling GEMVs of a layer (one input: ffn_gate + ffn_up,
             // attn_qkv + attn_gate, attn_q + attn_k + attn_v) when all of type T,
