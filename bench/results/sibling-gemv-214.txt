@@ -1,0 +1,32 @@
+Sibling GEMVs in one launch (#214, D1 of #203), RX 9060 XT, 2026-10-03
+
+The 2-3 GEMVs of one input (ffn_gate + ffn_up, attn_qkv + attn_gate, attn_q + attn_k
++ attn_v) at a verification's 4 tokens run as one launch (gemv_group): the members'
+grids back to back, each block runs its type's body (the type's own kernel code).
+
+Per-launch cost (omph-gemv-bench --merge-type T, same-type siblings concatenated):
+  6-8 us saved per launch removed at 1 token, 9.5-12.6 us at 4 tokens.
+
+Occupancy check (#214): the NT = 4 kernels keep their bandwidth down to 8 waves per
+SIMD (capped with dummy LDS: IQ4_XS 10.74 ms at 16 KB extra, IQ3_XXS 8.75, Q4_K 3.18).
+Grouped kernel: __launch_bounds__(256, 8) -> 190 VGPRs, no spills, once IQ2_XXS's
+body is left out (with it 22 VGPRs spilled; ~5 groups contain IQ2_XXS and keep
+separate launches). Inlined switch without the bound: 230 VGPRs (NT 4), 256 + spills
+(NT 2, 3); non-inlined bodies: 256 VGPRs + scratch.
+
+All sibling groups of the model (omph-gemv-bench --group --nt N, 3 repetitions):
+  NT 4: 127 of 128 groups taken (with IQ2_XXS) -> 26.41 -> 25.50 ms (-0.90 ms, 6.6 us per
+        launch removed), every member output bit-identical to the separate launches
+  NT 3: grouped slower (25.51 -> 27.02 ms, spills)   -> not used
+  NT 2: parity (24.61 -> 24.68 ms)                    -> not used
+
+End to end, speculative decode (MTP k = 3, wiki1000, --generate 128, same binary,
+OMPH_NO_GROUP=1 alternated, 5 runs each):
+  separate launches  16.61 16.63 16.64 16.64 16.64   median 16.64 ms per generated token
+  grouped            16.34 16.37 16.38 16.39 16.39   median 16.38 ms (-0.26, -1.6 %)
+
+Identity: speculative output equal to plain greedy with oracle drafts at k = 3
+(4-token verifications) in the default, K4 and f32 KV modes, corrupted drafts
+included; MTP k = 3 equal to plain greedy; specval (k = 1, 2, 4) unchanged.
+Not done: the single-token (plain decode, MTP drafts) grouping, whose persistent
+kernels need a different scheme; the plain step is not the default path.
