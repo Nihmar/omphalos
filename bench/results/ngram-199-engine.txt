@@ -1,0 +1,12 @@
+# n-gram (prompt lookup) drafts in the engine (#199), engine commit d71eaec
+# RX 9060 XT, 160 W cap; omph-generate greedy, Qwen3.8-27B IQ3_S .omph (format 4), K4/V4 default mix,
+# scenarios of bench/results/ngram-199 (quote, edit-cc, edit-py, prose, HumanEval 0/80/144);
+# t/s = decode tokens / decode time, median of 5 runs; every output identical to plain greedy.
+# dflash: --dflash models/Qwen3.8-27B-DFlash2-Q4_K_M.omph; mtp: --draft-mtp 3.
+drafter ngram  quote  he-80  he-0  prose  edit-cc  he-144  edit-py
+dflash  0      104.9   87.0  76.1   41.8    121.9    65.8     85.8
+dflash  1      132.6   91.3  79.3   41.7    193.5    67.8    169.3
+mtp     0       71.8   60.6  56.2   40.3     75.2    51.1     73.1
+mtp     1      112.4   70.1  62.6   40.0    195.8    54.4    159.5
+# identity: oracle drafts of 8, 9, 12, 15 tokens with --draft-corrupt 4 and OMPH_SPEC_CHECK=1,
+# K8 and K4 caches: identical to plain greedy (needs the #251 fix: verifications attend in groups of 8).
