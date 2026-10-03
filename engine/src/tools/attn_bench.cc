@@ -193,5 +193,28 @@ int main(int argc, char ** argv) {
         }
     }
     std::printf("identity: %d of %d rows of multi-token calls differ from the single-token call\n", bad, checked);
+    // prefill calls (more than 8 tokens): the WMMA kernel against the scalar one
+    // on the same cache (#191): max and mean |difference| over max |output|
+    std::vector<float> fa((size_t) max_t * kNh * kHd), sc((size_t) max_t * kNh * kHd);
+    for (const int64_t seq : seqs) {
+        for (const int64_t t : toks) {
+            if (t <= 8) continue;
+            const auto run = [&](const bool allow, std::vector<float> & dst) {
+                return omph::kernels::attention_gqa(q, kv, gate, out, t, seq, kNh, kNkv, kHd, scale, true, work,
+                                                    work_bytes, nullptr, nullptr, allow, chunk, true) &&
+                       hipMemcpy(dst.data(), out, (size_t) t * kNh * kHd * 4, hipMemcpyDeviceToHost) == hipSuccess;
+            };
+            if (!run(true, fa) || !run(false, sc)) return 1;
+            double mx = 0.0, md = 0.0, sd = 0.0;
+            const size_t n = (size_t) t * kNh * kHd;
+            for (size_t i = 0; i < n; ++i) {
+                mx = std::max(mx, (double) std::fabs(sc[i]));
+                md = std::max(md, (double) std::fabs(fa[i] - sc[i]));
+                sd += std::fabs(fa[i] - sc[i]);
+            }
+            std::printf("prefill seq %lld T %lld: WMMA vs scalar max|d| / max|out| %.2e, mean|d| / max|out| %.2e\n",
+                        (long long) seq, (long long) t, md / mx, sd / (double) n / mx);
+        }
+    }
     return bad == 0 ? 0 : 1;
 }
