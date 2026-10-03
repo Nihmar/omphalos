@@ -62,12 +62,13 @@ bool Runner::mtp_block(const int32_t * toks, const float * h_in, const int64_t p
                                          static_cast<const float *>(x_),
                                          static_cast<float *>(resid_), L.post_norm, h16_, T, ne,
                                          (float) h_.eps, nullptr) ||
-        !fork_join(
+        !(grouped(h16_, ne, T, {{&L.ffn_up, ffn2_, h_.n_ff}, {&L.ffn_gate, ffn1_, h_.n_ff}}) ||
+          fork_join(
             T,
             [&] { return matmul(L.ffn_up, h16_, static_cast<float *>(ffn2_), h_.n_ff, ne, T); },
             [&] {
                 return matmul(L.ffn_gate, h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T);
-            }) ||
+            })) ||
         !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
                                    static_cast<const float *>(ffn2_), ffn16_, T * h_.n_ff,
                                    nullptr) ||

@@ -58,7 +58,10 @@ bool Runner::attn_layer(const int64_t il, const LayerWeights & L, const int64_t 
     // kv_only (the MTP KV fill, #124): K and V into the cache, nothing else.
     // attn_prep still runs its q heads on whatever fused_ holds; nobody reads
     // their output.
-    const bool proj_ok = fork_join(
+    const bool grp = kv_only ? grouped(h16_, ne, T, {{&L.attn_k, k_, kv_out}, {&L.attn_v, v_, kv_out}})
+                             : grouped(h16_, ne, T,
+                                       {{&L.attn_k, k_, kv_out}, {&L.attn_v, v_, kv_out}, {&L.attn_q, fused_, q_out}});
+    const bool proj_ok = grp || fork_join(
         T,
         [&] {
             return matmul(L.attn_k, h16_, static_cast<float *>(k_), kv_out, ne, T) &&
@@ -146,7 +149,8 @@ bool Runner::gdn_layer(const int64_t il, const LayerWeights & L, const int64_t T
     float * seq_state = state_cur_[(size_t) il];
     (void) st;
 
-    const bool proj_ok = fork_join(
+    const bool proj_ok =
+        grouped(h16_, ne, T, {{&L.attn_gate, z_, v_dims}, {&L.attn_qkv, fused_, channels}}) || fork_join(
         T,
         [&] {
             // beta / alpha (BF16, 48 rows each) are dotted inside gdn_step (#88)
