@@ -917,10 +917,22 @@ bool Runner::verify(const std::vector<int32_t> & toks, const int64_t pos0,
     return true;
 }
 
+void Runner::observe_draft(const int32_t * toks, const int64_t n) {
+    if (env_.draft_vocab <= 0) {
+        return;
+    }
+    for (int64_t i = 0; i < n; ++i) {
+        draft_oov_ += ((toks[i] >= env_.draft_vocab ? 1.0 : 0.0) - draft_oov_) / 64.0;
+    }
+}
+
 bool Runner::commit(const int64_t accepted) {
     const int64_t T = verify_tokens_;
     if (T == 0 || accepted < 1 || accepted > T) {
         return fail("commit: no verification, or accepted out of range");
+    }
+    if ((int64_t) last_toks_.size() >= accepted) {
+        observe_draft(last_toks_.data(), accepted);  // the verified tokens kept
     }
     check_tokens_ = T;
     verify_tokens_ = 0;

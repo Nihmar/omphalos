@@ -334,6 +334,13 @@ private:
     void * mtp_pending_ = nullptr;  // h of the last kept position (zeros at the start)
     void * mtp_g_ = nullptr;        // the MTP block's own normed output (chaining)
     std::vector<int32_t> last_toks_;
+    // #217: the share of recent tokens (the prompt, the kept ones) outside the
+    // drafts' vocabulary prefix, averaged over ~64 tokens. The drafts use the
+    // prefix while it stays under kDraftOovMax: English and code sit at 0-2 %,
+    // Italian at ~16 % (where a prefix draft misses too often to pay off).
+    static constexpr double kDraftOovMax = 0.05;
+    double draft_oov_ = 0.0;
+    void observe_draft(const int32_t * toks, int64_t n);
     int64_t last_pos0_ = 0;
     // The MTP block over T positions: embeddings of `toks`, h rows `h_in`,
     // positions pos0..; kv_only stops after the K / V write, `head` also runs

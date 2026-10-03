@@ -713,7 +713,12 @@ Details:
 
 - `k` drafts per step by chaining the MTP layer on its own output **[verify]** exactly which hidden state is fed back (pre- or post-norm) in the reference.
 - **Measured and not done (#126):** a frequency-truncated draft head. The top 32k / 64k tokens of a wikitext + C++ corpus cover 94.9 % / 97.5 % of generated tokens, so the ~2 ms a draft saves is about what the lost acceptance costs, and the ranking is corpus-dependent (other languages fall outside it). Adaptive k: k = 3 is best or tied on every prompt measured (`bench/results/m6-speculative.txt`).
-- **Truncated-vocab draft head:** score only the top ~32k most frequent tokens = first rows of the frequency-sorted `lm_head` (§8.3). Build the frequency table from a corpus representative of the real workload (for code-heavy use, a code corpus including the languages you actually use), tokenized with the model's tokenizer (`uv run` + `tokenizers`).
+- **Done (#217): a vocabulary-prefix draft head with a fallback.** Two things differ from #126:
+  - a larger prefix, the first 98304 ids (low BPE ids are the frequent ones: 99 % of English prose, 100 % of code), read in place with no copy and no frequency ranking;
+  - an adaptive switch to the whole head when more than 5 % of the recent tokens fall outside the prefix (Italian prose sits at ~16-20 %).
+
+  Speculative decoding: prose −3.4 %, code −6.7 %, English chat −6.4 %, Italian chat at parity; output unchanged (`bench/results/draft-vocab-217.txt`).
+- **Truncated-vocab draft head (the original idea):** score only the top ~32k most frequent tokens = first rows of the frequency-sorted `lm_head` (§8.3). Build the frequency table from a corpus representative of the real workload (for code-heavy use, a code corpus including the languages you actually use), tokenized with the model's tokenizer (`uv run` + `tokenizers`).
 - **Adaptive k:** track acceptance over the last few steps and pick k ∈ {1, 2, 3, 4} dynamically.
 - Tree drafting (several candidates per position) is attractive for memory-bound verification, but the DeltaNet recurrence needs a separate state per branch → not worth it initially.
 

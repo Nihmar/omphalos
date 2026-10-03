@@ -2482,11 +2482,16 @@ bool gemv_iq1_m(const void * blocks, const void * x_f16, float * y, const int64_
 
 bool gemv_q4k(const void * packed, const void * x_f16, float * y, const int64_t rows,
               const int64_t k, hipStream_t stream) {
+    return gemv_q4k_prefix(packed, x_f16, y, rows, rows, k, stream);
+}
+
+bool gemv_q4k_prefix(const void * packed, const void * x_f16, float * y, const int64_t total_rows,
+                     const int64_t rows, const int64_t k, hipStream_t stream) {
     if (packed == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
-        k % 256 != 0) {
+        k % 256 != 0 || rows > total_rows) {
         return false;
     }
-    const int64_t n_blocks = rows * (k / 256);
+    const int64_t n_blocks = total_rows * (k / 256);  // the layout is the whole tensor's
     const omph::format::Q4kLayout l = omph::format::q4k_layout(n_blocks);
     const size_t smem = (size_t) kQ4kChunkSub * 64;
     const auto * base = static_cast<const uint8_t *>(packed);

@@ -14,6 +14,7 @@
 #include "kernels/attn.hh"
 #include "kernels/dequant.hh"
 #include "kernels/elementwise.hh"
+#include "kernels/gemv.hh"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -86,8 +87,24 @@ bool Runner::mtp_block(const int32_t * toks, const float * h_in, const int64_t p
     const float * xl = static_cast<const float *>(x_) + (T - 1) * ne;
     if (!omph::kernels::rms_norm(xl, mtp_head_norm_, static_cast<float *>(mtp_g_), 1, ne,
                                  (float) h_.eps, 1.0f, nullptr) ||
-        !omph::kernels::cast_f32_to_f16(static_cast<const float *>(mtp_g_), h16_, ne, nullptr) ||
-        !matmul(head_, h16_, static_cast<float *>(logits_), h_.n_vocab, ne, 1)) {
+        !omph::kernels::cast_f32_to_f16(static_cast<const float *>(mtp_g_), h16_, ne, nullptr)) {
+        return fail("mtp: head failed");
+    }
+    // A draft needs its argmax only (sampled speculation keeps it as a point
+    // mass, #197): over the first draft_vocab token ids, the frequent ones,
+    // reading a fraction of the 682 MiB head (#217), while the recent text
+    // stays inside them (draft_oov_). Validation (logits) and the other head
+    // types read it whole.
+    const GemvEntry * hg = head_.gemv;
+    const int64_t nv = logits == nullptr && env_.draft_vocab > 0 && env_.draft_vocab < h_.n_vocab && use_gemv_ &&
+                               draft_oov_ < kDraftOovMax &&
+                               hg != nullptr && hg->type == 12 && hg->rows == h_.n_vocab
+                           ? env_.draft_vocab
+                           : h_.n_vocab;
+    if (nv < h_.n_vocab
+            ? !omph::kernels::gemv_q4k_prefix(head_.dev, h16_, static_cast<float *>(logits_), h_.n_vocab, nv, ne,
+                                              gemv_stream_)
+            : !matmul(head_, h16_, static_cast<float *>(logits_), h_.n_vocab, ne, 1)) {
         return fail("mtp: head failed");
     }
     if (logits != nullptr) {
@@ -100,7 +117,7 @@ bool Runner::mtp_block(const int32_t * toks, const float * h_in, const int64_t p
     }
     if (argmax != nullptr) {
         unsigned long long key = 0;
-        if (!omph::kernels::argmax_f32(static_cast<const float *>(logits_), h_.n_vocab,
+        if (!omph::kernels::argmax_f32(static_cast<const float *>(logits_), nv,
                                        static_cast<unsigned long long *>(argmax_key_), nullptr) ||
             hipMemcpy(&key, argmax_key_, sizeof(key), hipMemcpyDeviceToHost) != hipSuccess) {
             return fail("mtp: argmax failed");
