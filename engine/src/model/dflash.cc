@@ -13,6 +13,7 @@
 
 #include "kernels/dflash.hh"
 #include "kernels/elementwise.hh"
+#include "kernels/gemv.hh"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -263,13 +264,24 @@ bool Runner::dflash_draft(const int32_t token, const int64_t pos, const int64_t 
     // final norm, the selector gate and the MASK rows' logits through the target head
     using namespace omph::kernels;
     const int64_t P = B - 1;
+    // The candidates come from the first draft_vocab token ids while the recent
+    // text stays inside them, as MTP's drafts (#217): the head's Q4_K tiles hold
+    // those rows first, so one tile GEMV reads that fraction of the 682 MiB.
+    const GemvEntry * hg = head_.gemv;
+    const int64_t nv = env_.draft_vocab > 0 && env_.draft_vocab < h_.n_vocab && env_.draft_vocab % 16 == 0 &&
+                               use_gemv_ && draft_oov_ < kDraftOovMax && hg != nullptr && hg->type == 12 &&
+                               hg->rows == h_.n_vocab
+                           ? env_.draft_vocab
+                           : h_.n_vocab;
+    const void * hx = static_cast<const uint8_t *>(h16_) + ne * 2;
     if (!rms_norm(static_cast<const float *>(x_), dfl_out_norm_, static_cast<float *>(cur_), B, ne, dfl_eps_, 1.0f,
                   nullptr) ||
         !cast_f32_to_f16(static_cast<const float *>(cur_), h16_, B * ne, nullptr) ||
         !matmul(dfl_gate_w_, h16_, static_cast<float *>(dfl_sgate_), kRank, ne, B) ||
-        !matmul(head_, static_cast<const uint8_t *>(h16_) + ne * 2, static_cast<float *>(dfl_logits_), h_.n_vocab,
-                ne, P) ||
-        !dflash_topk(static_cast<const float *>(dfl_logits_), P, h_.n_vocab, dfl_ids_, dfl_vals_, nullptr) ||
+        !(nv < h_.n_vocab
+              ? gemv_tokens(12, head_.dev, hx, static_cast<float *>(dfl_logits_), nv, ne, (int) P, nullptr)
+              : matmul(head_, hx, static_cast<float *>(dfl_logits_), h_.n_vocab, ne, P)) ||
+        !dflash_topk(static_cast<const float *>(dfl_logits_), P, nv, dfl_ids_, dfl_vals_, nullptr) ||
         !dflash_selector(dfl_ids_, dfl_vals_, static_cast<const float *>(dfl_sgate_), token, dfl_sel_prev_,
                          dfl_sel_next_, h_.n_vocab, P, dfl_scores_, nullptr)) {
         return fail("drafter: head / selector failed");
