@@ -814,10 +814,81 @@ bool unrepack_iq3_s_tiles(const void * tiles, const int64_t rows, const int64_t 
     return true;
 }
 
+// ----------------------------------------------------------- IQ3_XXS tiles
+
+int64_t iq3xxs_tiles_bytes(const int64_t rows, const int64_t blocks_per_row) {
+    return rows % 16 == 0 ? rows / 16 * blocks_per_row * kIq3xxsTileBytes : 0;
+}
+
+bool repack_iq3_xxs_tiles(const void * gguf, const int64_t rows, const int64_t blocks, std::vector<uint8_t> & dst) {
+    if (rows % 16 != 0 || blocks <= 0) {
+        return false;
+    }
+    const int64_t n_blocks = rows * blocks;
+    const Iq3XxsLayout l = iq3_xxs_layout(n_blocks);
+    std::vector<uint8_t> r((size_t) l.total);
+    repack_iq3_xxs(gguf, n_blocks, r.data());
+    const uint8_t * qs = r.data() + l.qs_off;
+    const uint8_t * aux = r.data() + l.aux_off;
+    const uint8_t * d = r.data() + l.d_off;
+    dst.assign((size_t) iq3xxs_tiles_bytes(rows, blocks), 0);
+    for (int64_t tile = 0; tile < rows / 16; ++tile) {
+        for (int64_t b = 0; b < blocks; ++b) {
+            uint8_t * o = dst.data() + (tile * blocks + b) * kIq3xxsTileBytes;
+            for (int l2 = 0; l2 < 32; ++l2) {
+                const int64_t row = tile * 16 + (l2 & 15);
+                const int h = l2 >> 4;
+                for (int sb = 0; sb < 8; ++sb) {
+                    std::memcpy(o + l2 * 32 + sb * 4, qs + ((row * blocks + b) * 8 + sb) * 8 + h * 4, 4);
+                }
+            }
+            for (int rr = 0; rr < 16; ++rr) {
+                const int64_t row = tile * 16 + rr;
+                std::memcpy(o + 1024 + rr * 32, aux + (row * blocks + b) * 32, 32);
+                std::memcpy(o + 1536 + rr * 2, d + (row * blocks + b) * 2, 2);
+            }
+        }
+    }
+    return true;
+}
+
+bool unrepack_iq3_xxs_tiles(const void * tiles, const int64_t rows, const int64_t blocks, std::vector<uint8_t> & dst) {
+    if (rows % 16 != 0 || blocks <= 0) {
+        return false;
+    }
+    const int64_t n_blocks = rows * blocks;
+    const Iq3XxsLayout l = iq3_xxs_layout(n_blocks);
+    std::vector<uint8_t> r((size_t) l.total, 0);
+    uint8_t * qs = r.data() + l.qs_off;
+    uint8_t * aux = r.data() + l.aux_off;
+    uint8_t * d = r.data() + l.d_off;
+    const auto * in = static_cast<const uint8_t *>(tiles);
+    for (int64_t tile = 0; tile < rows / 16; ++tile) {
+        for (int64_t b = 0; b < blocks; ++b) {
+            const uint8_t * o = in + (tile * blocks + b) * kIq3xxsTileBytes;
+            for (int l2 = 0; l2 < 32; ++l2) {
+                const int64_t row = tile * 16 + (l2 & 15);
+                const int h = l2 >> 4;
+                for (int sb = 0; sb < 8; ++sb) {
+                    std::memcpy(qs + ((row * blocks + b) * 8 + sb) * 8 + h * 4, o + l2 * 32 + sb * 4, 4);
+                }
+            }
+            for (int rr = 0; rr < 16; ++rr) {
+                const int64_t row = tile * 16 + rr;
+                std::memcpy(aux + (row * blocks + b) * 32, o + 1024 + rr * 32, 32);
+                std::memcpy(d + (row * blocks + b) * 2, o + 1536 + rr * 2, 2);
+            }
+        }
+    }
+    dst.assign((size_t) n_blocks * 98, 0);
+    unrepack_iq3_xxs(r.data(), n_blocks, dst.data());
+    return true;
+}
+
 // ------------------------------------------------------- the engine's layout
 
 uint32_t engine_layout(const uint32_t type) {
-    if (type == 21) {
+    if (type == 21 || type == 18) {
         return 2;
     }
     return repacked_bytes(type, 1) > 0 ? 1 : 0;
@@ -829,7 +900,7 @@ int64_t engine_layout_bytes(const uint32_t type, const int64_t rows, const int64
         return 0;
     }
     switch (engine_layout(type)) {
-        case 2: return iq3s_tiles_bytes(rows, k / 256);
+        case 2: return type == 18 ? iq3xxs_tiles_bytes(rows, k / 256) : iq3s_tiles_bytes(rows, k / 256);
         case 1: return repacked_bytes(type, rows * (k / 256));
         default: return 0;
     }
@@ -841,7 +912,9 @@ bool to_engine_layout(const uint32_t type, const void * gguf, const int64_t rows
         return false;
     }
     switch (engine_layout(type)) {
-        case 2: return repack_iq3_s_tiles(gguf, rows, k / 256, dst);
+        case 2:
+            return type == 18 ? repack_iq3_xxs_tiles(gguf, rows, k / 256, dst)
+                              : repack_iq3_s_tiles(gguf, rows, k / 256, dst);
         case 1: return repack_any(type, gguf, rows * (k / 256), dst);
         default: return false;
     }
@@ -853,7 +926,9 @@ bool from_engine_layout(const uint32_t type, const void * src, const int64_t row
         return false;
     }
     switch (engine_layout(type)) {
-        case 2: return unrepack_iq3_s_tiles(src, rows, k / 256, gguf);
+        case 2:
+            return type == 18 ? unrepack_iq3_xxs_tiles(src, rows, k / 256, gguf)
+                              : unrepack_iq3_s_tiles(src, rows, k / 256, gguf);
         case 1: {
             const int64_t n_blocks = rows * (k / 256);
             gguf.assign((size_t) (n_blocks * quant_block_bytes(type)), 0);

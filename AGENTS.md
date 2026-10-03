@@ -74,7 +74,7 @@ cmake -S engine -B engine/build -DOMPH_LLAMA_DIR=<llama.cpp> -DOMPH_LLAMA_LIB=/v
 
 # convert the GGUF once (#178): weights repacked into the kernels' layouts and verified bit for bit,
 # the metadata (tokenizer, chat template) copied, the source SHA-256 recorded; ~1 min, 11.3 GiB.
-# The engine refuses an .omph of another format version (IQ3_S tiles: format 2): reconvert
+# The engine refuses an .omph of another format version (IQ3_S tiles: 2; IQ3_XXS tiles: 3): reconvert
 engine/build/omph-convert <model.gguf> [<model.omph>]
 
 # tokenizer (#148): text on stdin -> ids, or --decode ids -> text (reads a .gguf or an .omph)

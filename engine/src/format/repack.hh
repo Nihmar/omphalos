@@ -240,12 +240,27 @@ int64_t iq3s_tiles_bytes(int64_t rows, int64_t blocks_per_row);
 bool repack_iq3_s_tiles(const void * gguf, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
 bool unrepack_iq3_s_tiles(const void * tiles, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
 
+// ----------------------------------------------------------- IQ3_XXS tiles
+//
+// IQ3_XXS for the WMMA kernels (#219), built on the repacked layout above, in
+// 16-row tiles. Per tile and 256-weight block, 1568 bytes (the 16 GGUF blocks'
+// size), for the 32 lanes of a WMMA wave (lane l: row l % 16, half h = l / 16,
+// which takes weights 16 h .. 16 h + 15 of each sub-block):
+//   [ qs  ] 1024 B  lane l: 32 B, sub-block sb's grid-index bytes 4 h .. 4 h + 3 at 4 sb
+//   [ aux ]  512 B  row r: 32 B, the 8 sub-blocks' scale + sign-index words
+//   [ d   ]   32 B  row r: the block's f16 scale
+// Rows a multiple of 16. Lossless: unrepack rebuilds the GGUF bytes.
+constexpr int64_t kIq3xxsTileBytes = 1568;
+int64_t iq3xxs_tiles_bytes(int64_t rows, int64_t blocks_per_row);
+bool repack_iq3_xxs_tiles(const void * gguf, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
+bool unrepack_iq3_xxs_tiles(const void * tiles, int64_t rows, int64_t blocks_per_row, std::vector<uint8_t> & dst);
+
 // ------------------------------------------------------- the engine's layout
 //
-// The layout the engine's kernels read a tensor of `type` in (format version 2,
-// #178): 2 (IQ3_S tiles) for IQ3_S, 1 (the repacked layout above) for the other
-// types with one, 0 (the GGUF bytes) otherwise; its size, and the conversions
-// both ways (rows x k weights, row-major).
+// The layout the engine's kernels read a tensor of `type` in (format version 3,
+// #178, #219): 2 (WMMA tiles) for IQ3_S and IQ3_XXS, 1 (the repacked layout
+// above) for the other types with one, 0 (the GGUF bytes) otherwise; its size,
+// and the conversions both ways (rows x k weights, row-major).
 uint32_t engine_layout(uint32_t type);
 int64_t engine_layout_bytes(uint32_t type, int64_t rows, int64_t k);
 bool to_engine_layout(uint32_t type, const void * gguf, int64_t rows, int64_t k, std::vector<uint8_t> & dst);

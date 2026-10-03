@@ -100,6 +100,9 @@ int main() {
     CHECK(omph::format::engine_layout(21) == 2 && omph::format::iq3s_tiles_bytes(16, 2) == 2 * 1760,
           "IQ3_S takes the tiles, 1760 bytes per tile and block");
     CHECK(omph::format::engine_layout_bytes(21, 8, 512) == 0, "IQ3_S tiles need rows %% 16 == 0");
+    CHECK(omph::format::engine_layout(18) == 2 && omph::format::iq3xxs_tiles_bytes(16, 2) == 2 * 1568,
+          "IQ3_XXS takes the tile layout");
+    CHECK(omph::format::engine_layout_bytes(18, 8, 512) == 0, "IQ3_XXS tiles need rows %% 16 == 0");
     std::printf("test_repack: %d failure(s)\n", omph_test::failures);
     return omph_test::failures == 0 ? 0 : 1;
 }
