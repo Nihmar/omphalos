@@ -606,7 +606,7 @@ plus short causal conv1d on q/k/v (keep the conv tail as state), gates/normaliza
 Two options:
 
 - **FP16 path**: dequantize weight tiles to FP16 in LDS, `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (or rocWMMA). Numerically closest to reference.
-- **INT8 path: available [corrected, #203; M3 had it wrong].** gfx1200's iu8 WMMA sustains 168.6 TOPS against 88.7 TFLOPS f16 (random operands, 160 W cap; `bench/results/ceilings-203.txt`). M3's probe assembled gfx11's operand form and concluded there was none; M0's hipBLASLt int8 figure measured the library. An int8 prefill GEMM (exact integer weights, activations quantized per 32-block as llama.cpp's MMQ does) changes the activations' numerics: a candidate of #203 phase 2, decided by KL against the f16 path.
+- **INT8 path: available [corrected, #203; M3 had it wrong].** gfx1200's iu8 WMMA sustains 168.6 TOPS against 88.7 TFLOPS f16 (random operands, 160 W cap; `bench/results/ceilings-203.txt`). M3's probe assembled gfx11's operand form and concluded there was none; M0's hipBLASLt int8 figure measured the library. **Measured and rejected for IQ3_S (#213, `bench/results/int8-gemm-213.txt`):** with activations in q8 blocks of 32 the numerics cost little (KL 0.0007 vs the f16 path, below the default KV cache's own), but IQ3_S's per-32 scales force a rescale of every output element every 2 WMMAs (~28 VALU per WMMA), so the int8 tile GEMM runs at 43-46 TOPS against the f16 kernel's 56 TFLOPS; even no rescale at all stops at 49. The prefill stays on the f16 GEMM.
 - Double-buffer LDS tiles; overlap global loads, dequant and WMMA; tune tile sizes for 32 CUs. Start slow and correct.
 
 ### 10.6 Small ops
@@ -923,7 +923,7 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 
 ### 16.7 Prefill-specific
 
-- INT8 WMMA path (IQ values fit int8) vs FP16 path — measure speed vs KL.
+- ~~INT8 WMMA path (IQ values fit int8) vs FP16 path — measure speed vs KL.~~ Measured (#213): KL fine, speed 0.8x the f16 kernel; rejected (§10.5).
 - Double-buffered LDS tiles, overlapping load / dequant / WMMA.
 - Tune ubatch size (512 vs 1024 vs 2048) against VRAM scratch.
 - KV-only MTP shadow pass instead of full MTP layer (§12.2).
