@@ -48,6 +48,7 @@ EnvOptions EnvOptions::from_env() {
     o.no_fused_gemm = flag("OMPH_NO_FUSED_GEMM");
     o.no_b4 = flag("OMPH_NO_B4");
     o.no_group = flag("OMPH_NO_GROUP");
+    o.no_swiglu_gemm = flag("OMPH_NO_SWIGLU_GEMM");
     if (const char * v = std::getenv("OMPH_DRAFT_VOCAB")) {
         o.draft_vocab = std::atoll(v);
     }

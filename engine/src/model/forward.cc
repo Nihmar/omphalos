@@ -156,21 +156,21 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
                                              T, ne, (float) h_.eps, nullptr)) {
             return fail("residual/norm failed");
         }
-        const bool gate_up_ok =
-            grouped(h16_, ne, T, {{&L.ffn_up, ffn2_, h_.n_ff}, {&L.ffn_gate, ffn1_, h_.n_ff}}) ||
-            fork_join(
-            T,
-            [&] {
-                return matmul(L.ffn_up, h16_, static_cast<float *>(ffn2_), h_.n_ff, ne, T);
-            },
-            [&] {
-                return matmul(L.ffn_gate, h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T);
-            });
-        if (!gate_up_ok ||
-            !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
-                                       static_cast<const float *>(ffn2_), ffn16_, T * h_.n_ff,
-                                       nullptr) ||
-            !matmul(L.ffn_down, ffn16_, static_cast<float *>(cur_), ne, h_.n_ff, T)) {
+        // a prefill chunk: gate, then up with SwiGLU in its GEMM's epilogue (#221)
+        const bool fused = up_swiglu_ok(L.ffn_up, h_.n_ff, ne, T);
+        const bool act_ok =
+            fused ? matmul(L.ffn_gate, h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T) &&
+                        up_swiglu(L.ffn_up, h16_, static_cast<const float *>(ffn1_), ffn16_, h_.n_ff, ne, T)
+                  : (grouped(h16_, ne, T, {{&L.ffn_up, ffn2_, h_.n_ff}, {&L.ffn_gate, ffn1_, h_.n_ff}}) ||
+                     fork_join(
+                         T,
+                         [&] { return matmul(L.ffn_up, h16_, static_cast<float *>(ffn2_), h_.n_ff, ne, T); },
+                         [&] {
+                             return matmul(L.ffn_gate, h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T);
+                         })) &&
+                        omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
+                                                  static_cast<const float *>(ffn2_), ffn16_, T * h_.n_ff, nullptr);
+        if (!act_ok || !matmul(L.ffn_down, ffn16_, static_cast<float *>(cur_), ne, h_.n_ff, T)) {
             return fail("ffn failed");
         }
         // x = ffn + resid; for all but the last layer, the same launch also
