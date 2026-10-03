@@ -138,7 +138,9 @@ uv run python check_vision.py --image <llama.cpp>/tools/mtmd/test-1.jpeg
                                                   # images vs llama.cpp, teacher-forced logits
                                                   # (needs tools/native/dump_mtmd_logits)
 uv run python compare_logits.py ref.f32 test.f32  # KL + top-1 agreement over every
-                                                  # position (e.g. OMPH_KV_F32=1 vs default)
+                                                  # position (e.g. OMPH_KV_F32=1 vs default;
+                                                  # OMPH_GDN_EXACT=1 vs default for the WY prefill,
+                                                  # #240, which check_gpu_gdn's 10 tokens never reach)
 
 # long-context KV validation (exact f32 KV kept in host RAM as the reference)
 OMPH_KV_HOST=1 engine/build/omph-run <model> <tokens.txt> ref.f32 --logits-tail 512
@@ -200,6 +202,7 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_STAGE_MIB=N` | A/B | f16 weights staged for the GEMM in row slices of ~N MiB (default 20, cache-resident; 0 = whole tensors; #129, #132) |
 | `OMPH_ATTN_DEC_SCALAR` | A/B | decode / verification attention on the scalar kernel instead of the WMMA one (#169) |
 | `OMPH_ATTN_SCALAR` | A/B | prefill attention on the scalar kernel instead of the WMMA one (#97) |
+| `OMPH_GDN_EXACT` | A/B | prefill delta rule per token (bit-identical to decode) instead of the chunked WY form (#240: f16 WMMAs, KL 0.0002-0.0005 vs exact, ~3 % faster prefill); verifications always run the exact rule |
 | `OMPH_GDN_SERIAL` | A/B | a multi-token delta rule in one launch (one workgroup per head) instead of the token-parallel form (#96) |
 | `OMPH_NO_BF16_GEMV` | A/B | BF16 weights through the f16 path |
 | `OMPH_NO_F16_CACHE` | A/B | re-convert f16-path weights on every call |
