@@ -1,0 +1,16 @@
+# DFlash2 candidates over the first OMPH_DRAFT_VOCAB = 98304 token ids (#245, the #217 rule), 2026-10-04.
+# RX 9060 XT, 160 W cap, main c8519ea + this change (.omph format 6). Same binary, OMPH_DRAFT_VOCAB=0 (the whole
+# 682 MiB head) vs the default prefix (the first 98304 rows of the head's Q4_K tiles, ~270 MiB) while the
+# recent text stays inside it (draft_oov_ < 5 %).
+#
+# 3k wikitext prompt, omph-run --dflash --generate 200, 2 runs each: 85 steps, 115 drafts kept either way;
+#   whole head 55.88 / 55.93 ms per step, prefix 54.47 / 54.52 ms (-2.5 %).
+#
+# Scenarios of bench/results/ngram-199 through omph-server (--ctx 32768 --cache-ram 0), t/s, one run per cell;
+# every output identical to plain greedy (--no-mtp):
+#   config                  quote  he-80  he-0  prose  edit-cc  he-144  edit-py
+#   plain                   24.0   24.0   24.0  23.9   23.9     23.9    23.7
+#   dflash, whole head      120.3  98.6   88.1  46.6   143.4    76.0    98.4
+#   dflash, prefix          120.4  101.5  89.7  47.5   143.6    77.9    98.3
+#   dflash+ngram, whole     166.3  106.8  93.3  46.1   265.4    77.3    219.9
+#   dflash+ngram, prefix    166.3  107.7  95.7  46.1   265.4    79.0    219.8
