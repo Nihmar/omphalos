@@ -2822,6 +2822,160 @@ bool gemv_tokens(const uint32_t type, const void * packed, const void * x_f16, f
     return type == 21 && launch_iq3s_tiles_n(nt, packed, x_f16, y, rows, k, stream);
 }
 
+// --- sibling GEMVs in one launch (#214) ------------------------------------
+//
+// The 2-3 GEMVs a layer runs on one input (ffn_gate + ffn_up, attn_qkv +
+// attn_gate, attn_q + attn_k + attn_v) as one launch of NT = 2..4 tokens:
+// each launch costs ~10 us of fill / drain plus the gap to the next
+// (omph-gemv-bench --merge-type). The grid is the members' grids back to back;
+// a block finds its member and runs that type's body (the same code as the
+// type's own kernel, so the outputs are bit-identical), with one LDS buffer
+// sized for the largest body (the IQ3_S tiles). Carrying every body costs
+// occupancy (~184 VGPRs: 8 waves per SIMD), which the NT kernels absorb
+// (#214: no loss down to 8 waves per SIMD).
+namespace {
+
+constexpr int kGroupLds = 12800;  // iq3s_tiles_body: grid 4096 + reduction 8704
+
+struct GroupItem {
+    uint32_t type;
+    unsigned blocks;          // this member's blocks
+    const uint8_t * p[5];     // the layout's sections, in the body's order
+    float * y;
+    long long rows;
+    long long n;              // k / 32 (the tiles: k / 256)
+};
+
+struct GroupArgs {
+    GroupItem it[kGemvGroupMax];
+    int n;
+};
+
+// The type's body, inlined. Left alone the allocator gave the switch more
+// registers than any one body needs (NT = 4: 230 VGPRs; NT = 2, 3: 256 with
+// spills), and non-inlined calls cost more still (256 VGPRs plus scratch); the
+// kernel asks for 8 waves per SIMD instead (<= 192 VGPRs, no spills).
+template <int NT>
+__device__ __forceinline__ void group_body(const GroupItem & t, const __half * __restrict__ x, const long long b,
+                                        uint8_t * __restrict__ lds) {
+    switch (t.type) {
+        case 21: iq3s_tiles_body<NT>(t.p[0], x, t.y, t.rows, t.n, b, lds); break;
+        case 18: iq3_ntg_body<NT, 4>(t.p[0], t.p[1], t.p[2], x, t.y, t.rows, t.n, b, lds); break;
+        case 12: q4k_ntg_body<NT, 4>(t.p[0], t.p[1], x, t.y, t.rows, t.n, b, lds); break;
+        case 23: iq4_ntg_body<NT, 4>(t.p[0], t.p[1], x, t.y, t.rows, t.n, b, lds); break;
+        case 17: iq2xs_ntg_body<NT, 4>(t.p[0], t.p[1], t.p[2], x, t.y, t.rows, t.n, b, lds); break;
+        case 22: iq2s_ntg_body<NT, 4>(t.p[0], t.p[1], t.p[2], t.p[3], t.p[4], x, t.y, t.rows, t.n, b, lds); break;
+        case 10: q2k_ntg_body<NT, 4>(t.p[0], t.p[1], t.p[2], t.p[3], x, t.y, t.rows, t.n, b, lds); break;
+        case 14: q6k_ntg_body<NT, 2>(t.p[0], t.p[1], t.p[2], t.p[3], x, t.y, t.rows, t.n, b, lds); break;
+        default: break;
+    }
+}
+
+template <int NT>
+__global__ __launch_bounds__(256, 8) void gemv_group_kernel(const GroupArgs g, const __half * __restrict__ x) {
+    __shared__ __attribute__((aligned(16))) uint8_t lds[kGroupLds];
+    long long b = blockIdx.x;
+    int m = 0;
+    while (m + 1 < g.n && b >= (long long) g.it[m].blocks) {
+        b -= g.it[m].blocks;
+        ++m;
+    }
+    group_body<NT>(g.it[m], x, b, lds);
+}
+
+// One member's device record (the launch helpers' layout arithmetic); false
+// for a type without an NT body.
+bool group_item(const GemvGroupItem & in, GroupItem & o) {
+    const int64_t rows = in.rows;
+    const int64_t k = in.k;
+    const int64_t nb = rows * (k / 256);
+    const auto * base = static_cast<const uint8_t *>(in.packed);
+    o = GroupItem{};
+    o.type = in.type;
+    o.y = in.y;
+    o.rows = rows;
+    o.n = k / 32;
+    const auto ntg = [&](const int r) { o.blocks = (unsigned) ((rows + 8 * r - 1) / (8 * r)); };
+    switch (in.type) {
+        case 21:
+            if (rows % 16 != 0) return false;
+            o.p[0] = base;
+            o.n = k / 256;
+            o.blocks = (unsigned) ((rows / 16 + kTileTiles - 1) / kTileTiles);
+            return true;
+        case 18: {
+            const auto l = omph::format::iq3_xxs_layout(nb);
+            o.p[0] = base + l.qs_off; o.p[1] = base + l.aux_off; o.p[2] = base + l.d_off;
+            ntg(4);
+            return true;
+        }
+        case 12: {
+            const auto l = omph::format::q4k_layout(nb);
+            o.p[0] = base + l.qs_off; o.p[1] = base + l.meta_off;
+            ntg(4);
+            return true;
+        }
+        case 23: {
+            const auto l = omph::format::iq4_layout(nb);
+            o.p[0] = base + l.qs_off; o.p[1] = base + l.meta_off;
+            ntg(4);
+            return true;
+        }
+        case 17: {
+            const auto l = omph::format::iq2_xs_layout(nb);
+            o.p[0] = base + l.qs_off; o.p[1] = base + l.sc_off; o.p[2] = base + l.d_off;
+            ntg(4);
+            return true;
+        }
+        // IQ2_XXS (in ~5 groups) is left out: its body made the others spill
+        // (192 VGPRs with 22 spilled; 190 and none without it)
+        case 22: {
+            const auto l = omph::format::iq2s_layout(nb);
+            o.p[0] = base + l.qs_off; o.p[1] = base + l.signs_off; o.p[2] = base + l.qh_off;
+            o.p[3] = base + l.sc_off; o.p[4] = base + l.d_off;
+            ntg(4);
+            return true;
+        }
+        case 10: {
+            const auto l = omph::format::q2k_layout(nb);
+            o.p[0] = base + l.sc_off; o.p[1] = base + l.qs_off; o.p[2] = base + l.d_off; o.p[3] = base + l.dmin_off;
+            ntg(4);
+            return true;
+        }
+        case 14: {
+            const auto l = omph::format::q6k_layout(nb);
+            o.p[0] = base + l.ql_off; o.p[1] = base + l.qh_off; o.p[2] = base + l.sc_off; o.p[3] = base + l.d_off;
+            ntg(2);
+            return true;
+        }
+        default: return false;
+    }
+}
+
+} // namespace
+
+bool gemv_group(const GemvGroupItem * items, const int n, const void * x_f16, const int nt, hipStream_t stream) {
+    // NT = 4 only: at 2 and 3 tokens the grouped kernel is no faster (2) or
+    // slower (3: -1.5 ms over the model's groups, spills), #214
+    if (items == nullptr || x_f16 == nullptr || n < 2 || n > kGemvGroupMax || nt != 4) {
+        return false;
+    }
+    GroupArgs g{};
+    g.n = n;
+    unsigned total = 0;
+    for (int i = 0; i < n; ++i) {
+        const GemvGroupItem & in = items[i];
+        if (in.packed == nullptr || in.y == nullptr || in.rows <= 0 || in.k <= 0 || in.k % 256 != 0 ||
+            in.k != items[0].k || !group_item(in, g.it[i])) {
+            return false;
+        }
+        total += g.it[i].blocks;
+    }
+    const auto * x = static_cast<const __half *>(x_f16);
+    gemv_group_kernel<4><<<total, 256, 0, stream>>>(g, x);
+    return hipGetLastError() == hipSuccess;
+}
+
 // --- dequantization from the repacked layouts (M8) --------------------------
 //
 // f16 rows of a repacked tensor for the GEMM path, read from VRAM: a --gemv
