@@ -16,3 +16,10 @@ WMMA, random register operands, 4 A x 4 B per wave, 5 s each (bench/gemm/wmma_ra
 Power during the WMMA runs: 160 W (the cap; power1_cap_max 182 W), GFX clock 2.63-2.82 GHz
 Kernel launch, dependent tiny kernels on one stream (bench/launch/gap.hip, 2 s warm-up):
   stream 2.68 us per kernel, HIP graph 2.24 us per kernel
+WMMA with interleaved VALU work (bench/gemm/wmma_valu.hip: 4 x 4 WMMAs per wave on register
+operands, N independent f32 FMAs per WMMA, 3 s each); the overlap is partial:
+  FMAs per WMMA     0      4      8      12     16
+  f16 TFLOPS        88     72     70     -      60
+  iu8 TOPS          166    123    115    100    90
+  -> an int8 GEMM on IQ weights (rescale per 32-weight sub-block) tops out at ~1.15-1.4x the
+     f16 path, not 1.9x (#213)
