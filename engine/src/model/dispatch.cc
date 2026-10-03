@@ -69,7 +69,7 @@ bool Runner::up_swiglu_ok(const Mat & up, const int64_t n_out, const int64_t k, 
     // matmul's own route to the fused GEMM, without its ablations
     return !env_.no_swiglu_gemm && !env_.no_fused_gemm && !env_.skip_stage && !env_.skip_gemv &&
            env_.skip_gemv_type < 0 && up.t != nullptr && g != nullptr && g->rows == n_out && g->k == k &&
-           (!use_gemv_ || !gemv_path(T));
+           (!use_gemv_ || (T > 1 && !gemv_path(T)));  // only where the GEMM path runs (#248)
 }
 
 bool Runner::up_swiglu(const Mat & up, const void * x16, const float * gate, void * out16, const int64_t n_out,
