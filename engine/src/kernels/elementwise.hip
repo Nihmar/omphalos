@@ -139,6 +139,30 @@ __global__ void swiglu_f16_kernel(const float * __restrict__ x, const float * __
     }
 }
 
+// One wave per block: each lane holds block / 32 values.
+__global__ void q8_roundtrip_kernel(const __half * __restrict__ x, __half * __restrict__ out,
+                                    const long long n_blocks, const int block) {
+    const long long b = (long long) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (b >= n_blocks) {
+        return;
+    }
+    const int lane = threadIdx.x & 31;
+    const __half * xb = x + b * block;
+    float amax = 0.0f;
+    for (int i = lane; i < block; i += 32) {
+        amax = fmaxf(amax, fabsf(__half2float(xb[i])));
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, o));
+    }
+    const float d = amax / 127.0f;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+    for (int i = lane; i < block; i += 32) {
+        const float q = fminf(fmaxf(rintf(__half2float(xb[i]) * id), -127.0f), 127.0f);
+        out[b * block + i] = __float2half(q * d);
+    }
+}
+
 // Each thread keeps the best key of a strided slice, the waves and then the
 // workgroup reduce it, and one atomicMax per workgroup merges them.
 constexpr int kArgmaxThreads = 1024;
@@ -273,6 +297,17 @@ bool swiglu_f16(const float * x, const float * y, void * out_f16, const int64_t 
     }
     swiglu_f16_kernel<<<(unsigned) ((n + kBlock - 1) / kBlock), kBlock, 0, stream>>>(
         x, y, reinterpret_cast<__half *>(out_f16), (long long) n);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool q8_roundtrip_f16(const void * x, void * out, const int64_t rows, const int64_t k, const int block,
+                      hipStream_t stream) {
+    if (x == nullptr || out == nullptr || rows <= 0 || block < 32 || block % 32 != 0 || k % block != 0) {
+        return false;
+    }
+    const long long n_blocks = rows * k / block;
+    q8_roundtrip_kernel<<<(unsigned) ((n_blocks + 7) / 8), 256, 0, stream>>>(
+        reinterpret_cast<const __half *>(x), reinterpret_cast<__half *>(out), n_blocks, block);
     return hipGetLastError() == hipSuccess;
 }
 

@@ -582,6 +582,21 @@ void * Runner::lazy(void ** p, const size_t bytes) {
     return *p;
 }
 
+const void * Runner::q8_input(const void * x16, const int64_t k, const int64_t T) {
+    constexpr int64_t kMaxK = 32768;
+    if (env_.test_q8act <= 0) {
+        return x16;
+    }
+    if (k > kMaxK || T > max_tokens_) {
+        throw std::runtime_error("OMPH_TEST_Q8ACT: input larger than its buffer");
+    }
+    void * q = lazy(&q8x_, (size_t) max_tokens_ * kMaxK * 2);
+    if (!omph::kernels::q8_roundtrip_f16(x16, q, T, k, env_.test_q8act, hipStreamPerThread)) {
+        throw std::runtime_error("OMPH_TEST_Q8ACT: bad block size");
+    }
+    return q;
+}
+
 // Device pointer to the original GGUF bytes of a tensor that was not
 // repacked (or whose repacked layout is the GGUF bytes, IQ1_M).
 const void * Runner::raw_bytes(const std::string & name) {
