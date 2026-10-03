@@ -312,7 +312,10 @@ bool Runner::lm_head(const int64_t T, std::vector<float> & logits, int32_t * gre
     // bytes per row back instead of 1 MB of logits.
     if (verifying_ && verify_argmax_ != nullptr && use_gemv_ && T <= kVerifyRowsMax &&
         head_.gemv != nullptr && head_.gemv->type == 12) {
-        for (int64_t t0 = 0; t0 < T;) {
+        // 5..16 tokens: one read of the 682 MB head (#244); fewer: four at a time
+        const bool one = T > 4 && omph::kernels::gemv_tokens(12, head_.dev, h16_, static_cast<float *>(logits_),
+                                                             h_.n_vocab, ne, (int) T, nullptr);
+        for (int64_t t0 = 0; t0 < T && !one;) {
             const int64_t n = std::min<int64_t>(4, T - t0);
             const uint8_t * x = static_cast<const uint8_t *>(h16_) + t0 * ne * 2;
             float * y = static_cast<float *>(logits_) + t0 * h_.n_vocab;
@@ -343,7 +346,7 @@ bool Runner::lm_head(const int64_t T, std::vector<float> & logits, int32_t * gre
         logits.clear();
         return true;
     }
-    if (use_gemv_ && T > 1 && T < gemm_min_ && head_.gemv != nullptr && head_.gemv->type == 12) {
+    if (gemv_path(T) && head_.gemv != nullptr && head_.gemv->type == 12) {
         for (int64_t r0 = 0; r0 < T; r0 += kHeadRows) {
             const int64_t rows = std::min<int64_t>(kHeadRows, T - r0);
             for (int64_t t0 = 0; t0 < rows;) {
