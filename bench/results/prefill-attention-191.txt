@@ -1,0 +1,31 @@
+Prefill attention (WMMA flash attention, #191), RX 9060 XT, 2026-10-03
+omph-attn-bench --tokens 512: one layer's 512-token chunk at the end of a cache of seq keys
+(attention + merge, median), default K8/V4 cache with the FP16 window.
+
+Ablation (temporary switches in the kernel, 32k, the kernel before these changes: 19.3 ms):
+  no K staging -2.6, no V staging -1.0, no QK^T WMMA -2.9, no softmax -6.0, no P V WMMA -1.2,
+  no O rescale -1.4, all of them off -> 9.9 ms (barriers, staging stores, P through LDS)
+Steps (ms per chunk):            4k     32k    100k   32k K4
+  main (24a266b)                 2.43   19.2   57.3   18.6
+  1 softmax: no mask on open tiles (32-bit tile-relative mask), raw v_exp_f32
+                                 2.25   17.9
+  2 V staging: consecutive lanes on consecutive keys (the transposed 2-byte stores
+    were 1280 B apart, one LDS bank: 32-way conflicts)
+                                 1.80   14.2           14.5
+  3 transposed form: S^T = K q^T, O^T += V^T P^T (P stays in registers as the B
+    operand, the softmax in-lane + one permlanex16, 1 correction exp per lane)
+                                 1.52   11.9   36.1   11.9
+Tried and dropped: lazy O rescaling (rescale only when the max grows by 2^8: +3-5 %),
+transposing V in registers with 8-key x 8-dim jobs (128 busy threads: 25.1 ms), the
+consecutive-key mapping for K's staging (15.1 vs 14.2 ms).
+
+Accuracy: WMMA vs scalar kernel on the same synthetic quantized cache (attn-bench): max
+5.4e-5, mean 1.4e-6 of max |out|, the same before and after. Prefill logits (last 256
+rows) against the exact reference (scalar kernel, f32 KV) at 32k: main 0.000969, new
+0.000901 (K4: 0.001480 / 0.001491), top-1 99.61 % both. Main vs new directly: 1e-6 with
+the f32 cache; ~5e-4 with the quantized one (rounding differences flip Q4/Q8 codes of the
+cache written for the next chunks: noise of the cache's own size, not a bias).
+
+Prefill wall (OMPH_TIMING, alternated with main's library):
+  4k:  main 4712 4703 4695 / new 4640 4647 4629 ms (-1.4 %)
+  32k: main 44904 45102 / new 41505 41570 ms (-7.7 %)
