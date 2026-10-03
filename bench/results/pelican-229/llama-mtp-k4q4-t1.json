@@ -1,0 +1,17 @@
+{
+ "run": "llama-mtp-k4q4-t1",
+ "engine": "llama",
+ "mtp": true,
+ "kv": "k4q4",
+ "temperature": 1.0,
+ "tokens": 15271,
+ "thinking_closed": true,
+ "total_s": 550.1,
+ "prefill_tps": 250.5,
+ "decode_tps": 27.79,
+ "prompt_n": 76,
+ "peak_vram_mib": 14835,
+ "idle_vram_mib": 356,
+ "svg": true,
+ "png": "llama-mtp-k4q4-t1.png"
+}

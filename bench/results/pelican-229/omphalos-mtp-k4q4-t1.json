@@ -1,0 +1,17 @@
+{
+ "run": "omphalos-mtp-k4q4-t1",
+ "engine": "omphalos",
+ "mtp": true,
+ "kv": "k4q4",
+ "temperature": 1.0,
+ "tokens": 56473,
+ "thinking_closed": true,
+ "total_s": 1196.2,
+ "prefill_tps": 319.1,
+ "decode_tps": 47.22,
+ "prompt_n": 76,
+ "peak_vram_mib": 13572,
+ "idle_vram_mib": 356,
+ "svg": true,
+ "png": "omphalos-mtp-k4q4-t1.png"
+}

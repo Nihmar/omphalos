@@ -1,0 +1,16 @@
+{
+ "run": "omphalos-mtp-t0",
+ "engine": "omphalos",
+ "mtp": true,
+ "temperature": 0.0,
+ "tokens": 34373,
+ "thinking_closed": true,
+ "total_s": 566.7,
+ "prefill_tps": 332.9,
+ "decode_tps": 60.7,
+ "prompt_n": 76,
+ "peak_vram_mib": 13832,
+ "idle_vram_mib": 356,
+ "svg": true,
+ "png": "omphalos-mtp-t0.png"
+}

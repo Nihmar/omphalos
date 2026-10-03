@@ -1,0 +1,744 @@
+We need to respond to user: "Write SVG code that displays a 2D animation of a pelican riding a bicycle. No additional testing is required."
+
+We need produce final with SVG code. Need think in English same language. Need likely provide an SVG with animation. No testing required. We can write a self-contained SVG with CSS/SMIL animation: pelican riding bicycle, wheels rotate, pedals move, pelican bobbing, background scroll maybe.
+
+Need ensure code works. Let's design concise but valid SVG. Could use viewBox, animateTransform for rotation of wheels, legs/pedals, body bob, head? Pelican has big beak/pouch. Bicycle wheels circles with spokes? Use animateTransform rotate. Pedals rotate with crank. Pelican body sits on saddle, legs maybe animated? Simpler: pelican body group on bike, wheels rotate, bicycle moves? If background moves left while bike remains center. Or bike bounces.
+
+Need "displays a 2D animation". Could just SVG file. Need maybe include xmlns.
+
+Let's craft. Elements:
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 400" width="800" height="400">
+ background sky rect, ground line.
+ Bicycle group translate to center. Wheels: rear cx=150 cy=300 r=50; front cx=350 cy=300 r=50. Frame lines. Saddle at (200,230). Handlebars at (320,230). Pedal/crank at (250,300). animate wheel rotate: <g transform-origin? In SVG animateTransform on group with cx? Better: <g transform="rotate(0 150 300)"> circle etc. But animateTransform type=rotate values="0 150 300;360 150 300". Need nested group. For spokes.
+
+Pelican: group with translate maybe (230,190). Body ellipse, neck path, head circle, beak polygon/pouch. animateTransform translate bob: values="0 0;0 -6;0 0" dur 1s repeat indefinite. Legs? Could have legs from body to pedals, rotate with pedals? Hard. Maybe simple feet on pedals that move with crank? We can attach foot to pedal group? If crank rotates, feet should move. But leg shape connecting to body cannot easily follow without morph. Could hide legs or make them short flippers on pedals? For cartoon pelican riding, legs maybe small, can animate with foot positions at pedals? Simpler: pelican's body bobs; pedals rotate; feet maybe ellipses attached to pedals and rotate with crank. But feet need to move around crank. If pelican body is static-ish, feet rotating independent may look odd. Could have pelican feet as orange ovals at pedal positions animated to rotate with crank, and maybe legs as lines from body to foot? Could animate line endpoint? SMIL animate d? Complex. Could just have no visible legs; pelican body sits over pedals with flippers on pedals rotating? Or use a group for entire pelican and bicycle moving forward while wheels spin and background scrolls. The question only asks pelican riding bicycle, not perfect anatomy.
+
+Let's produce visually acceptable: bike with spinning wheels, pelican body sitting, bobbing; pedal crank spins; maybe legs are two orange lines/ellipses at pedals but not attached? Could attach legs to pedal group: foot ellipse rotates around crank. But leg from body? If foot rotates away, line doesn't connect. Could just draw a small orange oval at each pedal, it will rotate with crank. Maybe enough.
+
+Alternatively animate path of pelican's feet using animateMotion along circular path? Could have two feet groups following circular paths around crank, with delay. Body remains; no legs. But maybe okay.
+
+Need robust SVG: animateTransform requires from/to? For rotate: <animateTransform attributeName="transform" type="rotate" from="0 250 300" to="360 250 300" dur="1s" repeatCount="indefinite"/>. For wheel spokes group.
+
+Need background road scroll: rect with pattern? Use animateTransform translate on ground stripes. But if bike doesn't move, road moving left gives illusion. Create <g id="road"> lines animate translate from 0 0 to -200 0. But need continuous. Could make repeated dashes. Simpler: <line y1=350 ... stroke-dasharray="40 20"> animate stroke-dashoffset from 0 to -60? Use <animate attributeName="stroke-dashoffset" from="0" to="60" dur="1s" repeatCount="indefinite"/>. That scrolls road.
+
+Let's design coordinates:
+viewBox 0 0 800 400.
+Sky rect fill #bde0fe.
+Ground rect y=340 fill #8ecae6? Road line y=350.
+Bicycle:
+Wheel radius 55. Rear center (210,300), front center (410,300). Frame: bottom bracket (300,300). Saddle (240,235). Seatpost from (240,235) to (270,300)? Top tube (240,235) to (380,245)? Down tube (300,300) to (380,245). Chainstay (210,300) to (300,300). Seatstay (210,300) to (240,235). Fork (380,245) to (410,300). Handlebar (380,245) up to (400,220) maybe.
+Saddle: rounded rect at (240,225).
+Crank center (300,300). Crank arms length 20: line to pedal. animate rotate. Pedal ovals.
+Pelican: sits near saddle center (260,200). Body ellipse cx=270 cy=200 rx=55 ry=35 fill white. Tail? Neck: path from body top front to head. Head circle cx=320 cy=150 r=18. Beak: big orange polygon from head to right, pouch curve. Eye. Pelican body may overlap saddle.
+Legs? Could draw two orange legs from body to pedals? If not animated, weird. Could animate body bob; legs maybe not connected. Maybe draw flippers near pedals only. Let's include small orange ellipses as feet attached to crank rotation: at pedal positions (320,300) and (280,300) relative? Actually crank arms. In a rotating group around (300,300), place arm line to (320,300), pedal ellipse at (320,300). Opposite arm to (280,300). When rotating, they move. Pelican body static. Could also animate pelican body slight vertical bob, and legs? no.
+
+Maybe better: animate entire pelican+bicycle with a subtle vertical bounce and forward? If we move bike horizontally? Could use animateTransform translate on entire scene? But then it leaves. Could loop background.
+
+Need no testing required, so final just code. But maybe user expects answer with code only? We can provide short intro and code block.
+
+Need ensure valid XML. Use CSS? SMIL. Some environments support SMIL. Could also CSS animation. But SVG code with <animate> is fine.
+
+Let's refine to be clean and pretty.
+
+Potential issue: animateTransform on group with existing transform? If group has transform translate, animateTransform by default replaces unless additive="sum". For wheels, group can have no transform. For bob, pelican group no initial transform or use additive sum if has translate. We'll structure:
+<g id="pelican">
+  <animateTransform attributeName="transform" type="translate" values="0 0;0 -6;0 0" keyTimes="0;0.5;1" dur="1.2s" repeatCount="indefinite"/>
+  shapes
+</g>
+No base transform.
+
+For wheels: <g class="wheel-rear">
+  <animateTransform attributeName="transform" type="rotate" from="0 210 300" to="360 210 300" dur="1.5s" repeatCount="indefinite"/>
+  circle, spokes
+</g>
+
+But if circle stroke centered, rotation of full wheel including tire not visible unless spokes. Good.
+
+Crank group:
+<g>
+ <animateTransform ... from="0 300 300" to="360 300 300" dur="1.5s"/>
+ <line x1="280" y1="300" x2="320" y2="300" .../>
+ <ellipse cx="320" cy="300" rx="8" ry="5" fill="orange"/>
+ <ellipse cx="280" cy="300" rx="8" ry="5" fill="orange"/>
+</g>
+
+But pedals rotate 180? It's okay.
+
+Road dashoffset: <line x1="0" y1="360" x2="800" y2="360" stroke="#457b9d" stroke-width="4" stroke-dasharray="40 20"><animate attributeName="stroke-dashoffset" from="0" to="60" dur="1.5s" repeatCount="indefinite"/></line>. For moving left, dashoffset positive? Let's see: increasing dashoffset shifts pattern backwards along path? If path left-to-right, increasing offset moves dashes to left? Actually dashoffset positive shifts pattern start earlier, making dashes appear move toward start? We can use from 60 to 0? Doesn't matter, scrolling.
+
+Maybe add cloud? Not necessary.
+
+Need make pelican recognizable: large beak and throat pouch. Coordinates:
+Pelican body centered at (270,195). Neck from (290,180) to (315,150). Head circle (318,145) r=16. Beak: path M 318 145 L 385 155 Q 390 160 385 168 L 330 170 Q 325 158 318 158 Z? Need pouch. Simpler: upper beak line/polygon: <polygon points="320,145 385,150 385,158 325,158" fill="#ff8c00"/>; pouch: <path d="M 322 158 Q 360 195 385 158 L 325 162 Z" fill="#ff7f50"/>. Eye black.
+Maybe head at (320,140), beak extends right. Since pelican riding facing right.
+
+Bicycle orientation right. Front wheel right (410,300), rear left (210,300). Pelican facing right.
+
+Saddle under pelican: ellipse at (250,235) rx=20 ry=8 fill black. Pelican body sits above, maybe cy=205.
+
+Legs/feet: If we add rotating pedals, they move around. To make pelican feet, maybe attach two orange foot ellipses to pedals. They may go under body. Fine.
+
+Need maybe animate body bob synchronized with pedals. Use dur 0.75? If crank 1s, bob maybe 0.5s? For pedaling two feet, bob each pedal stroke: dur=0.5s? Could use 1s values with two bobs: values="0 0;0 -4;0 0;0 -4;0 0" dur="1s". Good. keyTimes="0;0.25;0.5;0.75;1". But not necessary.
+
+Let's make code not too long but detailed.
+
+Possible concern: SMIL animateTransform values require list of transform values separated by semicolon. For rotate can use values="0 210 300;360 210 300". For translate bob use values="0 0; 0 -5; 0 0; 0 -5; 0 0".
+
+Need maybe set preserveAspectRatio? Fine.
+
+Let's ensure no invalid attributes. xmlns only.
+
+Potential visual: The pelican body may hide crank; place pelican after bike so body in front? If body drawn after frame, it covers pedal. But we want feet visible. Draw bike, then pelican body, then maybe feet? If feet rotate behind body? Could draw crank after pelican so pedals in front. But frame behind body. Order:
+background, bike frame, wheels, saddle, pelican body/neck/head, crank/pedals (feet) in front. But crank center might be covered by body? Draw after body so pedals visible.
+
+Pelican body maybe too low covering crank. Let's set body cy=190, rx=50 ry=30. Saddle y=230. Body bottom 220. Crank at y=300, below body, visible. Feet ellipses at radius 20 from (300,300), max y 320/280. Visible. Good.
+
+Add legs? Maybe simple orange lines from body to pedals? Could animate foot positions by using same crank rotation group but leg line from body? Not possible. Skip.
+
+Could add a basket? no.
+
+Need maybe add title/desc. Fine.
+
+Let's draft:
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 400" width="800" height="400" role="img" aria-label="Animated pelican riding a bicycle">
+  <defs>
+    <g id="wheel">
+      <circle r="55" fill="none" stroke="#222" stroke-width="8"/>
+      <circle r="6" fill="#222"/>
+      <g stroke="#444" stroke-width="3">
+        <line x1="-55" y1="0" x2="55" y2="0"/>
+        <line x1="0" y1="-55" x2="0" y2="55"/>
+        <line x1="-39" y1="-39" x2="39" y2="39"/>
+        <line x1="-39" y1="39" x2="39" y2="-39"/>
+      </g>
+    </g>
+  </defs>
+
+  <rect width="800" height="400" fill="#bde0fe"/>
+  <rect y="330" width="800" height="70" fill="#a7c957"/>
+  <line x1="0" y1="350" x2="800" y2="350" stroke="#ffffff" stroke-width="4" stroke-dasharray="45 35">
+    <animate attributeName="stroke-dashoffset" from="0" to="80" dur="1s" repeatCount="indefinite"/>
+  </line>
+
+  <g id="bike">
+    <!-- rear wheel -->
+    <g transform="translate(210 300)">
+      <use href="#wheel"/>
+      <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="1s" repeatCount="indefinite" additive="sum"/>
+    </g>
+
+But issue: If <g transform="translate"> and animateTransform additive sum with type rotate from 0 to 360, it rotates around local origin (0,0) after translate? Additive sum means animation transform post-multiplied? Actually transform list: base translate then animate rotate? additive sum adds animation to base, I think result transform = base * animation? For type rotate from 0 to 360 no center, rotation around local coordinate origin (which is wheel center due to translate). This is simpler. But use of href? SVG 2 href okay, but maybe xlink required for older. Use xlink:href? Add xmlns:xlink. Or just duplicate wheel. Simpler no defs? Use defs with <use xlink:href> and include xmlns:xlink. But some validators? Add xmlns:xlink="http://www.w3.org/1999/xlink". Use xlink:href="#wheel".
+
+If base transform translate and animate additive sum, okay. Alternatively no base transform, use animate from="0 210 300" to="360 210 300" on group containing wheel centered at 0? Need place shapes at 210? Easier: define wheel centered at 0; then group with transform translate and animate additive sum.
+
+But for additive sum, the animation transform is applied after base? Let's recall: If additive sum, the animation is added to the base value of transform. For transform functions, they are concatenated? The animation transform is post-multiplied? In SVG 1.1: if additive=sum, animation transform is post-multiplied to base? Example base translate(100,0), animate rotate(30) yields translate(100,0) rotate(30)? That rotates around translated origin? Yes. Good.
+
+But if from="0" to="360" type=rotate no center, rotates around origin of current coordinate system, which is wheel center because group translated. Good.
+
+Need wheel shapes inside <use> not transformable? Use.
+
+For front wheel: <g transform="translate(410 300)"> <use xlink:href="#wheel"/> <animateTransform ... additive="sum"/> </g>
+
+But animateTransform within group after use? It animates group's transform. Good.
+
+Frame lines should not rotate. Draw separately.
+
+Crank group: <g transform="translate(300 300)"> <animateTransform type=rotate from=0 to=360 dur=1s additive=sum/> <line x1="-20" y1="0" x2="20" y2="0" stroke.../> <ellipse cx="20" cy="0" .../> <ellipse cx="-20" cy="0" .../> </g>. This rotates pedals around crank center. Good.
+
+Pelican group: maybe no transform. Add animate translate values. Could have base? No.
+
+But if pelican group uses animateTransform additive? no base.
+
+Need ensure <use> can contain <animateTransform>? No, animation should be on group containing use.
+
+Let's write:
+
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 800 400" width="800" height="400">
+...
+</svg>
+
+Potential issue: <use> href with xlink requires xlink namespace. Fine.
+
+But maybe some browsers don't support SMIL? Most do. Could use CSS animations in <style>. But SMIL is fine. If we want more compatibility, CSS keyframes with transform-origin? But for SVG, CSS transform-origin can be tricky. SMIL is straightforward.
+
+Let's consider if animateTransform with additive sum and from/to on group with existing transform works. Yes.
+
+Could include multiple animate for bob. Let's set pelican group:
+<g id="pelican">
+  <animateTransform attributeName="transform" type="translate" values="0 0;0 -5;0 0;0 -5;0 0" keyTimes="0;0.25;0.5;0.75;1" dur="1s" repeatCount="indefinite"/>
+  ...
+</g>
+
+Need if no transform base, okay.
+
+Pelican shapes:
+Body: <ellipse cx="260" cy="195" rx="55" ry="32" fill="#ffffff" stroke="#333" stroke-width="3"/>
+Tail: <path d="M215 195 Q190 180 205 160" .../> maybe.
+Neck: <path d="M285 180 C 305 170, 310 155, 315 145" stroke="#fff" stroke-width="18" fill="none" stroke-linecap="round"/> But stroke white with outline? Could draw body neck as path fill white: <path d="M275 185 Q305 175 315 140 Q325 155 305 190 Z" fill="#fff" stroke="#333" stroke-width="3"/>. Simpler: neck circle/ellipse: <ellipse cx="305" cy="165" rx="16" ry="30" fill="#fff" stroke="#333" transform="rotate(-15 305 165)"/>
+Head: <circle cx="320" cy="135" r="18" fill="#fff" stroke="#333"/>
+Eye: <circle cx="325" cy="130" r="3" fill="#222"/>
+Beak upper: <path d="M322 130 L390 138 L390 146 L326 146 Z" fill="#ffa500" stroke="#333" stroke-width="2"/>
+Pouch: <path d="M324 146 Q350 185 390 146 Q370 155 326 152 Z" fill="#ff8c00" stroke="#333" stroke-width="2"/>
+Maybe beak too far right (x=390) close to handlebar (380). okay.
+
+Need head/beak maybe too high. Fine.
+
+Bicycle frame coordinates:
+Rear wheel center (210,300). Front (410,300). Crank (300,300). Saddle (250,230). Seatpost: line 250,230 to 270,300. Top tube: 250,230 to 370,240. Down tube: 370,240 to 300,300. Seat tube? maybe 250,230 to 300,300. Chainstay: 210,300 to 300,300. Seatstay: 210,300 to 250,230. Fork: 370,240 to 410,300. Handlebar stem: 370,240 to 380,220; handlebar: line 365,220 to 395,220. Saddle: ellipse 250,228 rx=18 ry=7 fill #222.
+Pedal/crank center at 300,300. Frame may have bottom bracket circle.
+
+Need draw order: background, road, rear wheel, frame, front wheel? If front wheel behind frame? Could draw wheels then frame. But if frame over wheel, okay.
+Pelican after saddle? Maybe pelican after frame and before crank.
+
+If pelican body drawn after front wheel? The beak might overlap handlebar. Fine.
+
+Let's write code:
+
+<svg ...>
+  <defs>
+    <g id="wheel">
+      <circle r="55" fill="none" stroke="#1f2937" stroke-width="8"/>
+      <g stroke="#374151" stroke-width="4">
+       <line x1="-55" y1="0" x2="55" y2="0"/>
+       <line x1="0" y1="-55" x2="0" y2="55"/>
+       <line x1="-39" y1="-39" x2="39" y2="39"/>
+       <line x1="-39" y1="39" x2="39" y2="-39"/>
+      </g>
+      <circle r="7" fill="#111827"/>
+    </g>
+  </defs>
+  <rect width="800" height="400" fill="#bae6fd"/>
+  <rect y="330" width="800" height="70" fill="#86efac"/>
+  <line ... road />
+
+  <!-- bike -->
+  <g stroke="#374151" stroke-width="6" fill="none" stroke-linecap="round">
+    <!-- wheels with animation -->
+    <g transform="translate(210 300)">
+      <use xlink:href="#wheel" stroke="none"? Wait use inherits stroke? The wheel group has own stroke. If parent g has stroke, use maybe inherits? The wheel shapes have explicit stroke, so okay. But parent stroke may affect? fine.
+      <animateTransform .../>
+    </g>
+But if parent g has stroke width and wheel group explicit, okay.
+
+However <use> inside <g> that has animateTransform: the animate is child of g, okay.
+
+Frame lines in same g? If frame in same g with stroke, but wheels group inside? Let's separate.
+
+<g id="bike">
+  <g transform="translate(210 300)">
+    <use xlink:href="#wheel"/>
+    <animateTransform ... additive="sum"/>
+  </g>
+  <g transform="translate(410 300)">
+    <use xlink:href="#wheel"/>
+    <animateTransform ... additive="sum"/>
+  </g>
+  <g stroke="#374151" stroke-width="6" fill="none" stroke-linecap="round">
+    <line x1="210" y1="300" x2="300" y2="300"/>
+    <line x1="210" y1="300" x2="250" y2="230"/>
+    <line x1="250" y1="230" x2="300" y2="300"/>
+    <line x1="300" y1="300" x2="370" y2="240"/>
+    <line x1="250" y1="230" x2="370" y2="240"/>
+    <line x1="370" y1="240" x2="410" y2="300"/>
+    <line x1="370" y1="240" x2="380" y2="218"/>
+    <line x1="365" y1="218" x2="395" y2="218"/>
+    <ellipse cx="250" cy="228" rx="18" ry="7" fill="#111827" stroke="none"/>
+  </g>
+  <!-- crank -->
+  <g transform="translate(300 300)">
+    <animateTransform .../>
+    <line x1="-20" y1="0" x2="20" y2="0" stroke="#111827" stroke-width="6" stroke-linecap="round"/>
+    <ellipse cx="20" cy="0" rx="9" ry="5" fill="#f97316"/>
+    <ellipse cx="-20" cy="0" rx="9" ry="5" fill="#f97316"/>
+  </g>
+</g>
+
+But if crank drawn before pelican, pelican body may cover pedals. Draw crank after pelican maybe. But frame line and crank should be before pelican? Pelican sits on saddle; pedals should be visible in front. Let's draw pelican then crank. But crank center might be behind body? Body at y=195, bottom 227; crank at 300, so visible. Draw after pelican okay.
+
+Pelican:
+<g>
+ <animateTransform .../>
+ <ellipse body/>
+ <path neck? />
+ <circle head/>
+ <path beak/>
+ <path pouch/>
+ <circle eye/>
+</g>
+
+But body may need stroke. Use stroke #334155.
+
+Potential issue: <animateTransform> on pelican group will translate entire pelican including beak. Good.
+
+Road dash animation: line with stroke-dashoffset animation. If line has stroke-dasharray, animate stroke-dashoffset. Good.
+
+Should we animate bicycle forward? Could add slight bounce to whole bike? Not necessary.
+
+Need maybe add chain? no.
+
+Let's consider exact animation durations. Wheels and crank both 1s. Road 1s. Pelican bob 1s with two bobs.
+
+Potential problem: The road dash movement direction: if from 0 to 80, dashes move left or right? For a line from left to right, increasing dashoffset shifts pattern to left? Let's test mentally: dash pattern starts at distance -dashoffset? Positive offset means the pattern is shifted backward along the path, so dashes appear to move towards the start (left) as offset increases? It will scroll one direction. Fine.
+
+Need maybe use <animate attributeName="stroke-dashoffset" from="80" to="0" for left? Not important.
+
+Need maybe use <title> for accessibility.
+
+Now, let's check XML validity:
+- Need close all tags.
+- xlink namespace used only for use. Good.
+- <use xlink:href="#wheel"/>. Could also use href. With xmlns:xlink included.
+- animateTransform additive attribute valid.
+
+But one subtlety: In SVG, <animateTransform> on a <g> that has a <use> and an existing transform, if additive="sum", the animation is additive to base. For from="0" to="360", it's a rotate transform. If base transform is translate(210,300), result should be translate(210,300) rotate(angle). Good.
+
+But if there are multiple animateTransform on same element? no.
+
+Potential issue: The wheel <g id="wheel"> contains lines with coordinates relative to 0,0. <use> copies it. The parent g translate positions it. The animateTransform on parent g will animate transform of that group, which includes the use. Good.
+
+Let's think if the animateTransform child of g with base transform and use may be ignored because transform attribute is presentation attribute? No, SMIL works.
+
+Could use <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="1s" repeatCount="indefinite" additive="sum"/>. For rotate without center, center is 0,0 in local coordinates. Good.
+
+Potential issue with additive sum and from/to: The animated transform values are absolute? It adds. For rotate, from 0 to 360, base translate, result maybe base * animate. Good.
+
+If some browsers require `values` rather than from/to? from/to okay.
+
+Let's maybe avoid additive by using center coordinates and no base transform: define wheel shapes centered at 210? Could duplicate. But using additive is fine.
+
+Alternative: Use CSS animation for wheel with transform-box: fill-box; transform-origin: center; but SMIL okay.
+
+Let's ensure the code is self-contained. Provide in code block.
+
+User said "No additional testing is required." So we don't need to mention testing. Just code. Could include "Here is an SVG..." and code.
+
+Need final answer not too verbose. But desired oververbosity 9; but code is main. Could include a short note: "Save as .svg or embed in HTML." But likely okay.
+
+Let's consider if user wants "displays a 2D animation" maybe wants actual animated SVG. We can deliver.
+
+Let's refine visual proportions:
+ViewBox 800x400.
+Wheels radius 55. Rear center 210, front 410. Distance 200. Bike width good.
+Ground at y=350, wheel bottom at 355. Slight below ground? Wheel bottom = 355, ground line at 350, so wheels intersect ground. Could set ground y=360, road line y=360, wheel bottom 355 above? If ground rect starts y=340, road line at 350, wheel bottom 355 below line. Could set wheel center y=295, bottom 350. Let's adjust.
+
+Set wheel centers y=295. Ground/road y=350. Wheel bottom 350 exactly. Frame coordinates:
+Rear (210,295), front (410,295), crank (300,295). Saddle (250,225). Handlebar (380,215).
+Frame:
+chainstay 210,295 to 300,295
+seatstay 210,295 to 250,225
+seat tube 250,225 to 300,295
+down tube 300,295 to 370,235? top tube 250,225 to 370,235
+fork 370,235 to 410,295
+stem 370,235 to 380,212
+bar 365,212 to 395,212
+Saddle ellipse 250,222.
+Crank (300,295). Pedals length 20.
+Pelican body cy=185? Saddle at 222, body bottom around 217. Set body cx=265 cy=185 rx=55 ry=32. bottom 217. Good.
+Neck/head: head at (325,125), beak to 395. Might overlap front wheel? front wheel top 240, beak y ~130, okay.
+Let's set:
+body ellipse cx=265 cy=185 rx=55 ry=32
+neck: ellipse cx=305 cy=150 rx=16 ry=28 rotate -15.
+head circle cx=325 cy=115 r=18? If neck top 122, head center 115. Beak at y=110. Maybe too high. Use head (325,125), neck ellipse cy=155 ry=30. Body top 153. Good.
+Neck: ellipse cx=305 cy=155 rx=15 ry=30 rotate(-10 305 155). Head circle cx=322 cy=120 r=18. Eye cx=328 cy=115.
+Beak: upper polygon points="325,118 395,124 395,132 330,132". Pouch path M 330 132 Q 355 175 395 132 Q 370 142 330 138 Z. This beak length 70. Good.
+Body fill white, stroke #334155.
+
+Pelican tail: maybe path from left side body to back: <path d="M215 185 Q190 175 195 155 Q215 165 225 175 Z" fill="#fff" stroke...>. Optional.
+
+Wing: <ellipse cx=255 cy=190 rx=35 ry=18 fill="#e2e8f0" stroke.../> to add detail.
+
+Legs/feet? Pedal ellipses orange. Could call them feet.
+
+Crank animation: line -20 to 20. Pedals at x ±20 y0. When rotated, foot positions. Good.
+
+Add chain? maybe ellipse from rear wheel to crank? Not necessary.
+
+Let's assemble with adjusted y:
+
+<svg ... viewBox="0 0 800 400">
+<defs> wheel radius 55 </defs>
+<rect width=800 height=400 fill="#bae6fd"/>
+<rect y="330" width="800" height="70" fill="#86efac"/>
+<line x1="0" y1="350" x2="800" y2="350" stroke="#f8fafc" stroke-width="6" stroke-dasharray="50 30">
+  <animate attributeName="stroke-dashoffset" from="0" to="80" dur="1s" repeatCount="indefinite"/>
+</line>
+
+<!-- rear wheel -->
+<g transform="translate(210 295)">
+  <use xlink:href="#wheel"/>
+  <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="1s" repeatCount="indefinite" additive="sum"/>
+</g>
+<!-- front wheel -->
+<g transform="translate(410 295)">
+  <use xlink:href="#wheel"/>
+  <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="1s" repeatCount="indefinite" additive="sum"/>
+</g>
+
+<g stroke="#334155" stroke-width="6" fill="none" stroke-linecap="round">
+ <line x1="210" y1="295" x2="300" y2="295"/>
+ <line x1="210" y1="295" x2="250" y2="225"/>
+ <line x1="250" y1="225" x2="300" y2="295"/>
+ <line x1="300" y1="295" x2="370" y2="235"/>
+ <line x1="250" y1="225" x2="370" y2="235"/>
+ <line x1="370" y1="235" x2="410" y2="295"/>
+ <line x1="370" y1="235" x2="380" y2="212"/>
+ <line x1="365" y1="212" x2="395" y2="212"/>
+ <ellipse cx="250" cy="222" rx="18" ry="7" fill="#111827" stroke="none"/>
+ <circle cx="300" cy="295" r="6" fill="#111827" stroke="none"/>
+</g>
+
+Pelican group:
+<g>
+  <animateTransform attributeName="transform" type="translate" values="0 0;0 -4;0 0;0 -4;0 0" keyTimes="0;0.25;0.5;0.75;1" dur="1s" repeatCount="indefinite"/>
+  <path d="M220 180 Q185 170 195 145 Q220 155 235 165 Z" fill="#f8fafc" stroke="#334155" stroke-width="3"/>
+  <ellipse cx="265" cy="185" rx="55" ry="32" fill="#ffffff" stroke="#334155" stroke-width="3"/>
+  <ellipse cx="255" cy="190" rx="35" ry="18" fill="#e2e8f0" stroke="#334155" stroke-width="2"/>
+  <ellipse cx="305" cy="155" rx="15" ry="30" fill="#ffffff" stroke="#334155" stroke-width="3" transform="rotate(-10 305 155)"/>
+  <circle cx="322" cy="120" r="18" fill="#ffffff" stroke="#334155" stroke-width="3"/>
+  <circle cx="328" cy="115" r="3" fill="#111827"/>
+  <path d="M325 118 L395 124 L395 132 L330 132 Z" fill="#fdba74" stroke="#334155" stroke-width="2"/>
+  <path d="M330 132 Q355 175 395 132 Q370 142 330 138 Z" fill="#fb923c" stroke="#334155" stroke-width="2"/>
+</g>
+
+Crank after pelican:
+<g transform="translate(300 295)">
+  <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="1s" repeatCount="indefinite" additive="sum"/>
+  <line x1="-20" y1="0" x2="20" y2="0" stroke="#111827" stroke-width="6" stroke-linecap="round"/>
+  <ellipse cx="20" cy="0" rx="9" ry="5" fill="#f97316"/>
+  <ellipse cx="-20" cy="0" rx="9" ry="5" fill="#f97316"/>
+</g>
+
+</svg>
+
+Check if pelican body covers saddle? Body bottom 217, saddle at 222, body overlaps. Good.
+
+Potential issue: Pelican tail path coordinates maybe behind body. Fine.
+
+Potential issue: The pelican's beak might overlap handlebar? Handlebar at x 365-395 y212, beak y118-132, no.
+
+Need maybe animate head look? no.
+
+Let's consider if the code with `<use xlink:href="#wheel"/>` and `defs` with id works. Yes.
+
+Could there be a problem with `<animateTransform>` placed after `<use>` inside the same `<g>`? The animation element can be anywhere inside the element? It should be child of element being animated. Yes.
+
+But for `<g transform="translate(210 295)">`, the `<animateTransform>` with `additive="sum"` will animate the transform attribute. It may need `attributeName="transform"`. Good.
+
+Potential issue: For wheel group, base transform is `translate(210 295)`. Additive sum animation `rotate` around 0,0. This yields translation then rotation? In transform lists, if base is translate, animation post-multiplied? The result may be `translate(210 295) rotate(angle)`, which rotates around local origin at wheel center. Correct. If it were `rotate(angle) translate(210 295)`, rotation around global origin would orbit wheel. But SVG spec says additive animation is post-multiplied? Let's verify: For transform, additive sum means animation transform is concatenated to the base value? The order? I recall `transform` animation additive: the animated value is added to the base value by post-multiplying. For `transform`, `base * animation`? That means animation in local coordinate after base. Yes. Example: if you have translate(100,0) and animate rotate(90), result is translate then rotate, so object rotates around its own translated origin. Good.
+
+If uncertain, we can avoid additive by not using base transform and specify rotation center in values for each wheel group. But if group contains use at 0,0, we can wrap in a static translate outside? Need animate on inner group? Example:
+<g transform="translate(210 295)">
+  <g>
+    <use xlink:href="#wheel"/>
+    <animateTransform attributeName="transform" type="rotate" from="0 0 0" to="360 0 0" dur="1s" repeatCount="indefinite"/>
+  </g>
+</g>
+No additive, inner group transform only animation. That may be clearer. Let's do that: outer g translate, inner g animate. Then no additive ambiguity. Same for crank and maybe wheels.
+
+Structure:
+<g transform="translate(210 295)">
+  <g>
+    <use xlink:href="#wheel"/>
+    <animateTransform attributeName="transform" type="rotate" from="0 0 0" to="360 0 0" dur="1s" repeatCount="indefinite"/>
+  </g>
+</g>
+
+This is safer. For crank:
+<g transform="translate(300 295)">
+  <g>
+    <animateTransform ... from="0 0 0" to="360 0 0" .../>
+    <line .../>
+  </g>
+</g>
+
+No additive.
+
+For pelican bob, group has no base transform; animation transform translate. Good.
+
+Could use `<animateTransform attributeName="transform" type="rotate" values="0 0 0;360 0 0" dur="1s" repeatCount="indefinite"/>`. from/to okay.
+
+Let's update code accordingly.
+
+Need ensure <g> with animation and use: The `<animateTransform>` can be first child or after use. It targets parent g. Fine.
+
+Now check final code:
+
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 800 400" width="800" height="400">
+  <title>Pelican riding a bicycle</title>
+  <defs>
+    <g id="wheel">
+      <circle r="55" fill="none" stroke="#1f2937" stroke-width="8"/>
+      <g stroke="#374151" stroke-width="4">
+        <line x1="-55" y1="0" x2="55" y2="0"/>
+        <line x1="0" y1="-55" x2="0" y2="55"/>
+        <line x1="-39" y1="-39" x2="39" y2="39"/>
+        <line x1="-39" y1="39" x2="39" y2="-39"/>
+      </g>
+      <circle r="7" fill="#111827"/>
+    </g>
+  </defs>
+
+  <rect width="800" height="400" fill="#bae6fd"/>
+  <rect y="330" width="800" height="70" fill="#86efac"/>
+  <line x1="0" y1="350" x2="800" y2="350" stroke="#f8fafc" stroke-width="6" stroke-dasharray="50 30">
+    <animate attributeName="stroke-dashoffset" from="0" to="80" dur="1s" repeatCount="indefinite"/>
+  </line>
+
+  <g transform="translate(210 295)">
+    <g>
+      <use xlink:href="#wheel"/>
+      <animateTransform attributeName="transform" type="rotate" from="0 0 0" to="360 0 0" dur="1s" repeatCount="indefinite"/>
+    </g>
+  </g>
+  <g transform="translate(410 295)">
+    <g>
+      <use xlink:href="#wheel"/>
+      <animateTransform attributeName="transform" type="rotate" from="0 0 0" to="360 0 0" dur="1s" repeatCount="indefinite"/>
+    </g>
+  </g>
+
+  <g stroke="#334155" stroke-width="6" fill="none" stroke-linecap="round">
+    <line x1="210" y1="295" x2="300" y2="295"/>
+    <line x1="210" y1="295" x2="250" y2="225"/>
+    <line x1="250" y1="225" x2="300" y2="295"/>
+    <line x1="300" y1="295" x2="370" y2="235"/>
+    <line x1="250" y1="225" x2="370" y2="235"/>
+    <line x1="370" y1="235" x2="410" y2="295"/>
+    <line x1="370" y1="235" x2="380" y2="212"/>
+    <line x1="365" y1="212" x2="395" y2="212"/>
+    <ellipse cx="250" cy="222" rx="18" ry="7" fill="#111827" stroke="none"/>
+    <circle cx="300" cy="295" r="6" fill="#111827" stroke="none"/>
+  </g>
+
+  <g>
+    <animateTransform attributeName="transform" type="translate" values="0 0;0 -4;0 0;0 -4;0 0" keyTimes="0;0.25;0.5;0.75;1" dur="1s" repeatCount="indefinite"/>
+    <path d="M220 180 Q185 170 195 145 Q220 155 235 165 Z" fill="#f8fafc" stroke="#334155" stroke-width="3"/>
+    <ellipse cx="265" cy="185" rx="55" ry="32" fill="#ffffff" stroke="#334155" stroke-width="3"/>
+    <ellipse cx="255" cy="190" rx="35" ry="18" fill="#e2e8f0" stroke="#334155" stroke-width="2"/>
+    <ellipse cx="305" cy="155" rx="15" ry="30" fill="#ffffff" stroke="#334155" stroke-width="3" transform="rotate(-10 305 155)"/>
+    <circle cx="322" cy="120" r="18" fill="#ffffff" stroke="#334155" stroke-width="3"/>
+    <circle cx="328" cy="115" r="3" fill="#111827"/>
+    <path d="M325 118 L395 124 L395 132 L330 132 Z" fill="#fdba74" stroke="#334155" stroke-width="2"/>
+    <path d="M330 132 Q355 175 395 132 Q370 142 330 138 Z" fill="#fb923c" stroke="#334155" stroke-width="2"/>
+  </g>
+
+  <g transform="translate(300 295)">
+    <g>
+      <animateTransform attributeName="transform" type="rotate" from="0 0 0" to="360 0 0" dur="1s" repeatCount="indefinite"/>
+      <line x1="-20" y1="0" x2="20" y2="0" stroke="#111827" stroke-width="6" stroke-linecap="round"/>
+      <ellipse cx="20" cy="0" rx="9" ry="5" fill="#f97316"/>
+      <ellipse cx="-20" cy="0" rx="9" ry="5" fill="#f97316"/>
+    </g>
+  </g>
+</svg>
+
+Check if pelican group animation with translate values and no base transform: At start transform translate 0,0. Good. The neck ellipse has its own transform rotate; that's fine. The group's animateTransform does not override child transforms.
+
+Potential visual issue: The pelican body's wing ellipse is inside body, but with stroke may look like flap. Fine.
+
+Could add a slight forward lean? Not needed.
+
+Need maybe use `href` not `xlink:href`? We included xlink. Some modern linters might prefer href, but xlink is valid.
+
+Should we include CSS to disable pointer events? no.
+
+Let's think of possible XML namespace issue: `xlink:href` requires xmlns:xlink. We have. Good.
+
+SMIL elements: `animate`, `animateTransform`. Valid.
+
+One subtle issue: `<use xlink:href="#wheel"/>` inside a `<g>` that has an `<animateTransform>` as sibling. The animation targets the parent g. It will rotate the entire g, including use. Good.
+
+But the `<g>` being animated has no initial `transform` attribute. During animation, transform is set. Before animation starts? It starts at load. Fine.
+
+Another subtle issue: If `from` and `to` for rotate are specified as `0 0 0` and `360 0 0`, it interpolates angles from 0 to 360. Good.
+
+Could the road line animation with `stroke-dashoffset` from 0 to 80 cause a jump at repeat? Since 80 equals dasharray sum (50+30=80), seamless. Good.
+
+Wheel rotation dur 1s, road dash dur 1s, crank dur 1s. Good.
+
+Maybe bicycle wheels should rotate relative to speed; if road dashes 80 per second and wheel circumference ~345, unrealistic, but no matter.
+
+Need maybe ensure final answer only code. Could include "Save as pelican-bicycle.svg". The user requested write SVG code. I can provide a code block. No additional testing required. Fine.
+
+Let's also consider if user might want animation in a single SVG, not separate CSS. Yes.
+
+Potential alternative: Use CSS keyframes to be more compact? SMIL is okay.
+
+Let's ensure no markdown issues. Use ```svg.
+
+Final answer: Provide code.
+
+Double-check all tags:
+<svg ...>
+ <title>...</title>
+ <defs>
+  <g id="wheel">
+   <circle .../>
+   <g ...>
+    <line .../>
+    ...
+   </g>
+   <circle .../>
+  </g>
+ </defs>
+ <rect .../>
+ <rect .../>
+ <line ...>
+  <animate .../>
+ </line>
+ <g ...>
+  <g>
+   <use .../>
+   <animateTransform .../>
+  </g>
+ </g>
+ ...
+ <g stroke=...>
+  lines...
+  ellipse...
+  circle...
+ </g>
+ <g>
+  <animateTransform .../>
+  path...
+  ellipse...
+  ellipse...
+  ellipse ... transform ... />
+  circle...
+  circle...
+  path...
+  path...
+ </g>
+ <g ...>
+  <g>
+   <animateTransform .../>
+   line...
+   ellipse...
+   ellipse...
+  </g>
+ </g>
+</svg>
+
+All good.
+
+Need maybe the `<use>` will inherit stroke from parent? The parent g has no stroke; wheel defs has explicit strokes. Good.
+
+Could there be issue that the `<g id="wheel">` lines have stroke width 4 but the outer circle stroke 8. Good.
+
+Could the frame line `250,225 to 370,235` intersect saddle? fine.
+
+Potential improvement: Add pedal chain? no.
+
+Let's think about pelican beak shape: Upper beak path M325 118 L395 124 L395 132 L330 132 Z. Pouch M330 132 Q355 175 395 132 Q370 142 330 138 Z. The pouch bottom curve goes down to 175, maybe overlapping body? Body top at 153, pouch bottom 175 overlaps neck/body. That's okay (throat pouch). But it may cover neck. Fine.
+
+Maybe beak too low/high? Head circle center 120 radius 18, top 102 bottom 138. Upper beak starts at 118 to 132, okay. Eye at 115.
+
+Maybe pelican is too small relative to bike? Body 110 wide, bike 200, okay.
+
+Should add feet on pedals? We have orange ellipses rotating. They might be seen as pedals, not feet. Could color orange to imply feet. Fine.
+
+Could add two legs as lines from body to pedals that also rotate? Not possible. But maybe if we attach legs to crank group, they'd rotate as entire leg? If leg line from crank to body? No.
+
+Maybe to improve, hide pedals and draw orange feet ellipses on pedals, no legs. Acceptable cartoon.
+
+Could add a basket with egg? no.
+
+Need final answer. Ensure no analysis in final. Use code block.
+
+Let's consider if there is any requirement "No additional testing is required." Could mean don't spend time testing. We can just output.
+
+One more thought: Some SVG viewers may not support `xlink:href` without `xmlns:xlink`? We included. Some older require `xlink:href` and namespace. Good.
+
+Could use both `href` and `xlink:href` for compatibility? Not necessary, but can add `href="#wheel"` too? In XML, an element can have both `href` and `xlink:href`? It may be invalid if same attribute? Actually `href` is different attribute; could include both, but unnecessary. Use `xlink:href`.
+
+Potential issue: `<animateTransform>` inside a `<g>` that contains `<use>` but before `<use>`? In my code I put use then animate. It doesn't matter. Good.
+
+Let's maybe include `fill="freeze"`? Not needed with repeat indefinite.
+
+Now final.
+</think>
+
+```svg
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 800 400" width="800" height="400">
+  <title>Pelican riding a bicycle</title>
+
+  <defs>
+    <g id="wheel">
+      <circle r="55" fill="none" stroke="#1f2937" stroke-width="8"/>
+      <g stroke="#374151" stroke-width="4">
+        <line x1="-55" y1="0" x2="55" y2="0"/>
+        <line x1="0" y1="-55" x2="0" y2="55"/>
+        <line x1="-39" y1="-39" x2="39" y2="39"/>
+        <line x1="-39" y1="39" x2="39" y2="-39"/>
+      </g>
+      <circle r="7" fill="#111827"/>
+    </g>
+  </defs>
+
+  <rect width="800" height="400" fill="#bae6fd"/>
+  <rect y="330" width="800" height="70" fill="#86efac"/>
+
+  <line x1="0" y1="350" x2="800" y2="350" stroke="#f8fafc" stroke-width="6" stroke-dasharray="50 30">
+    <animate attributeName="stroke-dashoffset" from="0" to="80" dur="1s" repeatCount="indefinite"/>
+  </line>
+
+  <g transform="translate(210 295)">
+    <g>
+      <use xlink:href="#wheel"/>
+      <animateTransform attributeName="transform" type="rotate" from="0 0 0" to="360 0 0" dur="1s" repeatCount="indefinite"/>
+    </g>
+  </g>
+
+  <g transform="translate(410 295)">
+    <g>
+      <use xlink:href="#wheel"/>
+      <animateTransform attributeName="transform" type="rotate" from="0 0 0" to="360 0 0" dur="1s" repeatCount="indefinite"/>
+    </g>
+  </g>
+
+  <g stroke="#334155" stroke-width="6" fill="none" stroke-linecap="round">
+    <line x1="210" y1="295" x2="300" y2="295"/>
+    <line x1="210" y1="295" x2="250" y2="225"/>
+    <line x1="250" y1="225" x2="300" y2="295"/>
+    <line x1="300" y1="295" x2="370" y2="235"/>
+    <line x1="250" y1="225" x2="370" y2="235"/>
+    <line x1="370" y1="235" x2="410" y2="295"/>
+    <line x1="370" y1="235" x2="380" y2="212"/>
+    <line x1="365" y1="212" x2="395" y2="212"/>
+
+    <ellipse cx="250" cy="222" rx="18" ry="7" fill="#111827" stroke="none"/>
+    <circle cx="300" cy="295" r="6" fill="#111827" stroke="none"/>
+  </g>
+
+  <g>
+    <animateTransform
+      attributeName="transform"
+      type="translate"
+      values="0 0;0 -4;0 0;0 -4;0 0"
+      keyTimes="0;0.25;0.5;0.75;1"
+      dur="1s"
+      repeatCount="indefinite"
+    />
+
+    <path d="M220 180 Q185 170 195 145 Q220 155 235 165 Z" fill="#f8fafc" stroke="#334155" stroke-width="3"/>
+    <ellipse cx="265" cy="185" rx="55" ry="32" fill="#ffffff" stroke="#334155" stroke-width="3"/>
+    <ellipse cx="255" cy="190" rx="35" ry="18" fill="#e2e8f0" stroke="#334155" stroke-width="2"/>
+    <ellipse cx="305" cy="155" rx="15" ry="30" fill="#ffffff" stroke="#334155" stroke-width="3" transform="rotate(-10 305 155)"/>
+    <circle cx="322" cy="120" r="18" fill="#ffffff" stroke="#334155" stroke-width="3"/>
+    <circle cx="328" cy="115" r="3" fill="#111827"/>
+
+    <path d="M325 118 L395 124 L395 132 L330 132 Z" fill="#fdba74" stroke="#334155" stroke-width="2"/>
+    <path d="M330 132 Q355 175 395 132 Q370 142 330 138 Z" fill="#fb923c" stroke="#334155" stroke-width="2"/>
+  </g>
+
+  <g transform="translate(300 295)">
+    <g>
+      <animateTransform attributeName="transform" type="rotate" from="0 0 0" to="360 0 0" dur="1s" repeatCount="indefinite"/>
+      <line x1="-20" y1="0" x2="20" y2="0" stroke="#111827" stroke-width="6" stroke-linecap="round"/>
+      <ellipse cx="20" cy="0" rx="9" ry="5" fill="#f97316"/>
+      <ellipse cx="-20" cy="0" rx="9" ry="5" fill="#f97316"/>
+    </g>
+  </g>
+</svg>
+```
