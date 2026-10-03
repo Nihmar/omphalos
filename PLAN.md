@@ -533,7 +533,8 @@ Codebook tables (**[verify]** sizes): IQ2_XS grid 512 × 8 B, IQ2_S grid 1024 ×
   - The GEMV takes 1..16 tokens in one launch, and each token's output is bit-identical to the 1-token call. Verification of 4 tokens: 14.45 -> 13.29 ms over all IQ3_S tensors.
   - The GEMM reaches 50.3 -> 52.8 TFLOPS.
   - End to end: plain 44.17 -> 44.04 ms and speculative 16.88 -> 16.62 ms per token (`bench/results/iq3s-tiles-178.txt`).
-- **Next:** IQ4_XS, IQ3_XXS, Q4_K, the 2-bit types and Q6_K.
+- **IQ3_XXS (#219, format 3) is done.** The tile kernels became one skeleton over a tile decoder (`quant_decode.hh`). 4-token GEMVs 8.81 -> 7.99 ms, GEMM 51.7 -> 53.7 TFLOPS, speculative ~-0.4 ms per round; the 1-token GEMV is 0.27 ms slower (`bench/results/iq3xxs-tiles-219.txt`).
+- **Next, by the profile (#203):** the 2-bit types (compute-bound at 4 tokens). IQ4_XS and Q4_K stay row-wise: their 4-token GEMVs are already at the 1-token cost.
 
 ---
 

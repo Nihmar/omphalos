@@ -1,0 +1,30 @@
+IQ3_XXS on the WMMA tile layout (#219, #178 stage C), RX 9060 XT, 2026-10-03
+.omph format 3: IQ3_XXS in 16-row tiles (1568 B per tile and block, the GGUF size).
+The tile kernels are one skeleton over a tile decoder (quant_decode.hh: TileIq3s,
+TileIq3xxs) for the GEMV (1..16 tokens), the grouped verification launch and the GEMM.
+
+Kernels, all IQ3_XXS tensors (omph-gemv-bench --all-of-type 18):
+                 row-wise (main)   tiles
+  1 token        7.47 ms           7.74 ms
+  2 tokens       7.86              7.83
+  4 tokens       8.81              7.99
+  8 / 16 tokens  -                 8.29 / 8.42
+  GEMM 512       51.7 TFLOPS       53.7 TFLOPS
+  every token of a 2..16-token call equal to the 1-token call bit for bit
+IQ3_S unchanged by the templating (A/B vs the previous binary, 3 alternations:
+nt1 13.01-13.02 both, nt4 13.42-13.44 both).
+Sibling groups at 4 tokens (--group): separate 25.94-26.06 ms, grouped 25.27-25.37.
+
+End to end vs main (main on the format-2 file), the same prompts:
+  speculative, ms per verification round (the trajectories differ, so per round):
+    code     56.32 56.44 -> 55.93 56.00   (-0.4 ms)
+    en chat  55.77 55.77 -> 55.46 55.43   (-0.3 ms)
+    prose    55.77 55.74 -> 55.36 55.40   (-0.4 ms)
+  plain decode step gpu: 43.92 43.99 43.93 -> 44.12 44.14 44.15 (+0.2 ms: the 1-token tile
+    GEMV is slower than the row-wise kernel; the plain step is not the default path)
+  prefill 4k: main 4680 4798 4711, new 4700 4705 4710 ms (parity within the noise)
+
+Decode KL, 63 forced steps at 2048 context, against main's exact f32 KV:
+  main default 0.000409, new default 0.000456, new with f32 KV 0.000001, main vs new
+  0.000067; top-1 100 % everywhere (the weights' f16 rounding is negligible; the KV
+  quantization dominates).
