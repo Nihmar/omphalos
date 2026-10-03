@@ -254,7 +254,7 @@ int main(int argc, char ** argv) {
             // #214: every sibling group of the model (any types) at --nt N tokens,
             // as separate launches (gemv_tokens / gemv_multi per member) and as
             // one gemv_group launch; outputs compared bit for bit
-            const int nt = std::max(2, std::min(4, g_nt));
+            const int nt = std::max(1, std::min(16, g_nt));  // the tiles: 1..16 (#255)
             const char * names[3][3] = {{"ffn_gate", "ffn_up", nullptr},
                                         {"attn_qkv", "attn_gate", nullptr},
                                         {"attn_q", "attn_k", "attn_v"}};
@@ -280,7 +280,7 @@ int main(int argc, char ** argv) {
                 }
             }
             void * x = nullptr;
-            std::vector<_Float16> hx((size_t) kmax * 4);
+            std::vector<_Float16> hx((size_t) kmax * 16);
             for (size_t i = 0; i < hx.size(); ++i) hx[i] = (_Float16) (((int) (i * 7919 % 2001) - 1000) / 1000.0f);
             std::vector<float *> ya(3, nullptr), yb(3, nullptr);
             if (hipMalloc(&x, hx.size() * 2) != hipSuccess ||
@@ -288,8 +288,8 @@ int main(int argc, char ** argv) {
                 return fail("out of VRAM (group)");
             }
             for (int i = 0; i < 3; ++i) {
-                if (hipMalloc(&ya[i], (size_t) rmax * 4 * 4) != hipSuccess ||
-                    hipMalloc(&yb[i], (size_t) rmax * 4 * 4) != hipSuccess) {
+                if (hipMalloc(&ya[i], (size_t) rmax * 16 * 4) != hipSuccess ||
+                    hipMalloc(&yb[i], (size_t) rmax * 16 * 4) != hipSuccess) {
                     return fail("out of VRAM (group)");
                 }
             }
