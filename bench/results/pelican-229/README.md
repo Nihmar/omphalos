@@ -13,6 +13,7 @@ Rendered with the model's chat template (thinking on, reasoning effort xhigh, th
 | llama-plain-t0 | k8q4 | 65396 (thinking not closed) | 3938.1 s | 244.5 t/s | 16.61 t/s | 14054 MiB (356) |
 | llama-plain-t1 | k8q4 | 22829 | 1194.7 s | 268.5 t/s | 19.12 t/s | 14054 MiB (356) |
 | omphalos-dflash-k4q4-t0 | k4q4 | 20121 | 260.1 s | 291.9 t/s | 77.47 t/s | 14195 MiB (210) |
+| omphalos-dflash-k4q4-t0.5 | k4q4 | 31388 | 469.2 s | 289.2 t/s | 66.96 t/s | 14322 MiB (210) |
 | omphalos-dflash-k4q4-t0.6 | k4q4 | 22305 | 357.0 s | 279.2 t/s | 62.54 t/s | 14195 MiB (210) |
 | omphalos-dflash-k4q4-t1 | k4q4 | 22814 | 482.6 s | 281.8 t/s | 47.31 t/s | 14195 MiB (210) |
 | omphalos-mtp-k4q4-t0 | k4q4 | 65396 (thinking not closed) | 986.5 s | 321.8 t/s | 66.32 t/s | 13572 MiB (356) |
@@ -64,6 +65,12 @@ Rendered with the model's chat template (thinking on, reasoning effort xhigh, th
 20121 tokens, 260.1 s, prefill 291.9 t/s, decode 77.47 t/s, peak VRAM 14195 MiB
 
 ![omphalos-dflash-k4q4-t0](omphalos-dflash-k4q4-t0.png)
+
+## omphalos-dflash-k4q4-t0.5
+
+31388 tokens, 469.2 s, prefill 289.2 t/s, decode 66.96 t/s, peak VRAM 14322 MiB
+
+![omphalos-dflash-k4q4-t0.5](omphalos-dflash-k4q4-t0.5.png)
 
 ## omphalos-dflash-k4q4-t0.6
 
