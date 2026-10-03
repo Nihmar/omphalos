@@ -87,8 +87,12 @@ public:
     // within their common prefix (#158), else the caches restart.
     GenerateResult generate(const std::vector<int32_t> & prompt, const GenerateRequest & request,
                             const std::function<bool(int32_t)> & on_token);
+    // The request being generated, its counters so far (drafted, accepted):
+    // valid inside on_token only (progress reports, #231).
+    const GenerateResult & running() const { return *running_; }
 
 private:
+    const GenerateResult * running_ = nullptr;
     bool is_eog(int32_t id) const;
     int32_t sample(const std::vector<float> & logits, const Sampling & s);
     // The sampling distribution of one logits row (temperature, top-k, min-p,

@@ -322,6 +322,7 @@ bool Generator::expand(const std::vector<int32_t> & prompt, const GenerateReques
 GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, const GenerateRequest & req,
                                    const std::function<bool(int32_t)> & on_token) {
     GenerateResult res;
+    running_ = &res;
     Expanded ex;
     if (prompt_ids.empty() || !expand(prompt_ids, req, ex)) {
         res.stop = GenerateResult::Stop::Error;

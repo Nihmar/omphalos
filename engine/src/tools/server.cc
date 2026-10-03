@@ -290,7 +290,24 @@ struct Server {
         }
         GenerateResult res;
         if (!gone) {
+            // a progress line every 3 s of decoding, as llama-server's (#231)
+            double t_first = 0.0, t_last = 0.0;
+            int64_t n = 0, n_last = 0;
             res = gen.generate(prompt, greq, [&](const int32_t t) {
+                const double now = omph::runtime::now_ms();
+                if (n++ == 0) t_first = t_last = now;
+                if (now - t_last >= 3000.0) {
+                    const GenerateResult & r = gen.running();
+                    std::fprintf(stderr, "  %lld tokens, %.1f t/s (last 3 s: %.1f t/s)", (long long) n,
+                                 1000.0 * (double) (n - 1) / (now - t_first),
+                                 1000.0 * (double) (n - n_last) / (now - t_last));
+                    if (r.drafted > 0) {
+                        std::fprintf(stderr, ", drafts accepted %.0f %%", 100.0 * (double) r.accepted / (double) r.drafted);
+                    }
+                    std::fprintf(stderr, "\n");
+                    t_last = now;
+                    n_last = n;
+                }
                 send(parser.push(tok.piece(t, false)));
                 return !gone && !parser.stopped();
             });
@@ -366,12 +383,15 @@ struct Server {
         static const char * kStop[] = {"length", "end of generation", "stop token", "stopped", "context full",
                                        "error"};
         std::fprintf(stderr,
-                     "%s %s: prompt %zu tokens (%lld cached%s) in %.0f ms; %zu tokens in %.0f ms (%.1f t/s); "
-                     "stop: %s%s\n",
+                     "%s %s: prompt %zu tokens (%lld cached%s) in %.0f ms (%.1f t/s); %zu tokens in %.0f ms "
+                     "(%.1f t/s, drafts accepted %lld / %lld); stop: %s%s\n",
                      req.method.c_str(), req.path.c_str(), (size_t) prompt_len, (long long) res.cached_tokens,
-                     res.restored ? ", checkpoint" : "",
-                     res.prefill_ms, res.tokens.size(), res.decode_ms,
+                     res.restored ? ", checkpoint" : "", res.prefill_ms,
+                     res.prefill_ms > 0 ? 1000.0 * (double) (res.prompt_tokens - res.cached_tokens) / res.prefill_ms
+                                        : 0.0,
+                     res.tokens.size(), res.decode_ms,
                      res.decode_ms > 0 ? 1000.0 * completion_tokens / res.decode_ms : 0.0,
+                     (long long) res.accepted, (long long) res.drafted,
                      parser.stopped() ? "stop string" : kStop[(int) res.stop], gone ? " (client gone)" : "");
     }
 };
