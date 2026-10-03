@@ -301,29 +301,26 @@ __global__ __launch_bounds__(kThreads) void gemm_q_kernel(
 }
 
 
-// IQ3_S tiles (#178): a workgroup = 8 waves x 16 rows (128 rows) x 256 tokens.
-// Each wave decodes its rows' weights straight into WMMA A operands, as the
-// tile GEMV does (gemv.hip), and reuses them for 16 token tiles; only x goes
-// through LDS, one 32-weight sub-block at a time, double-buffered. 52.7 vs
-// 50.3 TFLOPS for all IQ3_S tensors at 512 tokens (bench/gemv/iq3s_wil.hip).
+// WMMA tiles (#178, #219): a workgroup = 8 waves x 16 rows (128 rows) x 256
+// tokens. Each wave decodes its rows' weights straight into WMMA A operands,
+// with the tile GEMVs' decoders (quant_decode.hh), and reuses them for 16
+// token tiles; only x goes through LDS, one 32-weight sub-block at a time,
+// double-buffered. IQ3_S: 52.7 vs 50.3 TFLOPS of the row-wise decode at 512
+// tokens (bench/gemv/iq3s_wil.hip).
 constexpr int kGtTok = 256;   // tokens per workgroup
 constexpr int kGtXLd = 40;    // halves per staged token row (32 + 8 pad)
-__global__ __launch_bounds__(256) void gemm_iq3s_tiles_kernel(const uint8_t * __restrict__ wt,
-                                                             const _Float16 * __restrict__ x,
-                                                             float * __restrict__ y, const int n_out,
-                                                             const long long blocks, const int tokens,
-                                                             const long long ldy) {
-    __shared__ uint2 grid[512];
+template <class TD>
+__global__ __launch_bounds__(256) void gemm_tiles_kernel(const uint8_t * __restrict__ wt,
+                                                        const _Float16 * __restrict__ x, float * __restrict__ y,
+                                                        const long long blocks, const int tokens,
+                                                        const long long ldy) {
+    __shared__ __attribute__((aligned(16))) uint8_t tab[TD::kLds];
     __shared__ _Float16 xs[2][kGtTok * kGtXLd];
     const int tid = (int) threadIdx.x;
-    for (int i = tid; i < 512; i += blockDim.x) {
-        const uint32_t g = omph::quant::kIq3sGrid[i];
-        grid[i] = make_uint2(qd::grid_pair_to_half2<0x04010400u>(g), qd::grid_pair_to_half2<0x04030402u>(g));
-    }
+    TD::init(tab);
     const int lane = tid & 31;
     const int wv = tid >> 5;
     const int h = lane >> 4;
-    const int r = lane & 15;
     const long long tile = (long long) blockIdx.y * 8 + wv;
     const long long n0 = (long long) blockIdx.x * kGtTok;
     const long long k = blocks * 256;
@@ -346,49 +343,14 @@ __global__ __launch_bounds__(256) void gemm_iq3s_tiles_kernel(const uint8_t * __
     __syncthreads();
     int buf = 0;
     for (long long b = 0; b < blocks; ++b) {
-        const uint8_t * o = wt + (tile * blocks + b) * omph::format::kIq3sTileBytes;
-        const uint4 q0 = *reinterpret_cast<const uint4 *>(o + lane * 32);
-        const uint4 q1 = *reinterpret_cast<const uint4 *>(o + lane * 32 + 16);
-        const uint4 s4 = *reinterpret_cast<const uint4 *>(o + 1024 + lane * 16);
-        const uint32_t qhw = *reinterpret_cast<const uint32_t *>(o + 1536 + lane * 4);
-        const uint32_t scw = *reinterpret_cast<const uint32_t *>(o + 1664 + r * 4);
-        const float dv = qd::load_half(o + 1728 + r * 2);
-        const uint32_t qw[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
-        const uint32_t sw[4] = {s4.x, s4.y, s4.z, s4.w};
+        const typename TD::Blk kb = TD::load(wt + (tile * blocks + b) * TD::kBytes, lane);
 #pragma unroll 1
         for (int sb = 0; sb < 8; ++sb) {
             const long long s = b * 8 + sb;
             if (s + 1 < blocks * 8) {
                 stage(s + 1, xs[buf ^ 1]);  // the next sub-block's x
             }
-            const uint32_t q = qw[sb];
-            const uint32_t qhn = (qhw >> (4 * sb)) & 0xFu;
-            const uint32_t s16 = (sw[sb >> 1] >> (16 * (sb & 1))) & 0xFFFFu;
-            const uint32_t sg = h == 0 ? (((s16 & 0xFFu) << 8) | ((s16 >> 8) << 24))
-                                       : ((s16 & 0xFFu) | ((s16 >> 8) << 16));
-            const uint32_t sc = (scw >> (8 * (sb >> 1))) & 0xFFu;
-            const float dbr = dv * (1.0f + 2.0f * (float) ((sb & 1) ? (sc >> 4) : (sc & 0xF)));
-            const qd::half2_v d2 = {(_Float16) dbr, (_Float16) dbr};
-            half8 a[2];
-#pragma unroll
-            for (int gl = 0; gl < 2; ++gl) {
-                const int g = 2 * h + gl;
-                const uint32_t word = (q >> (16 * gl)) & 0xFFFFu;
-                const uint32_t i1 = (word & 0xFFu) | (((qhn >> (2 * gl)) & 1u) << 8);
-                const uint32_t i2 = (word >> 8) | (((qhn >> (2 * gl + 1)) & 1u) << 8);
-                const uint2 g1 = grid[i1];
-                const uint2 g2 = grid[i2];
-                constexpr uint32_t kSign2 = 0x80008000u;
-                const uint32_t wv4[4] = {((sg << (4 * g)) & kSign2) | g1.x, ((sg << (4 * g + 1)) & kSign2) | g1.y,
-                                         ((sg << (4 * g + 2)) & kSign2) | g2.x,
-                                         ((sg << (4 * g + 3)) & kSign2) | g2.y};
-#pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    const qd::half2_v p = __builtin_bit_cast(qd::half2_v, wv4[i]) * d2;
-                    a[gl][2 * i] = p[0];
-                    a[gl][2 * i + 1] = p[1];
-                }
-            }
+            const half8 a[2] = {TD::frag(tab, kb, sb, 0, h), TD::frag(tab, kb, sb, 1, h)};
             const _Float16 * cur = xs[buf];
 #pragma unroll
             for (int j = 0; j < 16; ++j) {
@@ -459,18 +421,26 @@ bool gemm_q(const uint32_t type, const void * packed, const void * x, float * y,
                 dec, xh, y, (int) n_out, (int) k, (int) tokens, (long long) ldy);
         }
     };
+    const auto tiles = [&](const auto td) {
+        const dim3 grid((unsigned) ((tokens + kGtTok - 1) / kGtTok), (unsigned) (n_out / 128));
+        gemm_tiles_kernel<decltype(td)><<<grid, 256, 0, stream>>>(base, static_cast<const _Float16 *>(x), y, blocks,
+                                                                (int) tokens, (long long) ldy);
+    };
     switch (type) {
         case 21:
             if (n_out % 128 == 0) {  // the tile GEMM (#178)
-                const dim3 grid((unsigned) ((tokens + kGtTok - 1) / kGtTok), (unsigned) (n_out / 128));
-                gemm_iq3s_tiles_kernel<<<grid, 256, 0, stream>>>(base, static_cast<const _Float16 *>(x), y,
-                                                                (int) n_out, blocks, (int) tokens,
-                                                                (long long) ldy);
+                tiles(qd::TileIq3s{});
             } else {
                 launch(qd::DecIq3sTile::make(base, n_blocks, blocks));
             }
             break;
-        case 18: launch(qd::DecIq3xxs::make(base, n_blocks, blocks)); break;
+        case 18:
+            if (n_out % 128 == 0) {  // #219
+                tiles(qd::TileIq3xxs{});
+            } else {
+                launch(qd::DecIq3xxsTile::make(base, n_blocks, blocks));
+            }
+            break;
         case 16: launch(qd::DecIq2xxs::make(base, n_blocks, blocks)); break;
         case 17: launch(qd::DecIq2xs::make(base, n_blocks, blocks)); break;
         case 22: launch(qd::DecIq2s::make(base, n_blocks, blocks)); break;

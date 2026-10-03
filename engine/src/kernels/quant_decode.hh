@@ -211,6 +211,29 @@ struct DecIq3xxs {  // GGUF type 18
     }
 };
 
+struct DecIq3xxsTile {  // GGUF type 18, .omph layout 2 (#219)
+    const uint8_t * base;
+    long long blocks;  // 256-weight blocks per row
+    using Raw = DecIq3xxs::Raw;
+    static DecIq3xxsTile make(const uint8_t * base, const int64_t /*n_blocks*/, const long long blocks) {
+        return {base, blocks};
+    }
+    __device__ Raw load(const long long row, const long long s) const {
+        const uint8_t * o = base + ((row >> 4) * blocks + (s >> 3)) * omph::format::kIq3xxsTileBytes;
+        const int r = (int) (row & 15);
+        const int sb = (int) (s & 7);
+        Raw w;
+        w.q.x = *reinterpret_cast<const uint32_t *>(o + r * 32 + sb * 4);         // half 0: index bytes 0-3
+        w.q.y = *reinterpret_cast<const uint32_t *>(o + (r + 16) * 32 + sb * 4);  // half 1: bytes 4-7
+        w.a = *reinterpret_cast<const uint32_t *>(o + 1024 + r * 32 + sb * 4);
+        w.dv = load_half(o + 1536 + r * 2);
+        return w;
+    }
+    __device__ void decode(const Raw & r, const long long s, float (&v)[32]) const {
+        DecIq3xxs{}.decode(r, s, v);
+    }
+};
+
 struct DecIq2xxs {  // GGUF type 16
     const uint8_t * qs;
     const uint8_t * d;
@@ -583,5 +606,124 @@ __device__ inline void pack32(const float (&v)[32], uint4 (&o)[4]) {
         o[i] = make_uint4(w[0], w[1], w[2], w[3]);
     }
 }
+
+// --- WMMA tile decoders (#178, #219) ----------------------------------------
+//
+// One per tile layout (format/repack.hh), shared by the tile GEMVs (gemv.hip)
+// and the tile GEMM (gemm.hip). A wave's lane l (row l % 16, half h = l / 16)
+// loads its words of a 256-weight block (load), then builds its WMMA A operand
+// for sub-block sb and group half gl: weights 16 h + 8 gl .. + 7 as f16 (the
+// sub-block scale times the grid value, in half2 arithmetic; frag); the
+// activations take the same k order. init fills the kLds bytes of LDS the
+// decode reads (the grid as half2 pairs or words).
+typedef _Float16 tile_h8 __attribute__((ext_vector_type(8)));
+
+struct TileIq3s {  // GGUF type 21
+    static constexpr long long kBytes = omph::format::kIq3sTileBytes;
+    static constexpr int kLds = 4096;
+    __device__ static void init(uint8_t * lds) {
+        uint2 * grid = reinterpret_cast<uint2 *>(lds);
+        for (int i = (int) threadIdx.x; i < 512; i += blockDim.x) {
+            const uint32_t g = omph::quant::kIq3sGrid[i];
+            grid[i] = make_uint2(grid_pair_to_half2<0x04010400u>(g), grid_pair_to_half2<0x04030402u>(g));
+        }
+    }
+    struct Blk {
+        uint4 q0, q1, s4;
+        uint32_t qhw, scw;
+        float dv;
+    };
+    __device__ static Blk load(const uint8_t * o, const int lane) {
+        const int r = lane & 15;
+        Blk k;
+        k.q0 = *reinterpret_cast<const uint4 *>(o + lane * 32);
+        k.q1 = *reinterpret_cast<const uint4 *>(o + lane * 32 + 16);
+        k.s4 = *reinterpret_cast<const uint4 *>(o + 1024 + lane * 16);
+        k.qhw = *reinterpret_cast<const uint32_t *>(o + 1536 + lane * 4);
+        k.scw = *reinterpret_cast<const uint32_t *>(o + 1664 + r * 4);
+        k.dv = __half2float(*reinterpret_cast<const __half *>(o + 1728 + r * 2));
+        return k;
+    }
+    __device__ static tile_h8 frag(const uint8_t * lds, const Blk & k, const int sb, const int gl, const int h) {
+        const uint2 * grid = reinterpret_cast<const uint2 *>(lds);
+        const uint32_t qw[8] = {k.q0.x, k.q0.y, k.q0.z, k.q0.w, k.q1.x, k.q1.y, k.q1.z, k.q1.w};
+        const uint32_t sw[4] = {k.s4.x, k.s4.y, k.s4.z, k.s4.w};
+        const uint32_t q = qw[sb];
+        const uint32_t qhn = (k.qhw >> (4 * sb)) & 0xFu;
+        const uint32_t s16 = (sw[sb >> 1] >> (16 * (sb & 1))) & 0xFFFFu;
+        // the pair-ordered sign word with this half's bytes back in place
+        const uint32_t sg = h == 0 ? (((s16 & 0xFFu) << 8) | ((s16 >> 8) << 24)) : ((s16 & 0xFFu) | ((s16 >> 8) << 16));
+        const uint32_t sc = (k.scw >> (8 * (sb >> 1))) & 0xFFu;
+        const float dbr = k.dv * (1.0f + 2.0f * (float) ((sb & 1) ? (sc >> 4) : (sc & 0xF)));
+        const half2_v d2 = {(_Float16) dbr, (_Float16) dbr};
+        const int g = 2 * h + gl;  // the 8-weight group of the sub-block
+        const uint32_t word = (q >> (16 * gl)) & 0xFFFFu;
+        const uint32_t i1 = (word & 0xFFu) | (((qhn >> (2 * gl)) & 1u) << 8);
+        const uint32_t i2 = (word >> 8) | (((qhn >> (2 * gl + 1)) & 1u) << 8);
+        const uint2 g1 = grid[i1];
+        const uint2 g2 = grid[i2];
+        constexpr uint32_t kSign2 = 0x80008000u;
+        const uint32_t wv4[4] = {((sg << (4 * g)) & kSign2) | g1.x, ((sg << (4 * g + 1)) & kSign2) | g1.y,
+                                 ((sg << (4 * g + 2)) & kSign2) | g2.x, ((sg << (4 * g + 3)) & kSign2) | g2.y};
+        tile_h8 a;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const half2_v p = __builtin_bit_cast(half2_v, wv4[i]) * d2;
+            a[2 * i] = p[0];
+            a[2 * i + 1] = p[1];
+        }
+        return a;
+    }
+};
+
+struct TileIq3xxs {  // GGUF type 18 (#219)
+    static constexpr long long kBytes = omph::format::kIq3xxsTileBytes;
+    static constexpr int kLds = 1024;
+    __device__ static void init(uint8_t * lds) {
+        uint32_t * grid = reinterpret_cast<uint32_t *>(lds);
+        for (int i = (int) threadIdx.x; i < 256; i += blockDim.x) {
+            grid[i] = omph::quant::kIq3xxsGrid[i];
+        }
+    }
+    struct Blk {
+        uint4 q0, q1, a0, a1;
+        float dv;
+    };
+    __device__ static Blk load(const uint8_t * o, const int lane) {
+        const int r = lane & 15;
+        Blk k;
+        k.q0 = *reinterpret_cast<const uint4 *>(o + lane * 32);
+        k.q1 = *reinterpret_cast<const uint4 *>(o + lane * 32 + 16);
+        k.a0 = *reinterpret_cast<const uint4 *>(o + 1024 + r * 32);
+        k.a1 = *reinterpret_cast<const uint4 *>(o + 1024 + r * 32 + 16);
+        k.dv = __half2float(*reinterpret_cast<const __half *>(o + 1536 + r * 2));
+        return k;
+    }
+    __device__ static tile_h8 frag(const uint8_t * lds, const Blk & k, const int sb, const int gl, const int h) {
+        const uint32_t * grid = reinterpret_cast<const uint32_t *>(lds);
+        const uint32_t qw[8] = {k.q0.x, k.q0.y, k.q0.z, k.q0.w, k.q1.x, k.q1.y, k.q1.z, k.q1.w};
+        const uint32_t aw[8] = {k.a0.x, k.a0.y, k.a0.z, k.a0.w, k.a1.x, k.a1.y, k.a1.z, k.a1.w};
+        const uint32_t a = aw[sb];
+        const float db = (k.dv * (0.5f + (float) (a >> 28))) * 0.5f;
+        const half2_v d2 = {(_Float16) db, (_Float16) db};
+        const uint32_t word = (qw[sb] >> (16 * gl)) & 0xFFFFu;  // index bytes 4 h + 2 gl, + 1
+        const uint32_t b1 = grid[word & 0xFFu];
+        const uint32_t b2 = grid[word >> 8];
+        const uint32_t sgn = iq3xxs_group_signs(a, 2 * h + gl);
+        constexpr uint32_t kSign2 = 0x80008000u;
+        const uint32_t wv4[4] = {(sgn & kSign2) | grid_pair_to_half2<0x04010400u>(b1),
+                                 ((sgn << 1) & kSign2) | grid_pair_to_half2<0x04030402u>(b1),
+                                 ((sgn << 2) & kSign2) | grid_pair_to_half2<0x04010400u>(b2),
+                                 ((sgn << 3) & kSign2) | grid_pair_to_half2<0x04030402u>(b2)};
+        tile_h8 v;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const half2_v p = __builtin_bit_cast(half2_v, wv4[i]) * d2;
+            v[2 * i] = p[0];
+            v[2 * i + 1] = p[1];
+        }
+        return v;
+    }
+};
 
 } // namespace omph::kernels::qd
