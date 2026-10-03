@@ -2,18 +2,19 @@
 
 The prompt is rendered once with the GGUF's chat template by omph-tokenize
 (thinking on, reasoning effort xhigh: the template's default) and sent as the
-same raw prompt to either engine's completion endpoint, in four configurations
-per engine: temperature 0 and 1, each without and with MTP speculative
-decoding. --kv picks the KV cache: k8q4 (the default: omphalos' own mix,
-llama.cpp q8_0 / q4_0) or k4q4 (omphalos OMPH_KV_K4=1, llama.cpp q4_0 / q4_0);
-k4q4 runs are tagged so. The generation runs until the model stops (context 64K, no thinking
+same raw prompt to either engine's completion endpoint: temperature 0 and 1,
+each in the decoding modes of --spec (default plain,mtp: without and with MTP
+speculative decoding; dflash: the DFlash2 drafter of --drafter, #245). --kv
+picks the KV cache: k8q4 (the default: omphalos' own mix, llama.cpp q8_0 /
+q4_0) or k4q4 (omphalos OMPH_KV_K4=1, llama.cpp q4_0 / q4_0); k4q4 runs are
+tagged so. The generation runs until the model stops (context 64K, no thinking
 budget). Temperature 1 samples with Qwen's recommended top_k 20, top_p 0.95,
 min_p 0 and a fixed seed on both engines; temperature 0 is greedy.
 
     uv run python pelican.py --llama-server <llama.cpp>/build-hip/bin/llama-server \\
         --out ../bench/results/pelican-229
 
-Per run: <engine>-<mtp|plain>[-k4q4]-t<T>.svg (the answer's SVG), .png (its first
+Per run: <engine>-<plain|mtp|dflash>[-k4q4]-t<T>.svg (the answer's SVG), .png (its first
 frame, rsvg-convert), .txt (thinking and answer) and .json (tokens, times,
 speeds, peak VRAM); README.md summarizes them. Peak VRAM is the GPU's
 mem_info_vram_used (sysfs) sampled every 0.2 s during the request, with the
@@ -112,31 +113,33 @@ def extract_svg(answer: str) -> str:
     return m.group(0) if m else ""
 
 
-def config_name(engine: str, mtp: bool, kv: str) -> str:
-    return f"{engine}-{'mtp' if mtp else 'plain'}" + ("-k4q4" if kv == "k4q4" else "")
+def config_name(engine: str, spec: str, kv: str) -> str:
+    return f"{engine}-{spec}" + ("-k4q4" if kv == "k4q4" else "")
 
 
-def server_cmd(engine: str, args, port: int, mtp: bool) -> list[str]:
+def server_cmd(engine: str, args, port: int, spec: str) -> list[str]:
     if engine == "omphalos":
         cmd = [f"{args.omph}/omph-server", omph_file(args.model), "--port", str(port), "--ctx", str(args.ctx),
                "--cache-ram", "0"]  # no prompt checkpoints: every run prefills
-        return cmd + ([] if mtp else ["--no-mtp"])
+        return cmd + {"plain": ["--no-mtp"], "mtp": [], "dflash": ["--dflash", omph_file(args.drafter)]}[spec]
     cmd = [args.llama_server, "-m", args.model, "--port", str(port), "-c", str(args.ctx), "-ngl", "999", "-fa",
            "on", "-ctk", "q4_0" if args.kv == "k4q4" else "q8_0", "-ctv", "q4_0", "-np", "1", "--no-webui"]
-    if mtp:  # the fork's MTP flags (bench/m0_mtp_ab.sh), 3 drafts as omphalos
+    if spec == "dflash":  # llama.cpp's DFlash2 (PR #27342), 7 drafts as omphalos
+        cmd += ["-md", args.drafter, "--spec-type", "draft-dflash", "--spec-draft-n-max", "7"]
+    if spec == "mtp":  # the fork's MTP flags (bench/m0_mtp_ab.sh), 3 drafts as omphalos
         cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", "3", "--spec-draft-p-min", "0.1",
                 "--cache-type-k-draft", "q4_0", "--cache-type-v-draft", "q4_0"]
     return cmd
 
 
-def run_config(engine: str, mtp: bool, args, prompt: str, prompt_n: int, out: Path, rows: list) -> None:
-    name = config_name(engine, mtp, args.kv)
+def run_config(engine: str, spec: str, args, prompt: str, prompt_n: int, out: Path, rows: list) -> None:
+    name = config_name(engine, spec, args.kv)
     env = {**os.environ, **({"OMPH_KV_K4": "1"} if engine == "omphalos" and args.kv == "k4q4" else {})}
     idle = wait_vram_idle()
     port = free_port()
     url = f"http://127.0.0.1:{port}"
     with open(out / f"{name}.server.log", "w") as log:
-        proc = subprocess.Popen(server_cmd(engine, args, port, mtp), stdout=log, stderr=subprocess.STDOUT,
+        proc = subprocess.Popen(server_cmd(engine, args, port, spec), stdout=log, stderr=subprocess.STDOUT,
                                 env=env)
         try:
             wait_health(url, proc)
@@ -158,7 +161,7 @@ def run_config(engine: str, mtp: bool, args, prompt: str, prompt_n: int, out: Pa
                                         str(out / f"{tag}.svg")], capture_output=True, text=True, check=False)
                     png = f"{tag}.png" if r.returncode == 0 else ""
                 row = {
-                    "run": tag, "engine": engine, "mtp": mtp, "kv": args.kv, "temperature": temp,
+                    "run": tag, "engine": engine, "mtp": spec == "mtp", "spec": spec, "kv": args.kv, "temperature": temp,
                     "tokens": tm["predicted_n"], "thinking_closed": THINK_END in text,
                     "total_s": round(wall, 1),
                     "prefill_tps": round(tm["prompt_n"] / tm["prompt_ms"] * 1000, 1) if tm["prompt_ms"] else 0,
@@ -177,17 +180,20 @@ def run_config(engine: str, mtp: bool, args, prompt: str, prompt_n: int, out: Pa
 
 
 def write_readme(out: Path, rows: list, args) -> None:
-    rows = sorted(rows, key=lambda r: (r["engine"], r["mtp"], r.get("kv", "k8q4"), r["temperature"]))
+    rows = sorted(rows, key=lambda r: (r["engine"], r.get("spec", "mtp" if r["mtp"] else "plain"), r.get("kv", "k8q4"),
+                                      r["temperature"]))
     lines = [
         "# Pelican riding a bicycle (#229)", "",
         f"Prompt: \"{PROMPT}\"", "",
         ("Rendered with the model's chat template (thinking on, reasoning effort xhigh, the template's default), "
          "the same raw prompt to omphalos (`omph-server`) and llama.cpp (`llama-server`, HIP), context 64K, no "
          "thinking budget. KV cache k8q4: omphalos' default (K4 on 8 layers, V4), llama.cpp `-ctk q8_0 -ctv "
-         "q4_0`; k4q4 runs: omphalos `OMPH_KV_K4=1`, llama.cpp `-ctk q4_0 -ctv q4_0`. Temperature 0 is greedy; temperature 1 samples with top_k 20, top_p 0.95, min_p 0, "
+         "q4_0`; k4q4 runs: omphalos `OMPH_KV_K4=1`, llama.cpp `-ctk q4_0 -ctv q4_0`. Temperature 0 is greedy; 0.6 and 1 sample with top_k 20, top_p 0.95, min_p 0, "
          f"seed {SEED}. MTP: omphalos' speculative decoding (3 drafts), llama.cpp's `--spec-type draft-mtp "
-         "--spec-draft-n-max 3`. The images are each SVG's first frame (`rsvg-convert`); open the `.svg` "
-         "files in a browser for the animation. `tools/pelican.py` produced everything here."), "",
+         "--spec-draft-n-max 3`. DFlash2: the z-lab Q4_K_M drafter, 7 drafts (omphalos `--dflash`, llama.cpp "
+         "`-md ... --spec-type draft-dflash --spec-draft-n-max 7`). The images are each SVG's first frame (`rsvg-convert`); open the `.svg` "
+         "files in a browser for the animation. `tools/pelican.py` produced everything here."
+         " omphalos runs from 2026-10-04 on (the `dflash` runs, `mtp-k4q4-t0.6`) also draft with n-grams of the context (on by default since #199, sampled runs included); the older ones predate them (#262 separates the two)."), "",
         "| run | KV | tokens (thinking + answer) | total time | prefill | decode | peak VRAM (idle) |",
         "|---|---|---|---|---|---|---|",
     ]
@@ -214,7 +220,9 @@ def main() -> None:
     ap.add_argument("--ctx", type=int, default=65536)
     ap.add_argument("--temps", default="0,1")
     ap.add_argument("--kv", default="k8q4", choices=["k8q4", "k4q4"])
-    ap.add_argument("--mtp", default="0,1", help="0: plain, 1: MTP speculative decoding")
+    ap.add_argument("--spec", default="plain,mtp", help="plain, mtp (MTP speculative decoding), dflash (#245)")
+    ap.add_argument("--drafter", default=str(ROOT / "models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"),
+                    help="the DFlash2 drafter GGUF (omphalos reads the .omph next to it)")
     ap.add_argument("--engines", default="omphalos,llama")
     ap.add_argument("--only", default="", help="only these runs, e.g. omphalos-mtp-t0,llama-plain-t1")
     args = ap.parse_args()
@@ -230,14 +238,14 @@ def main() -> None:
         rows.append(json.loads(f.read_text()))
     done = {r["run"] for r in rows}
     for engine in args.engines.split(","):
-        for mtp in [m == "1" for m in args.mtp.split(",")]:
-            name = config_name(engine, mtp, args.kv)
+        for spec in args.spec.split(","):
+            name = config_name(engine, spec, args.kv)
             todo = [t for t in args.temps
                     if f"{name}-t{t:g}" not in done and (not args.only or f"{name}-t{t:g}" in args.only)]
             if todo:
                 saved = args.temps
                 args.temps = todo
-                run_config(engine, mtp, args, prompt, prompt_n, out, rows)
+                run_config(engine, spec, args, prompt, prompt_n, out, rows)
                 args.temps = saved
                 write_readme(out, rows, args)
     write_readme(out, rows, args)

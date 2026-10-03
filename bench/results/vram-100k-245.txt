@@ -1,0 +1,13 @@
+# A 100k-token prompt with DFlash2 (#245), 2026-10-04, RX 9060 XT, 160 W cap, main 07a7654 (.omph format 6).
+# omph-server --ctx 131072 --cache-ram 0, OMPH_KV_K4=1 (K4/V4); prompt: 99639 tokens of wikitext-2 train text,
+# raw completion, greedy, 256 tokens. VRAM: the device's mem_info_vram_used (sysfs), sampled every 50 ms during
+# the request; the desktop alone used 210 MiB. One run per configuration.
+#
+#   config    VRAM after load   peak during the request   prefill (99639 tokens)   decode at ~100k
+#   DFlash2   15335 MiB         15347 MiB                 151.5 s  658 t/s         53.1 t/s
+#   MTP       14733 MiB         14746 MiB                 152.1 s  655 t/s         54.9 t/s
+#   plain     13923 MiB         13931 MiB                 151.0 s  660 t/s         19.9 t/s
+#
+# The three outputs are the same text. DFlash2 at 128K context fits the 16 GB card with ~1 GB to spare
+# (the desktop included); the drafter's KV ring is a 2048-token window, so its cost does not grow with the
+# context. On this prose continuation DFlash2 and MTP decode at the same speed (prose drafts are short).

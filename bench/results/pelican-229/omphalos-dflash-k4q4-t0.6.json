@@ -1,0 +1,18 @@
+{
+ "run": "omphalos-dflash-k4q4-t0.6",
+ "engine": "omphalos",
+ "mtp": false,
+ "spec": "dflash",
+ "kv": "k4q4",
+ "temperature": 0.6,
+ "tokens": 22305,
+ "thinking_closed": true,
+ "total_s": 357.0,
+ "prefill_tps": 279.2,
+ "decode_tps": 62.54,
+ "prompt_n": 76,
+ "peak_vram_mib": 14195,
+ "idle_vram_mib": 210,
+ "svg": true,
+ "png": "omphalos-dflash-k4q4-t0.6.png"
+}
