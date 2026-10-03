@@ -543,7 +543,7 @@ Codebook tables (**[verify]** sizes): IQ2_XS grid 512 × 8 B, IQ2_S grid 1024 ×
   - All 43 tensors: 1 token 3.92 -> 3.88 ms, 4 tokens 5.41 -> 4.00, 8 tokens 10.83 -> 4.14, 16 tokens 21.94 -> 4.05.
   - GEMM at 512 tokens 57.7 -> 56.6 ms over the four types. Decode KL vs the exact f32 KV: 0.000468 -> 0.000484.
   - End to end: plain step 42.34 -> 42.20 ms, MTP step -3.1 %, DFlash2 step -7.7 %; DFlash2 + n-gram 193.5 -> 262.1 t/s on edit-cc (`bench/results/tiles-iq2-253.txt`).
-- **Left row-wise:** IQ1_M (one 18.6 MiB tensor) and Q6_K (the MTP block, and the DFlash2 drafter's 148 MiB: ~0.8 ms per DFlash2 step).
+- **Q6_K (#258, format 6) is done:** the DFlash2 drafter's 8-token GEMVs 1.19 -> 0.50 ms, the MTP block's 1-token ones 1.20 -> 1.12 ms; DFlash2 step -1.4 % (`bench/results/tiles-q6k-258.txt`). Only IQ1_M (one 18.6 MiB tensor) stays row-wise.
 
 ---
 

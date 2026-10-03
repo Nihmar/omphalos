@@ -1,0 +1,20 @@
+# Q6_K in WMMA tiles (#258, .omph format 6), 2026-10-03, RX 9060 XT, 160 W cap.
+# base: main b807354 (format 5); tiles: perf/258-q6k-tiles.
+#
+# GEMVs over all Q6_K tensors of a file (omph-gemv-bench --all-of-type 14 [--nt N]), ms per pass:
+#   file                          tensors  MiB    1 token        4 tokens       8 tokens       16 tokens
+#                                                 base   tiles   base   tiles   base   tiles   base   tiles
+#   model (the MTP block)         8        332.2  1.200  1.119   1.375  1.133   2.586  1.145   5.032  1.178
+#   DFlash2 drafter (Q4_K_M)      4        147.7  0.573  0.496   0.639  0.498   1.189  0.502   2.326  0.518
+# Every row of a 2..16-token call equals the 1-token call bit for bit (--multi), both files.
+#
+# End to end, 5 runs alternating base / tiles, median (as bench/results/tiles-iq2-253.txt):
+#              base      tiles
+#   plain      41.43     41.45 ms per token
+#   MTP step   52.63     52.44 ms
+#   DFlash2    56.73     55.91 ms   (-1.4 %)
+#   prefill 4k 4179.6    4182.1 ms
+#
+# Checks: DFlash2, MTP k = 3 and oracle drafts of 8 / 15 tokens (--draft-corrupt 4) with OMPH_SPEC_CHECK=1,
+# K8 and OMPH_KV_K4=1: identical to plain greedy; check_gpu_mtp, check_gpu_decode --gemv,
+# check_gpu_run --layers, check_server and the CPU tests pass.
