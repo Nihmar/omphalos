@@ -3,6 +3,7 @@
 
 #include "format/repack.hh"
 #include "kernels/attn.hh"
+#include "kernels/dflash.hh"
 #include "kernels/dequant.hh"
 #include "kernels/elementwise.hh"
 #include "kernels/gdn.hh"
@@ -218,6 +219,15 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
                                            static_cast<float *>(x_), T * ne, nullptr)) {
             return fail("residual failed");
         }
+        // the drafter's features (#245): this layer's output, when it names it
+        for (size_t f = 0; f < dfl_capture_.size(); ++f) {
+            if (dfl_capture_[f] == il &&
+                !omph::kernels::dflash_capture(static_cast<const float *>(x_), T, ne, ne,
+                                               static_cast<__half *>(dfl_feat_), dfl_fc_.gemv->k,
+                                               (int64_t) f * ne, nullptr)) {
+                return fail("drafter feature capture failed");
+            }
+        }
         if (!trace_dir.empty()) {
             std::vector<float> host((size_t) T * ne);
             (void) hipMemcpy(host.data(), x_, host.size() * 4, hipMemcpyDeviceToHost);
@@ -247,6 +257,9 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
     }
     // A verification's tokens are filled at commit(), only those kept.
     if (mtp_ && !verifying_ && !mtp_fill(T)) {
+        return false;
+    }
+    if (!verifying_ && !dflash_inject(start_pos, T)) {
         return false;
     }
     report_phases();

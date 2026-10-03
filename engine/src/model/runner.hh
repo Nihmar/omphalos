@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -84,7 +85,7 @@ public:
     // `last_logits_only` keeps the lm_head to one row.
     explicit Runner(const std::string & path, const int64_t max_tokens, const bool use_gemv,
                     const omph::runtime::EnvOptions & env, const bool last_logits_only = false,
-                    const int64_t kv_capacity = 0, bool mtp = false);
+                    const int64_t kv_capacity = 0, bool mtp = false, const std::string & dflash = "");
 
     // Memory is owned by mem_; the stream and the events are released here.
     ~Runner();
@@ -153,6 +154,15 @@ public:
     // draft's logits row is appended to it (validation).
     bool mtp_draft(int32_t token, int64_t pos, int64_t k, std::vector<int32_t> & drafts,
                    std::vector<float> * logits = nullptr);
+
+    // --- DFlash2 drafting (#245), with a drafter .omph given at construction ---
+    // Its KV ring gets the kept tokens' target features like the MTP KV (after
+    // every forward the runner keeps, and at commit()). Drafts up to
+    // dflash_block() - 1 tokens after `token` at position `pos`: one pass of
+    // the block [token, MASK...] and the selector's greedy path.
+    bool dflash_on() const { return dfl_block_ > 0; }
+    int64_t dflash_block() const { return dfl_block_; }
+    bool dflash_draft(int32_t token, int64_t pos, int64_t k, std::vector<int32_t> & drafts);
 
 private:
     bool checkpoint_copy(void * host, bool save);
@@ -371,6 +381,58 @@ private:
     bool embed(const int32_t * toks, int64_t T, const ForwardInputs * in, float * dst);
     // The KV fill of the first `keep` tokens of the last forward.
     bool mtp_fill(int64_t keep);
+
+    // DFlash2 (#245; model/dflash.cc). The drafter's tensors sit in the weight
+    // image under "dflash." + their name.
+    struct DflashLayer {
+        const float * attn_norm = nullptr;
+        const float * ffn_norm = nullptr;
+        const float * q_norm = nullptr;
+        const float * k_norm = nullptr;
+        const float * attn_conv_base = nullptr;  // (n_embd, 2 taps, 2 sides)
+        const float * ffn_conv_base = nullptr;
+        Mat q, k, v, o, attn_conv, ffn_conv, gate, up, down;
+    };
+    void dflash_load();  // hyperparameters, tensors, buffers
+    // The target features of rows [0, T) of the last forward into the ring at pos0..
+    bool dflash_inject(int64_t pos0, int64_t T);
+    bool dflash_layer(const DflashLayer & L, int64_t l, int64_t B, int64_t pos);
+    std::unique_ptr<omph::gguf::File> dft_file_;
+    int64_t dfl_block_ = 0;             // 0: no drafter
+    std::vector<int64_t> dfl_capture_;  // target layers whose output is a feature, in feature order
+    std::vector<DflashLayer> dfl_;
+    Mat dfl_fc_, dfl_gate_w_;
+    const float * dfl_enc_norm_ = nullptr;
+    const float * dfl_out_norm_ = nullptr;
+    const void * dfl_sel_prev_ = nullptr;  // repacked Q4_K, one 256-weight row per token
+    const void * dfl_sel_next_ = nullptr;
+    int32_t dfl_mask_ = 0;
+    int64_t dfl_ne_ = 0;       // drafter width (5120)
+    int64_t dfl_ff_ = 0;       // its FFN (17408)
+    int64_t dfl_swa_ = 0;      // sliding window (2048) = ring slots
+    int64_t dfl_group_ = 0;    // conv group size (16)
+    float dfl_eps_ = 0.0f;
+    float dfl_theta_ = 0.0f;
+    void * dfl_feat_ = nullptr;    // (rows, n_capture * n_embd) f16: the last forward's features
+    void * dfl_ring_k_ = nullptr;  // layers x slots x (8 x 128) f16
+    void * dfl_ring_v_ = nullptr;
+    int32_t * dfl_tags_ = nullptr; // slots: the position a slot holds (-1: none)
+    void * dfl_bk_ = nullptr;      // the block's K / V (B, 8 x 128) f32
+    void * dfl_bv_ = nullptr;
+    void * dfl_dyn_ = nullptr;     // conv coefficients (B, 4 x groups) f32
+    void * dfl_sgate_ = nullptr;   // selector gate (B, 256) f32
+    void * dfl_attn_ws_ = nullptr; // attention partials
+    void * dfl_logits_ = nullptr;  // (B - 1, n_vocab) f32
+    int32_t * dfl_ids_ = nullptr;  // (B - 1, 16)
+    float * dfl_vals_ = nullptr;
+    float * dfl_scores_ = nullptr; // (B - 1, 16, 16)
+    // Adaptive draft length: per draft position n, an average of "the first n
+    // drafts were all kept" over the steps that drafted n; a step drafts the
+    // positions above OMPH_DFLASH_KEEP, all of them every 8th step (exploring).
+    std::vector<double> dfl_keep_;
+    int64_t dfl_drafted_ = 0;      // drafts of the last dflash_draft
+    int64_t dfl_steps_ = 0;
+    void dflash_observe(int64_t kept_drafts);
     std::vector<float *> state_cur_;  // recurrent layers: the state the next step reads
     std::vector<float *> state_alt_;  // speculation: the buffer a verification writes
     std::vector<int64_t> rec_index_;  // recurrent layer -> 0.. (-1 for attention)

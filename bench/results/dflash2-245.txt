@@ -1,0 +1,33 @@
+# DFlash2 drafting (#245), 2026-10-03, engine 1eed850 + feat/245-dflash2. RX 9060 XT, card overclocked by the
+# maintainer that morning. Drafter: z-lab/Qwen3.8-27B-DFlash2-GGUF Q4_K_M -> omph-convert (81 tensors, 1.06 GiB).
+#
+# Greedy, the #199 scenario prompts (bench/results/ngram-199/*.json), omph-server --ctx 32768 --cache-ram 0,
+# default KV; llama.cpp: the RX9060XT fork's llama-server -md DFlash2-Q4_K_M --spec-type draft-dflash
+# --spec-draft-n-max 7 -c 32768 -fa on -ctk q8_0 -ctv q4_0. tok/step = generated / verifications.
+#
+#   scenario   llama DFlash2         omphalos DFlash2      omphalos MTP (3 drafts)   DFlash2 / MTP
+#              tok/step  t/s         tok/step  t/s         tok/step  t/s
+#   quote      6.82      50.1        6.66      89.3        3.82      70.9            1.26x
+#   he-80      5.28      39.5        5.37      72.6        3.26      60.4            1.20x
+#   he-0       5.06      37.8        4.83      65.5        3.02      55.8            1.17x
+#   he-144     4.14      30.9        4.23      56.9        2.89      53.2            1.07x
+#   edit-cc    7.93      58.5        7.93     105.0        3.98      74.1            1.42x
+#   prose      2.62      19.6        2.60      37.8        2.18      39.8            0.95x
+# (omphalos t/s with OMPH_DFLASH_KEEP=0.12 and the flash-decoding drafter attention; tok/step without the
+#  adaptive length.) The same tokens per step as llama.cpp: the drafter reproduces its drafts.
+#
+# Adaptive draft length (OMPH_DFLASH_KEEP, t/s):  keep 0: prose 34.6, edit-cc 103.0 | 0.12: 37.3 / 101.8 |
+#   0.18: 37.9 / 99.5 | 0.25: 33.6 / 95.4. The selector's softmax (p_min 0.05-0.3) barely moves anything.
+#
+# One step, 7 drafts, 3k-token wikitext prompt (rocprofv3, 51 steps): 77.7 ms, of which the target's 8-token
+# verification ~62 ms (IQ3 tiles 21.5, IQ4_XS 15.7, small types ~12, Q4_K incl. drafter and heads 15.0) and the
+# drafter's attention 4.65 ms -> 1.8 ms after the flash-decoding rewrite (357 us per layer, one workgroup per
+# CU by LDS).
+#
+# VRAM, omph-server --ctx 131072, OMPH_KV_K4=1 (device total, desktop ~150 MiB included):
+#   MTP     14633 MiB after load
+#   DFlash2 15248 MiB after load, 15252 after a request (no MTP block; drafter 1.06 GiB + its KV ring 42 MB
+#           + features 26 MB)
+#
+# Checks: greedy with DFlash2 identical to plain greedy (K8 and K4, OMPH_SPEC_CHECK=1; a 3k prompt over WY
+# prefill chunks); check_server (MTP default) and the CPU tests pass.

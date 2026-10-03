@@ -40,6 +40,7 @@ add_library(omphalos SHARED
     src/model/layers.cc
     src/model/dispatch.cc
     src/model/mtp.cc
+    src/model/dflash.cc
     src/model/generator.cc
     src/kernels/probe.hip
     src/kernels/dequant.hip
@@ -48,6 +49,7 @@ add_library(omphalos SHARED
     src/kernels/gdn.hip
     src/kernels/gemv.hip
     src/kernels/gemm.hip
+    src/kernels/dflash.hip
 )
 target_include_directories(omphalos
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include

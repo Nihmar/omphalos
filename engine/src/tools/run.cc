@@ -79,6 +79,7 @@ int main(int argc, char ** argv) {
     int64_t draft_corrupt = 0;  // corrupt every N-th draft (0: never)
     bool mtp = false;           // --mtp: load the MTP block (#124)
     bool draft_mtp = false;     // --draft-mtp K: speculative decode with MTP drafts
+    std::string dflash;         // --dflash FILE: ... with DFlash2 drafts instead (#245)
     std::string mtp_out;        // --mtp-out: the first two drafts' logits (validation)
     // A flag's numeric value: a whole non-negative number or nothing.
     const auto count = [](const char * s, int64_t & out) {
@@ -115,6 +116,10 @@ int main(int argc, char ** argv) {
             if (!count(argv[++i], draft_k) || draft_k < 1) return usage();
             mtp = true;
             draft_mtp = true;
+        } else if (std::strcmp(argv[i], "--dflash") == 0 && has_value) {
+            dflash = argv[++i];
+            draft_mtp = true;
+            draft_k = 7;
         } else if (std::strcmp(argv[i], "--mtp-out") == 0 && has_value) {
             mtp_out = argv[++i];
             mtp = true;
@@ -178,12 +183,12 @@ int main(int argc, char ** argv) {
             return 2;
         }
         const omph::runtime::EnvOptions env = omph::runtime::EnvOptions::from_env();
-        if (mtp && !(use_gemv && generate > 0)) {
-            std::fprintf(stderr, "--mtp needs --gemv and --generate\n");
+        if ((mtp || !dflash.empty()) && !(use_gemv && generate > 0)) {
+            std::fprintf(stderr, "--mtp / --dflash need --gemv and --generate\n");
             return 2;
         }
         omph::model::Runner runner(model, act_chunk, use_gemv && generate > 0, env, last_logits,
-                                   total_len, mtp);
+                                   total_len, mtp, dflash);
         std::vector<int32_t> oracle;
         if (!oracle_path.empty()) {
             std::ifstream in(oracle_path);
@@ -327,7 +332,8 @@ int main(int argc, char ** argv) {
                     const double c0 = omph::runtime::now_ms();
                     if (draft_mtp) {
                         std::vector<int32_t> drafts;
-                        if (!runner.mtp_draft(next, pos, draft_k, drafts)) {
+                        if (!(dflash.empty() ? runner.mtp_draft(next, pos, draft_k, drafts)
+                                             : runner.dflash_draft(next, pos, draft_k, drafts))) {
                             return 1;
                         }
                         n_drafted += (int64_t) drafts.size();

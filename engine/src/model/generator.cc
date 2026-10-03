@@ -17,10 +17,16 @@ Generator::Generator(const Config & config, const omph::runtime::EnvOptions & en
     tokenizer_ = std::make_unique<omph::text::Tokenizer>(*file_);
     // The decode configuration: repacked weights for the GEMVs, one logits
     // row, the KV for the whole context.
+    if (!config_.dflash.empty()) {
+        config_.mtp = false;
+    }
     runner_ = std::make_unique<Runner>(config_.model, std::min(config_.chunk, config_.context),
                                        /*use_gemv=*/true, env_, /*last_logits_only=*/true,
-                                       config_.context, config_.mtp);
-    if (config_.mtp) {
+                                       config_.context, config_.mtp, config_.dflash);
+    if (runner_->dflash_on()) {
+        config_.draft_k = runner_->dflash_block() - 1;
+    }
+    if (config_.mtp || runner_->dflash_on()) {
         runner_->enable_speculation(config_.draft_k + 1);
     }
     for (const char * t : {"<|im_end|>", "<|endoftext|>"}) {
@@ -396,8 +402,8 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
         return res;
     }
     bool go = emit(next);
-    if (req.speculative && config_.mtp && !forcing) {
-        // Speculative decoding (#122, #124): draft k tokens with the MTP block,
+    if (req.speculative && (config_.mtp || runner_->dflash_on()) && !forcing) {
+        // Speculative decoding (#122, #124): draft k tokens with the MTP block (or DFlash2, #245),
         // verify [next, drafts] in one forward, keep the drafts the model
         // agrees with plus its own next token. Greedy: the same tokens as
         // plain greedy. Sampled (#197): speculative sampling (Leviathan et al.,
@@ -418,7 +424,8 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
             std::vector<int32_t> batch{next};
             if (k > 0) {
                 std::vector<int32_t> drafts;
-                if (!runner_->mtp_draft(next, pos, k, drafts)) {
+                if (!(runner_->dflash_on() ? runner_->dflash_draft(next, pos, k, drafts)
+                                           : runner_->mtp_draft(next, pos, k, drafts))) {
                     res.stop = GenerateResult::Stop::Error;
                     break;
                 }

@@ -26,10 +26,16 @@ namespace omph::model {
 
 Runner::Runner(const std::string & path, const int64_t max_tokens, const bool use_gemv,
                 const omph::runtime::EnvOptions & env, const bool last_logits_only,
-                const int64_t kv_capacity, const bool mtp)
+                const int64_t kv_capacity, const bool mtp, const std::string & dflash)
     : env_(env), file_(path), h_(read_hparams(file_)), use_gemv_(use_gemv), mtp_(mtp) {
     if (!file_.omph()) {
         throw std::runtime_error(path + " is not an .omph file: convert the GGUF with omph-convert (#178)");
+    }
+    if (!dflash.empty()) {  // the DFlash2 drafter (#245): its tensors join the weight image
+        dft_file_ = std::make_unique<omph::gguf::File>(dflash);
+        if (!dft_file_->omph()) {
+            throw std::runtime_error(dflash + " is not an .omph file: convert the drafter GGUF with omph-convert");
+        }
     }
     timer_stage_.enable(env_.phases);
     timer_gemm_.enable(env_.phases);
@@ -58,16 +64,29 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     // out of VRAM (#92).
     {
         struct Place {
+            const omph::gguf::File * f;
             const omph::gguf::TensorInfo * t;
+            std::string name;
             size_t off;
         };
         std::vector<Place> places;
         size_t total = 0;
+        std::vector<std::pair<const omph::gguf::File *, const omph::gguf::TensorInfo *>> all;
         for (const omph::gguf::TensorInfo & t : file_.tensors()) {
-            if (!in_stack(t.name)) {
+            all.emplace_back(&file_, &t);
+        }
+        if (dft_file_ != nullptr) {
+            for (const omph::gguf::TensorInfo & t : dft_file_->tensors()) {
+                all.emplace_back(dft_file_.get(), &t);
+            }
+        }
+        for (const auto & [f, tp] : all) {
+            const omph::gguf::TensorInfo & t = *tp;
+            const std::string name = f == &file_ ? t.name : "dflash." + t.name;
+            if (f == &file_ && !in_stack(t.name)) {
                 continue;
             }
-            if (t.name == "token_embd.weight") {
+            if (f == &file_ && t.name == "token_embd.weight") {
                 if (t.layout != omph::gguf::kLayoutGguf) {
                     throw std::runtime_error("token_embd.weight is not stored in the GGUF layout");
                 }
@@ -81,7 +100,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 const int64_t rows = t.ne.size() >= 2 ? (int64_t) t.ne[1] : 1;
                 if (t.layout != omph::format::engine_layout(t.type) ||
                     t.stored != (uint64_t) omph::format::engine_layout_bytes(t.type, rows, k)) {
-                    throw std::runtime_error(t.name + ": not in this engine's layout (reconvert with omph-convert)");
+                    throw std::runtime_error(name + ": not in this engine's layout (reconvert with omph-convert)");
                 }
                 GemvEntry e;
                 e.off = total;
@@ -89,23 +108,26 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 e.rows = (int64_t) t.ne[1];
                 e.k = (int64_t) t.ne[0];
                 e.type = t.type;
-                gems_[t.name] = e;
+                gems_[name] = e;
             }
-            places.push_back({&t, total});
+            places.push_back({f, &t, name, total});
             total += ((size_t) t.stored + 255) & ~(size_t) 255;
         }
         dev_weights_ = mem_.device(total, "cannot allocate the weight image");
         auto * base = static_cast<uint8_t *>(dev_weights_);
         for (const Place & p : places) {
-            if (hipMemcpy(base + p.off, file_.tensor_data(*p.t), (size_t) p.t->stored, hipMemcpyHostToDevice) !=
+            if (hipMemcpy(base + p.off, p.f->tensor_data(*p.t), (size_t) p.t->stored, hipMemcpyHostToDevice) !=
                 hipSuccess) {
-                throw std::runtime_error("cannot upload " + p.t->name);
+                throw std::runtime_error("cannot upload " + p.name);
             }
-            off_[p.t->name] = p.off;
+            off_[p.name] = p.off;
         }
     }
 
     resolve_layers();
+    if (dft_file_ != nullptr) {
+        dflash_load();
+    }
 
     // The f16 staging scratch holds the slice of rows of one weight that a
     // GEMM is about to read (it is reset for every slice: the dequant and the
@@ -480,6 +502,9 @@ void Runner::watch_step_end() {
 }
 
 bool Runner::reset_sequence() {
+    if (dfl_tags_ != nullptr && hipMemsetAsync(dfl_tags_, 0xFF, (size_t) dfl_swa_ * 4, nullptr) != hipSuccess) {
+        return fail("reset: drafter ring failed");
+    }
     const int64_t ssm_q = h_.ssm_n_kh * h_.ssm_s;
     const int64_t ssm_channels = 2 * ssm_q + h_.ssm_inner;
     const size_t n_state = (size_t) h_.ssm_n_vh * h_.ssm_s * h_.ssm_s;
@@ -733,7 +758,8 @@ void * Runner::stage_w(const std::string & name, const int64_t row0, int64_t nro
 Runner::Mat Runner::resolve(const std::string & name) const {
     Mat m;
     m.name = name;
-    m.t = file_.tensor(name);
+    const bool dft = name.rfind("dflash.", 0) == 0;
+    m.t = dft ? (dft_file_ != nullptr ? dft_file_->tensor(name.substr(7)) : nullptr) : file_.tensor(name);
     const auto off = off_.find(name);
     if (m.t != nullptr && off != off_.end()) {
         m.dev = static_cast<const uint8_t *>(dev_weights_) + off->second;
@@ -960,7 +986,8 @@ bool Runner::commit(const int64_t accepted) {
                 std::swap(state_cur_[(size_t) il], state_alt_[(size_t) il]);
             }
         }
-        return !mtp_ || mtp_fill(accepted);
+        dflash_observe(accepted - 1);
+        return (!mtp_ || mtp_fill(accepted)) && dflash_inject(verify_pos0_, accepted);
     }
     const int64_t n_kh = h_.ssm_n_kh;
     const int64_t n_vh = h_.ssm_n_vh;
@@ -1019,7 +1046,8 @@ bool Runner::commit(const int64_t accepted) {
             }
         }
     }
-    return !mtp_ || mtp_fill(accepted);
+    dflash_observe(accepted - 1);
+    return (!mtp_ || mtp_fill(accepted)) && dflash_inject(verify_pos0_, accepted);
 }
 
 // OMPH_SPEC_CHECK: the replay of all T recorded tokens onto the state the

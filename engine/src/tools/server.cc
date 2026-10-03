@@ -6,6 +6,7 @@
 //   --ctx N           KV capacity (default 8192)
 //   --chunk N         prefill chunk (default 512)
 //   --no-mtp          do not load the MTP block (no speculative decoding, -352 MiB of VRAM)
+//   --dflash FILE     draft with a DFlash2 drafter .omph instead of the MTP block (#245)
 //   --cache-ram MIB   pinned host RAM for sequence checkpoints (default 2048, 0: none): a
 //                     retried answer or a history without the reasoning resumes from one
 //   --mmproj FILE     the vision encoder: images as base64 data: URLs in image_url
@@ -428,6 +429,7 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--ctx")) cfg.context = std::atoll(val());
         else if (!std::strcmp(argv[i], "--chunk")) cfg.chunk = std::atoll(val());
         else if (!std::strcmp(argv[i], "--no-mtp")) cfg.mtp = false;
+        else if (!std::strcmp(argv[i], "--dflash")) cfg.dflash = val();
         else if (!std::strcmp(argv[i], "--cache-ram")) cfg.cache_mib = std::atoll(val());
         else if (!std::strcmp(argv[i], "--alias")) alias = val();
         else if (!std::strcmp(argv[i], "--mmproj")) mmproj = val();
