@@ -108,4 +108,18 @@ bool gdn_replay(float * state, const float * replay, int64_t tokens, int64_t hea
 bool gdn_conv_select(const float * conv_hist, float * conv_dst, int64_t accepted,
                      int64_t conv_k, int64_t channels, hipStream_t stream);
 
+// Every recurrent layer's rollback after a partly rejected verification in
+// one launch (#255): per layer, gdn_replay of `accepted` records on its state
+// and gdn_conv_select of its conv tail, the same operations (bit-identical).
+constexpr int kGdnRollbackMax = 64;
+struct GdnRollback {
+    float * state[kGdnRollbackMax];
+    const float * replay[kGdnRollbackMax];
+    const float * conv_hist[kGdnRollbackMax];
+    float * conv_dst[kGdnRollbackMax];
+    int layers = 0;
+};
+bool gdn_rollback(const GdnRollback & r, int64_t accepted, int64_t heads, int64_t n_kh, int64_t conv_k,
+                  int64_t channels, hipStream_t stream);
+
 } // namespace omph::kernels

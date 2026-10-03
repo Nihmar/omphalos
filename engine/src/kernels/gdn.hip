@@ -997,12 +997,9 @@ __global__ __launch_bounds__(256) void delta_wy_b_kernel(const float * __restric
 
 // The rank-1 updates of recorded tokens, on the state of the step before them:
 // gdn_step's thread layout and float operations (decay, then fma with k and d).
-__global__ __launch_bounds__(256) void gdn_replay_kernel(float * __restrict__ state,
-                                                         const float * __restrict__ replay,
-                                                         const long long tokens,
-                                                         const long long n_kh) {
-    const long long h = blockIdx.x;
-    const long long heads = gridDim.x;
+__device__ __forceinline__ void replay_body(float * __restrict__ state, const float * __restrict__ replay,
+                                            const long long tokens, const long long n_kh, const long long h,
+                                            const long long heads) {
     const int tid = (int) threadIdx.x;
     const int col = tid & (kDeltaS - 1);
     const int lo = (tid >> 7) * kDeltaRows;
@@ -1033,6 +1030,29 @@ __global__ __launch_bounds__(256) void gdn_replay_kernel(float * __restrict__ st
         S[(lo + r) * kDeltaS + col] = st[r];
     }
 }
+
+__global__ __launch_bounds__(256) void gdn_replay_kernel(float * __restrict__ state,
+                                                         const float * __restrict__ replay,
+                                                         const long long tokens,
+                                                         const long long n_kh) {
+    replay_body(state, replay, tokens, n_kh, blockIdx.x, gridDim.x);
+}
+
+// blockIdx.y = the layer; x < heads: its replay, the rest: its conv tail
+__global__ __launch_bounds__(256) void gdn_rollback_kernel(const GdnRollback r, const long long tokens,
+                                                           const long long heads, const long long n_kh,
+                                                           const long long rows, const long long channels) {
+    const int l = (int) blockIdx.y;
+    if ((long long) blockIdx.x < heads) {
+        replay_body(r.state[l], r.replay[l], tokens, n_kh, blockIdx.x, heads);
+        return;
+    }
+    const long long i = ((long long) blockIdx.x - heads) * blockDim.x + threadIdx.x;
+    if (i < rows * channels) {
+        r.conv_dst[l][i] = r.conv_hist[l][tokens * channels + i];
+    }
+}
+
 
 __global__ void gdn_conv_select_kernel(const float * __restrict__ hist, float * __restrict__ dst,
                                        const long long accepted, const long long rows,
@@ -1067,6 +1087,19 @@ bool gdn_conv_select(const float * conv_hist, float * conv_dst, const int64_t ac
     const long long n = (long long) (conv_k - 1) * channels;
     gdn_conv_select_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(
         conv_hist, conv_dst, (long long) accepted, (long long) (conv_k - 1), (long long) channels);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool gdn_rollback(const GdnRollback & r, const int64_t accepted, const int64_t heads, const int64_t n_kh,
+                  const int64_t conv_k, const int64_t channels, hipStream_t stream) {
+    if (r.layers <= 0 || r.layers > kGdnRollbackMax || accepted < 0 || heads <= 0 || n_kh <= 0 || conv_k <= 1 ||
+        channels <= 0) {
+        return false;
+    }
+    const long long n = (long long) (conv_k - 1) * channels;
+    const dim3 grid((unsigned) (heads + (n + 255) / 256), (unsigned) r.layers);
+    gdn_rollback_kernel<<<grid, 256, 0, stream>>>(r, (long long) accepted, (long long) heads, (long long) n_kh,
+                                                  (long long) (conv_k - 1), (long long) channels);
     return hipGetLastError() == hipSuccess;
 }
 
