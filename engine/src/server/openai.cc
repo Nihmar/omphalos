@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <random>
 #include <stdexcept>
 
@@ -133,6 +134,19 @@ void parse_sampling(const Json & body, const Defaults & d, Job & job) {
     job.frequency_penalty = (float) number(body, "frequency_penalty", -2.0, 2.0, d.frequency_penalty);
     job.presence_penalty = (float) number(body, "presence_penalty", -2.0, 2.0, d.presence_penalty);
     job.penalty_last_n = (int) number(body, "repeat_last_n", 0.0, 1e9, d.penalty_last_n);
+    // llama.cpp's default window is 64 tokens, which #298's measurements show
+    // barely bites (1024 does): a repeat penalty with a short window looks like
+    // it does nothing. Say it once per process (#315).
+    if (job.repeat_penalty != 1.0f && job.penalty_last_n < 256) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr,
+                         "omphalos: repeat_penalty %.2f with repeat_last_n %d: a window that short "
+                         "barely bites, 1024 is what #298 measured\n",
+                         (double) job.repeat_penalty, job.penalty_last_n);
+        }
+    }
     if (const Json * bias = body.find("logit_bias"); bias != nullptr && !bias->is_null() &&
         !(bias->is_object() && bias->size() == 0)) {
         bad("logit_bias is not implemented: omit it, or send {}", "logit_bias");

@@ -61,6 +61,10 @@ struct AttnPrep {
     __half * v16 = nullptr;
     long long ring = 0;              // its slots (window + kKvRingExtra)
     bool k_q4 = false;               // quantize K as Q4 into k_q8 (V's format, #81)
+    // The MTP block's KV fill (#124) writes K and V and nothing reads its q
+    // heads: skip their blocks (a third of the grid) instead of normalizing and
+    // rotating whatever fused_ holds (#315).
+    bool skip_q = false;
 };
 bool attn_prep(const AttnPrep & a, hipStream_t stream);
 

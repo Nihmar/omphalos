@@ -94,7 +94,7 @@ speculation statistics on stderr (`--ids` prints the token ids instead).
 | `--ids` | off | print the generated token ids instead of text |
 | `--max N` | `512` | tokens to generate |
 | `--temp T` | `0` | sampling temperature; `0` is greedy |
-| `--top-k K`, `--top-p P`, `--min-p M` | `0` / `1` / `0` | the truncations, in that order |
+| `--top-k K`, `--top-p P`, `--min-p M` | `0` / `1` / `0` | the truncations, applied top-k, then min-p, then top-p (top-p over the mass min-p kept) |
 | `--seed S` | random | the sampling seed |
 | `--repeat-penalty P` | `1.0` | llama.cpp's penalty, `1` is off |
 | `--repeat-last-n N` | `64` | the window the three penalties look at, `0` is off |

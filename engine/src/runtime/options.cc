@@ -1,5 +1,6 @@
 #include "runtime/options.hh"
 
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 
@@ -74,6 +75,7 @@ EnvOptions EnvOptions::from_env() {
     o.trace_f16 = flag("OMPH_TRACE_F16");
     o.trace_stage = flag("OMPH_TRACE_STAGE");
     o.spec_check = flag("OMPH_SPEC_CHECK");
+    o.check_finite = flag("OMPH_CHECK_FINITE");
     if (const char * b = std::getenv("OMPH_TEST_BAD_SIDE")) {
         o.test_bad_side = std::atoi(b);
     }
@@ -94,6 +96,30 @@ EnvOptions EnvOptions::from_env() {
     }
     if (const char * q = std::getenv("OMPH_TEST_Q8ACT")) {
         o.test_q8act = std::atoi(q);
+    }
+    // Ablations give wrong results with valid timings (the header says so): a
+    // stale one in the environment must not look like an engine bug. Name the
+    // ones that are on, once, where they are parsed (#315).
+    std::string off;
+    const struct {
+        const char * name;
+        bool on;
+    } ablations[] = {
+        {"OMPH_SKIP_ATTN", o.skip_attn},        {"OMPH_SKIP_FFN", o.skip_ffn},
+        {"OMPH_SKIP_BLOCKS", o.skip_blocks},    {"OMPH_SKIP_GEMV", o.skip_gemv},
+        {"OMPH_SKIP_GEMV_TYPE", o.skip_gemv_type >= 0},
+        {"OMPH_SKIP_STAGE", o.skip_stage},      {"OMPH_TEST_BAD_SIDE", o.test_bad_side > 0},
+        {"OMPH_TEST_MROPE", o.test_mrope != 0}, {"OMPH_TEST_Q8ACT", o.test_q8act > 0},
+    };
+    for (const auto & a : ablations) {
+        if (a.on) {
+            off += off.empty() ? "" : " ";
+            off += a.name;
+        }
+    }
+    if (!off.empty()) {
+        std::fprintf(stderr, "omphalos: ablation active: %s -- results are not the engine's\n",
+                     off.c_str());
     }
     return o;
 }

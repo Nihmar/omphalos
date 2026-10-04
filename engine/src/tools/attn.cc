@@ -8,7 +8,9 @@
 //         q4q4 = OMPH_KV_K4); --window: the FP16 window of the quantized cache
 //         (128 as in omph-run; 0 makes every key go through the quantized
 //         blocks); --chunk: tokens per call (1 = the decode path, with the
-//         split-K attention), all of them by default.
+//         split-K attention), all of them by default; --key-chunk N: keys per
+//         split, fixed (the runner's, #136/#161); -1 asks for the runner's own
+//         value for this many tokens, 0 (default) the kernel's own split.
 //   writes <out-prefix>.out.f32 and, with --trace, the intermediate tensors.
 #include "format/gguf.hh"
 #include "kernels/attn.hh"
@@ -77,7 +79,7 @@ int main(int argc, char ** argv) {
     if (argc < 6) {
         std::fprintf(stderr,
                      "usage: %s <model.gguf> <layer> <in.f32> <out-prefix> <tokens> [--trace] "
-                     "[--kv f32|q8q4|q4q4] [--window N] [--chunk N]\n",
+                     "[--kv f32|q8q4|q4q4] [--window N] [--chunk N] [--key-chunk N|-1]\n",
                      argv[0]);
         return 2;
     }
@@ -90,6 +92,7 @@ int main(int argc, char ** argv) {
     std::string kv_mode = "f32";
     int64_t window = 128;
     int64_t chunk = 0;
+    int64_t key_chunk = 0;  // 0: the kernel's own split; < 0: the engine's (#136)
     for (int i = 6; i < argc; ++i) {
         if (std::strcmp(argv[i], "--trace") == 0) {
             trace = true;
@@ -99,6 +102,8 @@ int main(int argc, char ** argv) {
             window = std::atoll(argv[++i]);
         } else if (std::strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
             chunk = std::atoll(argv[++i]);
+        } else if (std::strcmp(argv[i], "--key-chunk") == 0 && i + 1 < argc) {
+            key_chunk = std::atoll(argv[++i]);
         } else {
             std::fprintf(stderr, "unknown option: %s\n", argv[i]);
             return 2;
@@ -113,6 +118,11 @@ int main(int argc, char ** argv) {
     if (chunk == 0 || chunk > tokens) {
         chunk = tokens;
     }
+    // What the runner gives every attention of the run: fixed key chunks make a
+    // verification's rows the decode step's bit for bit (#161). Negative: the
+    // engine's value; 0: the kernel's own split.
+    const int64_t attn_key_chunk =
+        key_chunk < 0 ? omph::kernels::attention_key_chunk(tokens) : key_chunk;
     const bool quant = kv_mode != "f32";
     const bool k_q4 = kv_mode == "q4q4";
 
@@ -307,7 +317,7 @@ int main(int argc, char ** argv) {
                     static_cast<const float *>(q) + t0 * att, kv,
                     static_cast<const float *>(gate) + t0 * att, nullptr, n, t0 + n, n_head,
                     n_head_kv, head_dim, scale, quant, work, work_bytes, nullptr,
-                    static_cast<uint8_t *>(attn16) + t0 * att * 2)) {
+                    static_cast<uint8_t *>(attn16) + t0 * att * 2, true, attn_key_chunk)) {
                 return fail("attention failed");
             }
         }

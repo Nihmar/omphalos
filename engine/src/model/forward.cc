@@ -249,6 +249,9 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
         if (!lm_head(T, logits, greedy)) {
             return false;
         }
+        if (env_.check_finite && !check_logits_finite(T, logits)) {
+            return false;
+        }
     } else {
         logits.clear();
         if (hipDeviceSynchronize() != hipSuccess) {
@@ -275,6 +278,16 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
 // once the results are on the host.
 bool Runner::lm_head(const int64_t T, std::vector<float> & logits, int32_t * greedy) {
     const int64_t ne = h_.n_embd;
+    // The fast paths (the device argmax of a decode step, four verification rows
+    // per weight read) are written for a Q4_K head, GGUF type 12; any other type
+    // goes through head_chunked, which dequantizes 32768 rows per vocabulary
+    // chunk on every call. Say it once instead of looking like a mystery (#315).
+    if (head_.gemv != nullptr && head_.gemv->type != 12 && !head_type_warned_) {
+        head_type_warned_ = true;
+        std::fprintf(stderr,
+                     "lm_head: type %u takes the chunked f16 path (the fast paths are for Q4_K)\n",
+                     head_.gemv->type);
+    }
     if (!omph::kernels::rms_norm(static_cast<const float *>(x_), out_norm_,
                                  static_cast<float *>(cur_), T, ne, (float) h_.eps, 1.0f,
                                  nullptr) ||
@@ -383,6 +396,35 @@ bool Runner::lm_head(const int64_t T, std::vector<float> & logits, int32_t * gre
         return true;
     }
     return head_chunked(h16_, T, logits.data());
+}
+
+bool Runner::check_logits_finite(const int64_t T, const std::vector<float> & logits) {
+    const int64_t rows = !logits.empty() ? (int64_t) (logits.size() / h_.n_vocab)
+                                         : (verifying_ ? T : 1);
+    std::vector<float> staged;
+    const float * host = logits.data();
+    if (logits.empty()) {
+        // the greedy argmax and the verification paths never bring the rows
+        // back: 1 MB per row, and only under the switch
+        staged.resize((size_t) rows * h_.n_vocab);
+        if (!copy_logits(staged.data(), rows)) {
+            return false;
+        }
+        host = staged.data();
+    }
+    for (int64_t r = 0; r < rows; ++r) {
+        const float * row = host + r * h_.n_vocab;
+        for (int64_t j = 0; j < h_.n_vocab; ++j) {
+            if (!std::isfinite(row[j])) {
+                std::fprintf(stderr,
+                             "OMPH_CHECK_FINITE: logits row %lld of %lld is not finite at token "
+                             "id %lld\n",
+                             (long long) r, (long long) rows, (long long) j);
+                return fail("logits are not finite");
+            }
+        }
+    }
+    return true;
 }
 
 // The first `rows` rows of logits_ to the host (synchronous).

@@ -1,5 +1,6 @@
 // Gated delta net kernels (PLAN.md §10.2, autoregressive path).
 #include "kernels/gdn.hh"
+#include "kernels/shapes.hh"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -32,7 +33,8 @@ namespace {
 //   tid = 0..255; col = tid & (s-1); half = tid >> 7 -> rows [half*s/2, ...)
 //   decay, then the S^T k partials (combined across the halves in LDS), d,
 //   the rank-1 update, and the S^T q partials.
-constexpr int kDeltaS = 128;              // state size; the wrapper checks it
+// kDeltaS (the state size) comes from kernels/shapes.hh; the wrapper checks the
+// launch dims against it and the model loader checks the metadata.
 constexpr int kDeltaRows = kDeltaS / 2;   // rows per thread
 
 __global__ __launch_bounds__(256) void delta_step_kernel(const GdnStep a) {
@@ -415,7 +417,7 @@ __device__ inline ChunkWork chunk_work(const GdnStep & a, const long long heads)
 constexpr int kConvTokens = 8;
 
 __global__ __launch_bounds__(kDeltaS) void delta_conv_kernel(const GdnStep a) {
-    constexpr int kMaxConv = 4;  // conv_k (checked at launch)
+    // kMaxConv (conv_k) comes from kernels/shapes.hh
     __shared__ float red[kConvTokens][4];
     const long long t0 = (long long) blockIdx.y * kConvTokens;
     const int nt = (int) (a.tokens - t0 < kConvTokens ? a.tokens - t0 : kConvTokens);

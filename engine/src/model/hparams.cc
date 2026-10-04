@@ -3,6 +3,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "kernels/shapes.hh"
+
 namespace omph::model {
 
 namespace {
@@ -76,12 +78,40 @@ HParams read_hparams(const omph::gguf::File & f) {
         h.ssm_conv_k <= 1) {
         throw std::runtime_error("incomplete hyperparameters");
     }
-    // What the kernels hard-code for this model (single-model engine).
+    // What the kernels hard-code for this model (single-model engine): the
+    // constants in kernels/shapes.hh, which every kernel wrapper checks at
+    // launch too. Checking them here names the field that is wrong and refuses
+    // before 11 GiB of tensors are read, instead of failing on the first layer
+    // that runs with a message that does not say why.
     const omph::gguf::TensorInfo * out = f.tensor("output.weight");
-    if (h.head_dim != 256 || h.n_rot > h.head_dim || h.n_head % h.n_head_kv != 0 ||
-        h.ssm_s != 128 || h.ssm_inner % h.ssm_n_vh != 0 || h.ssm_n_vh % h.ssm_n_kh != 0 ||
-        out == nullptr || out->ne.size() < 2 || (int64_t) out->ne[1] != h.n_vocab) {
-        throw std::runtime_error("hyperparameters outside what the kernels support");
+    const auto refuse = [](const std::string & what) {
+        throw std::runtime_error("unsupported model: " + what +
+                                 " (this engine runs one model: Qwen3.8-27B, PLAN.md)");
+    };
+    if (h.head_dim != omph::kernels::kHeadDim || h.n_rot > h.head_dim || h.n_rot % 2 != 0) {
+        refuse("attention head_dim " + std::to_string(h.head_dim) + " with rope " +
+               std::to_string(h.n_rot) + ": the kernels need head_dim " +
+               std::to_string(omph::kernels::kHeadDim) + " and an even rope");
+    }
+    if (h.n_head != h.n_head_kv * omph::kernels::kGqaGroup) {
+        refuse("attention " + std::to_string(h.n_head) + " query heads / " +
+               std::to_string(h.n_head_kv) + " kv heads: the kernels need " +
+               std::to_string(omph::kernels::kGqaGroup) + " query heads per KV head");
+    }
+    if (h.ssm_s != omph::kernels::kDeltaS || h.ssm_inner % h.ssm_n_vh != 0 ||
+        h.ssm_n_vh % h.ssm_n_kh != 0) {
+        refuse("delta-net state " + std::to_string(h.ssm_s) + ", " +
+               std::to_string(h.ssm_inner) + " values in " + std::to_string(h.ssm_n_vh) +
+               " heads in " + std::to_string(h.ssm_n_kh) + " groups: the kernels need " +
+               std::to_string(omph::kernels::kDeltaS) + " and whole groups");
+    }
+    if (h.ssm_conv_k > omph::kernels::kMaxConv) {
+        refuse("conv window " + std::to_string(h.ssm_conv_k) + ": the kernel holds " +
+               std::to_string(omph::kernels::kMaxConv));
+    }
+    if (out == nullptr || out->ne.size() < 2 || (int64_t) out->ne[1] != h.n_vocab) {
+        refuse("output.weight and token_embd.weight disagree on the vocabulary (" +
+               std::to_string(h.n_vocab) + ")");
     }
     return h;
 }

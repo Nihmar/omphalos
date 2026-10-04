@@ -55,9 +55,8 @@ bool Runner::attn_layer(const int64_t il, const LayerWeights & L, const int64_t 
     const int64_t kv_out = h_.n_head_kv * h_.head_dim;
     const KvView kv = kv_view(il);
 
-    // kv_only (the MTP KV fill, #124): K and V into the cache, nothing else.
-    // attn_prep still runs its q heads on whatever fused_ holds; nobody reads
-    // their output.
+    // kv_only (the MTP KV fill, #124): K and V into the cache, nothing else --
+    // attn_prep's q blocks are skipped (skip_q), their output is not read.
     const bool grp = kv_only ? grouped(h16_, ne, T, {{&L.attn_k, k_, kv_out}, {&L.attn_v, v_, kv_out}})
                              : grouped(h16_, ne, T,
                                        {{&L.attn_k, k_, kv_out}, {&L.attn_v, v_, kv_out}, {&L.attn_q, fused_, q_out}});
@@ -93,6 +92,7 @@ bool Runner::attn_layer(const int64_t il, const LayerWeights & L, const int64_t 
     for (int c = 0; c < 3; ++c) prep.sections[c] = h_.rope_sections[c];
     prep.eps = (float) h_.eps;
     prep.rotate = kv.quant;
+    prep.skip_q = kv_only;
     if (kv.quant) {
         prep.k_q8 = kv.q.kq;
         prep.k_scales = reinterpret_cast<__half *>(kv.q.ksc);
@@ -309,6 +309,16 @@ bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T
         return false;
     }
     if (kv_host_) {
+        // The whole prefix, on every call, for this layer: the staging buffer is
+        // shared by the attention layers, so the rows the previous layer left in
+        // it are not this layer's -- a per-layer row counter cannot tell what is
+        // already staged (tried and caught by the bit check in #315). Uploading
+        // only what a call adds needs either per-layer staging buffers (VRAM:
+        // ~0.8 GB per layer at 98k, so only up to ~16k fits) or a key offset in
+        // attention_gqa, staging the keys in pieces and accumulating the splits.
+        // As it is, the cost is 8 KiB of host-to-device traffic per token per
+        // layer: measured 55 vs 42 ms per step at 2.6k tokens, i.e. ~12 ms of
+        // PCIe against 42 ms of GPU, growing with the context (#315).
         const size_t bytes = (size_t) (pos0 + T) * kv_out * 4;
         if (hipMemcpy(kv_stage_k_, k_cache, bytes, hipMemcpyHostToDevice) != hipSuccess ||
             hipMemcpy(kv_stage_v_, v_cache, bytes, hipMemcpyHostToDevice) != hipSuccess) {

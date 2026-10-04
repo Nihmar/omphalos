@@ -207,6 +207,7 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 |---|---|---|
 | `OMPH_TIMING` | diagnostics | VRAM after load, per-step `step gpu` / `step wall` |
 | `OMPH_PHASES` | diagnostics | per-phase GPU totals; its ~460 events per step add ~2.6 ms, so never measure the step with it (#100) |
+| `OMPH_CHECK_FINITE` | diagnostics | every forward's logits rows scanned for NaN / Inf and the run stopped, naming the row and the token id (#315): a non-finite logit otherwise becomes a token, and the device and host argmax disagree about NaN |
 | `OMPH_TEST_BAD_SIDE=N` | diagnostics | swap the side stream the calibration rejected back in after N decode steps: exercises the #144 watchdog |
 | `OMPH_TEST_MROPE=swap\|flat` | ablation | image positions with h and w exchanged, or 1D: must score worse in `check_vision.py` (#160) |
 | `OMPH_TEST_Q8ACT=B` | ablation | every prefill GEMM's input quantized to int8 in blocks of B along k (one amax / 127 scale each, llama.cpp's q8_1 at B = 32) and back: an int8 GEMM's numerics, for its KL (#213) |
