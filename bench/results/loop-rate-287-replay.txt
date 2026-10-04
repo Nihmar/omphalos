@@ -1,0 +1,54 @@
+# #287: the repetition loops of the 2026-10-04 pi session, replayed.
+# Engine 24ace9c (branch test/287-session-replay), RX 9060 XT, 2026-10-04.
+#
+# What is replayed: tools/pi_session.py rebuilds the request pi sent from the
+# session's own JSONL (the merged system prompt, the thinking as
+# reasoning_content, the tool calls and results, the compaction summary, the
+# loop-police warning as a user turn, and the 12 tools of that moment), at the
+# cut just before the turn that looped: the first loop-police truncation,
+# 2026-10-04T09:17:56Z, a 98,229-token prompt. The rebuild is faithful to
+# within 0.02%: the tokenizer puts it at 98,250 ids against the 98,229 the
+# session's usage recorded for that turn (and 45,200 against 45,184 for the
+# 11:44:19 cut).
+#
+# tools/loop_rate.py --pi-session, --ctx 131072, max_tokens 4096, thinking on
+# (the session's regime), greedy unless the configuration says otherwise. The
+# metric is loop-police's semantic detector (paragraphs >= 40 chars
+# fingerprinted by their first 60 chars; a fingerprint seen 3 times is one
+# repetition) plus the worst paragraph pair.
+#
+# config                  prompt                tokens  paragraphs  reps  worst pair  pairs >= 0.85
+# greedy (KV default mix) 2026-10-04T09:17:56Z    4096       74        0     0.914        1
+# k8 (OMPH_KV_K4_LAYERS=none)                     4096       59        0     1.000        5 (1 verbatim)
+# k4-all (OMPH_KV_K4=1)                           4096       77        1     1.000       22 (2+ verbatim)
+# temp 0.6 top-p 0.95 top-k 20                     3685       37        0     0.906        1
+#
+# Read:
+#
+# 1. The loop reproduces, but only with the real context. The same model on a
+#    fresh single-turn prompt (bench/results/loop-rate-287.txt) never repeated
+#    a paragraph; on the session's own 98k-token context it re-derives the same
+#    CommonMark rule over and over, up to verbatim. What the session had and a
+#    fresh prompt does not: its own reasoning of every earlier turn
+#    (preserve_thinking) and the tool results it was reacting to.
+# 2. The KV precision is the configuration variable with the largest effect:
+#    K4 on every attention layer (#81, and what the README's "everything on"
+#    example used before #289, and what that session ran) produces 22 near
+#    duplicate paragraph pairs against 1 for the measured default mix and 5 for
+#    K8. It is also the only configuration loop-police's own fingerprint rule
+#    fires on -- as it did five times that day.
+# 3. The sampler recipe of #285 (temperature 0.6, top_p 0.95, top_k 20) shows
+#    one mild pair (0.906) and closes the turn after 3,685 tokens instead of
+#    running to the 4,096 cap, i.e. it neither repeats nor drifts.
+#
+# Caveats: one prompt, one greedy run per configuration, no seed (the
+# configurations diverge inside the first few hundred characters and the
+# trajectories are chaotic), so the counts are indicative rather than a
+# distribution; K4-all at 16k is also the configuration #175 measured above
+# llama.cpp's q8_0/q4_0 KL budget, which is the mechanism the numbers here
+# suggest. The prompts and the per-run reasoning are reproducible with
+#
+#   uv run python loop_rate.py --configs greedy,k8,k4-all,sampled --ctx 131072 \
+#       --pi-session <session.jsonl> --cuts 2026-10-04T09:17:56Z --max-tokens 4096
+#
+# The CSV next to this file is the same table, tagged with the engine commit.
