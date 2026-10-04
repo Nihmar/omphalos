@@ -54,6 +54,9 @@ typedef struct {
     int64_t cache_mib;       /* pinned host RAM for sequence checkpoints: a prompt that
                                 diverges from the cached one resumes from the latest
                                 checkpoint before the difference (default 2048, 0: none) */
+    int64_t kv_ram_mib;      /* pinned host RAM for whole conversations: a prompt that leaves
+                                the cached conversation saves it, one that continues a saved
+                                one restores it without a prefill (default 8192, 0: none) */
 } omph_engine_params;
 
 void omph_engine_params_default(omph_engine_params * p);

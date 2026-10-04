@@ -128,6 +128,18 @@ public:
     bool checkpoint_save(void * host);
     bool checkpoint_restore(const void * host);
 
+    // --- saved conversations (#179) ---
+    // The quantized KV of positions [0, n) (the attention layers' and the MTP
+    // block's) and the DFlash2 drafter's ring: with a checkpoint at m <= n, the
+    // whole state of the sequence's first m tokens, whatever the caches held
+    // since. kv_prefix_bytes is 0 when the KV is not the quantized cache
+    // (OMPH_KV_F32 / OMPH_KV_HOST). The ring's entries past m are rewritten
+    // before the drafter reads them (positions are injected in order).
+    size_t kv_prefix_bytes(int64_t n) const;
+    bool kv_prefix_save(void * host, int64_t n);
+    // the first m of the n positions a buffer of kv_prefix_bytes(n) holds
+    bool kv_prefix_restore(const void * host, int64_t n, int64_t m);
+
     // --- speculative decoding (#122) ---
     // Allocates what a verification of up to `max_tokens` tokens needs to be
     // rolled back (the alternate delta-net states, +151 MB, the replay records,
@@ -169,6 +181,7 @@ public:
 
 private:
     bool checkpoint_copy(void * host, bool save);
+    bool kv_prefix_copy(void * host, int64_t n, int64_t m, bool save);
     // Final norm and lm_head of the T rows in h16_, into `logits` on the host
     // (or, with `greedy` on a single-token GEMV step, only the argmax). Returns
     // once the results are on the host.
@@ -413,6 +426,7 @@ private:
     int64_t dfl_ne_ = 0;       // drafter width (5120)
     int64_t dfl_ff_ = 0;       // its FFN (17408)
     int64_t dfl_swa_ = 0;      // sliding window (2048) = ring slots
+    size_t dfl_ring_bytes_ = 0;  // each of dfl_ring_k_ / dfl_ring_v_
     int64_t dfl_group_ = 0;    // conv group size (16)
     float dfl_eps_ = 0.0f;
     float dfl_theta_ = 0.0f;

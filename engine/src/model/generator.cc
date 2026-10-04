@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 #include <unordered_map>
 
 #include "runtime/timing.hh"
+
+#include <hip/hip_runtime.h>
 
 namespace omph::model {
 
@@ -94,6 +97,12 @@ Generator::Generator(const Config & config, const omph::runtime::EnvOptions & en
     image_pad_ = tokenizer_->find("<|image_pad|>");
     if (config_.cache_mib > 0) {
         max_checkpoints_ = (size_t) (config_.cache_mib << 20) / runner_->checkpoint_bytes();
+    }
+}
+
+Generator::~Generator() {
+    for (const Snapshot & s : snapshots_) {
+        (void) hipHostFree(s.host);
     }
 }
 
@@ -213,6 +222,96 @@ void Generator::drop_checkpoints(const bool all) {
     }
 }
 
+namespace {
+bool prefix_of(const std::vector<int32_t> & a, const std::vector<int32_t> & b, const size_t n) {
+    return n <= a.size() && n <= b.size() && std::equal(a.begin(), a.begin() + (std::ptrdiff_t) n, b.begin());
+}
+} // namespace
+
+// Before a prompt that does not continue the cached sequence overwrites it:
+// that sequence to host RAM (#179), with its state at its end and at its valid
+// checkpoints, unless it is short or already saved. Saved conversations it
+// extends are merged into it (their points kept); the least recently used go
+// past the budget.
+void Generator::save_snapshot(const std::vector<int32_t> & prompt, GenerateResult & res) {
+    const int64_t n = (int64_t) seq_.size();
+    if (config_.kv_ram_mib <= 0 || n < kSnapshotMin || prefix_of(seq_, prompt, (size_t) n)) {
+        return;
+    }
+    for (Snapshot & s : snapshots_) {  // already saved at this point
+        if (prefix_of(seq_, s.tokens, (size_t) n) && std::count(s.points.begin(), s.points.end(), n) > 0) {
+            s.used = ++clock_;
+            return;
+        }
+    }
+    const size_t kv = runner_->kv_prefix_bytes(n);
+    const size_t cp = runner_->checkpoint_bytes();
+    if (kv == 0) return;
+    // the points and where their state comes from: the device (the end), a
+    // checkpoint, or a saved conversation this one extends
+    struct Point {
+        int64_t pos;
+        const void * from;
+    };
+    std::vector<Point> pts{{n, nullptr}};
+    for (const Checkpoint & c : checkpoints_) {
+        const int64_t p = (int64_t) c.tokens.size();
+        if (p >= kSnapshotMin && p < n && valid(c)) pts.push_back({p, c.host});
+    }
+    std::vector<size_t> merged;
+    for (size_t k = 0; k < snapshots_.size(); ++k) {
+        const Snapshot & s = snapshots_[k];
+        if (!prefix_of(s.tokens, seq_, s.tokens.size())) continue;
+        merged.push_back(k);
+        for (size_t q = 0; q < s.points.size(); ++q) {
+            pts.push_back({s.points[q], static_cast<const uint8_t *>(s.host) + s.kv + q * cp});
+        }
+    }
+    std::sort(pts.begin(), pts.end(), [](const Point & a, const Point & b) { return a.pos < b.pos; });
+    pts.erase(std::unique(pts.begin(), pts.end(), [](const Point & a, const Point & b) { return a.pos == b.pos; }),
+              pts.end());
+    const size_t bytes = kv + pts.size() * cp;
+    const size_t budget = (size_t) config_.kv_ram_mib << 20;
+    if (bytes > budget) return;
+    const double t0 = omph::runtime::now_ms();
+    void * host = nullptr;
+    if (hipHostMalloc(&host, bytes) != hipSuccess) {
+        (void) hipGetLastError();
+        return;  // no pinned memory: the conversation will be prefilled again
+    }
+    Snapshot snap{seq_, host, bytes, kv, {}, ++clock_};
+    bool ok = runner_->kv_prefix_save(host, n);
+    for (size_t q = 0; q < pts.size() && ok; ++q) {
+        void * dst = static_cast<uint8_t *>(host) + kv + q * cp;
+        if (pts[q].from == nullptr) {
+            ok = runner_->checkpoint_save(dst);
+        } else {
+            std::memcpy(dst, pts[q].from, cp);
+        }
+        snap.points.push_back(pts[q].pos);
+    }
+    for (size_t q = merged.size(); q-- > 0;) {  // their points live on in snap
+        (void) hipHostFree(snapshots_[merged[q]].host);
+        snapshot_total_ -= snapshots_[merged[q]].bytes;
+        snapshots_.erase(snapshots_.begin() + (std::ptrdiff_t) merged[q]);
+    }
+    if (!ok) {
+        (void) hipHostFree(host);
+        return;
+    }
+    while (!snapshots_.empty() && snapshot_total_ + bytes > budget) {  // the least recently used go
+        auto lru = std::min_element(snapshots_.begin(), snapshots_.end(),
+                                    [](const Snapshot & a, const Snapshot & b) { return a.used < b.used; });
+        (void) hipHostFree(lru->host);
+        snapshot_total_ -= lru->bytes;
+        snapshots_.erase(lru);
+    }
+    snapshots_.push_back(std::move(snap));
+    snapshot_total_ += bytes;
+    res.saved = true;
+    res.checkpoint_ms += omph::runtime::now_ms() - t0;
+}
+
 // Brings the caches to the longest usable prefix of `prompt`: the cached
 // sequence when the prompt extends it, else the latest valid checkpoint
 // within their common prefix, else nothing. Returns its length.
@@ -229,6 +328,36 @@ int64_t Generator::resume(const std::vector<int32_t> & prompt, GenerateResult & 
             (best == nullptr || c.tokens.size() > best->tokens.size())) {
             best = &c;
         }
+    }
+    // a point of a saved conversation (#179) the prompt continues, when it
+    // reaches further than the checkpoints
+    Snapshot * snap = nullptr;
+    size_t at = 0;
+    int64_t reach = best != nullptr ? (int64_t) best->tokens.size() : 0;
+    for (Snapshot & s : snapshots_) {
+        for (size_t q = 0; q < s.points.size(); ++q) {
+            const int64_t p = s.points[q];
+            if (p > reach && p < (int64_t) prompt.size() && prefix_of(s.tokens, prompt, (size_t) p)) {
+                snap = &s;
+                at = q;
+                reach = p;
+            }
+        }
+    }
+    if (snap != nullptr) {
+        const double t0 = omph::runtime::now_ms();
+        const int64_t n = (int64_t) snap->tokens.size();
+        if (!runner_->kv_prefix_restore(snap->host, n, reach) ||
+            !runner_->checkpoint_restore(static_cast<const uint8_t *>(snap->host) + snap->kv +
+                                         at * runner_->checkpoint_bytes())) {
+            seq_.clear();  // the KV may be half overwritten: start over
+            return runner_->reset_sequence() ? 0 : -1;
+        }
+        res.checkpoint_ms += omph::runtime::now_ms() - t0;
+        res.restored = true;
+        snap->used = ++clock_;
+        seq_.assign(snap->tokens.begin(), snap->tokens.begin() + reach);
+        return reach;
     }
     if (best != nullptr) {
         const double t0 = omph::runtime::now_ms();
@@ -396,6 +525,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
     }
     rng_.seed(req.sampling.seed);
     const double t0 = omph::runtime::now_ms();
+    save_snapshot(prompt, res);
     const int64_t from = resume(prompt, res);
     if (from < 0) {
         drop_checkpoints(true);

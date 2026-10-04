@@ -130,8 +130,9 @@ void Runner::dflash_load() {
     const int64_t kv = kKvHeads * kHd;
     const int64_t feat_rows = std::max<int64_t>(max_tokens_, 16);
     dfl_feat_ = mem_.device((size_t) feat_rows * dfl_fc_.gemv->k * 2, "out of VRAM (drafter features)");
-    dfl_ring_k_ = mem_.device((size_t) n_layer * dfl_swa_ * kv * 2, "out of VRAM (drafter KV)");
-    dfl_ring_v_ = mem_.device((size_t) n_layer * dfl_swa_ * kv * 2, "out of VRAM (drafter KV)");
+    dfl_ring_bytes_ = (size_t) n_layer * dfl_swa_ * kv * 2;
+    dfl_ring_k_ = mem_.device(dfl_ring_bytes_, "out of VRAM (drafter KV)");
+    dfl_ring_v_ = mem_.device(dfl_ring_bytes_, "out of VRAM (drafter KV)");
     dfl_tags_ = static_cast<int32_t *>(mem_.device((size_t) dfl_swa_ * 4, "out of VRAM (drafter KV)"));
     (void) hipMemset(dfl_tags_, 0xFF, (size_t) dfl_swa_ * 4);
     dfl_bk_ = mem_.device((size_t) B * kv * 4);

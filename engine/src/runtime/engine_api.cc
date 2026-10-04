@@ -59,6 +59,7 @@ void omph_engine_params_default(omph_engine_params * p) {
     p->chunk = 512;
     p->mtp = 1;
     p->cache_mib = 2048;
+    p->kv_ram_mib = 8192;
 }
 
 omph_engine * omph_engine_load(const omph_engine_params * p, char * err, const size_t err_size) {
@@ -79,6 +80,7 @@ omph_engine * omph_engine_load(const omph_engine_params * p, char * err, const s
         c.chunk = p->chunk > 0 ? p->chunk : 512;
         c.mtp = p->mtp != 0;
         c.cache_mib = p->cache_mib > 0 ? p->cache_mib : 0;
+        c.kv_ram_mib = p->kv_ram_mib > 0 ? p->kv_ram_mib : 0;
         e->gen = std::make_unique<omph::model::Generator>(c, omph::runtime::EnvOptions::from_env());
         return e.release();
     } catch (const std::exception & ex) {

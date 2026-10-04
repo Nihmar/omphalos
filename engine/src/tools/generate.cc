@@ -13,6 +13,7 @@
 //   --dflash FILE     draft with a DFlash2 drafter .omph instead of the MTP block (#245)
 //   --ctx N           KV capacity (default 8192)
 //   --cache-mib N     host RAM for sequence checkpoints (default 2048, 0: none)
+//   --kv-ram N        host RAM for whole conversations (default 8192, 0: none, #179)
 //   --repeat N        run the same request N times (the second and later
 //                     restore the checkpoint before the generation prompt, #158)
 //   --then FILE       then a second chat request from FILE (a conversation's
@@ -79,6 +80,7 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--seed")) req.sampling.seed = std::strtoull(val(), nullptr, 10);
         else if (!std::strcmp(argv[i], "--ctx")) cfg.context = std::atoll(val());
         else if (!std::strcmp(argv[i], "--cache-mib")) cfg.cache_mib = std::atoll(val());
+        else if (!std::strcmp(argv[i], "--kv-ram")) cfg.kv_ram_mib = std::atoll(val());
         else if (!std::strcmp(argv[i], "--repeat")) repeat = std::atoi(val());
         else if (!std::strcmp(argv[i], "--then")) then_path = val();
         else if (!std::strcmp(argv[i], "--mmproj")) mmproj = val();
@@ -181,10 +183,11 @@ int main(int argc, char ** argv) {
                                            "context full", "error"};
             const double tps = res.decode_ms > 0 ? 1000.0 * (double) res.tokens.size() / res.decode_ms : 0.0;
             std::fprintf(stderr,
-                         "prompt %lld tokens (%lld cached%s) in %.1f ms (checkpoints %.1f ms); %zu tokens in "
+                         "prompt %lld tokens (%lld cached%s%s) in %.1f ms (checkpoints %.1f ms); %zu tokens in "
                          "%.1f ms (%.2f ms/token, %.1f t/s); drafts %lld / %lld accepted; stop: %s\n",
                          (long long) res.prompt_tokens, (long long) res.cached_tokens,
-                         res.restored ? ", restored" : "", res.prefill_ms, res.checkpoint_ms,
+                         res.restored ? ", restored" : "", res.saved ? ", previous saved" : "", res.prefill_ms,
+                         res.checkpoint_ms,
                          res.tokens.size(), res.decode_ms,
                          res.tokens.empty() ? 0.0 : res.decode_ms / (double) res.tokens.size(), tps,
                          (long long) res.accepted, (long long) res.drafted, kStop[(int) res.stop]);

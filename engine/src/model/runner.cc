@@ -599,6 +599,76 @@ bool Runner::checkpoint_save(void * host) { return checkpoint_copy(host, true); 
 
 bool Runner::checkpoint_restore(const void * host) { return checkpoint_copy(const_cast<void *>(host), false); }
 
+// The parts of a saved KV prefix of n positions: per attention layer K (Q8
+// or Q4), its scales, V (Q4) and its scales -- each cache is position-major,
+// so a prefix is one contiguous piece -- then the MTP block's, then the
+// drafter's ring and its position tags. A restore copies the first m rows of
+// each part (and the whole ring).
+size_t Runner::kv_prefix_bytes(const int64_t n) const {
+    if (kv_kq_ == nullptr || n <= 0 || n > max_seq_) return 0;
+    const size_t attn_kv = (size_t) h_.n_head_kv * h_.head_dim;
+    const size_t scales = (size_t) h_.n_head_kv * (h_.head_dim / 32) * 2;
+    size_t bytes = 0;
+    for (const uint8_t k4 : kv_k4_) {
+        bytes += (size_t) n * (attn_kv / (k4 ? 2 : 1) + scales + attn_kv / 2 + scales);
+    }
+    if (mtp_kq_ != nullptr) bytes += (size_t) n * (attn_kv + scales + attn_kv / 2 + scales);
+    if (dfl_tags_ != nullptr) bytes += 2 * dfl_ring_bytes_ + (size_t) dfl_swa_ * 4;
+    return bytes;
+}
+
+bool Runner::kv_prefix_copy(void * host, const int64_t n, const int64_t m, const bool save) {
+    if (kv_prefix_bytes(n) == 0 || m <= 0 || m > n) {
+        return fail("saved conversation: needs the quantized KV cache and 0 < m <= n <= the context");
+    }
+    const size_t attn_kv = (size_t) h_.n_head_kv * h_.head_dim;
+    const size_t scales = (size_t) h_.n_head_kv * (h_.head_dim / 32) * 2;
+    auto * at = static_cast<uint8_t *>(host);
+    // a part of `row` bytes per position: m rows, then skip to the next part
+    const auto copy = [&](void * dev, const size_t row) {
+        const size_t bytes = (size_t) m * row;
+        const hipError_t e = save ? hipMemcpyAsync(at, dev, bytes, hipMemcpyDeviceToHost, nullptr)
+                                  : hipMemcpyAsync(dev, at, bytes, hipMemcpyHostToDevice, nullptr);
+        at += (size_t) n * row;
+        return e == hipSuccess;
+    };
+    if (hipDeviceSynchronize() != hipSuccess) {
+        return fail("saved conversation: device error");
+    }
+    auto * kq = static_cast<uint8_t *>(kv_kq_);
+    auto * ks = static_cast<uint8_t *>(kv_ks_);
+    auto * vq = static_cast<uint8_t *>(kv_vq_);
+    auto * vs = static_cast<uint8_t *>(kv_vs_);
+    bool ok = true;
+    for (size_t i = 0; i < kv_k4_.size() && ok; ++i) {
+        ok = copy(kq + kv_kq_off_[i], attn_kv / (kv_k4_[i] ? 2 : 1)) && copy(ks + i * max_seq_ * scales, scales) &&
+             copy(vq + i * max_seq_ * attn_kv / 2, attn_kv / 2) && copy(vs + i * max_seq_ * scales, scales);
+    }
+    if (ok && mtp_kq_ != nullptr) {
+        ok = copy(mtp_kq_, attn_kv) && copy(mtp_ks_, scales) && copy(mtp_vq_, attn_kv / 2) && copy(mtp_vs_, scales);
+    }
+    if (ok && dfl_tags_ != nullptr) {
+        const auto whole = [&](void * dev, const size_t bytes) {
+            const hipError_t e = save ? hipMemcpyAsync(at, dev, bytes, hipMemcpyDeviceToHost, nullptr)
+                                      : hipMemcpyAsync(dev, at, bytes, hipMemcpyHostToDevice, nullptr);
+            at += bytes;
+            return e == hipSuccess;
+        };
+        ok = whole(dfl_ring_k_, dfl_ring_bytes_) && whole(dfl_ring_v_, dfl_ring_bytes_) &&
+             whole(dfl_tags_, (size_t) dfl_swa_ * 4);
+    }
+    if (!ok || hipDeviceSynchronize() != hipSuccess) {
+        return fail("saved conversation: copy failed");
+    }
+    return true;
+}
+
+bool Runner::kv_prefix_save(void * host, const int64_t n) { return kv_prefix_copy(host, n, n, true); }
+
+bool Runner::kv_prefix_restore(const void * host, const int64_t n, const int64_t m) {
+    return kv_prefix_copy(const_cast<void *>(host), n, m, false);
+}
+
 // Allocates *p on first use (the f16-path buffers, #86).
 void * Runner::lazy(void ** p, const size_t bytes) {
     if (*p == nullptr) {

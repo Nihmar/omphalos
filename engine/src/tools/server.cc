@@ -7,6 +7,9 @@
 //   --chunk N         prefill chunk (default 512)
 //   --no-mtp          do not load the MTP block (no speculative decoding, -352 MiB of VRAM)
 //   --dflash FILE     draft with a DFlash2 drafter .omph instead of the MTP block (#245)
+//   --kv-ram MIB      pinned host RAM for whole conversations (default 8192, 0: none, #179):
+//                     a prompt that leaves the cached conversation saves it first, one that
+//                     continues a saved conversation restores it instead of prefilling
 //   --cache-ram MIB   pinned host RAM for sequence checkpoints (default 2048, 0: none): a
 //                     retried answer or a history without the reasoning resumes from one
 //   --mmproj FILE     the vision encoder: images as base64 data: URLs in image_url
@@ -384,10 +387,11 @@ struct Server {
         static const char * kStop[] = {"length", "end of generation", "stop token", "stopped", "context full",
                                        "error"};
         std::fprintf(stderr,
-                     "%s %s: prompt %zu tokens (%lld cached%s) in %.0f ms (%.1f t/s); %zu tokens in %.0f ms "
+                     "%s %s: prompt %zu tokens (%lld cached%s%s) in %.0f ms (%.1f t/s); %zu tokens in %.0f ms "
                      "(%.1f t/s, drafts accepted %lld / %lld); stop: %s%s\n",
                      req.method.c_str(), req.path.c_str(), (size_t) prompt_len, (long long) res.cached_tokens,
-                     res.restored ? ", checkpoint" : "", res.prefill_ms,
+                     res.restored ? ", restored" : "", res.saved ? ", previous conversation saved" : "",
+                     res.prefill_ms,
                      res.prefill_ms > 0 ? 1000.0 * (double) (res.prompt_tokens - res.cached_tokens) / res.prefill_ms
                                         : 0.0,
                      res.tokens.size(), res.decode_ms,
@@ -431,6 +435,7 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--no-mtp")) cfg.mtp = false;
         else if (!std::strcmp(argv[i], "--dflash")) cfg.dflash = val();
         else if (!std::strcmp(argv[i], "--cache-ram")) cfg.cache_mib = std::atoll(val());
+        else if (!std::strcmp(argv[i], "--kv-ram")) cfg.kv_ram_mib = std::atoll(val());
         else if (!std::strcmp(argv[i], "--alias")) alias = val();
         else if (!std::strcmp(argv[i], "--mmproj")) mmproj = val();
         else if (!std::strcmp(argv[i], "--api-key")) api_key = val();
