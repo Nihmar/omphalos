@@ -595,9 +595,12 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
     const bool forcing = req.force != nullptr && !req.force->empty();
     const bool greedy = req.sampling.temperature <= 0.0f && !forcing;
     // the penalties are host-side (apply_penalties), so a penalized greedy step
-    // takes the argmax on the host and gives up the speculative drafts: the
-    // device argmax and the verifications cannot see them (#298)
+    // takes the argmax on the host; the verifications' device argmax cannot see
+    // them, so that step gives up the speculative drafts (#298). The sampled
+    // path keeps speculating: each row's window carries the drafts accepted so
+    // far, and the acceptance test still keeps plain sampling's distribution.
     const bool dev_argmax = greedy && !req.sampling.penalizes();
+    const bool speculate = !(greedy && req.sampling.penalizes());
     int32_t next = forcing ? (*req.force)[0] : sample(logits, req.sampling);
     if (forcing && req.forced_logits != nullptr) {
         req.forced_logits->insert(req.forced_logits->end(), logits.begin(), logits.end());
@@ -633,7 +636,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
         return res;
     }
     bool go = emit(next);
-    if (req.speculative && (config_.mtp || runner_->dflash_on()) && !forcing && dev_argmax) {
+    if (req.speculative && (config_.mtp || runner_->dflash_on()) && !forcing && speculate) {
         // Speculative decoding (#122, #124): draft k tokens with the MTP block (or DFlash2, #245),
         // verify [next, drafts] in one forward, keep the drafts the model
         // agrees with plus its own next token. Greedy: the same tokens as
