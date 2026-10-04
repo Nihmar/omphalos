@@ -25,6 +25,7 @@
 //   --force FILE      decode these token ids instead (one per step); --logits-out
 //                     then gets the prompt's row and every step's (validation)
 #include "model/generator.hh"
+#include "tools/cli.hh"
 #include "runtime/options.hh"
 #include "runtime/timing.hh"
 #include "text/chat.hh"
@@ -74,20 +75,20 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--no-spec")) req.speculative = false;
         else if (!std::strcmp(argv[i], "--no-mtp")) cfg.mtp = false;
         else if (!std::strcmp(argv[i], "--dflash")) cfg.dflash = val();
-        else if (!std::strcmp(argv[i], "--max")) req.max_tokens = std::atoll(val());
-        else if (!std::strcmp(argv[i], "--temp")) req.sampling.temperature = (float) std::atof(val());
-        else if (!std::strcmp(argv[i], "--top-k")) req.sampling.top_k = std::atoi(val());
-        else if (!std::strcmp(argv[i], "--top-p")) req.sampling.top_p = (float) std::atof(val());
-        else if (!std::strcmp(argv[i], "--min-p")) req.sampling.min_p = (float) std::atof(val());
-        else if (!std::strcmp(argv[i], "--seed")) req.sampling.seed = std::strtoull(val(), nullptr, 10);
-        else if (!std::strcmp(argv[i], "--repeat-penalty")) req.sampling.repeat_penalty = (float) std::atof(val());
-        else if (!std::strcmp(argv[i], "--repeat-last-n")) req.sampling.penalty_last_n = std::atoi(val());
-        else if (!std::strcmp(argv[i], "--frequency-penalty")) req.sampling.frequency_penalty = (float) std::atof(val());
-        else if (!std::strcmp(argv[i], "--presence-penalty")) req.sampling.presence_penalty = (float) std::atof(val());
-        else if (!std::strcmp(argv[i], "--ctx")) cfg.context = std::atoll(val());
-        else if (!std::strcmp(argv[i], "--cache-mib")) cfg.cache_mib = std::atoll(val());
-        else if (!std::strcmp(argv[i], "--kv-ram")) cfg.kv_ram_mib = std::atoll(val());
-        else if (!std::strcmp(argv[i], "--repeat")) repeat = std::atoi(val());
+        else if (!std::strcmp(argv[i], "--max")) req.max_tokens = (int64_t) omph::cli::integer(val(), "--max");
+        else if (!std::strcmp(argv[i], "--temp")) req.sampling.temperature = (float) omph::cli::number(val(), "--temp");
+        else if (!std::strcmp(argv[i], "--top-k")) req.sampling.top_k = omph::cli::integer(val(), "--top-k");
+        else if (!std::strcmp(argv[i], "--top-p")) req.sampling.top_p = (float) omph::cli::number(val(), "--top-p");
+        else if (!std::strcmp(argv[i], "--min-p")) req.sampling.min_p = (float) omph::cli::number(val(), "--min-p");
+        else if (!std::strcmp(argv[i], "--seed")) req.sampling.seed = omph::cli::uinteger(val(), "--seed");
+        else if (!std::strcmp(argv[i], "--repeat-penalty")) req.sampling.repeat_penalty = (float) omph::cli::number(val(), "--repeat-penalty");
+        else if (!std::strcmp(argv[i], "--repeat-last-n")) req.sampling.penalty_last_n = (int) omph::cli::integer(val(), "--repeat-last-n");
+        else if (!std::strcmp(argv[i], "--frequency-penalty")) req.sampling.frequency_penalty = (float) omph::cli::number(val(), "--frequency-penalty");
+        else if (!std::strcmp(argv[i], "--presence-penalty")) req.sampling.presence_penalty = (float) omph::cli::number(val(), "--presence-penalty");
+        else if (!std::strcmp(argv[i], "--ctx")) cfg.context = omph::cli::integer(val(), "--ctx");
+        else if (!std::strcmp(argv[i], "--cache-mib")) cfg.cache_mib = omph::cli::integer(val(), "--cache-mib");
+        else if (!std::strcmp(argv[i], "--kv-ram")) cfg.kv_ram_mib = omph::cli::integer(val(), "--kv-ram");
+        else if (!std::strcmp(argv[i], "--repeat")) repeat = (int) omph::cli::integer(val(), "--repeat");
         else if (!std::strcmp(argv[i], "--then")) then_path = val();
         else if (!std::strcmp(argv[i], "--mmproj")) mmproj = val();
         else if (!std::strcmp(argv[i], "--image")) image_paths.push_back(val());

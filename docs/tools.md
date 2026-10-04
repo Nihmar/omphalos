@@ -7,6 +7,11 @@ are listed in [AGENTS.md](../AGENTS.md) and, authoritatively, in
 `engine/src/runtime/options.hh` -- the tools below read the same ones, so
 `omph-run`'s ablations work for `omph-generate` too.
 
+A numeric option whose value is not entirely a number is refused with the flag
+and the value it got (`--top-p 0.95--top-k` used to set `top_p` to 0.95 and
+leave the rest as a stray argument, #306), so a typo cannot configure a run
+half-way.
+
 Which model file a tool takes: the engine binaries that *run* the model
 (`omph-generate`, `omph-server`, `omph-run`, the C ABI) load only the `.omph`
 that `omph-convert` writes -- a plain GGUF is refused with "is not an .omph
