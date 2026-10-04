@@ -1,54 +1,88 @@
 # #287: the repetition loops of the 2026-10-04 pi session, replayed.
-# Engine 24ace9c (branch test/287-session-replay), RX 9060 XT, 2026-10-04.
+# Engine a2ddd60 (main, after #294), RX 9060 XT, 2026-10-04.
 #
 # What is replayed: tools/pi_session.py rebuilds the request pi sent from the
 # session's own JSONL (the merged system prompt, the thinking as
-# reasoning_content, the tool calls and results, the compaction summary, the
-# loop-police warning as a user turn, and the 12 tools of that moment), at the
-# cut just before the turn that looped: the first loop-police truncation,
-# 2026-10-04T09:17:56Z, a 98,229-token prompt. The rebuild is faithful to
-# within 0.02%: the tokenizer puts it at 98,250 ids against the 98,229 the
-# session's usage recorded for that turn (and 45,200 against 45,184 for the
-# 11:44:19 cut).
+# reasoning_content, the tool calls and results, a compaction as summary + kept
+# tail, the loop-police warning as a user turn, the aborted turns dropped as
+# pi drops them), at the cut just before a turn that looped. The rebuild is
+# faithful to within 0.02 %: the first cut's prompt tokenizes to 98,250 ids
+# against the 98,229 the session's usage recorded, and another to 45,200
+# against 45,184.
 #
-# tools/loop_rate.py --pi-session, --ctx 131072, max_tokens 4096, thinking on
-# (the session's regime), greedy unless the configuration says otherwise. The
-# metric is loop-police's semantic detector (paragraphs >= 40 chars
-# fingerprinted by their first 60 chars; a fingerprint seen 3 times is one
-# repetition) plus the worst paragraph pair.
+#   uv run python loop_rate.py --configs greedy,k8,k4-all,sampled --ctx 131072 \
+#       --pi-session <session.jsonl> --cuts T1,T2,... --max-tokens 4096 --dump DIR
 #
-# config                  prompt                tokens  paragraphs  reps  worst pair  pairs >= 0.85
-# greedy (KV default mix) 2026-10-04T09:17:56Z    4096       74        0     0.914        1
-# k8 (OMPH_KV_K4_LAYERS=none)                     4096       59        0     1.000        5 (1 verbatim)
-# k4-all (OMPH_KV_K4=1)                           4096       77        1     1.000       22 (2+ verbatim)
-# temp 0.6 top-p 0.95 top-k 20                     3685       37        0     0.906        1
+# Four cuts (the prompts of four of the five loop-police truncations of that
+# day: the first at 09:17:56Z, then 10:29:38Z, 11:44:19Z and 12:01:55Z, two of
+# them after the 10:26 compaction), four configurations, 16 runs of 4096
+# tokens (greedy unless the configuration says otherwise), thinking on, the
+# engine's own defaults for everything else. `pairs` are the paragraph pairs at
+# 0.85 similarity or more, `verb` the verbatim ones (1.000), `fire` where
+# loop-police's semantic detector would truncate with its default settings
+# (threshold 3, paragraphs >= 40 chars, fingerprint 60).
+#
+# config    cut        tokens  paras  pairs  verb  worst  pairs/100p  fire
+# greedy    09:17:56     4096     74      1     0  0.914         1.4   --
+# greedy    10:29:38      409      9      1     0  0.941        11.1   --
+# greedy    11:44:19     2247     43      1     0  0.934         2.3   --
+# greedy    12:01:55     1366      4      0     0  0.324         0.0   --
+# k8        09:17:56     4096     59      4     1  1.000         6.8   --
+# k8        10:29:38      409      9      1     0  0.941        11.1   --
+# k8        11:44:19     2136     41      2     2  1.000         4.9   --
+# k8        12:01:55     1366      4      0     0  0.324         0.0   --
+# k4-all    09:17:56     4096     77     21    17  1.000        27.3   at 91 %
+# k4-all    10:29:38      409      9      1     0  0.941        11.1   --
+# k4-all    11:44:19     1218     17      0     0  0.830         0.0   --
+# k4-all    12:01:55     1373      4      0     0  0.324         0.0   --
+# sampled   09:17:56     3685     37      1     0  0.906         2.7   --
+# sampled   10:29:38      126      3      0     0  0.412         0.0   --
+# sampled   11:44:19     3047     57     14     6  1.000        24.6   at 79 %
+# sampled   12:01:55     2548     39      3     1  1.000         7.7   at 47 %
 #
 # Read:
 #
-# 1. The loop reproduces, but only with the real context. The same model on a
-#    fresh single-turn prompt (bench/results/loop-rate-287.txt) never repeated
-#    a paragraph; on the session's own 98k-token context it re-derives the same
-#    CommonMark rule over and over, up to verbatim. What the session had and a
-#    fresh prompt does not: its own reasoning of every earlier turn
-#    (preserve_thinking) and the tool results it was reacting to.
-# 2. The KV precision is the configuration variable with the largest effect:
-#    K4 on every attention layer (#81, and what the README's "everything on"
-#    example used before #289, and what that session ran) produces 22 near
-#    duplicate paragraph pairs against 1 for the measured default mix and 5 for
-#    K8. It is also the only configuration loop-police's own fingerprint rule
-#    fires on -- as it did five times that day.
-# 3. The sampler recipe of #285 (temperature 0.6, top_p 0.95, top_k 20) shows
-#    one mild pair (0.906) and closes the turn after 3,685 tokens instead of
-#    running to the 4,096 cap, i.e. it neither repeats nor drifts.
+# 1. The loops are the context, not a knob. 14 of the 16 streams end in a
+#    near-duplicate paragraph pair (>= 0.85), 7 of them with at least one
+#    verbatim repeat, and the model is doing what it did that day: re-deriving
+#    the same CommonMark rule (in the pre-compaction cuts), or the same
+#    `_quoteDepth` / list-marker analysis (in the post-compaction ones). A
+#    fresh single-turn prompt never repeated a paragraph
+#    (bench/results/loop-rate-287.txt), so what matters is the agent's own
+#    reasoning of every earlier turn plus the tool results it was reacting to.
 #
-# Caveats: one prompt, one greedy run per configuration, no seed (the
-# configurations diverge inside the first few hundred characters and the
-# trajectories are chaotic), so the counts are indicative rather than a
-# distribution; K4-all at 16k is also the configuration #175 measured above
-# llama.cpp's q8_0/q4_0 KL budget, which is the mechanism the numbers here
-# suggest. The prompts and the per-run reasoning are reproducible with
+# 2. With four prompts no configuration dominates. #295 replayed only the
+#    09:17:56 cut and it made K4-everywhere look like the outlier: that stream
+#    is still the worst of the sixteen (21 pairs, 17 verbatim, the detector
+#    fires at 91 %), but the same configuration is clean on the other three
+#    cuts, while the sampled configuration repeats worst on the 11:44:19 cut
+#    (14 pairs, 6 verbatim). One stream is not a ranking: the K4 hypothesis of
+#    #175 stays plausible for the longest prompts and is not established here.
+# 3. The one directional signal: none of the four greedy runs over the default
+#    mixed KV produced a verbatim repeat (0 of 130 paragraphs), while K8, K4
+#    everywhere and the sampler each did (3, 17 and 7), and the two sampled
+#    runs that did also wrote the longest reasoning (3047 and 2548 tokens).
+#    Greedy is not "safe" -- its worst pair is 0.94 -- but it is the only
+#    configuration that never fell into a verbatim loop here.
 #
-#   uv run python loop_rate.py --configs greedy,k8,k4-all,sampled --ctx 131072 \
-#       --pi-session <session.jsonl> --cuts 2026-10-04T09:17:56Z --max-tokens 4096
+# 4. loop-police's own settings (bench/results/loop-rate-287-sweep.csv, the
+#    same 16 streams): its default semantic detector would have truncated 3 of
+#    the 16, at 47 %, 79 % and 91 % of the stream -- i.e. late, after the
+#    repetition is already there. Raising the threshold from 3 to 5 silences
+#    all three, including the stream with 17 verbatim paragraphs: the detector
+#    is not over-firing, it is under-firing. A paragraph floor of 160 chars or
+#    a 120-char fingerprint removes one or two of the three. What it cannot
+#    see is the common case here -- the same plan re-derived in different
+#    words, two paragraphs at 0.9+ that do not share their first 60 characters
+#    -- so if the goal is to truncate these streams, the rule to add is a pair
+#    similarity one (two paragraphs >= 0.9), not a tighter threshold.
 #
-# The CSV next to this file is the same table, tagged with the engine commit.
+# Caveats: one greedy run per (cut, configuration) with no seed, so the
+# sampled rows are one draw each and the greedy ones are one trajectory each;
+# four prompts show the spread and cannot rank the configurations, which is
+# why the numbers here are stated as what they are, not as a ranking. The
+# prompts and every per-run reasoning are reproducible with the command above
+# (they live in --dump).
+#
+# Both CSVs next to this file are the same tables, per run, tagged with the
+# engine commit.

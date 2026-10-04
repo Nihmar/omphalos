@@ -79,19 +79,98 @@ CONFIGS = {
 }
 
 
-def paragraphs(text: str, skip_fences: bool) -> list[str]:
-    """Blank-line separated paragraphs, as loop-police's semantic detector sees
-    them; `skip_fences` drops the ones inside or containing ``` (its rule, and
-    an unbalanced fence then silences the rest of the stream)."""
-    out: list[str] = []
+def paragraph_spans(text: str, skip_fences: bool) -> list[tuple[int, str]]:
+    """Blank-line separated paragraphs and their offsets, as loop-police's
+    semantic detector sees them; `skip_fences` drops the ones inside or
+    containing ``` (its rule, and an unbalanced fence then silences the rest of
+    the stream)."""
+    out: list[tuple[int, str]] = []
     in_fence = False
+    at = 0
     for block in re.split(r"\r?\n[ \t]*\r?\n", text):
         marks = block.count("```")
         if not (skip_fences and in_fence) and not (skip_fences and marks) and block.strip():
-            out.append(block.strip())
+            out.append((at + len(block) - len(block.lstrip()), block.strip()))
+        at += len(block) + 2
         if marks % 2 == 1:
             in_fence = not in_fence
     return out
+
+
+def paragraphs(text: str, skip_fences: bool) -> list[str]:
+    return [p for _, p in paragraph_spans(text, skip_fences)]
+
+
+def pair_counts(text: str, para_min: int, floor: float = 0.85) -> tuple[int, int, float]:
+    """(paragraph pairs at or above `floor`, of them verbatim, the worst ratio):
+    what a fingerprint rule misses when the model re-derives the same plan in
+    slightly different words."""
+    paras = [p[:1500] for p in paragraphs(text, True) if len(p) >= para_min]
+    matcher = difflib.SequenceMatcher(None)
+    pairs = verbatim = 0
+    worst = 0.0
+    for i in range(len(paras)):
+        for j in range(i + 1, len(paras)):
+            matcher.set_seqs(paras[i], paras[j])
+            ratio = matcher.ratio()
+            worst = max(worst, ratio)
+            if ratio >= floor:
+                pairs += 1
+                verbatim += ratio >= 0.999
+    return pairs, verbatim, worst
+
+
+def first_firing(text: str, para_min: int, fp_len: int, threshold: int,
+                 skip_fences: bool = True) -> int | None:
+    """Where loop-police would truncate: the offset of the paragraph whose
+    fingerprint reaches `threshold`, or None. Its escalation aids are ignored
+    (the truncation is what a violation costs)."""
+    counts: dict[str, int] = {}
+    for at, block in paragraph_spans(text, skip_fences):
+        if len(block) < para_min:
+            continue
+        fp = re.sub(r"^\d+([.)])\s+", r"#\1 ", block)[:fp_len]
+        counts[fp] = counts.get(fp, 0) + 1
+        if counts[fp] >= threshold:
+            return at
+    return None
+
+
+# loop-police's defaults and the settings the postmortem suggests (a longer
+# paragraph floor and fingerprint, a higher threshold): the sweep reports, per
+# stream, how much of it each setting would have let through (#287).
+SWEEP = [(3, 40, 60), (3, 160, 60), (5, 40, 60), (5, 160, 60), (3, 40, 120), (5, 160, 120)]
+
+
+def sweep(paths: list[Path], out: Path | None = None) -> None:
+    """Per stream: how much the model repeated and where loop-police's semantic
+    detector would have truncated it under each setting of SWEEP."""
+    head = f"{'stream':44s} {'pairs':>6s} {'verb':>5s} {'worst':>6s} " + \
+        " ".join(f"t{t}/p{p}/f{f}".rjust(11) for t, p, f in SWEEP)
+    print(head)
+    rows = []
+    for path in sorted(paths):
+        text = path.read_text(errors="replace")
+        pairs, verbatim, worst = pair_counts(text, 40)
+        cells = []
+        row = {"stream": path.name, "chars": len(text), "pairs_085": pairs, "verbatim": verbatim,
+               "worst_pair": round(worst, 3)}
+        for threshold, para_min, fp_len in SWEEP:
+            at = first_firing(text, para_min, fp_len, threshold)
+            cells.append("--" if at is None else f"{100.0 * at / max(len(text), 1):5.0f}%")
+            row[f"first_firing_t{threshold}_p{para_min}_f{fp_len}"] = "" if at is None else at
+        rows.append(row)
+        print(f"{path.name:44s} {pairs:6d} {verbatim:5d} {worst:6.3f} " + " ".join(c.rjust(11) for c in cells))
+    print("cells: the offset of the first truncation as a share of the stream (--: none); "
+          "pairs: paragraphs at 0.85 similarity or more")
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["stream"])
+            w.writeheader()
+            for row in rows:
+                w.writerow(row)
+        print(f"wrote {out}")
 
 
 def score(text: str, para_min: int, fp_len: int, threshold: int,
@@ -137,7 +216,14 @@ def main() -> None:
     ap.add_argument("--threshold", type=int, default=3)
     ap.add_argument("--out", default=None, help="CSV path (bench/results/...), tagged with the commit")
     ap.add_argument("--dump", default=None, help="directory for each run's reasoning (a .txt per run)")
+    ap.add_argument("--sweep", default=None,
+                    help="do not run anything: score the .txt files of this directory with a grid of "
+                         "loop-police settings and print where each would truncate")
     args = ap.parse_args()
+
+    if args.sweep:
+        sweep(sorted(Path(args.sweep).glob("*.txt")), Path(args.out) if args.out else None)
+        return
 
     if args.pi_session:
         recs = pi_session.records(args.pi_session)
