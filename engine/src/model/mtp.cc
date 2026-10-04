@@ -19,11 +19,60 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
 
 namespace omph::model {
+
+// Rows for positions [pos0, pos0 + T) of the MTP window (#171): a call stays
+// within the sinks or within the window (mtp_fill splits a prompt's chunk), or
+// spans both while the window still starts right after the sinks. A fill that
+// does not continue the window (a prompt's skipped part, a restore before it)
+// starts a new one at pos0; a write past the last row first moves the last
+// mtp_window_ positions before pos0 (draft rows included: a draft chain reads
+// its earlier drafts) to the front of the window.
+bool Runner::mtp_rows(const int64_t pos0, const int64_t T, const bool kv_only) {
+    if (mtp_window_ == 0 || pos0 + T <= kMtpSink) {
+        return true;  // row = position
+    }
+    if (pos0 >= kMtpSink && (pos0 < mtp_base_ || (kv_only && pos0 > mtp_next_))) {
+        mtp_base_ = pos0;
+        mtp_next_ = pos0;
+    }
+    if (kMtpSink + pos0 + T - mtp_base_ <= mtp_cap_) {
+        return true;
+    }
+    const int64_t from = pos0 + T - mtp_window_;
+    const int64_t n = pos0 - from;  // rows kept; the shift from - base > window >= n: no overlap
+    const size_t attn_kv = (size_t) h_.n_head_kv * h_.head_dim;
+    const size_t scales = (size_t) h_.n_head_kv * (h_.head_dim / 32) * 2;
+    const int64_t src = from - mtp_base_;
+    const auto move = [&](void * buf, const size_t row) {
+        auto * b = static_cast<uint8_t *>(buf) + (size_t) kMtpSink * row;
+        return n <= 0 || hipMemcpyAsync(b, b + (size_t) src * row, (size_t) n * row, hipMemcpyDeviceToDevice,
+                                        nullptr) == hipSuccess;
+    };
+    if (!move(mtp_kq_, attn_kv) || !move(mtp_ks_, scales) || !move(mtp_vq_, attn_kv / 2) || !move(mtp_vs_, scales)) {
+        return fail("mtp: window shift failed");
+    }
+    mtp_base_ = from;
+    mtp_next_ = std::min(mtp_next_, pos0);
+    return true;
+}
+
+// The cache row of position pos0 (#171).
+int64_t Runner::mtp_row(const int64_t pos0) const {
+    return mtp_window_ == 0 || pos0 < kMtpSink ? pos0 : kMtpSink + pos0 - mtp_base_;
+}
+
+void Runner::mtp_rewind(const int64_t pos) {
+    if (mtp_window_ > 0 && pos < mtp_base_) {
+        mtp_base_ = std::max(pos, kMtpSink);
+    }
+    mtp_next_ = std::min(mtp_next_, pos);
+}
 
 bool Runner::mtp_block(const int32_t * toks, const float * h_in, const int64_t pos0,
                        const int64_t T, const bool kv_only, int32_t * argmax,
@@ -51,8 +100,20 @@ bool Runner::mtp_block(const int32_t * toks, const float * h_in, const int64_t p
         !omph::kernels::add_rms_norm_f16(static_cast<const float *>(x_), nullptr, nullptr,
                                          mtp_L_.attn_norm, h16_, T, ne, (float) h_.eps,
                                          nullptr) ||
-        !attn_layer(h_.n_layer, mtp_L_, T, pos0, kv_only)) {
+        !mtp_rows(pos0, T, kv_only)) {
         return fail("mtp: attention failed");
+    }
+    // the window's row, RoPE at the position (image rows bring theirs)
+    const int64_t row = mtp_row(pos0);
+    const int64_t delta = rope_delta_;
+    rope_delta_ += pos0 - row;
+    const bool att = attn_layer(h_.n_layer, mtp_L_, T, row, kv_only);
+    rope_delta_ = delta;
+    if (!att) {
+        return fail("mtp: attention failed");
+    }
+    if (kv_only) {
+        mtp_next_ = std::max(mtp_next_, pos0 + T);
     }
     if (kv_only) {
         return true;
@@ -142,10 +203,17 @@ bool Runner::mtp_fill(const int64_t keep) {
                   row, hipMemcpyDeviceToDevice) != hipSuccess) {
         return fail("mtp fill: h copy failed");
     }
-    // inside a forward: its image rows and M-RoPE positions (the rows of
-    // [0, keep) are the forward's)
-    return mtp_block(last_toks_.data(), static_cast<const float *>(mtp_hin_), last_pos0_, keep,
-                     true, nullptr, nullptr, inputs_);
+    // a prompt fills only its sinks and its last window (#171; with images:
+    // every row, the forward's image rows and M-RoPE positions are for [0, keep))
+    const auto fill = [&](const int64_t a, const int64_t b) {  // rows [a, b) of the forward
+        return a >= b || mtp_block(last_toks_.data() + a, static_cast<const float *>(mtp_hin_) + a * ne,
+                                   last_pos0_ + a, b - a, true, nullptr, nullptr, inputs_);
+    };
+    if (inputs_ != nullptr || mtp_fill_from_ <= last_pos0_) {
+        return fill(0, keep);
+    }
+    const int64_t sinks = std::clamp<int64_t>(kMtpSink - last_pos0_, 0, keep);
+    return fill(0, sinks) && fill(std::clamp<int64_t>(mtp_fill_from_ - last_pos0_, sinks, keep), keep);
 }
 
 bool Runner::mtp_draft(const int32_t token, const int64_t pos, const int64_t k,

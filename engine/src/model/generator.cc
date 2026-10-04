@@ -365,6 +365,7 @@ int64_t Generator::resume(const std::vector<int32_t> & prompt, GenerateResult & 
             res.checkpoint_ms += omph::runtime::now_ms() - t0;
             res.restored = true;
             best->used = ++clock_;
+            runner_->mtp_rewind((int64_t) best->tokens.size());
             seq_.resize(best->tokens.size());
             return (int64_t) seq_.size();
         }
@@ -534,6 +535,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
     const double t0 = omph::runtime::now_ms();
     save_snapshot(prompt, res);
     const int64_t from = resume(prompt, res);
+    runner_->mtp_prompt((int64_t) prompt.size());
     if (from < 0) {
         drop_checkpoints(true);
         res.stop = GenerateResult::Stop::Error;
