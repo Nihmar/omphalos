@@ -15,6 +15,7 @@
 #include "runtime/scratch.hh"
 #include "runtime/timing.hh"
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
@@ -474,8 +475,8 @@ private:
     int64_t dfl_drafted_ = 0;      // drafts of the last dflash_draft
     int64_t dfl_steps_ = 0;
     void dflash_observe(int64_t kept_drafts);
-    std::vector<float *> state_cur_;  // recurrent layers: the state the next step reads
-    std::vector<float *> state_alt_;  // speculation: the buffer a verification writes
+    std::vector<__half *> state_cur_;  // recurrent layers: the state the next step reads (f16, #273)
+    std::vector<__half *> state_alt_;  // speculation: the buffer a verification writes
     std::vector<int64_t> rec_index_;  // recurrent layer -> 0.. (-1 for attention)
     int64_t spec_max_ = 0;            // 0: speculation off
     bool verifying_ = false;

@@ -5,6 +5,23 @@
 #include <hip/hip_runtime.h>
 
 namespace omph::kernels {
+
+// The state is stored in f16 and computed in f32 (#273). A call that runs
+// several tokens rounds it after each, as a decode step's store and reload
+// does, so a verification's rows and a replay stay the decode steps' bit for
+// bit (the prefill's WY chunks round once, at the store).
+// The f32 value is materialized before the conversion: left alone, the
+// compiler fused the replay's fma and its rounding into one mixed-precision
+// fma (one rounding instead of two), and rollbacks no longer matched the
+// decode steps on rare values.
+__device__ inline float st_round(float x) {
+    asm volatile("" : "+v"(x));
+    return __half2float(__float2half(x));
+}
+__device__ inline __half st_store(float x) {
+    asm volatile("" : "+v"(x));
+    return __float2half(x);
+}
 namespace {
 
 // Fused one-token delta rule: one workgroup per head, 256 threads (two per
@@ -24,7 +41,7 @@ __global__ __launch_bounds__(256) void delta_step_kernel(const GdnStep a) {
     __shared__ float kq[2 * kDeltaS];  // k then q of this head's key group
     __shared__ float red[8];
     const long long h = blockIdx.x;
-    float * S = a.state + h * kDeltaS * kDeltaS;
+    __half * S = a.state + h * kDeltaS * kDeltaS;
     const int tid = (int) threadIdx.x;
     const int col = tid & (kDeltaS - 1);
     const int half = tid >> 7;
@@ -131,7 +148,7 @@ __global__ __launch_bounds__(256) void delta_step_kernel(const GdnStep a) {
     float st[kDeltaRows];
 #pragma unroll
     for (int r = 0; r < kDeltaRows; ++r) {
-        st[r] = S[(lo + r) * kDeltaS + col];
+        st[r] = __half2float(S[(lo + r) * kDeltaS + col]);
     }
     __syncthreads();  // kq
     float acc = 0.0f;
@@ -151,12 +168,12 @@ __global__ __launch_bounds__(256) void delta_step_kernel(const GdnStep a) {
     __syncthreads();
     const float dc = dd[col];
     float acc2 = 0.0f;
-    float * S_out = a.state_out != nullptr ? a.state_out + h * kDeltaS * kDeltaS : S;
+    __half * S_out = a.state_out != nullptr ? a.state_out + h * kDeltaS * kDeltaS : S;
 #pragma unroll
     for (int r = 0; r < kDeltaRows; ++r) {
         st[r] = fmaf(kq[lo + r], dc, st[r]);
         acc2 = fmaf(st[r], kq[kDeltaS + lo + r], acc2);
-        S_out[(lo + r) * kDeltaS + col] = st[r];
+        S_out[(lo + r) * kDeltaS + col] = st_store(st[r]);
     }
     __syncthreads();  // part is reused
     part[half * kDeltaS + col] = acc2;
@@ -194,7 +211,7 @@ __global__ __launch_bounds__(256) void delta_chunk_kernel(GdnStep a) {
     __shared__ float kq[2 * kDeltaS];  // k then q of this head's key group
     __shared__ float red[8];
     const long long h = blockIdx.x;
-    float * S = a.state + h * kDeltaS * kDeltaS;
+    __half * S = a.state + h * kDeltaS * kDeltaS;
     const int tid = (int) threadIdx.x;
     const int col = tid & (kDeltaS - 1);
     const int half = tid >> 7;
@@ -223,7 +240,7 @@ __global__ __launch_bounds__(256) void delta_chunk_kernel(GdnStep a) {
     float st[kDeltaRows];
 #pragma unroll
     for (int r = 0; r < kDeltaRows; ++r) {
-        st[r] = S[(lo + r) * kDeltaS + col];
+        st[r] = __half2float(S[(lo + r) * kDeltaS + col]);
     }
     const __half * x16_0 = a.x16;
     const float * z_0 = a.z;
@@ -337,6 +354,7 @@ __global__ __launch_bounds__(256) void delta_chunk_kernel(GdnStep a) {
         for (int r = 0; r < kDeltaRows; ++r) {
             st[r] = fmaf(kq[lo + r], dc, st[r]);
             acc2 = fmaf(st[r], kq[kDeltaS + lo + r], acc2);
+            st[r] = st_round(st[r]);  // a decode step's store and reload
         }
         __syncthreads();  // part is reused
         part[half * kDeltaS + col] = acc2;
@@ -362,10 +380,10 @@ __global__ __launch_bounds__(256) void delta_chunk_kernel(GdnStep a) {
                 __float2half(ov * inv * a.norm_w[col] * (zn / (1.0f + expf(-zn))));
         }
     }
-    float * S_out = a.state_out != nullptr ? a.state_out + h * kDeltaS * kDeltaS : S;
+    __half * S_out = a.state_out != nullptr ? a.state_out + h * kDeltaS * kDeltaS : S;
 #pragma unroll
     for (int r = 0; r < kDeltaRows; ++r) {
-        S_out[(lo + r) * kDeltaS + col] = st[r];
+        S_out[(lo + r) * kDeltaS + col] = st_store(st[r]);
     }
 }
 
@@ -578,7 +596,7 @@ __device__ inline float rec_other_half(const float x) {
 
 __global__ __launch_bounds__(64) void delta_rec_kernel(
     const float * __restrict__ cv, const float * __restrict__ gates, float * __restrict__ vo,
-    float * __restrict__ replay, const float * state, float * state_out,  // may alias
+    float * __restrict__ replay, const __half * state, __half * state_out,  // may alias
     const long long tokens, const long long n_kh, const long long channels, const float l2_scale) {
     const long long h = blockIdx.x;
     const long long heads = gridDim.x;
@@ -590,7 +608,7 @@ __global__ __launch_bounds__(64) void delta_rec_kernel(
     float st[kDeltaRows];
 #pragma unroll
     for (int r = 0; r < kDeltaRows; ++r) {
-        st[r] = state[(h * kDeltaS + r0 + r) * kDeltaS + col];
+        st[r] = __half2float(state[(h * kDeltaS + r0 + r) * kDeltaS + col]);
     }
     const long long rec_stride = heads + n_kh * kDeltaS + heads * kDeltaS;
     for (long long t = 0; t < tokens; ++t) {
@@ -613,6 +631,7 @@ __global__ __launch_bounds__(64) void delta_rec_kernel(
         for (int r = 0; r < kDeltaRows; ++r) {
             st[r] = fmaf(kk[r], dc, st[r]);
             c = fmaf(st[r], qq[r], c);
+            st[r] = st_round(st[r]);  // a decode step's store and reload
         }
         const float co = rec_other_half(c);
         if (half == 0) {
@@ -624,7 +643,7 @@ __global__ __launch_bounds__(64) void delta_rec_kernel(
     }
 #pragma unroll
     for (int r = 0; r < kDeltaRows; ++r) {
-        state_out[(h * kDeltaS + r0 + r) * kDeltaS + col] = st[r];
+        state_out[(h * kDeltaS + r0 + r) * kDeltaS + col] = st_store(st[r]);
     }
 }
 
@@ -968,8 +987,8 @@ __device__ __forceinline__ void wy_b_chunk(wy_f8 (&hs)[8], const float * __restr
 
 // Phase B: grid (heads), 256 threads; wave w owns value columns 16 w .. 16 w + 15.
 __global__ __launch_bounds__(256) void delta_wy_b_kernel(const float * __restrict__ cv, float * __restrict__ wy,
-                                                        const float * state,
-                                                        float * state_out,  // may alias
+                                                        const __half * state,
+                                                        __half * state_out,  // may alias
                                                         const long long tokens, const long long n_kh,
                                                         const long long channels, const float l2_scale) {
     const long long h = blockIdx.x;
@@ -986,7 +1005,7 @@ __global__ __launch_bounds__(256) void delta_wy_b_kernel(const float * __restric
     for (int it = 0; it < 8; ++it) {
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
-            hs[it][e] = state[sbase + (it * 16 + e) * kDeltaS];
+            hs[it][e] = __half2float(state[sbase + (it * 16 + e) * kDeltaS]);
         }
     }
     const long long n_chunks = (tokens + kWyC - 1) / kWyC;
@@ -999,14 +1018,14 @@ __global__ __launch_bounds__(256) void delta_wy_b_kernel(const float * __restric
     for (int it = 0; it < 8; ++it) {
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
-            state_out[sbase + (it * 16 + e) * kDeltaS] = hs[it][e];
+            state_out[sbase + (it * 16 + e) * kDeltaS] = st_store(hs[it][e]);
         }
     }
 }
 
 // The rank-1 updates of recorded tokens, on the state of the step before them:
 // gdn_step's thread layout and float operations (decay, then fma with k and d).
-__device__ __forceinline__ void replay_body(float * __restrict__ state, const float * __restrict__ replay,
+__device__ __forceinline__ void replay_body(__half * __restrict__ state, const float * __restrict__ replay,
                                             const long long tokens, const long long n_kh, const long long h,
                                             const long long heads) {
     const int tid = (int) threadIdx.x;
@@ -1014,11 +1033,11 @@ __device__ __forceinline__ void replay_body(float * __restrict__ state, const fl
     const int lo = (tid >> 7) * kDeltaRows;
     const long long kh = h % n_kh;
     const long long stride = heads + n_kh * kDeltaS + heads * kDeltaS;
-    float * S = state + h * kDeltaS * kDeltaS;
+    __half * S = state + h * kDeltaS * kDeltaS;
     float st[kDeltaRows];
 #pragma unroll
     for (int r = 0; r < kDeltaRows; ++r) {
-        st[r] = S[(lo + r) * kDeltaS + col];
+        st[r] = __half2float(S[(lo + r) * kDeltaS + col]);
     }
     for (long long t = 0; t < tokens; ++t) {
         const float * rec = replay + t * stride;
@@ -1031,16 +1050,16 @@ __device__ __forceinline__ void replay_body(float * __restrict__ state, const fl
         }
 #pragma unroll
         for (int r = 0; r < kDeltaRows; ++r) {
-            st[r] = fmaf(k[lo + r], dc, st[r]);
+            st[r] = st_round(fmaf(k[lo + r], dc, st[r]));  // as each decode step stored it
         }
     }
 #pragma unroll
     for (int r = 0; r < kDeltaRows; ++r) {
-        S[(lo + r) * kDeltaS + col] = st[r];
+        S[(lo + r) * kDeltaS + col] = st_store(st[r]);
     }
 }
 
-__global__ __launch_bounds__(256) void gdn_replay_kernel(float * __restrict__ state,
+__global__ __launch_bounds__(256) void gdn_replay_kernel(__half * __restrict__ state,
                                                          const float * __restrict__ replay,
                                                          const long long tokens,
                                                          const long long n_kh) {
@@ -1074,7 +1093,7 @@ __global__ void gdn_conv_select_kernel(const float * __restrict__ hist, float * 
 
 } // namespace
 
-bool gdn_replay(float * state, const float * replay, const int64_t tokens, const int64_t heads,
+bool gdn_replay(__half * state, const float * replay, const int64_t tokens, const int64_t heads,
                 const int64_t n_kh, hipStream_t stream) {
     if (state == nullptr || replay == nullptr || tokens < 0 || heads <= 0 || n_kh <= 0) {
         return false;

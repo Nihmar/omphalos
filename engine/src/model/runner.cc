@@ -263,7 +263,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     {
         const int64_t n_state = h_.ssm_n_vh * h_.ssm_s * h_.ssm_s;
         const int64_t n_conv = (h_.ssm_conv_k - 1) * ssm_channels;
-        const size_t per_layer = (((size_t) (n_state + 2 * n_conv) * 4) + 255) & ~(size_t) 255;
+        const size_t per_layer = (((size_t) n_state * 2 + (size_t) 2 * n_conv * 4) + 255) & ~(size_t) 255;
         const size_t n_rec = (size_t) std::count(kv_index_.begin(), kv_index_.end(), -1);
         alloc(&state_pool_, std::max<size_t>(n_rec, 1) * per_layer);
         if (hipMemset(state_pool_, 0, std::max<size_t>(n_rec, 1) * per_layer) != hipSuccess) {
@@ -284,7 +284,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         state_alt_.assign((size_t) h_.n_layer, nullptr);
         for (int64_t il = 0; il < h_.n_layer; ++il) {
             if (states_[(size_t) il] != nullptr) {
-                state_cur_[(size_t) il] = reinterpret_cast<float *>(
+                state_cur_[(size_t) il] = reinterpret_cast<__half *>(
                     static_cast<uint8_t *>(states_[(size_t) il]) + 2 * n_conv * 4);
             }
         }
@@ -520,7 +520,7 @@ bool Runner::reset_sequence() {
         // the two conv tails sit at the start of the layer's block; the state
         // in use may be the alternate buffer after a speculative commit
         if (hipMemsetAsync(states_[(size_t) il], 0, 2 * n_conv * 4, nullptr) != hipSuccess ||
-            hipMemsetAsync(state_cur_[(size_t) il], 0, n_state * 4, nullptr) != hipSuccess) {
+            hipMemsetAsync(state_cur_[(size_t) il], 0, n_state * 2, nullptr) != hipSuccess) {
             return fail("reset: cannot clear the delta-net state");
         }
     }
@@ -539,7 +539,7 @@ bool Runner::reset_sequence() {
 
 size_t Runner::checkpoint_bytes() const {
     const int64_t channels = 2 * h_.ssm_n_kh * h_.ssm_s + h_.ssm_inner;
-    const size_t per_layer = ((size_t) (h_.ssm_conv_k - 1) * channels + (size_t) h_.ssm_n_vh * h_.ssm_s * h_.ssm_s) * 4;
+    const size_t per_layer = (size_t) (h_.ssm_conv_k - 1) * channels * 4 + (size_t) h_.ssm_n_vh * h_.ssm_s * h_.ssm_s * 2;
     size_t bytes = 0;
     for (int64_t il = 0; il < h_.n_layer; ++il) {
         if (states_[(size_t) il] != nullptr) bytes += per_layer;
@@ -563,7 +563,7 @@ void * Runner::checkpoint_alloc() {
 bool Runner::checkpoint_copy(void * host, const bool save) {
     const int64_t channels = 2 * h_.ssm_n_kh * h_.ssm_s + h_.ssm_inner;
     const size_t conv_bytes = (size_t) (h_.ssm_conv_k - 1) * channels * 4;
-    const size_t state_bytes = (size_t) h_.ssm_n_vh * h_.ssm_s * h_.ssm_s * 4;
+    const size_t state_bytes = (size_t) h_.ssm_n_vh * h_.ssm_s * h_.ssm_s * 2;  // f16 (#273)
     auto * at = static_cast<uint8_t *>(host);
     const auto copy = [&](void * dev, const size_t bytes) {
         const hipError_t e = save ? hipMemcpyAsync(at, dev, bytes, hipMemcpyDeviceToHost, nullptr)
@@ -975,8 +975,8 @@ void Runner::enable_speculation(const int64_t max_tokens) {
             rec_index_[(size_t) il] = n_rec++;
         }
     }
-    auto * alt = static_cast<float *>(
-        mem_.device((size_t) std::max<int64_t>(n_rec, 1) * n_state * 4,
+    auto * alt = static_cast<__half *>(
+        mem_.device((size_t) std::max<int64_t>(n_rec, 1) * n_state * 2,
                     "out of VRAM (speculation states)"));
     for (int64_t il = 0; il < h_.n_layer; ++il) {
         if (rec_index_[(size_t) il] >= 0) {
@@ -1162,8 +1162,8 @@ bool Runner::check_replay() {
     const int64_t n_kh = h_.ssm_n_kh;
     const int64_t n_vh = h_.ssm_n_vh;
     const size_t n_state = (size_t) n_vh * h_.ssm_s * h_.ssm_s;
-    float * scratch = static_cast<float *>(lazy(&spec_check_scratch_, n_state * 4));
-    std::vector<float> a(n_state), b(n_state);
+    auto * scratch = static_cast<__half *>(lazy(&spec_check_scratch_, n_state * 2));
+    std::vector<uint16_t> a(n_state), b(n_state);
     int64_t mismatched = 0;
     for (int64_t il = 0; il < h_.n_layer; ++il) {
         const int64_t r = rec_index_[(size_t) il];
@@ -1172,15 +1172,15 @@ bool Runner::check_replay() {
         }
         const float * rec = static_cast<const float *>(replay_pool_) +
                             r * spec_max_ * omph::kernels::gdn_replay_floats(n_vh, n_kh);
-        if (hipMemcpy(scratch, state_cur_[(size_t) il], n_state * 4, hipMemcpyDeviceToDevice) !=
+        if (hipMemcpy(scratch, state_cur_[(size_t) il], n_state * 2, hipMemcpyDeviceToDevice) !=
                 hipSuccess ||
             !omph::kernels::gdn_replay(scratch, rec, check_tokens_, n_vh, n_kh, nullptr) ||
-            hipMemcpy(a.data(), scratch, n_state * 4, hipMemcpyDeviceToHost) != hipSuccess ||
-            hipMemcpy(b.data(), state_alt_[(size_t) il], n_state * 4, hipMemcpyDeviceToHost) !=
+            hipMemcpy(a.data(), scratch, n_state * 2, hipMemcpyDeviceToHost) != hipSuccess ||
+            hipMemcpy(b.data(), state_alt_[(size_t) il], n_state * 2, hipMemcpyDeviceToHost) !=
                 hipSuccess) {
             return fail("spec check: replay failed");
         }
-        if (std::memcmp(a.data(), b.data(), n_state * 4) != 0) {
+        if (std::memcmp(a.data(), b.data(), n_state * 2) != 0) {
             ++mismatched;
         }
     }
