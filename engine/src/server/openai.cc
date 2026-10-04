@@ -120,6 +120,28 @@ void parse_sampling(const Json & body, const Defaults & d, Job & job) {
     const double k = number(body, "top_k", -1.0, 1e9, d.top_k);
     job.top_k = k < 0 ? 0 : (int) k;
     job.min_p = (float) number(body, "min_p", 0.0, 1.0, d.min_p);
+    // Sampling fields the engine does not implement are refused, not dropped
+    // in silence (#284): a client that asks for a repetition penalty to stop
+    // a loop would otherwise never learn that nothing happened. A no-op value
+    // (0, 1.0, or an empty bias) is accepted, so clients that always send the
+    // field are unaffected.
+    const auto unimplemented = [&](const char * key, const double no_op, const char * no_op_text) {
+        const Json * v = body.find(key);
+        if (v == nullptr || v->is_null()) {
+            return;
+        }
+        if (!v->is_number() || v->as_number() != no_op) {
+            bad(std::string(key) + " is not implemented: only " + no_op_text + " is accepted", key);
+        }
+    };
+    unimplemented("frequency_penalty", 0.0, "0");
+    unimplemented("presence_penalty", 0.0, "0");
+    unimplemented("repetition_penalty", 1.0, "1.0");
+    unimplemented("repeat_penalty", 1.0, "1.0");
+    if (const Json * bias = body.find("logit_bias"); bias != nullptr && !bias->is_null() &&
+        !(bias->is_object() && bias->size() == 0)) {
+        bad("logit_bias is not implemented: omit it, or send {}", "logit_bias");
+    }
     const Json * seed = body.find("seed");
     if (seed != nullptr && !seed->is_null()) {
         if (!seed->is_number() || !seed->number_is_integer()) bad("seed must be an integer", "seed");
