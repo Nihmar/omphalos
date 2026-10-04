@@ -76,7 +76,7 @@ cmake -S engine -B engine/build -DOMPH_LLAMA_DIR=<llama.cpp> -DOMPH_LLAMA_LIB=/v
 # the metadata (tokenizer, chat template) copied, the source SHA-256 recorded; ~1 min, 11.3 GiB.
 # The engine refuses an .omph of another format version (IQ3_S tiles: 2; IQ3_XXS tiles: 3;
 # IQ4_XS and Q4_K tiles: 4, #244; IQ2_S, Q2_K, IQ2_XS, IQ2_XXS tiles: 5, #253;
-# Q6_K tiles: 6, #258): reconvert (the DFlash2 drafter .omph too)
+# Q6_K tiles: 6, #258; IQ1_M tiles: 7, #275): reconvert (the DFlash2 drafter .omph too)
 engine/build/omph-convert <model.gguf> [<model.omph>]
 
 # tokenizer (#148): text on stdin -> ids, or --decode ids -> text (reads a .gguf or an .omph)
@@ -223,7 +223,7 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_SKIP_ATTN` / `OMPH_SKIP_FFN` / `OMPH_SKIP_BLOCKS` | ablation | no attention / no FFN / no blocks at all |
 | `OMPH_SKIP_GEMV` / `OMPH_SKIP_GEMV_TYPE=T` / `OMPH_SKIP_STAGE` | ablation | no fused GEMVs / none of GGUF type T / no f16 + GEMM matmuls |
 
-`omph-gemv-bench <model> --all-of-type T [--nt N] [--gemm T]`, `--merge-type T` (#203: the sibling GEMVs of type T as separate launches vs one launch on their concatenated rows), `--group [--nt N]` (#214, #255: every sibling group as separate launches vs one `gemv_group` launch at N = 1..16 tokens, outputs compared) times every tensor of a GGUF type back to back (1 s warm-up; `--nt N`: the N-token verification kernels, #63, 2..16 (one pass for the tile types IQ3_S, IQ3_XXS, IQ4_XS, Q4_K, IQ2_S, Q2_K, IQ2_XS, IQ2_XXS, Q6_K, #178, #244, #253, #258; the 1..4-token bodies back to back for the others); `--multi` (without `--nt`): each token of an N-token call against the 1-token call; `--gemm T`: the prefill's fused dequant + WMMA GEMM on T tokens, with its TFLOPS, #208); it reads two switches of its own: `OMPH_BENCH_STREAMS=N` (alternate launches over N streams) and `OMPH_OCCUPANCY` (print the occupancy probe).
+`omph-gemv-bench <model> --all-of-type T [--nt N] [--gemm T]`, `--merge-type T` (#203: the sibling GEMVs of type T as separate launches vs one launch on their concatenated rows), `--group [--nt N]` (#214, #255: every sibling group as separate launches vs one `gemv_group` launch at N = 1..16 tokens, outputs compared) times every tensor of a GGUF type back to back (1 s warm-up; `--nt N`: the N-token verification kernels, #63, 2..16 (one pass for the tile types IQ3_S, IQ3_XXS, IQ4_XS, Q4_K, IQ2_S, Q2_K, IQ2_XS, IQ2_XXS, Q6_K, IQ1_M, #178, #244, #253, #258, #275; the 1..4-token bodies back to back for the others); `--multi` (without `--nt`): each token of an N-token call against the 1-token call; `--gemm T`: the prefill's fused dequant + WMMA GEMM on T tokens, with its TFLOPS, #208); it reads two switches of its own: `OMPH_BENCH_STREAMS=N` (alternate launches over N streams) and `OMPH_OCCUPANCY` (print the occupancy probe).
 
 ## Working agreements
 

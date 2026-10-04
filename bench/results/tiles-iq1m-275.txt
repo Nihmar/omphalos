@@ -1,0 +1,12 @@
+# IQ1_M in WMMA tiles (#275, .omph format 7), 2026-10-04, RX 9060 XT. base: main 85df63e (format 6).
+# The model's one IQ1_M tensor (ffn_gate, 18.6 MiB), omph-gemv-bench --all-of-type 29 --nt N, ms:
+#   tokens   1      4      8      16
+#   base     0.130  0.191  0.405  0.804
+#   tiles    0.126  0.120  0.123  0.123
+# Every row of a 2..16-token call equals the 1-token call (--multi). It stays out of the grouped launch
+# (its 16 KiB grid in the shared LDS, #226).
+# Steps, 5 alternating runs against main: plain 40.87 / 40.94 ms, MTP 51.65 / 51.63, DFlash2 54.00 / 53.90
+# (these verifications are short: within noise). The gain is in 8..16-token verifications (n-gram drafts):
+# -0.28 ms at 8 tokens, -0.68 ms at 16 per verification.
+# Checks: check_gpu_run --layers, check_gpu_decode --gemv, oracle drafts of 3 / 8 / 15 tokens with
+# OMPH_SPEC_CHECK=1 identical to plain greedy, CPU tests.

@@ -1285,4 +1285,70 @@ struct DecQ6kTile {  // GGUF type 14, .omph layout 2 (#258)
     __device__ void decode(const Raw & r, const long long s, float (&v)[32]) const { DecQ6k{}.decode(r, s, v); }
 };
 
+// IQ1_M tiles (#275): group g = 2 h + gl takes its index byte, qh byte 2 sb + h
+// (index bits 8-10 and the delta's sign) and scale field h; DecIq1m's f32
+// value d sc (grid + delta), rounded to f16 once. Grid (2048 x 8 bytes) in LDS.
+struct TileIq1m {  // GGUF type 29
+    static constexpr long long kBytes = omph::format::kIq1mTileBytes;
+    static constexpr int kLds = 16384;
+    __device__ static void init(uint8_t * lds) {
+        uint2 * grid = reinterpret_cast<uint2 *>(lds);
+        for (int i = (int) threadIdx.x; i < 2048; i += blockDim.x) {
+            const uint64_t g = omph::quant::kIq1sGrid[i];
+            grid[i] = make_uint2((uint32_t) g, (uint32_t) (g >> 32));
+        }
+    }
+    struct Blk {
+        uint4 q;
+        uint2 qh, sc;
+    };
+    __device__ static Blk load(const uint8_t * o, const int lane) {
+        Blk k;
+        k.q = *reinterpret_cast<const uint4 *>(o + lane * 16);
+        k.qh = *reinterpret_cast<const uint2 *>(o + 512 + lane * 8);
+        k.sc = *reinterpret_cast<const uint2 *>(o + 768 + (lane & 15) * 8);
+        return k;
+    }
+    __device__ static tile_h8 frag(const uint8_t * lds, const Blk & k, const int sb, const int gl, const int h) {
+        const uint2 * grid = reinterpret_cast<const uint2 *>(lds);
+        const uint32_t qw[4] = {k.q.x, k.q.y, k.q.z, k.q.w};
+        const uint32_t qs = (qw[sb >> 1] >> (16 * (sb & 1) + 8 * gl)) & 0xFFu;
+        const uint32_t qh = ((sb < 4 ? k.qh.x : k.qh.y) >> (8 * (sb & 3))) & 0xFFu;
+        const uint32_t idx = qs | ((qh << (gl == 0 ? 8 : 4)) & 0x700u);
+        const float delta = (qh & (gl == 0 ? 0x08u : 0x80u)) != 0 ? -0.125f : 0.125f;
+        const uint32_t sc16[4] = {k.sc.x & 0xFFFFu, k.sc.x >> 16, k.sc.y & 0xFFFFu, k.sc.y >> 16};
+        const uint16_t scale_u16 = (uint16_t) ((sc16[0] >> 12) | ((sc16[1] >> 8) & 0x00F0) |
+                                               ((sc16[2] >> 4) & 0x0F00) | (sc16[3] & 0xF000));
+        const float d = __half2float(__ushort_as_half(scale_u16));
+        const float dl = d * (2.0f * (float) ((sc16[sb >> 1] >> (6 * (sb & 1) + 3 * h)) & 7) + 1.0f);
+        const uint2 gr = grid[idx];
+        tile_h8 a;
+#pragma unroll
+        for (int jj = 0; jj < 8; ++jj) {
+            const int8_t g = (int8_t) (((jj < 4 ? gr.x : gr.y) >> (8 * (jj & 3))) & 0xFFu);
+            a[jj] = (_Float16) (dl * ((float) g + delta));
+        }
+        return a;
+    }
+};
+
+struct DecIq1mTile {  // GGUF type 29, .omph layout 2 (#275)
+    const uint8_t * base;
+    long long blocks;
+    using Raw = DecIq1m::Raw;
+    static DecIq1mTile make(const uint8_t * base, const int64_t, const long long blocks) { return {base, blocks}; }
+    __device__ Raw load(const long long row, const long long s) const {
+        const uint8_t * o = base + ((row >> 4) * blocks + (s >> 3)) * omph::format::kIq1mTileBytes;
+        const int r = (int) (row & 15);
+        const int sb = (int) (s & 7);
+        Raw w;
+        w.qs4 = (uint32_t) *reinterpret_cast<const uint16_t *>(o + r * 16 + sb * 2) |
+                ((uint32_t) *reinterpret_cast<const uint16_t *>(o + (r + 16) * 16 + sb * 2) << 16);
+        w.qh2 = (uint32_t) o[512 + r * 8 + sb] | ((uint32_t) o[512 + (r + 16) * 8 + sb] << 8);
+        w.sc = *reinterpret_cast<const uint2 *>(o + 768 + r * 8);
+        return w;
+    }
+    __device__ void decode(const Raw & r, const long long s, float (&v)[32]) const { DecIq1m{}.decode(r, s, v); }
+};
+
 } // namespace omph::kernels::qd
