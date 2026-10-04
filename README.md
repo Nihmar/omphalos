@@ -74,9 +74,13 @@ engine/build/omph-server $M [--mmproj models/mmproj-Qwen3.8-27B-BF16.gguf] [--ct
 # the DFlash2 drafter needs its own .omph too (7 drafts per step, #245)
 engine/build/omph-convert models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
 
-# everything on: a 128K context, K4/V4 KV, DFlash2 drafts, n-gram drafts (the
-# default) and images (a vision build); ~15 GiB of VRAM, the desktop included
-OMPH_NGRAM=1 OMPH_KV_K4=1 engine/build/omph-server \
+# everything on: a 128K context, DFlash2 drafts, n-gram drafts (the default)
+# and images (a vision build); ~15 GiB of VRAM, the desktop included. The KV
+# stays on its measured default (K4 on the eight least sensitive attention
+# layers, #175); OMPH_KV_K4=1 puts K4 everywhere and saves ~0.4 GB more at
+# 106k, at KL 0.0028 against 0.0015 for the mix and 0.0009 for K8 at 16k
+# (bench/results/k4-per-layer-175.txt): an experiment, not the default.
+OMPH_NGRAM=1 engine/build/omph-server \
     models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph --ctx 131072 --port 7070 \
     --dflash models/Qwen3.8-27B-DFlash2-Q4_K_M.omph \
     --mmproj models/mmproj-Qwen3.8-27B-BF16.gguf
@@ -97,6 +101,63 @@ unless they hold their no-op value (0, 1.0, `{}`) -- never dropped in silence
 and `--kv-ram` (sequence checkpoints and whole conversations in pinned host
 RAM), `--mmproj`, `--dflash`, the default sampling (`--temp`, `--top-k`,
 `--top-p`, `--min-p`, `--max-tokens`).
+
+### Serving a coding agent
+
+An agent whose model entry has no sampling parameters does not send
+`temperature`, so the server's default applies: greedy. On a reasoning model
+at a 20k-100k context that is the fastest way to a repetition loop -- a whole
+session with pi (`provider: omphalos`, 2026-10-04) ended in five
+`pi-loop-police` truncations
+([#285](https://github.com/Nihmar/omphalos/issues/285)). Serve an agent with
+the sampler Qwen recommends for thinking mode, and with a cap on a runaway
+turn:
+
+```sh
+engine/build/omph-server $M --ctx 131072 --temp 0.6 --top-p 0.95 --top-k 20 \
+    --max-tokens 16384 --dflash models/Qwen3.8-27B-DFlash2-Q4_K_M.omph
+```
+
+- `--max-tokens` (default: until the context is full) bounds one turn: without
+  it a runaway generation can decode the whole 131k.
+- thinking is on by default, and `preserve_thinking` (the template's default,
+  as in llama.cpp) keeps every earlier reasoning block in the prompt. A client
+  turns thinking off with `"chat_template_kwargs": {"enable_thinking": false}`
+  (or `"reasoning_effort": "none"`), and drops the history's reasoning with
+  `{"preserve_thinking": false}`.
+- `--temp`/`--top-p`/... only set what a request leaves out; a client that
+  sends its own sampling wins. A sampling field the engine does not implement
+  is refused, not ignored (#284).
+
+pi (`~/.pi/agent/models.json`) does not know a custom provider is a reasoning
+model, so it sends no temperature and its thinking level does nothing.
+Declaring both makes it send them (`off` -> `enable_thinking: false`, so the
+engine's sampler is the only variable left):
+
+```json
+{
+  "providers": {
+    "omphalos": {
+      "baseUrl": "http://localhost:7070/v1",
+      "api": "openai-completions",
+      "apiKey": "unused",
+      "piGuiCustomEndpoint": true,
+      "models": [{
+        "id": "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph",
+        "name": "Qwen3.8-27B (omphalos)",
+        "reasoning": true,
+        "thinkingLevelMap": { "off": "off", "low": "low", "medium": "medium", "high": "xhigh" },
+        "contextWindow": 131072,
+        "maxTokens": 16384,
+        "samplingParams": { "temperature": 0.6, "top_p": 0.95, "top_k": 20 },
+        "compat": { "thinkingFormat": "qwen-chat-template", "supportsReasoningEffort": false,
+                    "supportsDeveloperRole": false, "supportsStore": false,
+                    "maxTokensField": "max_tokens" }
+      }]
+    }
+  }
+}
+```
 
 `engine/examples/capi_demo.c` shows the C ABI: load, tokenize, render a chat,
 generate with a token callback.
