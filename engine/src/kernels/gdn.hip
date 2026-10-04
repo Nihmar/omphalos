@@ -562,60 +562,69 @@ __global__ __launch_bounds__(256) void delta_gate_kernel(const GdnStep a) {
     }
 }
 
-// 2. The recurrence: grid (heads, 128 / kRecCols), one lane per value column
-// holding all 128 rows of it. A column's update needs only its own S^T k and
-// S^T q, so no lane talks to another; the two accumulators (rows 0..63 and
-// 64..127) are summed at the end, exactly gdn_step's part[col] + part[s + col].
-// k | q are the same for the whole wave: the restrict pointers let them come
-// through scalar loads (LDS staging was 2.7x slower, #96).
-constexpr int kRecCols = 64;
+// 2. The recurrence: grid (heads, 128 / kRecCols), 64 lanes per block; each
+// wave takes 16 value columns, lanes 0-15 rows 0..63 of them and lanes 16-31
+// rows 64..127 (#271: twice the waves of a lane per whole column, half the
+// state per lane). A column's update needs only its own S^T k and S^T q: each
+// half sums its 64 rows, the halves trade sums through v_permlanex16, and
+// both add them as gdn_step does (part[col] + part[s + col]), so the rows are
+// the decode step's bit for bit.
+constexpr int kRecCols = 32;
 
-__global__ __launch_bounds__(kRecCols) void delta_rec_kernel(
+__device__ inline float rec_other_half(const float x) {
+    const int v = __float_as_int(x);
+    return __int_as_float(__builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xfedcba98u, false, false));
+}
+
+__global__ __launch_bounds__(64) void delta_rec_kernel(
     const float * __restrict__ cv, const float * __restrict__ gates, float * __restrict__ vo,
     float * __restrict__ replay, const float * state, float * state_out,  // may alias
     const long long tokens, const long long n_kh, const long long channels, const float l2_scale) {
     const long long h = blockIdx.x;
     const long long heads = gridDim.x;
-    const int col = (int) (blockIdx.y * kRecCols + threadIdx.x);
+    const int lane = (int) threadIdx.x & 31;
+    const int half = lane >> 4;
+    const int col = (int) (blockIdx.y * kRecCols + (threadIdx.x >> 5) * 16 + (lane & 15));
+    const int r0 = half * kDeltaRows;  // this lane's rows: r0 .. r0 + 63
     const long long kh = h % n_kh;
-    float st[kDeltaS];
+    float st[kDeltaRows];
 #pragma unroll
-    for (int r = 0; r < kDeltaS; ++r) {
-        st[r] = state[(h * kDeltaS + r) * kDeltaS + col];
+    for (int r = 0; r < kDeltaRows; ++r) {
+        st[r] = state[(h * kDeltaS + r0 + r) * kDeltaS + col];
     }
     const long long rec_stride = heads + n_kh * kDeltaS + heads * kDeltaS;
     for (long long t = 0; t < tokens; ++t) {
         const float b = gates[(t * heads + h) * 2];
         const float decay = gates[(t * heads + h) * 2 + 1];
-        const float * qq = cv + t * channels + kh * kDeltaS;
+        const float * qq = cv + t * channels + kh * kDeltaS + r0;
         const float * kk = qq + n_kh * kDeltaS;
-        float a0 = 0.0f;
-        float a1 = 0.0f;
+        float a = 0.0f;
 #pragma unroll
         for (int r = 0; r < kDeltaRows; ++r) {
             st[r] *= decay;
-            a0 = fmaf(st[r], kk[r], a0);
-            st[kDeltaRows + r] *= decay;
-            a1 = fmaf(st[kDeltaRows + r], kk[kDeltaRows + r], a1);
+            a = fmaf(st[r], kk[r], a);
         }
+        const float ao = rec_other_half(a);
+        const float a0 = half == 0 ? a : ao;
+        const float a1 = half == 0 ? ao : a;
         const float dc = (cv[t * channels + 2 * n_kh * kDeltaS + h * kDeltaS + col] - (a0 + a1)) * b;
-        float c0 = 0.0f;
-        float c1 = 0.0f;
+        float c = 0.0f;
 #pragma unroll
         for (int r = 0; r < kDeltaRows; ++r) {
             st[r] = fmaf(kk[r], dc, st[r]);
-            c0 = fmaf(st[r], qq[r], c0);
-            st[kDeltaRows + r] = fmaf(kk[kDeltaRows + r], dc, st[kDeltaRows + r]);
-            c1 = fmaf(st[kDeltaRows + r], qq[kDeltaRows + r], c1);
+            c = fmaf(st[r], qq[r], c);
         }
-        vo[(t * heads + h) * kDeltaS + col] = l2_scale * (c0 + c1);
-        if (replay != nullptr) {
-            replay[t * rec_stride + heads + n_kh * kDeltaS + h * kDeltaS + col] = dc;
+        const float co = rec_other_half(c);
+        if (half == 0) {
+            vo[(t * heads + h) * kDeltaS + col] = l2_scale * (c + co);
+            if (replay != nullptr) {
+                replay[t * rec_stride + heads + n_kh * kDeltaS + h * kDeltaS + col] = dc;
+            }
         }
     }
 #pragma unroll
-    for (int r = 0; r < kDeltaS; ++r) {
-        state_out[(h * kDeltaS + r) * kDeltaS + col] = st[r];
+    for (int r = 0; r < kDeltaRows; ++r) {
+        state_out[(h * kDeltaS + r0 + r) * kDeltaS + col] = st[r];
     }
 }
 
@@ -1124,7 +1133,9 @@ bool gdn_chunk(const GdnStep & a, const int64_t heads, hipStream_t stream) {
     const unsigned conv_groups = (unsigned) ((a.tokens + kConvTokens - 1) / kConvTokens);
     delta_conv_kernel<<<dim3((unsigned) (a.channels / kDeltaS), conv_groups), kDeltaS, 0, stream>>>(a);
     const unsigned gate_groups = (unsigned) ((a.tokens + kGateTokens - 1) / kGateTokens);
-    if (heads % 4 == 0) {
+    // 4 heads per block read a prefill chunk's x once for them; a short call
+    // (a verification) needs the workgroups more (#271: 12 of them at 8 tokens)
+    if (heads % 4 == 0 && a.tokens > kGateTokens) {
         delta_gate_kernel<4><<<dim3((unsigned) (heads / 4), gate_groups), 256, 0, stream>>>(a);
     } else {
         delta_gate_kernel<1><<<dim3((unsigned) heads, gate_groups), 256, 0, stream>>>(a);
@@ -1140,7 +1151,7 @@ bool gdn_chunk(const GdnStep & a, const int64_t heads, hipStream_t stream) {
         delta_post_kernel<<<per_token, kDeltaS, 0, stream>>>(a, wy_out(a.wy, a.tokens, heads, a.n_kh));
         return hipGetLastError() == hipSuccess;
     }
-    delta_rec_kernel<<<dim3((unsigned) heads, kDeltaS / kRecCols), kRecCols, 0, stream>>>(
+    delta_rec_kernel<<<dim3((unsigned) heads, kDeltaS / kRecCols), 64, 0, stream>>>(
         a.work, gates, vo, a.replay, a.state, a.state_out != nullptr ? a.state_out : a.state,
         a.tokens, a.n_kh, a.channels, a.l2_scale);
     delta_post_kernel<<<per_token, kDeltaS, 0, stream>>>(a, vo);

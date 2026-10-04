@@ -1,0 +1,16 @@
+# Delta-net verification kernels (#271), 2026-10-04, RX 9060 XT, 160 W cap, main 1589985 + this branch.
+#
+# DFlash2 step (8-token verifications; omph-run --dflash on the HumanEval 0 prompt, rocprofv3, ms per step):
+#                     main     gate HB=1 + rec split
+#   delta_gate        0.830    0.562     (48 workgroups instead of 12)
+#   delta_rec         1.108    0.997     (now ~300 GB/s: it reads and writes the 151 MB state)
+#
+# Steps, 3 alternating runs (abstep: plain golden 65 tokens; MTP / DFlash2: 3k wikitext, 200 tokens, ms per
+# verification step):
+#                     base     gate only            gate + rec
+#   plain             41.4-41.6  41.46-41.50        41.44-41.53   (unchanged: decode uses delta_step)
+#   MTP step          52.42-52.49  52.20-52.25      52.17
+#   DFlash2 step      54.42-54.61  54.19-54.31      54.26-54.31
+#
+# Identity: oracle drafts of 3, 8, 15 tokens with --draft-corrupt 4 and OMPH_SPEC_CHECK=1 identical to plain
+# greedy; check_gpu_gdn layers 0 / 1 / 20 and OMPH_GDN_EXACT=1 pass.
