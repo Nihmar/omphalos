@@ -1,0 +1,21 @@
+# Images: the CPU encode overlapped with the GPU prefill of the text before them (#180), 2026-10-04.
+# RX 9060 XT; i5-13400F with its E-cores disabled (6 P-cores, 12 threads). base: main fa710ab; new: this branch.
+# A fresh omph-server --mmproj per request (no image cache), chat: a system message of wikitext-2 text, then a
+# user message with tools/mtmd/test-1.jpeg (a 314-token image) and a line of text; max_tokens 1, thinking off.
+# "first token" = the request's wall time. 3 runs each, alternating:
+#
+#   text before the image          base: first token        new: first token
+#   ~800 tokens (1114 in all)      4261 / 4272 / 4257 ms    3317 / 3322 / 3320 ms   (-22 %)
+#   ~2427 tokens (2741 in all)     5844 / 5847 / 5861 ms    3428 / 3424 / 3420 ms   (-41 %)
+#
+# The image encodes in ~2.76 s alone; while the GPU prefills it takes 2.81-2.90 s, and the GPU prefill is
+# not slowed (2427 tokens in 2.67-2.68 s either way).
+#
+# Pinning the encoder (PLAN.md §14.3: leave core 0 to the thread that drives the GPU) was measured and dropped:
+#                                  10 threads, cores 1-5     12 threads, unpinned
+#   encode alone                   3271 / 3277 ms            2756 / 2757 ms
+#   encode during the GPU prefill  3276 / 3302 ms            2917 / 2917 ms
+#   the 2427-token prefill         2648 / 2670 ms            2664 / 2676 ms
+#
+# Checks: check_vision.py (image KL 0.001463 vs llama.cpp, within the text-only 0.001189 noise; the M-RoPE
+# ablations clearly worse), check_server.py --image, omph-capi-demo with an image (the C ABI), CPU tests.
