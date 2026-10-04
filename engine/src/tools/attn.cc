@@ -10,7 +10,8 @@
 //         blocks); --chunk: tokens per call (1 = the decode path, with the
 //         split-K attention), all of them by default; --key-chunk N: keys per
 //         split, fixed (the runner's, #136/#161); -1 asks for the runner's own
-//         value for this many tokens, 0 (default) the kernel's own split.
+//         value for a KV capacity of --ctx positions (8192, the runner's
+//         default, gives 64), 0 (default) the kernel's own split.
 //   writes <out-prefix>.out.f32 and, with --trace, the intermediate tensors.
 #include "format/gguf.hh"
 #include "kernels/attn.hh"
@@ -79,7 +80,7 @@ int main(int argc, char ** argv) {
     if (argc < 6) {
         std::fprintf(stderr,
                      "usage: %s <model.gguf> <layer> <in.f32> <out-prefix> <tokens> [--trace] "
-                     "[--kv f32|q8q4|q4q4] [--window N] [--chunk N] [--key-chunk N|-1]\n",
+                     "[--kv f32|q8q4|q4q4] [--window N] [--chunk N] [--key-chunk N|-1] [--ctx N]\n",
                      argv[0]);
         return 2;
     }
@@ -92,7 +93,8 @@ int main(int argc, char ** argv) {
     std::string kv_mode = "f32";
     int64_t window = 128;
     int64_t chunk = 0;
-    int64_t key_chunk = 0;  // 0: the kernel's own split; < 0: the engine's (#136)
+    int64_t key_chunk = 0;    // 0: the kernel's own split; < 0: the engine's (#136)
+    int64_t key_ctx = 8192;   // the KV capacity --key-chunk -1 mirrors (omph-run's default)
     for (int i = 6; i < argc; ++i) {
         if (std::strcmp(argv[i], "--trace") == 0) {
             trace = true;
@@ -104,6 +106,8 @@ int main(int argc, char ** argv) {
             chunk = std::atoll(argv[++i]);
         } else if (std::strcmp(argv[i], "--key-chunk") == 0 && i + 1 < argc) {
             key_chunk = std::atoll(argv[++i]);
+        } else if (std::strcmp(argv[i], "--ctx") == 0 && i + 1 < argc) {
+            key_ctx = std::atoll(argv[++i]);
         } else {
             std::fprintf(stderr, "unknown option: %s\n", argv[i]);
             return 2;
@@ -112,17 +116,18 @@ int main(int argc, char ** argv) {
     if (kv_mode != "f32" && kv_mode != "q8q4" && kv_mode != "q4q4") {
         return fail("--kv must be f32, q8q4 or q4q4");
     }
-    if (tokens <= 0 || window < 0 || chunk < 0) {
-        return fail("bad token count, window or chunk");
+    if (tokens <= 0 || window < 0 || chunk < 0 || key_ctx <= 0) {
+        return fail("bad token count, window, chunk or context");
     }
     if (chunk == 0 || chunk > tokens) {
         chunk = tokens;
     }
     // What the runner gives every attention of the run: fixed key chunks make a
     // verification's rows the decode step's bit for bit (#161). Negative: the
-    // engine's value; 0: the kernel's own split.
+    // engine's value for a context of key_ctx positions (its own is max_seq_, not
+    // the token count); 0: the kernel's own split.
     const int64_t attn_key_chunk =
-        key_chunk < 0 ? omph::kernels::attention_key_chunk(tokens) : key_chunk;
+        key_chunk < 0 ? omph::kernels::attention_key_chunk(key_ctx) : key_chunk;
     const bool quant = kv_mode != "f32";
     const bool k_q4 = kv_mode == "q4q4";
 
@@ -246,8 +251,15 @@ int main(int argc, char ** argv) {
                 dev_alloc(&v16, (size_t) (window + omph::kernels::kKvRingExtra) * kv_out * 2);
             }
         }
-        const size_t work_bytes =
-            omph::kernels::attention_gqa_work_bytes(chunk, n_head, n_head_kv, head_dim);
+        // With fixed key chunks the worst case depends on the sequence, not only
+        // on the tokens per call (attention_gqa_work_bytes' 6-argument form,
+        // what the runner sizes its buffer with): the 4-argument one under-sizes
+        // it and a long input fails to launch (#318).
+        const size_t work_bytes = attn_key_chunk > 0
+                                      ? omph::kernels::attention_gqa_work_bytes(
+                                            chunk, n_head, n_head_kv, head_dim, tokens, attn_key_chunk)
+                                      : omph::kernels::attention_gqa_work_bytes(chunk, n_head, n_head_kv,
+                                                                                head_dim);
         void * work = nullptr;
         dev_alloc(&work, work_bytes);
         if (!ok) {
