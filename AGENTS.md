@@ -130,7 +130,9 @@ cd tools
 uv run python validate_gpu_dequant.py <model> <tensor> /tmp/dq.raw  # dequant kernel, bit-exact
 uv run python check_gpu_linear.py <model> <tensor>  # matmul path
 uv run python check_gpu_attn.py <model> <layer>   # attention layers 3 / 7 / 63 (attn_prep +
-    # attention_gqa); [--kv q8q4|q4q4 --window 0] the quantized cache, [--chunk 1] the decode path
+    # attention_gqa); [--kv q8q4|q4q4 --window 0] the quantized cache, [--chunk 1] the decode path,
+    # [--verify] 2..16 tokens in one call against it (bit-identical to 8, #161), [--identity-tokens
+    # 2048] the same at a length where the fixed key chunks and the ring wrap matter (#318)
 uv run python check_gpu_gdn.py  <model> <layer>   # delta-net layers 0 / 1 / 20 (gdn_step);
     # [--chunk 1|3] the decode path / the conv state carried across calls
 uv run python check_gpu_run.py  <model> --layers  # 64-layer stack vs the dump
