@@ -526,6 +526,9 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
         const int64_t nv = runner_->hparams().n_vocab;
         std::vector<float> rows;
         Dist dist;
+        // One penalty window per step (#315): the rows of a verification differ
+        // by one token at each end, so it is extended, not rebuilt, per row.
+        PenaltyWindow pen;
         std::uniform_real_distribution<double> unit(0.0, 1.0);
         // n-gram drafts (#199): when the text so far repeats, the tokens that
         // followed it last time (up to 15) replace the model's drafts
@@ -569,10 +572,17 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
                 }
                 after = am[(size_t) a];
             } else {
+                if (req.sampling.penalizes()) {
+                    pen.reset(seq_, req.sampling.penalty_last_n);
+                }
                 while (after < 0) {
                     // the drafts accepted so far in this step are the freshest
-                    // tokens of the penalty window (#298)
-                    distribution(rows.data() + a * nv, nv, req.sampling, seq_, dist, batch.data(), a + 1);
+                    // tokens of the penalty window (#298): the row drops the
+                    // oldest token of the sequence's part and takes batch[a]
+                    if (req.sampling.penalizes()) {
+                        pen.next(seq_, batch[(size_t) a]);
+                    }
+                    distribution(rows.data() + a * nv, nv, req.sampling, pen, dist);
                     if (a + 1 == (int64_t) batch.size()) {
                         after = draw(dist, -1, rng_);
                         break;

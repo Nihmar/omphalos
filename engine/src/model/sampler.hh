@@ -47,12 +47,41 @@ struct Dist {
     double total = 0.0;
 };
 
-// llama.cpp's llama_sampler_penalties_apply, token for token: the last
-// `penalty_last_n` tokens of `seq` (the `n_extra` accepted drafts of the step
-// being sampled are the freshest ones, so the window of the sequence shrinks
-// accordingly), each with its count. `row` is modified in place.
-void apply_penalties(float * row, int64_t nv, const Sampling & s, const std::vector<int32_t> & seq,
-                     const int32_t * extra = nullptr, int64_t n_extra = 0);
+// The penalty window of a step (#298): the ids of the last `penalty_last_n`
+// tokens of the sequence with their counts, kept sorted by id. reset() follows
+// a sequence that only grew for O(1) per new token; the rows of a verification
+// (whose windows differ by one token at each end) then cost one binary search
+// each, instead of copying and sorting the window per row (#315).
+class PenaltyWindow {
+public:
+    // The window after `seq`. A rebuild costs O(n log n) in the window's
+    // length, so the plain decode path (one call per step) is what it was;
+    // a new length or a sequence that did not only grow rebuilds.
+    void reset(const std::vector<int32_t> & seq, int64_t penalty_last_n);
+    // Moves to the next row of the same step: the sequence's part of the window
+    // loses its oldest token, and the accepted draft `extra` joins it.
+    void next(const std::vector<int32_t> & seq, int32_t extra);
+    // llama.cpp's llama_sampler_penalties_apply over the window, token for
+    // token; `row` is modified in place.
+    void apply(float * row, int64_t nv, const Sampling & s) const;
+
+private:
+    struct Cnt {
+        int32_t id;
+        int32_t n;
+    };
+    std::vector<Cnt> v_;   // ascending by id, counts positive
+    std::vector<int32_t> scratch_;
+    std::vector<int32_t> added_;  // the drafts next() has added since reset()
+    int64_t first_ = 0;    // seq index of the oldest token in the window
+    int64_t end_ = 0;      // ... and one past its newest
+    int64_t last_n_ = 0;
+    // Drafts accepted so far in the step: they are the freshest tokens, and
+    // while the sequence is shorter than penalty_last_n - extras they add to
+    // the window instead of evicting a sequence token (#298).
+    int64_t extras_ = 0;
+    void add(int32_t id, int32_t d);
+};
 
 // The kept set without sorting the vocabulary (#197: the full sort of ~10^5
 // candidates cost ~25 ms per row): top-k by selection, min-p by a threshold,
@@ -60,8 +89,7 @@ void apply_penalties(float * row, int64_t nv, const Sampling & s, const std::vec
 // kept tokens are in descending order when top-p applies, else in id order.
 // `row` is modified in place when the penalties are on (the callers own their
 // logits buffer).
-void distribution(float * row, int64_t nv, const Sampling & s, const std::vector<int32_t> & seq, Dist & d,
-                  const int32_t * extra = nullptr, int64_t n_extra = 0);
+void distribution(float * row, int64_t nv, const Sampling & s, const PenaltyWindow & pen, Dist & d);
 
 // A draw from d without token `skip` (-1: none).
 int32_t draw(const Dist & d, int32_t skip, std::mt19937_64 & rng);

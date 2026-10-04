@@ -69,7 +69,12 @@ void test_penalties() {
                                    0.5, 0.6, 0.7, 1.1, 0.9, 1.3, 0.25, 1.5};
     std::vector<float> got = row_of(w, nv);
     std::vector<float> want = got;
-    omph::model::apply_penalties(got.data(), nv, s, seq, extra, 2);
+    // the row of a step with two accepted drafts: reset, then one next() per row
+    omph::model::PenaltyWindow pen;
+    pen.reset(seq, s.penalty_last_n);
+    pen.next(seq, extra[0]);
+    pen.next(seq, extra[1]);
+    pen.apply(got.data(), nv, s);
     std::vector<int32_t> win(seq.end() - 6, seq.end());  // 8 - 2
     win.push_back(extra[0]);
     win.push_back(extra[1]);
@@ -97,6 +102,66 @@ void test_penalties() {
     const std::vector<int32_t> gseq = {0, 0, 0, 0};
     std::mt19937_64 grng(7);
     CHECK(omph::model::sample_row(row, g, gseq, grng) == 1, "greedy ignores the penalties");
+}
+
+// The window is extended across the rows of a step and across the steps: every
+// row must carry the penalties a brute-force window of that row's last
+// `penalty_last_n` tokens would (random sequences, drafts and rewinds).
+void test_penalty_window() {
+    Sampling s;
+    s.repeat_penalty = 1.15f;
+    s.presence_penalty = 0.2f;
+    s.frequency_penalty = 0.05f;
+    s.penalty_last_n = 37;
+    const int64_t nv = 24;
+    const std::vector<double> w = [] {
+        std::vector<double> v(24);
+        for (size_t i = 0; i < v.size(); ++i) {
+            v[i] = 0.3 + 0.1 * (double) (i % 7);
+        }
+        return v;
+    }();
+    std::mt19937_64 rng(20261004);
+    std::uniform_int_distribution<int32_t> id(0, 31);  // 24..31 are outside the row
+    std::vector<int32_t> seq;
+    omph::model::PenaltyWindow pen;
+    for (int step = 0; step < 400; ++step) {
+        const int rows = 1 + (int) (rng() % 5);  // the drafts of this step
+        std::vector<int32_t> extra;
+        for (int r = 0; r < rows; ++r) {
+            extra.push_back(id(rng));
+        }
+        seq.push_back(id(rng));
+        if (rng() % 20 == 0 && seq.size() > 5) {
+            seq.resize(seq.size() - 3);  // a speculative rollback
+        }
+        pen.reset(seq, s.penalty_last_n);
+        omph::model::PenaltyWindow again;  // resetting twice is the same window
+        again.reset(seq, s.penalty_last_n);
+        for (int r = 0; r < rows; ++r) {
+            pen.next(seq, extra[(size_t) r]);
+            again.next(seq, extra[(size_t) r]);
+            std::vector<float> got = row_of(w, nv);
+            std::vector<float> twin = got;
+            std::vector<float> want = got;
+            pen.apply(got.data(), nv, s);
+            again.apply(twin.data(), nv, s);
+            // the row's window: the last `penalty_last_n - (r + 1)` tokens of
+            // the sequence, plus the r + 1 drafts accepted so far
+            const int64_t keep = std::max<int64_t>(0, s.penalty_last_n - (r + 1));
+            std::vector<int32_t> win(seq.end() - std::min<int64_t>(keep, (int64_t) seq.size()), seq.end());
+            win.insert(win.end(), extra.begin(), extra.begin() + r + 1);
+            penalties_ref(want.data(), nv, s, win);
+            bool equal = got == twin;
+            for (int64_t i = 0; i < nv && equal; ++i) {
+                equal = got[i] == want[i];
+            }
+            CHECK(equal, "step %d row %d: the incremental penalties differ", step, r);
+            if (!equal) {
+                return;  // one report is enough, the rest would repeat it
+            }
+        }
+    }
 }
 
 void test_top_k() {
@@ -190,6 +255,7 @@ void test_draw() {
 
 int main() {
     test_penalties();
+    test_penalty_window();
     test_top_k();
     test_min_p();
     test_top_p();

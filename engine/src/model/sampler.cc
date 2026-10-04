@@ -6,37 +6,99 @@
 
 namespace omph::model {
 
-void apply_penalties(float * row, const int64_t nv, const Sampling & s, const std::vector<int32_t> & seq,
-                     const int32_t * extra, const int64_t n_extra) {
-    const int64_t window = std::max<int64_t>(0, (int64_t) s.penalty_last_n - n_extra);
-    const int64_t from = std::max<int64_t>(0, (int64_t) seq.size() - window);
-    std::vector<int32_t> ids(seq.begin() + (std::ptrdiff_t) from, seq.end());
-    if (n_extra > 0) {
-        ids.insert(ids.end(), extra, extra + n_extra);
+void PenaltyWindow::add(const int32_t id, const int32_t d) {
+    if (d == 0) {
+        return;
     }
-    std::sort(ids.begin(), ids.end());
-    for (size_t i = 0; i < ids.size();) {
-        size_t j = i;
-        while (j < ids.size() && ids[j] == ids[i]) {
-            ++j;
+    const auto it = std::lower_bound(v_.begin(), v_.end(), id,
+                                     [](const Cnt & c, const int32_t k) { return c.id < k; });
+    if (it != v_.end() && it->id == id) {
+        it->n += d;
+        if (it->n <= 0) {
+            v_.erase(it);
         }
-        const int32_t id = ids[i];
-        if (id >= 0 && id < nv) {
-            // llama.cpp's rule: a negative logit is multiplied, a positive one
-            // divided (dividing both would make negative logits more likely)
-            if (s.repeat_penalty != 1.0f) {
-                row[id] = row[id] <= 0.0f ? row[id] * s.repeat_penalty : row[id] / s.repeat_penalty;
-            }
-            row[id] -= s.presence_penalty + (float) (j - i) * s.frequency_penalty;
-        }
-        i = j;
+        return;
+    }
+    if (d > 0) {
+        v_.insert(it, Cnt{id, d});
     }
 }
 
-void distribution(float * row, const int64_t nv, const Sampling & s, const std::vector<int32_t> & seq, Dist & d,
-                  const int32_t * extra, const int64_t n_extra) {
+void PenaltyWindow::reset(const std::vector<int32_t> & seq, const int64_t penalty_last_n) {
+    const int64_t size = (int64_t) seq.size();
+    // the window the sequence ends with: the last min(size, penalty_last_n)
+    const int64_t want = std::max<int64_t>(0, size - std::max<int64_t>(0, penalty_last_n));
+    if (penalty_last_n != last_n_ || size < end_) {
+        // a new window length, or a sequence that was rewound: start over
+        v_.clear();
+        added_.clear();
+        first_ = want;
+        end_ = size;
+        last_n_ = penalty_last_n;
+        extras_ = 0;
+        scratch_.assign(seq.begin() + (std::ptrdiff_t) want, seq.end());
+        std::sort(scratch_.begin(), scratch_.end());
+        for (size_t i = 0; i < scratch_.size();) {
+            size_t j = i;
+            while (j < scratch_.size() && scratch_[j] == scratch_[i]) {
+                ++j;
+            }
+            v_.push_back(Cnt{scratch_[i], (int32_t) (j - i)});
+            i = j;
+        }
+        return;
+    }
+    // The sequence grew: the drafts the last step added are tokens of it now
+    // (the sequence's own entries take over), the new ones join, and whatever
+    // the last step's rows had pushed out of the window comes back.
+    for (const int32_t id : added_) {
+        add(id, -1);
+    }
+    added_.clear();
+    extras_ = 0;
+    last_n_ = penalty_last_n;
+    for (int64_t i = end_; i < size; ++i) {
+        add(seq[(size_t) i], 1);
+    }
+    end_ = size;
+    for (; first_ < want; ++first_) {
+        add(seq[(size_t) first_], -1);
+    }
+    for (; want < first_;) {
+        --first_;
+        add(seq[(size_t) first_], 1);
+    }
+}
+
+void PenaltyWindow::next(const std::vector<int32_t> & seq, const int32_t extra) {
+    ++extras_;
+    // the sequence's part of the window holds all of it while it is shorter
+    // than what the drafts leave it: then nothing is dropped
+    const int64_t len = std::min<int64_t>(end_, std::max<int64_t>(0, last_n_ - extras_));
+    for (const int64_t want = end_ - len; first_ < want; ++first_) {
+        add(seq[(size_t) first_], -1);
+    }
+    add(extra, 1);
+    added_.push_back(extra);
+}
+
+void PenaltyWindow::apply(float * row, const int64_t nv, const Sampling & s) const {
+    for (const Cnt & c : v_) {
+        if (c.id < 0 || c.id >= nv || c.n <= 0) {
+            continue;
+        }
+        // llama.cpp's rule: a negative logit is multiplied, a positive one
+        // divided (dividing both would make negative logits more likely)
+        if (s.repeat_penalty != 1.0f) {
+            row[c.id] = row[c.id] <= 0.0f ? row[c.id] * s.repeat_penalty : row[c.id] / s.repeat_penalty;
+        }
+        row[c.id] -= s.presence_penalty + (float) c.n * s.frequency_penalty;
+    }
+}
+
+void distribution(float * row, const int64_t nv, const Sampling & s, const PenaltyWindow & pen, Dist & d) {
     if (s.penalizes()) {
-        apply_penalties(row, nv, s, seq, extra, n_extra);
+        pen.apply(row, nv, s);
     }
     const float inv_t = 1.0f / s.temperature;
     const float best = *std::max_element(row, row + nv);
@@ -122,14 +184,18 @@ int32_t draw(const Dist & d, const int32_t skip, std::mt19937_64 & rng) {
 
 int32_t sample_row(std::vector<float> & logits, const Sampling & s, const std::vector<int32_t> & seq,
                    std::mt19937_64 & rng) {
+    PenaltyWindow pen;
+    if (s.penalizes()) {
+        pen.reset(seq, s.penalty_last_n);
+    }
     if (s.temperature <= 0.0f) {
         if (s.penalizes()) {  // llama.cpp applies them before the greedy pick too
-            apply_penalties(logits.data(), (int64_t) logits.size(), s, seq);
+            pen.apply(logits.data(), (int64_t) logits.size(), s);
         }
         return (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin());
     }
     Dist d;
-    distribution(logits.data(), (int64_t) logits.size(), s, seq, d);
+    distribution(logits.data(), (int64_t) logits.size(), s, pen, d);
     return draw(d, -1, rng);
 }
 
