@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>omph-tui — static mockup</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #161a22; --panel2: #1d222c; --border: #2e3644;
+    --fg: #d8dee9; --dim: #7c8798; --accent: #5fafff; --accent2: #2b3a4d;
+    --ok: #56d364; --warn: #ffd75f; --err: #ff6b6b; --tt: #7ee0c8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: #07090d; color: var(--fg); margin: 0; padding: 28px 20px 60px;
+    font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px; line-height: 1.35;
+  }
+  h1 { font-size: 16px; font-weight: 600; margin: 0 0 4px; color: #fff; }
+  h1 small { color: var(--dim); font-weight: 400; }
+  p.note { color: var(--dim); margin: 0 0 22px; max-width: 110ch; }
+  .term {
+    width: 1100px; max-width: 100%; margin: 0 0 30px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+    box-shadow: 0 12px 40px #0008;
+  }
+  .titlebar {
+    display: flex; gap: 14px; align-items: center; padding: 6px 12px;
+    background: var(--panel2); border-bottom: 1px solid var(--border); color: #fff;
+  }
+  .titlebar .path { color: var(--dim); }
+  .chip { padding: 1px 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border); color: var(--dim); }
+  .chip.run { color: var(--ok); border-color: #2c5c39; background: #12251a; }
+  .chip.vram { color: var(--warn); border-color: #5c532a; background: #241f10; }
+  .chip.port { color: var(--accent); border-color: #2b4a68; background: #101d2a; }
+  .tabs { display: flex; gap: 2px; padding: 4px 8px 0; background: var(--panel); border-bottom: 1px solid var(--border); }
+  .tab { padding: 4px 12px; border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; color: var(--dim); }
+  .tab.on { background: var(--bg); border-color: var(--border); color: #fff; }
+  .tab.hover { background: #1f2733; color: #fff; }
+  .tab b { color: var(--accent); font-weight: 500; }
+  .panes { display: grid; grid-template-columns: 470px 1fr; gap: 1px; background: var(--border); }
+  .pane { background: var(--panel); }
+  .pane > h2 {
+    font-size: 12px; font-weight: 500; color: #fff; margin: 0; padding: 5px 10px;
+    background: var(--panel2); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between;
+  }
+  .pane > h2 span { color: var(--dim); font-weight: 400; }
+  .form { padding: 6px 10px 10px; }
+  .row { display: grid; grid-template-columns: 190px 1fr; gap: 10px; padding: 1.5px 0; }
+  .row label { color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .val { color: var(--fg); }
+  .val.sel { color: #fff; background: var(--accent2); border-radius: 3px; padding: 0 6px; }
+  .val.bool { color: var(--ok); }
+  .val.off { color: #56606f; }
+  .val.path { color: var(--tt); }
+  .sep { border-top: 1px dashed var(--border); margin: 6px 0 4px; }
+  .hint { color: #5b6677; }
+  .log { padding: 4px 10px 8px; height: 340px; overflow: hidden; }
+  .log div { white-space: pre; color: var(--dim); }
+  .log .req { color: var(--fg); }
+  .log .tt { color: var(--tt); }
+  .log .acc { color: var(--accent); }
+  .log .warn { color: var(--warn); }
+  .log .err { color: var(--err); }
+  .log .ok { color: var(--ok); }
+  .mid { border-top: 1px solid var(--border); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: right; padding: 3px 10px; white-space: nowrap; }
+  th { color: #fff; font-weight: 500; background: var(--panel2); border-bottom: 1px solid var(--border); }
+  th:first-child, td:first-child, th.l, td.l { text-align: left; }
+  td { color: var(--dim); border-bottom: 1px solid #1b2029; }
+  td.num { color: var(--fg); font-variant-numeric: tabular-nums; }
+  td.ok { color: var(--ok); } td.warn { color: var(--warn); }
+  tr.live td { background: #14202c; color: var(--accent); }
+  tr.hover td { background: #1f2733; }
+  .mouse { display: flex; gap: 10px; flex-wrap: wrap; padding: 6px 10px 8px; background: var(--panel); border-top: 1px solid var(--border); color: var(--dim); }
+  .mouse b { color: var(--fg); font-weight: 500; }
+  .btn { display: inline-block; padding: 1px 10px; margin-right: 8px; background: var(--accent2); border: 1px solid #35506e; border-radius: 4px; color: #fff; }
+  tr.live td.num { color: var(--accent); }
+  .bar { padding: 4px 10px; color: var(--dim); background: var(--panel2); border-top: 1px solid var(--border); display: flex; justify-content: space-between; }
+  .keys { display: flex; gap: 14px; flex-wrap: wrap; padding: 6px 10px; background: var(--bg); border-top: 1px solid var(--border); color: var(--dim); }
+  kbd { background: var(--panel2); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; padding: 0 6px; color: #fff; font-family: inherit; }
+  .modalwrap { padding: 18px; display: flex; justify-content: center; background: var(--bg); }
+  .modal { width: 620px; background: var(--panel); border: 1px solid var(--accent); border-radius: 6px; box-shadow: 0 10px 30px #000a; }
+  .modal h2 { margin: 0; padding: 6px 12px; background: var(--accent2); color: #fff; font-size: 12px; font-weight: 500; border-bottom: 1px solid var(--border); }
+  .modal .plist { padding: 6px 0; }
+  .modal .prow { display: grid; grid-template-columns: 22px 210px 1fr; gap: 8px; padding: 3px 12px; color: var(--dim); }
+  .modal .prow.on { background: #14202c; color: #fff; }
+  .modal .prow.on .mark { color: var(--accent); }
+  .modal .prow .desc { color: var(--dim); }
+  .modal .foot { padding: 6px 12px; border-top: 1px solid var(--border); color: var(--dim); }
+  code { color: var(--tt); }
+</style>
+</head>
+<body>
+
+<h1>omph-tui <small>— static HTML mockup of the planned terminal UI (not a screenshot)</small></h1>
+<p class="note">Sizes are a 120×45 terminal. Colours, borders and the widget shapes mirror what
+<a href="https://textual.textualize.io/">Textual</a> gives out of the box; every value shown below is a real one from
+this machine (the 27B model, the coding-agent recipe of the README, and the timings of the 98k-token replay of #287).</p>
+
+<!-- ── 1. running ─────────────────────────────────────────────────────────────────────────── -->
+<div class="term">
+  <div class="titlebar">
+    <strong>omph-tui</strong>
+    <span class="path">Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph</span>
+    <span class="chip run">● running</span>
+    <span class="chip port">127.0.0.1:7070</span>
+    <span class="chip">ctx 131072</span>
+    <span class="chip vram">VRAM est. 14.6 / 15.9 GiB</span>
+    <span class="chip">uptime 00:12:41</span>
+  </div>
+
+  <div class="tabs">
+    <div class="tab"><b>1</b> Model</div>
+    <div class="tab on"><b>2</b> Sampling</div>
+    <div class="tab hover"><b>3</b> Drafting</div>
+    <div class="tab"><b>4</b> Cache</div>
+    <div class="tab"><b>5</b> Vision</div>
+    <div class="tab"><b>6</b> Advanced</div>
+  </div>
+
+  <div class="panes">
+    <div class="pane">
+      <h2>Sampling <span>defaults for requests that leave the field out</span></h2>
+      <div class="form">
+        <div class="row"><label>temperature</label><span class="val">0.60</span></div>
+        <div class="row"><label>top-k</label><span class="val">20</span></div>
+        <div class="row"><label>top-p</label><span class="val">0.95</span></div>
+        <div class="row"><label>min-p</label><span class="val off">0.00 (off)</span></div>
+        <div class="row"><label>seed</label><span class="val off">random</span></div>
+        <div class="sep"></div>
+        <div class="row"><label>repeat-penalty</label><span class="val">1.10</span></div>
+        <div class="row"><label>repeat-last-n</label><span class="val">1024</span></div>
+        <div class="row"><label>frequency-penalty</label><span class="val off">0.00 (off)</span></div>
+        <div class="row"><label>presence-penalty</label><span class="val off">0.00 (off)</span></div>
+        <div class="sep"></div>
+        <div class="row"><label>max-tokens</label><span class="val">16384</span></div>
+        <div class="row"><label>speculative drafts</label><span class="val bool">[x] on (MTP, k=3)</span></div>
+        <div class="row"><label>penalized greedy</label><span class="val off">drafts off (host argmax)</span></div>
+        <div class="sep"></div>
+        <div class="row"><label>profile</label><span class="val sel">coding-agent ▾</span></div>
+        <div class="row"><label>command</label><span class="hint">F9 preview · F10 copy</span></div>
+      </div>
+    </div>
+
+    <div class="pane">
+      <h2>log <span>all · follow on · 1.2k lines</span></h2>
+      <div class="log">
+        <div>20:41:02 <span class="ok">ready</span>  Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph on http://127.0.0.1:7070 (context 131072)</div>
+        <div>20:41:03 <span class="dim">load</span>   11.29 GiB in 1.61 s (repacked layouts, MTP block, DFlash2 drafter)</div>
+        <div>20:41:04 <span class="dim">load</span>   warm-up: 1 decode step in 22.4 ms</div>
+        <div class="req">20:41:55 POST /v1/chat/completions: sampling temp 0.60 top-k 20 top-p 0.95 min-p 0.00 repeat 1.10 freq 0.00 pres 0.00 last-n 1024 seed 20261004</div>
+        <div>20:41:55         prompt 98255 tokens (0 cached) in 146815 ms (669.2 t/s)</div>
+        <div class="acc">20:42:58         2048 tokens, 39.1 t/s (last 3 s: 40.7 t/s), drafts accepted 71 %</div>
+        <div class="acc">20:43:01         3072 tokens, 39.3 t/s (last 3 s: 41.0 t/s), drafts accepted 72 %</div>
+        <div class="req">20:43:22 done: 4096 tokens in 104232 ms (39.3 t/s, drafts accepted 2762 / 10939); stop: length</div>
+        <div class="req">20:43:30 POST /v1/chat/completions: sampling temp 0.60 top-k 20 top-p 0.95 min-p 0.00 repeat 1.10 freq 0.00 pres 0.00 last-n 1024 seed 20261004</div>
+        <div>20:43:30         prompt 45205 tokens (45192 cached, restored) in 62 ms (209.7 t/s)</div>
+        <div class="acc">20:43:33         512 tokens, 41.8 t/s (last 3 s: 41.8 t/s), drafts accepted 68 %</div>
+        <div class="warn">20:43:36         note: a penalized greedy step gives up the speculative drafts</div>
+        <div class="err">20:43:41 400 /v1/completions  frequency_penalty is not implemented: only 0 is accepted</div>
+        <div>20:43:44 GET /health  ok</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mid">
+    <table>
+      <thead>
+        <tr>
+          <th class="l">#</th><th class="l">time</th><th class="l">endpoint</th><th class="l">sampling</th>
+          <th>prompt</th><th>cached</th><th>prefill</th><th>t/s</th><th>out</th><th>t/s</th>
+          <th>drafts</th><th>acc</th><th class="l">stop</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="l num">1</td><td class="l">20:41:55</td><td class="l">chat</td><td class="l">0.6/20/0.95 r1.10</td>
+          <td class="num">98255</td><td>0</td><td>146.8 s</td><td>669</td><td class="num">4096</td><td class="num">39.3</td>
+          <td>2762/10939</td><td class="warn">25 %</td><td class="l">length</td>
+        </tr>
+        <tr>
+          <td class="l num">2</td><td class="l">20:43:30</td><td class="l">chat</td><td class="l">0.6/20/0.95 r1.10</td>
+          <td class="num">45205</td><td class="ok">45192</td><td>62 ms</td><td>210</td><td class="num">889</td><td class="num">41.8</td>
+          <td>612/1611</td><td class="warn">38 %</td><td class="l">stop</td>
+        </tr>
+        <tr class="hover">
+          <td class="l num">3</td><td class="l">20:43:52</td><td class="l">health</td><td class="l">—</td>
+          <td>—</td><td>—</td><td>0.3 ms</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="l ok">ok</td>
+        </tr>
+        <tr class="live">
+          <td class="l num">4</td><td class="l">20:43:55</td><td class="l">chat</td><td class="l">0.6/20/0.95 r1.10</td>
+          <td class="num">45206</td><td>45193</td><td class="acc">prefilling…</td><td>—</td><td class="num">1536</td><td class="num">40.9</td>
+          <td>980/2480</td><td>39 %</td><td class="l">in flight</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="bar">
+    <span>requests: 4 · prompt 188k tok · generated 6.5k tok · avg 40.0 t/s decode · 669 t/s prefill</span>
+    <span>follow: on · autoscroll</span>
+  </div>
+
+  <div class="mouse">
+    <span><b>mouse:</b></span>
+    <span>click a tab to switch</span><span>wheel scrolls the log</span><span>drag the scrollbar</span>
+    <span>click a row <b>once</b> to select, <b>double</b> for details</span><span>click a Select to open it</span>
+    <span>click a checkbox/switch to toggle</span><span>hover highlights</span>
+    <span>Shift+drag selects text (the terminal's own selection)</span>
+  </div>
+  <div class="keys">
+    <span><kbd>F2</kbd> start</span><span><kbd>F3</kbd> stop</span><span><kbd>F5</kbd> restart</span>
+    <span><kbd>F7</kbd> profiles</span><span><kbd>F8</kbd> export CSV</span><span><kbd>F9</kbd> command</span>
+    <span><kbd>F10</kbd> copy</span><span><kbd>ctrl</kbd>+<kbd>L</kbd> clear log</span>
+    <span><kbd>t</kbd> test prompt</span><span><kbd>e</kbd> errors only</span><span><kbd>q</kbd> quit</span>
+  </div>
+</div>
+
+<!-- ── 2. profiles ────────────────────────────────────────────────────────────────────────── -->
+<div class="term">
+  <div class="titlebar"><strong>omph-tui</strong><span class="path">profile picker (F7)</span></div>
+  <div class="modalwrap">
+    <div class="modal">
+      <h2>Profiles — enter loads, s saves the current form, esc cancels</h2>
+      <div class="plist">
+        <div class="prow on"><span class="mark">▸</span><span>coding-agent</span><span class="desc">0.6 / 0.95 / 20 · repeat 1.1 n=1024 · ctx 131072 · DFlash2 · max-tokens 16384</span></div>
+        <div class="prow"><span class="mark"></span><span>default</span><span class="desc">greedy · ctx 8192 · MTP drafts · server defaults</span></div>
+        <div class="prow"><span class="mark"></span><span>long-context</span><span class="desc">greedy · ctx 131072 · OMPH_KV_K4_LAYERS=none (K8) · cache-ram 4096</span></div>
+        <div class="prow"><span class="mark"></span><span>fast</span><span class="desc">greedy · ctx 32768 · DFlash2 + n-gram · no cache-ram</span></div>
+        <div class="prow"><span class="mark"></span><span>vision</span><span class="desc">coding-agent + mmproj models/mmproj-Qwen3.8-27B-BF16.gguf</span></div>
+        <div class="prow"><span class="mark"></span><span>(from ~/.config/omphalos/profiles.json)</span><span class="desc">user profiles, same keys as the form</span></div>
+      </div>
+      <div class="foot">enter load · s save as… · d delete · esc cancel</div>
+    </div>
+  </div>
+</div>
+
+<!-- ── 3. request detail (double click) ─────────────────────────────────────────────────── -->
+<div class="term">
+  <div class="titlebar"><strong>omph-tui</strong><span class="path">double-clicked request #1 — the same numbers the log line carries, as fields</span>
+    <span class="chip">esc / click outside closes</span></div>
+  <div class="modalwrap">
+    <div class="modal" style="width:760px">
+      <h2>request #1 · 20:41:55 · POST /v1/chat/completions</h2>
+      <div class="form" style="padding:8px 14px">
+        <div class="row"><label>sampling</label><span class="val">temp 0.60 · top-k 20 · top-p 0.95 · min-p 0.00</span></div>
+        <div class="row"><label></label><span class="val">repeat 1.10 · last-n 1024 · freq 0.00 · pres 0.00 · seed 20261004</span></div>
+        <div class="row"><label>prompt</label><span class="val">98255 tokens · 0 cached · cold prefill</span></div>
+        <div class="row"><label>prefill</label><span class="val">146.8 s · 669.2 t/s</span></div>
+        <div class="row"><label>generated</label><span class="val">4096 tokens in 104.2 s · 39.3 t/s</span></div>
+        <div class="row"><label>drafts</label><span class="val">2762 accepted / 10939 proposed · 25 %</span></div>
+        <div class="row"><label>stop</label><span class="val">length (max-tokens)</span></div>
+        <div class="row"><label>usage</label><span class="val">prompt_tokens 98255 · completion_tokens 4096 · total 102351</span></div>
+        <div class="sep"></div>
+        <div class="row"><label>actions</label><span><span class="btn">copy JSON</span><span class="btn">copy curl</span><span class="btn">re-run prompt</span><span class="btn">filter log on #1</span></span></div>
+      </div>
+    </div>
+  </div>
+  <div class="mouse"><span><b>mouse:</b></span><span>the buttons above are clickable</span><span>the modal dims and takes clicks while it is open</span><span>esc or a click outside closes it</span></div>
+</div>
+
+<!-- ── 4. command preview ─────────────────────────────────────────────────────────────────── -->
+<div class="term">
+  <div class="titlebar"><strong>omph-tui</strong><span class="path">command preview (F9) — exactly what F2 will exec</span>
+    <span class="chip">copy: F10</span></div>
+  <div class="pane" style="padding:10px 14px">
+    <div class="log" style="height:auto">
+      <div class="tt">OMPH_NGRAM=1 OMPH_KV_K4_LAYERS=2,4,5,6,7,9,11,15 OMPH_MTP_WINDOW=16384 \</div>
+      <div class="tt">engine/build/omph-server models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph \</div>
+      <div class="tt">  --host 127.0.0.1 --port 7070 --ctx 131072 --chunk 512 \</div>
+      <div class="tt">  --temp 0.60 --top-k 20 --top-p 0.95 --min-p 0.00 \</div>
+      <div class="tt">  --repeat-penalty 1.10 --repeat-last-n 1024 --max-tokens 16384 \</div>
+      <div class="tt">  --cache-ram 2048 --kv-ram 8192 \</div>
+      <div class="tt">  --dflash models/Qwen3.8-27B-DFlash2-Q4_K_M.omph</div>
+      <div class="hint">engine-found: yes · omph missing next to the gguf: no · port free: yes · est. VRAM 14.6 GiB</div>
+    </div>
+  </div>
+  <div class="keys"><span><kbd>F10</kbd> copy to clipboard</span><span><kbd>F2</kbd> start with this</span><span><kbd>e</kbd> edit env line</span><span><kbd>esc</kbd> back</span></div>
+</div>
+
+</body>
+</html>
