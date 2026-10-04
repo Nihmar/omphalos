@@ -366,6 +366,7 @@ private:
     void * embd_stage_ = nullptr;
     int64_t embd_cap_ = 0;
     bool last_logits_only_ = false;
+    bool head_type_warned_ = false;  // lm_head on another type than Q4_K, said once
     static constexpr int64_t kHeadRows = 32;  // logits_ rows (multiple of 4)
     std::vector<int64_t> kv_index_;
     std::vector<char> conv_flip_;

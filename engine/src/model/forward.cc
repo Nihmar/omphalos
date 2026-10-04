@@ -278,6 +278,16 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
 // once the results are on the host.
 bool Runner::lm_head(const int64_t T, std::vector<float> & logits, int32_t * greedy) {
     const int64_t ne = h_.n_embd;
+    // The fast paths (the device argmax of a decode step, four verification rows
+    // per weight read) are written for a Q4_K head, GGUF type 12; any other type
+    // goes through head_chunked, which dequantizes 32768 rows per vocabulary
+    // chunk on every call. Say it once instead of looking like a mystery (#315).
+    if (head_.gemv != nullptr && head_.gemv->type != 12 && !head_type_warned_) {
+        head_type_warned_ = true;
+        std::fprintf(stderr,
+                     "lm_head: type %u takes the chunked f16 path (the fast paths are for Q4_K)\n",
+                     head_.gemv->type);
+    }
     if (!omph::kernels::rms_norm(static_cast<const float *>(x_), out_norm_,
                                  static_cast<float *>(cur_), T, ne, (float) h_.eps, 1.0f,
                                  nullptr) ||
