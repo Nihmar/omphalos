@@ -13,6 +13,10 @@
 #include "runtime/options.hh"
 #include "text/chat.hh"
 #include "text/json.hh"
+#ifdef OMPH_VISION
+#include "vision/encoder.hh"
+#endif
+#include <algorithm>
 
 static_assert((int) omph::model::GenerateResult::Stop::Length == OMPH_STOP_LENGTH &&
                   (int) omph::model::GenerateResult::Stop::EndOfGeneration == OMPH_STOP_EOG &&
@@ -24,6 +28,9 @@ static_assert((int) omph::model::GenerateResult::Stop::Length == OMPH_STOP_LENGT
 
 struct omph_engine {
     std::unique_ptr<omph::model::Generator> gen;
+#ifdef OMPH_VISION
+    std::unique_ptr<omph::vision::Encoder> vision;
+#endif
     std::string error;
 };
 
@@ -60,6 +67,7 @@ void omph_engine_params_default(omph_engine_params * p) {
     p->mtp = 1;
     p->cache_mib = 2048;
     p->kv_ram_mib = 8192;
+    p->mmproj_path = nullptr;
 }
 
 omph_engine * omph_engine_load(const omph_engine_params * p, char * err, const size_t err_size) {
@@ -82,6 +90,13 @@ omph_engine * omph_engine_load(const omph_engine_params * p, char * err, const s
         c.cache_mib = p->cache_mib > 0 ? p->cache_mib : 0;
         c.kv_ram_mib = p->kv_ram_mib > 0 ? p->kv_ram_mib : 0;
         e->gen = std::make_unique<omph::model::Generator>(c, omph::runtime::EnvOptions::from_env());
+        if (p->mmproj_path != nullptr) {
+#ifdef OMPH_VISION
+            e->vision = std::make_unique<omph::vision::Encoder>(p->mmproj_path, p->model_path);
+#else
+            throw std::runtime_error("built without vision (configure with OMPH_LLAMA_DIR)");
+#endif
+        }
         return e.release();
     } catch (const std::exception & ex) {
         report(ex.what());
@@ -139,6 +154,9 @@ void omph_generate_params_default(omph_generate_params * p) {
     p->speculative = 1;
     p->stop = nullptr;
     p->n_stop = 0;
+    p->images = nullptr;
+    p->image_sizes = nullptr;
+    p->n_images = 0;
 }
 
 int omph_generate(omph_engine * e, const int32_t * prompt, const size_t n, const omph_generate_params * p,
@@ -158,6 +176,20 @@ int omph_generate(omph_engine * e, const int32_t * prompt, const size_t n, const
         req.speculative = gp.speculative != 0;
         if (gp.stop != nullptr) req.stop.assign(gp.stop, gp.stop + gp.n_stop);
         const omph::text::Tokenizer & tok = e->gen->tokenizer();
+        if (gp.n_images > 0) {
+            if (gp.images == nullptr || gp.image_sizes == nullptr) return (int) fail(e, OMPH_E_ARG, "no image bytes");
+#ifdef OMPH_VISION
+            if (!e->vision) return (int) fail(e, OMPH_E_ARG, "the engine was loaded without mmproj_path");
+            std::vector<std::string> bytes;
+            for (size_t i = 0; i < gp.n_images; ++i) bytes.emplace_back(gp.images[i], gp.image_sizes[i]);
+            // the CPU encodes while the GPU prefills the text before the first image (#180)
+            const int32_t pad = tok.find("<|image_pad|>");
+            const std::vector<int32_t> before(prompt, std::find(prompt, prompt + n, pad));
+            req.images = e->vision->encode_all(bytes, [&] { e->gen->prefill(before); });
+#else
+            return (int) fail(e, OMPH_E_ARG, "built without vision");
+#endif
+        }
         const auto res = e->gen->generate(std::vector<int32_t>(prompt, prompt + n), req, [&](const int32_t t) {
             if (cb == nullptr) return true;
             const std::string piece = tok.piece(t, false);
