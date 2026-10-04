@@ -31,8 +31,11 @@ import json
 import os
 import re
 import subprocess
+import sys
+import urllib.error
 from pathlib import Path
 
+import pi_session
 from niah import free_port, post, wait_health
 from omph_model import omph_file
 
@@ -67,6 +70,8 @@ CONFIGS = {
     "greedy": {},
     "sampled": {"argv": ["--temp", "0.6", "--top-p", "0.95", "--top-k", "20"]},
     "k8": {"env": {"OMPH_KV_K4_LAYERS": "none"}},
+    "k4-all": {"env": {"OMPH_KV_K4": "1"}},  # the configuration the 2026-10-04 session ran (#81)
+
     "k8-sampled": {"env": {"OMPH_KV_K4_LAYERS": "none"},
                    "argv": ["--temp", "0.6", "--top-p", "0.95", "--top-k", "20"]},
     "nothink": {"request": {"chat_template_kwargs": {"enable_thinking": False}}},
@@ -118,7 +123,11 @@ def score(text: str, para_min: int, fp_len: int, threshold: int,
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--configs", default="greedy,sampled,k8")
-    ap.add_argument("--prompts", default=None, help="a JSON list of {system?, user}")
+    ap.add_argument("--prompts", default=None, help="a JSON list of {system?, user} or {messages, tools?}")
+    ap.add_argument("--pi-session", default=None,
+                    help="a pi session JSONL: one prompt per --cuts timestamp, rebuilt as pi sent it (#287)")
+    ap.add_argument("--cuts", default=None,
+                    help="comma-separated ISO timestamps (as in the session file): the turn that starts there")
     ap.add_argument("--model", default=str(ROOT / "models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"))
     ap.add_argument("--omph", default=str(ROOT / "engine/build"))
     ap.add_argument("--ctx", type=int, default=16384)
@@ -130,7 +139,15 @@ def main() -> None:
     ap.add_argument("--dump", default=None, help="directory for each run's reasoning (a .txt per run)")
     args = ap.parse_args()
 
-    prompts = json.loads(Path(args.prompts).read_text()) if args.prompts else PROMPTS
+    if args.pi_session:
+        recs = pi_session.records(args.pi_session)
+        prompts = []
+        for cut in (args.cuts or "").split(","):
+            req = pi_session.request_for_cut(recs, cut)
+            req["label"] = cut
+            prompts.append(req)
+    else:
+        prompts = json.loads(Path(args.prompts).read_text()) if args.prompts else PROMPTS
     commit = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], capture_output=True,
                             text=True, check=False).stdout.strip()
     rows = []
@@ -146,11 +163,22 @@ def main() -> None:
         try:
             wait_health(url, proc)
             for k, p in enumerate(prompts):
-                msgs = ([{"role": "system", "content": p["system"]}] if p.get("system") else []) + \
-                    [{"role": "user", "content": p["user"]}]
-                body = {"messages": msgs, "max_tokens": args.max_tokens, "stream": False,
-                        "chat_template_kwargs": {"enable_thinking": True}, **cfg.get("request", {})}
-                r = post(url + "/v1/chat/completions", body)
+                label = p.get("label", f"p{k}")
+                if "messages" in p:
+                    body = {"max_tokens": args.max_tokens, "stream": False,
+                            "chat_template_kwargs": {"enable_thinking": True},
+                            **{key: p[key] for key in ("messages", "tools") if key in p},
+                            **cfg.get("request", {})}
+                else:
+                    msgs = ([{"role": "system", "content": p["system"]}] if p.get("system") else []) + \
+                        [{"role": "user", "content": p["user"]}]
+                    body = {"messages": msgs, "max_tokens": args.max_tokens, "stream": False,
+                            "chat_template_kwargs": {"enable_thinking": True}, **cfg.get("request", {})}
+                try:
+                    r = post(url + "/v1/chat/completions", body)
+                except urllib.error.HTTPError as e:
+                    body_text = e.read().decode(errors="replace")
+                    sys.exit(f"{name} {label}: the server answered {e.code}: {body_text[:400]}")
                 m = r["choices"][0]["message"]
                 reasoning = m.get("reasoning_content") or ""
                 content = m.get("content") or ""
@@ -160,15 +188,15 @@ def main() -> None:
                 repeats_any = score(text, args.para_min_len, args.fingerprint_len, args.threshold, False)[0]
                 tokens = (r["usage"].get("completion_tokens") or 0)
                 per_k = 1000.0 * repeats / (tokens / 1000.0) if tokens else 0.0
-                rows.append({"config": name, "prompt": k, "reasoning_chars": len(reasoning),
+                rows.append({"config": name, "prompt": label, "reasoning_chars": len(reasoning),
                              "completion_tokens": tokens, "paragraphs": paras, "paragraphs_skipped": skipped,
                              "repetitions": repeats, "repetitions_anywhere": repeats_any,
                              "repeats_per_1k_tokens": round(per_k, 3), "worst_pair_similarity": round(worst, 3)})
                 if args.dump:
                     d = Path(args.dump)
                     d.mkdir(parents=True, exist_ok=True)
-                    (d / f"{name}-p{k}.txt").write_text(text)
-                print(f"{name:12s} p{k}: {tokens:5d} tokens, {paras:3d} paragraphs ({skipped} fence-skipped), "
+                    (d / f"{name}-{label}.txt").write_text(text)
+                print(f"{name:12s} {label}: {tokens:5d} tokens, {paras:3d} paragraphs ({skipped} fence-skipped), "
                       f"{repeats:2d}/{repeats_any:2d} repetitions, worst pair {worst:.3f}", flush=True)
         finally:
             proc.terminate()
@@ -176,12 +204,18 @@ def main() -> None:
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
+        previous = []
+        if out.exists():  # the runs accumulate: one CSV per experiment, the commit in every row
+            with out.open(newline="") as f:
+                previous = [r for r in csv.DictReader(f) if r]
         with out.open("w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=["commit", "config", "prompt", "reasoning_chars",
                                               "completion_tokens", "paragraphs", "paragraphs_skipped",
                                               "repetitions", "repetitions_anywhere",
                                               "repeats_per_1k_tokens", "worst_pair_similarity"])
             w.writeheader()
+            for row in previous:
+                w.writerow(row)
             for row in rows:
                 w.writerow({"commit": commit, **row})
         print(f"wrote {out}")

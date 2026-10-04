@@ -1,0 +1,5 @@
+commit,config,prompt,reasoning_chars,completion_tokens,paragraphs,paragraphs_skipped,repetitions,repetitions_anywhere,repeats_per_1k_tokens,worst_pair_similarity
+24ace9c,greedy,2026-10-04T09:17:56Z,15541,4096,74,1,0,0,0.0,0.914
+24ace9c,k8,2026-10-04T09:17:56Z,15325,4096,59,11,0,0,0.0,1.0
+24ace9c,k4-all,2026-10-04T09:17:56Z,15951,4096,77,5,1,1,244.141,1.0
+24ace9c,sampled,2026-10-04T09:17:56Z,11428,3685,37,9,0,0,0.0,0.906
