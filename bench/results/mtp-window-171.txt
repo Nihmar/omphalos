@@ -1,0 +1,28 @@
+# MTP attention window (#171), 2026-10-04, RX 9060 XT, 160 W cap; .omph format 6.
+# The MTP block's KV holds 16 sink positions plus a window of the last W..2W positions (OMPH_MTP_WINDOW=W,
+# default 16384; active when the context exceeds 2W + 16), and a prompt fills it only for its sinks and its
+# last W tokens. Greedy output unchanged (speculative = plain greedy, OMPH_SPEC_CHECK=1, 32k prompt).
+#
+# omph-generate --prompt-ids --max 256, MTP k = 3 + n-gram drafts, OMPH_KV_K4=1, --ctx 131072, one run each;
+# peak VRAM: device total (desktop ~200-300 MiB included):
+#
+#   99422-token wikitext prompt     peak VRAM    prefill      decode           drafts kept
+#     W = 0 (whole context)          14820 MiB   151.6 s      18.03 ms/token   198 / 450
+#     W = 4096                       14626       151.0        19.26            193 / 489
+#     W = 16384                      14664       150.8        19.27            193 / 489
+#     W = 32768                      14716       151.3        19.30            193 / 489
+#     W = 16384, 16 sinks            14672       151.1        19.28            193 / 489
+#   99000-token code prompt (engine/src)
+#     W = 0                          14820       150.6        23.66            175 / 680
+#     W = 16384 (default)            14672       150.1        23.29            176 / 689
+#     W = 4096                       14630       150.1        24.47            172 / 725
+#
+# 32k wikitext prompt (--ctx 40960): W = 0 20.69 ms/token (164 / 604), 2048 20.64 (164 / 616), 4096 20.89
+# (163 / 631). 3k prompt with the window active and holding everything: drafts identical to W = 0 (174 / 549).
+#
+# Findings: the window saves ~150 MiB at a 128k context (the 218 MiB cache becomes 54 MiB); the prefill pass
+# it skips is ~0.25 % of the compute (not measurable); the drafts' attention is ~0.5 ms per step cheaper at
+# 100k. Acceptance at 100k loses on prose (+7 % ms/token for every W from 4k to 32k) and not on code
+# (-1.6 % at 16k): the far context, not the window size, is what matters there. The 16 attention-sink
+# positions changed nothing measurable but are kept (StreamingLLM practice, 16 rows). Contexts up to
+# 2W + 16 = 32784 do not activate the window at all.
