@@ -150,6 +150,11 @@ the conversation growing stays fast.
 | `--presence-penalty P` | `0` | default `presence_penalty` |
 | `--max-tokens N` | `-1` | default cap per request; `-1` runs until the context is full |
 
+A numeric option whose value is not entirely a number is refused, naming the
+flag and the value it got (`--top-p 0.95--top-k`, a flag pasted without its
+space, used to set `top_p` to 0.95 and ignore the rest; #306) -- a typo cannot
+configure a run half-way.
+
 Every sampling option is only a **default for requests that leave that field
 out**: a client that sends its own wins. Greedy and sampled requests both
 decode speculatively (MTP drafts, or DFlash2's, plus n-gram drafts when the
@@ -243,9 +248,18 @@ the sampler Qwen recommends for thinking mode, and with a cap on a runaway
 turn:
 
 ```sh
-engine/build/omph-server $M --ctx 131072 --temp 0.6 --top-p 0.95 --top-k 20 \
-    --max-tokens 16384 --dflash models/Qwen3.8-27B-DFlash2-Q4_K_M.omph
+cd /path/to/omphalos
+M=models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph   # or wherever your .omph is
+engine/build/omph-server $M --ctx 131072 \
+    --temp 0.6 --top-p 0.95 --top-k 20 \
+    --repeat-penalty 1.1 --repeat-last-n 1024 \
+    --max-tokens 16384 \
+    --dflash models/Qwen3.8-27B-DFlash2-Q4_K_M.omph
 ```
+
+`M=` is repeated here because this block is copied on its own: with an empty
+`$M` the first argument becomes the model path and the engine answers
+`unknown option 131072`.
 
 - `--max-tokens` (default: until the context is full) bounds one turn: without
   it a runaway generation can decode the whole 131k.
