@@ -257,6 +257,21 @@ struct Server {
         greq.sampling.frequency_penalty = job.frequency_penalty;
         greq.sampling.presence_penalty = job.presence_penalty;
         greq.sampling.penalty_last_n = job.penalty_last_n;
+        // A 20 s - 2.5 min prefill with no output looks like a hang (#310): one
+        // line every 3 s, the same shape as the decode progress below.
+        {
+            const double t0 = omph::runtime::now_ms();
+            double t_last = t0;
+            greq.on_prefill = [&greq, t0, t_last](const int64_t done, const int64_t total) mutable {
+                const double now = omph::runtime::now_ms();
+                if (done < total && now - t_last < 3000.0) {
+                    return;
+                }
+                t_last = now;
+                std::fprintf(stderr, "  prefill %lld / %lld tokens, %.1f t/s\n", (long long) done,
+                             (long long) total, done > 0 && now > t0 ? 1000.0 * (double) done / (now - t0) : 0.0);
+            };
+        }
 
         const std::string id = omph::server::random_id(chat ? "chatcmpl-" : "cmpl-", 24);
         const auto created = (double) std::time(nullptr);

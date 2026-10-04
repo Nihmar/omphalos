@@ -185,6 +185,22 @@ int main(int argc, char ** argv) {
                                                    tok);
             }
             bool first = true;
+            // the same prefill progress the server prints (#310): a long
+            // prompt is minutes of silence otherwise
+            {
+                const double t0 = omph::runtime::now_ms();
+                double t_last = t0;
+                req.on_prefill = [t0, t_last](const int64_t done, const int64_t total) mutable {
+                    const double now = omph::runtime::now_ms();
+                    if (done < total && now - t_last < 3000.0) {
+                        return;
+                    }
+                    t_last = now;
+                    std::fprintf(stderr, "  prefill %lld / %lld tokens, %.1f t/s\n", (long long) done,
+                                 (long long) total,
+                                 done > 0 && now > t0 ? 1000.0 * (double) done / (now - t0) : 0.0);
+                };
+            }
             const auto res = gen.generate(prompt, req, [&](const int32_t t) {
                 if (out_ids) {
                     std::printf(first ? "%d" : " %d", t);

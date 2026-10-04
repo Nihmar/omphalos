@@ -69,6 +69,10 @@ struct GenerateRequest {
     // speculation), appending every step's logits row (the prompt's first)
     const std::vector<int32_t> * force = nullptr;
     std::vector<float> * forced_logits = nullptr;
+    // A long prompt is minutes of work with nothing to show: the server turns
+    // this into a progress line every few seconds (#310). Called after every
+    // prefill chunk with the tokens fed so far and the total.
+    std::function<void(int64_t done, int64_t total)> on_prefill;
 };
 
 struct GenerateResult {
@@ -155,8 +159,8 @@ private:
         int64_t rope_end = 0;                 // the RoPE position after the prompt
     };
     bool expand(const std::vector<int32_t> & prompt, const GenerateRequest & req, Expanded & out) const;
-    bool feed(const Expanded & p, int64_t from, std::vector<float> & last_logits,
-              const std::vector<int64_t> & cuts, GenerateResult & res);
+    bool feed(const Expanded & p, const GenerateRequest & req, int64_t from,
+              std::vector<float> & last_logits, const std::vector<int64_t> & cuts, GenerateResult & res);
     // Sequence checkpoints (#158): the state after tokens[0, pos), in pinned
     // host RAM; valid while seq_ starts with `tokens`.
     struct Checkpoint {
