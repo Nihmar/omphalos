@@ -309,6 +309,16 @@ bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T
         return false;
     }
     if (kv_host_) {
+        // The whole prefix, on every call, for this layer: the staging buffer is
+        // shared by the attention layers, so the rows the previous layer left in
+        // it are not this layer's -- a per-layer row counter cannot tell what is
+        // already staged (tried and caught by the bit check in #315). Uploading
+        // only what a call adds needs either per-layer staging buffers (VRAM:
+        // ~0.8 GB per layer at 98k, so only up to ~16k fits) or a key offset in
+        // attention_gqa, staging the keys in pieces and accumulating the splits.
+        // As it is, the cost is 8 KiB of host-to-device traffic per token per
+        // layer: measured 55 vs 42 ms per step at 2.6k tokens, i.e. ~12 ms of
+        // PCIe against 42 ms of GPU, growing with the context (#315).
         const size_t bytes = (size_t) (pos0 + T) * kv_out * 4;
         if (hipMemcpy(kv_stage_k_, k_cache, bytes, hipMemcpyHostToDevice) != hipSuccess ||
             hipMemcpy(kv_stage_v_, v_cache, bytes, hipMemcpyHostToDevice) != hipSuccess) {
