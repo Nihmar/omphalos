@@ -113,8 +113,9 @@ bool Generator::is_eog(const int32_t id) const {
 // Runs toks[from..] at positions from.. in prefill chunks; the last chunk's
 // logits row ends in last_logits. A chunk also ends at each of `cuts`, where
 // a checkpoint is saved.
-bool Generator::feed(const Expanded & p, const int64_t from, std::vector<float> & last_logits,
-                     const std::vector<int64_t> & cuts, GenerateResult & res) {
+bool Generator::feed(const Expanded & p, const GenerateRequest & req, const int64_t from,
+                     std::vector<float> & last_logits, const std::vector<int64_t> & cuts,
+                     GenerateResult & res) {
     const std::vector<int32_t> & toks = p.tokens;
     const int64_t n = (int64_t) toks.size();
     const int64_t ne = runner_->hparams().n_embd;
@@ -146,6 +147,9 @@ bool Generator::feed(const Expanded & p, const int64_t from, std::vector<float> 
             const double t0 = omph::runtime::now_ms();
             if (!save_checkpoint(toks, end)) return false;
             res.checkpoint_ms += omph::runtime::now_ms() - t0;
+        }
+        if (req.on_prefill) {
+            req.on_prefill(end, n);
         }
         off = end;
     }
@@ -578,7 +582,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
     res.cached_tokens = from;
     std::vector<float> logits;
     runner_->set_rope_delta(0);  // text-only prompts; with images every chunk has its positions
-    if (!feed(ex, from, logits, checkpoint_positions(prompt, from), res)) {
+    if (!feed(ex, req, from, logits, checkpoint_positions(prompt, from), res)) {
         seq_.clear();
         drop_checkpoints(true);
         res.stop = GenerateResult::Stop::Error;

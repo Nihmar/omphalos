@@ -215,6 +215,19 @@ Errors are OpenAI-shaped (`{"error": {"message", "type", "param",
 image placeholders that do not match the images, 401 without the API key, 405
 for a wrong method.
 
+#### Log
+
+On stderr, per request: the ready line (the model, the context), a progress
+line every 3 seconds while **prefilling** (`  prefill 12288 / 98255 tokens, 820
+t/s`) and while **decoding** (`  2048 tokens, 39.1 t/s (last 3 s: 40.7 t/s),
+drafts accepted 71 %`), then the summary: the sampling the request ran with,
+the prompt tokens and how many of them the cache held or restored, the prefill
+and decode times and rates, the drafts accepted and the stop reason
+(`(client gone)` when the client left first). Nothing for a minute means the
+model is loading or the prompt is prefilling, not that the server is hung --
+with `--cache-ram`/`--kv-ram` a continued conversation resumes instead of
+prefilling and says so (`restored`).
+
 #### Environment
 
 The server passes `OMPH_*` through to the engine. The ones worth knowing when
