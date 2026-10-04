@@ -101,7 +101,8 @@ engine/build/omph-capi-demo <model.omph>
 # per request (#231). --dflash FILE: draft with the DFlash2 drafter (#245) instead of the MTP block
 # (convert z-lab/Qwen3.8-27B-DFlash2-GGUF's Q4_K_M with omph-convert; also for omph-generate, omph-run).
 # Options: --host --port --ctx --cache-ram MIB (sequence checkpoints in host RAM, #158; default
-# 2048) --mmproj FILE (images as base64 data: URLs, #160) --alias --api-key --cors ORIGIN, request defaults --temp
+# 2048) --kv-ram MIB (whole conversations in host RAM: a prompt that leaves the cached one saves
+# it, one that continues a saved one restores it, #179; default 8192) --mmproj FILE (images as base64 data: URLs, #160) --alias --api-key --cors ORIGIN, request defaults --temp
 # --top-k --top-p --min-p --max-tokens (default greedy: speculative MTP decoding)
 engine/build/omph-server <model.omph> [--port 8080]
 
@@ -134,6 +135,8 @@ uv run python check_gpu_decode.py [--gemv]        # greedy decode vs the NumPy r
 uv run python check_tokenizer.py <model> <llama.cpp>/bin/llama-tokenize [--fuzz N]
                                                   # tokenizer vs llama.cpp, token for token
 uv run python check_chat_template.py <model>      # chat template vs jinja2, byte for byte
+uv run python check_conversations.py [--spec mtp,dflash]  # #179: back to a saved conversation:
+                                                  # restored, not prefilled, same answer
 uv run python check_server.py [--url URL]         # omph-server end to end with the openai
                                                   # client (starts ../engine/build/omph-server)
     [--image <llama.cpp>/tools/mtmd/test-1.jpeg]  # ... and images (the server gets --mmproj)
