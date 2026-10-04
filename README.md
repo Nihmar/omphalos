@@ -58,7 +58,7 @@ line.
 ```sh
 # once: the engine loads the .omph file omph-convert writes from the GGUF (#178)
 engine/build/omph-convert models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
-M=models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph
+M=models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph  # the examples below use $M
 
 # a chat request (OpenAI-style messages) in, streamed text out
 echo '{"messages":[{"role":"user","content":"Hi!"}],"add_generation_prompt":true}' |
@@ -76,7 +76,8 @@ engine/build/omph-convert models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
 
 # everything on: a 128K context, K4/V4 KV, DFlash2 drafts, n-gram drafts (the
 # default) and images (a vision build); ~15 GiB of VRAM, the desktop included
-OMPH_NGRAM=1 OMPH_KV_K4=1 engine/build/omph-server $M --ctx 131072 \
+OMPH_NGRAM=1 OMPH_KV_K4=1 engine/build/omph-server \
+    models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph --ctx 131072 --port 7070 \
     --dflash models/Qwen3.8-27B-DFlash2-Q4_K_M.omph \
     --mmproj models/mmproj-Qwen3.8-27B-BF16.gguf
 ```
