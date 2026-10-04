@@ -120,24 +120,19 @@ void parse_sampling(const Json & body, const Defaults & d, Job & job) {
     const double k = number(body, "top_k", -1.0, 1e9, d.top_k);
     job.top_k = k < 0 ? 0 : (int) k;
     job.min_p = (float) number(body, "min_p", 0.0, 1.0, d.min_p);
-    // Sampling fields the engine does not implement are refused, not dropped
-    // in silence (#284): a client that asks for a repetition penalty to stop
-    // a loop would otherwise never learn that nothing happened. A no-op value
-    // (0, 1.0, or an empty bias) is accepted, so clients that always send the
-    // field are unaffected.
-    const auto unimplemented = [&](const char * key, const double no_op, const char * no_op_text) {
-        const Json * v = body.find(key);
-        if (v == nullptr || v->is_null()) {
-            return;
-        }
-        if (!v->is_number() || v->as_number() != no_op) {
-            bad(std::string(key) + " is not implemented: only " + no_op_text + " is accepted", key);
-        }
-    };
-    unimplemented("frequency_penalty", 0.0, "0");
-    unimplemented("presence_penalty", 0.0, "0");
-    unimplemented("repetition_penalty", 1.0, "1.0");
-    unimplemented("repeat_penalty", 1.0, "1.0");
+    // A sampling field the engine does not implement is refused, not dropped
+    // in silence (#284): logit_bias here, and the three penalties are read
+    // just below (#298).
+    // llama.cpp's penalties sampler (#298): repeat_penalty (the name its
+    // server uses), frequency_penalty and presence_penalty, one window for all
+    // three. repetition_penalty is accepted as the vLLM spelling of the first.
+    job.repeat_penalty = (float) number(body, "repeat_penalty", 1e-9, 1e9, d.repeat_penalty);
+    if (const Json * v = body.find("repetition_penalty"); v != nullptr && !v->is_null()) {
+        job.repeat_penalty = (float) number(body, "repetition_penalty", 1e-9, 1e9, d.repeat_penalty);
+    }
+    job.frequency_penalty = (float) number(body, "frequency_penalty", -2.0, 2.0, d.frequency_penalty);
+    job.presence_penalty = (float) number(body, "presence_penalty", -2.0, 2.0, d.presence_penalty);
+    job.penalty_last_n = (int) number(body, "repeat_last_n", 0.0, 1e9, d.penalty_last_n);
     if (const Json * bias = body.find("logit_bias"); bias != nullptr && !bias->is_null() &&
         !(bias->is_object() && bias->size() == 0)) {
         bad("logit_bias is not implemented: omit it, or send {}", "logit_bias");

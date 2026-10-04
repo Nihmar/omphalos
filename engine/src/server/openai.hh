@@ -20,6 +20,12 @@ struct Defaults {
     int top_k = 0;
     float top_p = 1.0f;
     float min_p = 0.0f;
+    // llama.cpp's penalties sampler (--repeat-penalty/-last-n/--*-penalty):
+    // the same window for all three, off by default
+    float repeat_penalty = 1.0f;
+    float frequency_penalty = 0.0f;
+    float presence_penalty = 0.0f;
+    int penalty_last_n = 64;
     int64_t max_tokens = -1;   // -1: until the context is full
 };
 
@@ -41,6 +47,10 @@ struct Job {
     float min_p = 0.0f;
     bool seeded = false;
     uint64_t seed = 0;
+    float repeat_penalty = 1.0f;    // llama.cpp's --repeat-penalty
+    float frequency_penalty = 0.0f;
+    float presence_penalty = 0.0f;
+    int penalty_last_n = 64;        // llama.cpp's --repeat-last-n (0: off)
     int64_t max_tokens = -1;
     std::vector<std::string> stop;
     bool stream = false;

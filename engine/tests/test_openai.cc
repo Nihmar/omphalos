@@ -108,14 +108,17 @@ int main() {
     CHECK(rejects(R"({"messages":[{"role":"user","content":"Hi"}],"temperature":"hot"})"), "bad temperature");
     CHECK(!rejects(R"({"messages":[{"role":"user","content":"Hi"}],"frequency_penalty":0,)"
                    R"("presence_penalty":0,"repetition_penalty":1,"repeat_penalty":1.0,"logit_bias":{}})"),
-          "no-op values of unimplemented sampling fields");
-    CHECK(rejects(R"({"messages":[{"role":"user","content":"Hi"}],"frequency_penalty":0.2})") &&
-              rejects(R"({"messages":[{"role":"user","content":"Hi"}],"presence_penalty":0.2})") &&
-              rejects(R"({"messages":[{"role":"user","content":"Hi"}],"repetition_penalty":1.1})") &&
-              rejects(R"({"messages":[{"role":"user","content":"Hi"}],"repeat_penalty":0.9})") &&
-              rejects(R"({"messages":[{"role":"user","content":"Hi"}],"logit_bias":{"123":1}})") &&
-              rejects(R"({"messages":[{"role":"user","content":"Hi"}],"frequency_penalty":"no"})"),
+          "the no-op values of every sampling field");
+    CHECK(rejects(R"({"messages":[{"role":"user","content":"Hi"}],"logit_bias":{"123":1}})") &&
+              rejects(R"({"messages":[{"role":"user","content":"Hi"}],"frequency_penalty":"no"})") &&
+              rejects(R"({"messages":[{"role":"user","content":"Hi"}],"repeat_penalty":0})"),
           "unimplemented sampling fields are refused, not dropped in silence");
+    j = chat_job(R"({"messages":[{"role":"user","content":"Hi"}],"repeat_penalty":1.1,)"
+                 R"("repetition_penalty":1.2,"frequency_penalty":0.3,"presence_penalty":0.4,)"
+                 R"("repeat_last_n":1024})");
+    CHECK(j.repeat_penalty == 1.2f && j.frequency_penalty == 0.3f && j.presence_penalty == 0.4f &&
+              j.penalty_last_n == 1024,
+          "llama.cpp's penalties sampler (repetition_penalty is the vLLM spelling)");
     CHECK(rejects(R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]})") &&
               rejects(R"({"messages":[{"role":"user","content":[{"type":"image_url",)"
                       R"("image_url":{"url":"https://example.com/a.png"}}]}]})") &&

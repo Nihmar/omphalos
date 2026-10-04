@@ -21,6 +21,11 @@
 //                     defaults for requests that leave them out (default: greedy,
 //                     until the context is full); greedy and sampled requests both
 //                     decode speculatively with the MTP block (#197)
+//   --repeat-penalty P, --repeat-last-n N, --frequency-penalty P, --presence-penalty P
+//                     llama.cpp's penalties sampler (#298): the last N tokens of
+//                     the sequence are scaled by P (sign-aware) and pushed down
+//                     by freq/pres (defaults 1.0 / 64 / 0.0 / 0.0, i.e. off);
+//                     a penalized greedy step gives up the speculative drafts
 //
 // Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions,
 // POST /v1/completions (stream or not). One request at a time; a chat's next
@@ -56,13 +61,19 @@ using omph::text::Json;
 // default when it leaves it out. Printed in the per-request summary so that
 // "which sampling did that client get" is answerable from the log (#284).
 std::string sampling_label(const omph::server::Job & job) {
-    if (job.temperature <= 0.0f) {
-        return "greedy";
+    std::string label = job.temperature <= 0.0f ? "greedy" : "";
+    if (job.temperature > 0.0f) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "temp %.2f top-k %d top-p %.2f min-p %.2f", (double) job.temperature,
+                      job.top_k, (double) job.top_p, (double) job.min_p);
+        label = buf;
     }
-    char buf[128];
-    std::snprintf(buf, sizeof(buf), "temp %.2f top-k %d top-p %.2f min-p %.2f", (double) job.temperature,
-                  job.top_k, (double) job.top_p, (double) job.min_p);
-    std::string label = buf;
+    if (job.repeat_penalty != 1.0f || job.frequency_penalty != 0.0f || job.presence_penalty != 0.0f) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), " repeat %.2f freq %.2f pres %.2f last-n %d", (double) job.repeat_penalty,
+                      (double) job.frequency_penalty, (double) job.presence_penalty, job.penalty_last_n);
+        label += buf;
+    }
     if (job.seeded) {
         label += " seed " + std::to_string(job.seed);
     }
@@ -240,6 +251,10 @@ struct Server {
         greq.sampling.top_p = job.top_p;
         greq.sampling.min_p = job.min_p;
         greq.sampling.seed = job.seeded ? job.seed : std::random_device{}() * 0x100000000ull + std::random_device{}();
+        greq.sampling.repeat_penalty = job.repeat_penalty;
+        greq.sampling.frequency_penalty = job.frequency_penalty;
+        greq.sampling.presence_penalty = job.presence_penalty;
+        greq.sampling.penalty_last_n = job.penalty_last_n;
 
         const std::string id = omph::server::random_id(chat ? "chatcmpl-" : "cmpl-", 24);
         const auto created = (double) std::time(nullptr);
@@ -483,6 +498,10 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--top-k")) defaults.top_k = std::atoi(val());
         else if (!std::strcmp(argv[i], "--top-p")) defaults.top_p = (float) std::atof(val());
         else if (!std::strcmp(argv[i], "--min-p")) defaults.min_p = (float) std::atof(val());
+        else if (!std::strcmp(argv[i], "--repeat-penalty")) defaults.repeat_penalty = (float) std::atof(val());
+        else if (!std::strcmp(argv[i], "--repeat-last-n")) defaults.penalty_last_n = std::atoi(val());
+        else if (!std::strcmp(argv[i], "--frequency-penalty")) defaults.frequency_penalty = (float) std::atof(val());
+        else if (!std::strcmp(argv[i], "--presence-penalty")) defaults.presence_penalty = (float) std::atof(val());
         else if (!std::strcmp(argv[i], "--max-tokens")) defaults.max_tokens = std::atoll(val());
         else {
             std::fprintf(stderr, "unknown option %s\n", argv[i]);

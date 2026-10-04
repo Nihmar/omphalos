@@ -376,8 +376,11 @@ int64_t Generator::resume(const std::vector<int32_t> & prompt, GenerateResult & 
 
 // Host sampling: temperature, then top-k, min-p and top-p over the tokens
 // within e^-30 of the best (the rest cannot matter), from a seeded generator.
-int32_t Generator::sample(const std::vector<float> & logits, const Sampling & s) {
+int32_t Generator::sample(std::vector<float> & logits, const Sampling & s) {
     if (s.temperature <= 0.0f) {
+        if (s.penalizes()) {  // llama.cpp applies them before the greedy pick too
+            apply_penalties(logits.data(), (int64_t) logits.size(), s);
+        }
         return (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin());
     }
     Dist d;
@@ -389,7 +392,38 @@ int32_t Generator::sample(const std::vector<float> & logits, const Sampling & s)
 // candidates cost ~25 ms per row): top-k by selection, min-p by a threshold,
 // top-p over a descending prefix sorted only as far as its mass needs. The
 // kept tokens are in descending order when top-p applies, else in id order.
-void Generator::distribution(const float * row, const int64_t nv, const Sampling & s, Dist & d) const {
+void Generator::apply_penalties(float * row, const int64_t nv, const Sampling & s,
+                                const int32_t * extra, const int64_t n_extra) const {
+    const int64_t window = std::max<int64_t>(0, (int64_t) s.penalty_last_n - n_extra);
+    const int64_t from = std::max<int64_t>(0, (int64_t) seq_.size() - window);
+    std::vector<int32_t> ids(seq_.begin() + (std::ptrdiff_t) from, seq_.end());
+    if (n_extra > 0) {
+        ids.insert(ids.end(), extra, extra + n_extra);
+    }
+    std::sort(ids.begin(), ids.end());
+    for (size_t i = 0; i < ids.size();) {
+        size_t j = i;
+        while (j < ids.size() && ids[j] == ids[i]) {
+            ++j;
+        }
+        const int32_t id = ids[i];
+        if (id >= 0 && id < nv) {
+            // llama.cpp's rule: a negative logit is multiplied, a positive one
+            // divided (dividing both would make negative logits more likely)
+            if (s.repeat_penalty != 1.0f) {
+                row[id] = row[id] <= 0.0f ? row[id] * s.repeat_penalty : row[id] / s.repeat_penalty;
+            }
+            row[id] -= s.presence_penalty + (float) (j - i) * s.frequency_penalty;
+        }
+        i = j;
+    }
+}
+
+void Generator::distribution(float * row, const int64_t nv, const Sampling & s, Dist & d,
+                             const int32_t * extra, const int64_t n_extra) const {
+    if (s.penalizes()) {
+        apply_penalties(row, nv, s, extra, n_extra);
+    }
     const float inv_t = 1.0f / s.temperature;
     const float best = *std::max_element(row, row + nv);
     std::vector<std::pair<float, int32_t>> cand;  // (scaled logit, id), in id order
@@ -560,6 +594,10 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
 
     const bool forcing = req.force != nullptr && !req.force->empty();
     const bool greedy = req.sampling.temperature <= 0.0f && !forcing;
+    // the penalties are host-side (apply_penalties), so a penalized greedy step
+    // takes the argmax on the host and gives up the speculative drafts: the
+    // device argmax and the verifications cannot see them (#298)
+    const bool dev_argmax = greedy && !req.sampling.penalizes();
     int32_t next = forcing ? (*req.force)[0] : sample(logits, req.sampling);
     if (forcing && req.forced_logits != nullptr) {
         req.forced_logits->insert(req.forced_logits->end(), logits.begin(), logits.end());
@@ -595,7 +633,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
         return res;
     }
     bool go = emit(next);
-    if (req.speculative && (config_.mtp || runner_->dflash_on()) && !forcing) {
+    if (req.speculative && (config_.mtp || runner_->dflash_on()) && !forcing && dev_argmax) {
         // Speculative decoding (#122, #124): draft k tokens with the MTP block (or DFlash2, #245),
         // verify [next, drafts] in one forward, keep the drafts the model
         // agrees with plus its own next token. Greedy: the same tokens as
@@ -654,7 +692,9 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
                 after = am[(size_t) a];
             } else {
                 while (after < 0) {
-                    distribution(rows.data() + a * nv, nv, req.sampling, dist);
+                    // the drafts accepted so far in this step are the freshest
+                    // tokens of the penalty window (#298)
+                    distribution(rows.data() + a * nv, nv, req.sampling, dist, batch.data(), a + 1);
                     if (a + 1 == (int64_t) batch.size()) {
                         after = draw(dist, -1);
                         break;
@@ -704,7 +744,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
             const std::vector<int32_t> one{next};
             int32_t on_device = -1;
             if (!runner_->forward(one, step, std::string(), (int64_t) seq_.size(), true,
-                                  greedy ? &on_device : nullptr)) {
+                                  dev_argmax ? &on_device : nullptr)) {
                 res.stop = GenerateResult::Stop::Error;
                 break;
             }

@@ -35,6 +35,25 @@ struct Sampling {
     float top_p = 1.0f;        // 1: off
     float min_p = 0.0f;        // 0: off
     uint64_t seed = 0;
+    // OpenAI's penalties over the last `penalty_last_n` tokens of the
+    // sequence, prompt included, plus the tokens already accepted in the step
+    // being sampled (#298): a token that appeared is pushed down by
+    // `presence_penalty`, one that appeared n times by n * `frequency_penalty`.
+    // `penalty_last_n == 0` (or both penalties 0) is off; the penalty is
+    // applied to the raw logits, before temperature and the truncations, as
+    // llama.cpp's sampler chain does. Greedy (temperature 0) ignores them: its
+    // argmax runs on the device.
+    // llama.cpp's penalties sampler, all three over the same window: a token
+    // in it is scaled by `repeat_penalty` (sign-aware: see apply_penalties)
+    // and pushed down by `presence_penalty + n * frequency_penalty`.
+    float repeat_penalty = 1.0f;   // 1.0: off
+    float presence_penalty = 0.0f;
+    float frequency_penalty = 0.0f;
+    int penalty_last_n = 64;       // 0: off (llama.cpp's --repeat-last-n)
+    bool penalizes() const {
+        return penalty_last_n > 0 &&
+               (repeat_penalty != 1.0f || presence_penalty != 0.0f || frequency_penalty != 0.0f);
+    }
 };
 
 struct GenerateRequest {
@@ -106,16 +125,23 @@ public:
 private:
     const GenerateResult * running_ = nullptr;
     bool is_eog(int32_t id) const;
-    int32_t sample(const std::vector<float> & logits, const Sampling & s);
+    int32_t sample(std::vector<float> & logits, const Sampling & s);
     // The sampling distribution of one logits row (temperature, top-k, min-p,
     // top-p applied): the kept tokens with unnormalized weights, most likely
-    // first, and their total. sample() draws from it.
+    // first, and their total. sample() draws from it. `row` is modified in
+    // place when the penalties are on (the callers own their logits buffer).
     struct Dist {
         std::vector<int32_t> ids;
         std::vector<double> w;
         double total = 0.0;
     };
-    void distribution(const float * row, int64_t nv, const Sampling & s, Dist & d) const;
+    void distribution(float * row, int64_t nv, const Sampling & s, Dist & d,
+                      const int32_t * extra = nullptr, int64_t n_extra = 0) const;
+    // llama.cpp's llama_sampler_penalties_apply, token for token: the last
+    // `penalty_last_n` tokens of the sequence (the `n_extra` accepted drafts of
+    // the step being sampled are the freshest ones), each with its count.
+    void apply_penalties(float * row, int64_t nv, const Sampling & s,
+                         const int32_t * extra = nullptr, int64_t n_extra = 0) const;
     // A draw from d without token `skip` (-1: none).
     int32_t draw(const Dist & d, int32_t skip);
     // A prompt with its images expanded: an image's positions hold ids
