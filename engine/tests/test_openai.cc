@@ -106,6 +106,16 @@ int main() {
     CHECK(rejects(R"({"messages":[]})"), "no messages");
     CHECK(rejects(R"({"messages":[{"role":"user","content":"Hi"}],"n":2})"), "n > 1");
     CHECK(rejects(R"({"messages":[{"role":"user","content":"Hi"}],"temperature":"hot"})"), "bad temperature");
+    CHECK(!rejects(R"({"messages":[{"role":"user","content":"Hi"}],"frequency_penalty":0,)"
+                   R"("presence_penalty":0,"repetition_penalty":1,"repeat_penalty":1.0,"logit_bias":{}})"),
+          "no-op values of unimplemented sampling fields");
+    CHECK(rejects(R"({"messages":[{"role":"user","content":"Hi"}],"frequency_penalty":0.2})") &&
+              rejects(R"({"messages":[{"role":"user","content":"Hi"}],"presence_penalty":0.2})") &&
+              rejects(R"({"messages":[{"role":"user","content":"Hi"}],"repetition_penalty":1.1})") &&
+              rejects(R"({"messages":[{"role":"user","content":"Hi"}],"repeat_penalty":0.9})") &&
+              rejects(R"({"messages":[{"role":"user","content":"Hi"}],"logit_bias":{"123":1}})") &&
+              rejects(R"({"messages":[{"role":"user","content":"Hi"}],"frequency_penalty":"no"})"),
+          "unimplemented sampling fields are refused, not dropped in silence");
     CHECK(rejects(R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]})") &&
               rejects(R"({"messages":[{"role":"user","content":[{"type":"image_url",)"
                       R"("image_url":{"url":"https://example.com/a.png"}}]}]})") &&

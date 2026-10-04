@@ -88,7 +88,11 @@ images as base64 `data:` URLs), `/v1/completions`, `/v1/models` and
 `/health`, one request at a time; existing OpenAI clients work unchanged.
 Requests that leave the sampling out are greedy, the fastest path; the
 decode is speculative either way (MTP drafts, plus n-gram drafts when the
-context repeats; `--dflash` switches to the DFlash2 drafter). Options:
+context repeats; `--dflash` switches to the DFlash2 drafter). Sampling fields
+the engine does not implement (`frequency_penalty`, `presence_penalty`,
+`repetition_penalty`, `repeat_penalty`, `logit_bias`) are refused with a 400
+unless they hold their no-op value (0, 1.0, `{}`) -- never dropped in silence
+(#284). Options:
 `--port`, `--host`, `--ctx`, `--alias`, `--api-key`, `--cors`, `--cache-ram`
 and `--kv-ram` (sequence checkpoints and whole conversations in pinned host
 RAM), `--mmproj`, `--dflash`, the default sampling (`--temp`, `--top-k`,
