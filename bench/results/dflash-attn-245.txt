@@ -1,0 +1,27 @@
+# DFlash2 drafter attention with 32-key splits and an f16 query tile (#245), 2026-10-04. RX 9060 XT,
+# 160 W cap, main fc69172 + this change (.omph format 7). The flash-decoding part kernel (d2e1409) held a
+# 64-key split with the T x 4 queries in an f32 LDS tile: 58 KB of LDS per block (ks + vs 33, sc 8, qsh
+# 16, kp 0.5). 32-key splits halve ks / vs / sc, the f16 query tile halves qsh: 29 KB per block.
+#
+# rocprofv3, omph-run --generate 120 --dflash on the 3k-token wikitext prompt, mean per call over the
+# 255 calls (51 draft steps x 5 layers; 70 / 323 drafts accepted in both):
+#   kSplit  attention_part  attention_merge  per step (x 5)
+#   32      0.139 ms        0.027 ms         0.83 ms
+#   16      0.131 ms        0.051 ms         0.91 ms
+# 16-key splits were tried and rejected: the merge pass grows by more than the part kernel saves.
+#
+# Step A/B, 5 alternating runs (plain: the last decode step's `step gpu`, 65 tokens on
+# models/golden/cpu/tokens.txt; MTP / DFlash2: ms per verification step = the `speculative` summary's ms
+# per generated token x 200 / steps, --generate 200 on the 3k prompt; the same .omph for both sides):
+#   run     base plain  new plain   base MTP   new MTP   base DFlash2  new DFlash2
+#   1       40.81       41.05       51.73      51.78     53.93         53.07
+#   2       41.03       41.01       51.76      51.76     53.98         53.07
+#   3       41.09       41.11       51.78      51.78     54.02         53.07
+#   4       41.08       41.21       51.80      51.78     54.07         53.10
+#   5       41.13       41.14       51.80      51.80     54.10         53.10
+#   median  41.08       41.11       51.78      51.78     54.02         53.07
+#
+# DFlash2 step 54.02 -> 53.07 ms (-1.8 %); plain and MTP unchanged (no drafter). The three outputs are
+# identical between the two builds (plain, MTP, DFlash2).
+# Checks: DFlash2 greedy identical to plain greedy, K8 and K4 (OMPH_SPEC_CHECK=1), 300 tokens on the
+# he-144 prompt (bench/results/ngram-199/he-144.json); the CPU tests pass.

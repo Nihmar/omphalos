@@ -74,10 +74,10 @@ __global__ void ring_put_kernel(const float * __restrict__ src, const long long 
 
 // Flash-decoding over the virtual key list: positions lo0 .. pos0 - 1 from the
 // ring (when their tag matches), then the T block keys. Pass 1: one block per
-// (KV head, 64-key split) for all T x 4 queries of that KV head, the split's K
-// and V in LDS; partial (max, sum, acc[128]) per query. Pass 2 merges the
-// splits in order.
-constexpr int kSplit = 64;
+// (KV head, 32-key split) for all T x 4 queries of that KV head, the queries
+// and the split's K / V in LDS (f16); partial (max, sum, acc[128]) per query.
+// Pass 2 merges the splits in order.
+constexpr int kSplit = 32;
 constexpr int kMaxQ = 4 * 8;  // T x 4 query heads per KV head, T <= 8 (the block)
 
 __global__ __launch_bounds__(256) void attention_part_kernel(const float * __restrict__ q,
@@ -93,7 +93,7 @@ __global__ __launch_bounds__(256) void attention_part_kernel(const float * __res
     __shared__ __half vs[kSplit][kHd + 2];
     __shared__ long long kp[kSplit];  // the key's position, -1: invalid
     __shared__ float sc[kMaxQ][kSplit + 1];
-    __shared__ float qsh[kMaxQ][kHd + 1];
+    __shared__ __half qsh[kMaxQ][kHd + 2];
     const int kvh = (int) blockIdx.x;
     const int sp = (int) blockIdx.y;
     const int nsp = (int) gridDim.y;
@@ -135,8 +135,8 @@ __global__ __launch_bounds__(256) void attention_part_kernel(const float * __res
     for (int q0 = 0; q0 < nq; q0 += kMaxQ) {
         for (int i = tid; i < kMaxQ * kHd; i += 256) {
             const int qi = q0 + i / kHd;
-            qsh[i / kHd][i % kHd] =
-                qi < nq ? q[((long long) (qi / kGqa) * 32 + kvh * kGqa + qi % kGqa) * kHd + i % kHd] : 0.0f;
+            qsh[i / kHd][i % kHd] = __float2half(
+                qi < nq ? q[((long long) (qi / kGqa) * 32 + kvh * kGqa + qi % kGqa) * kHd + i % kHd] : 0.0f);
         }
         __syncthreads();
         const int ql = tid >> 3;
@@ -149,7 +149,7 @@ __global__ __launch_bounds__(256) void attention_part_kernel(const float * __res
                     float acc = 0.0f;
 #pragma unroll 16
                     for (int d = 0; d < kHd; ++d) {
-                        acc = fmaf(qsh[ql][d], __half2float(ks[k][d]), acc);
+                        acc = fmaf(__half2float(qsh[ql][d]), __half2float(ks[k][d]), acc);
                     }
                     s = acc * scale;
                 }
