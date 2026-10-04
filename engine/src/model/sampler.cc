@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace omph::model {
@@ -182,6 +183,18 @@ int32_t draw(const Dist & d, const int32_t skip, std::mt19937_64 & rng) {
     return last;
 }
 
+int32_t argmax_finite(const float * row, const int64_t nv) {
+    int32_t best = 0;
+    float best_v = -std::numeric_limits<float>::infinity();
+    for (int64_t i = 0; i < nv; ++i) {
+        if (std::isfinite(row[i]) && row[i] > best_v) {
+            best_v = row[i];
+            best = (int32_t) i;
+        }
+    }
+    return best;
+}
+
 int32_t sample_row(std::vector<float> & logits, const Sampling & s, const std::vector<int32_t> & seq,
                    std::mt19937_64 & rng) {
     PenaltyWindow pen;
@@ -192,7 +205,7 @@ int32_t sample_row(std::vector<float> & logits, const Sampling & s, const std::v
         if (s.penalizes()) {  // llama.cpp applies them before the greedy pick too
             pen.apply(logits.data(), (int64_t) logits.size(), s);
         }
-        return (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+        return argmax_finite(logits.data(), (int64_t) logits.size());
     }
     Dist d;
     distribution(logits.data(), (int64_t) logits.size(), s, pen, d);

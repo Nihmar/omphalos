@@ -232,6 +232,28 @@ void test_temperature() {
     CHECK(std::fabs(d.w[1] / d.w[0] - std::exp(2.0)) < 1e-4, "temperature 0.5: the ratio is not e^2");
 }
 
+// The greedy pick ignores non-finite values, exactly as the device's packed
+// argmax does (kernels/elementwise.hip): a corrupted row must not give the two
+// paths two different tokens (#318).
+void test_argmax_finite() {
+    const float plain[] = {1.0f, 3.0f, 2.0f};
+    CHECK(omph::model::argmax_finite(plain, 3) == 1, "the plain maximum");
+    const float ties[] = {2.0f, 1.0f, 2.0f};
+    CHECK(omph::model::argmax_finite(ties, 3) == 0, "the lowest id wins a tie");
+    const float nan_first[] = {std::nanf(""), 1.0f, 2.0f};
+    CHECK(omph::model::argmax_finite(nan_first, 3) == 2, "a leading NaN never wins");
+    const float nan_last[] = {1.0f, 2.0f, std::nanf("")};
+    CHECK(omph::model::argmax_finite(nan_last, 3) == 1, "a trailing NaN is ignored");
+    const float inf[] = {1.0f, INFINITY, -INFINITY};
+    CHECK(omph::model::argmax_finite(inf, 3) == 0, "an infinity is not finite either");
+    const float none[] = {std::nanf(""), INFINITY, -INFINITY};
+    CHECK(omph::model::argmax_finite(none, 3) == 0, "a row with no finite value gives id 0");
+    Sampling g;
+    std::vector<float> row = {1.0f, std::nanf(""), 3.0f, -INFINITY};
+    std::mt19937_64 rng(3);
+    CHECK(omph::model::sample_row(row, g, {}, rng) == 2, "greedy ignores the NaN");
+}
+
 void test_draw() {
     Sampling s;
     s.temperature = 1.0f;
@@ -261,6 +283,7 @@ int main() {
     test_top_p();
     test_min_p_with_top_p();
     test_temperature();
+    test_argmax_finite();
     test_draw();
     if (omph_test::failures == 0) {
         std::printf("test_sampler: ok\n");
