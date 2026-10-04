@@ -74,8 +74,18 @@ CONFIGS = {
 
     "k8-sampled": {"env": {"OMPH_KV_K4_LAYERS": "none"},
                    "argv": ["--temp", "0.6", "--top-p", "0.95", "--top-k", "20"]},
+    "k4-all-sampled": {"env": {"OMPH_KV_K4": "1"},
+                       "argv": ["--temp", "0.6", "--top-p", "0.95", "--top-k", "20"]},
     "nothink": {"request": {"chat_template_kwargs": {"enable_thinking": False}}},
     "no-ngram": {"env": {"OMPH_NGRAM": "0"}},
+    # llama.cpp's penalties sampler (#298), over the sampler recipe of #285
+    "pen-llama": {"argv": ["--temp", "0.6", "--top-p", "0.95", "--top-k", "20",
+                           "--repeat-penalty", "1.1", "--repeat-last-n", "1024"]},
+    "pen-short": {"argv": ["--temp", "0.6", "--top-p", "0.95", "--top-k", "20",
+                           "--repeat-penalty", "1.1", "--repeat-last-n", "64"]},
+    "pen-openai": {"argv": ["--temp", "0.6", "--top-p", "0.95", "--top-k", "20",
+                            "--frequency-penalty", "0.2", "--presence-penalty", "0.5",
+                            "--repeat-last-n", "1024"]},
 }
 
 
@@ -199,6 +209,27 @@ def score(text: str, para_min: int, fp_len: int, threshold: int,
     return repeats, worst, len(paras), skipped
 
 
+def write_csv(out: Path, rows: list[dict], commit: str) -> None:
+    """The CSV accumulates: one file per experiment, the commit in every row,
+    rewritten after every run so a killed matrix keeps what it measured."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    previous = []
+    if out.exists():
+        with out.open(newline="") as f:
+            fresh = {(row["config"], row["prompt"]) for row in rows}
+            previous = [r for r in csv.DictReader(f) if r and (r.get("config"), r.get("prompt")) not in fresh]
+    with out.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["commit", "config", "prompt", "prompt_tokens", "reasoning_chars",
+                                          "completion_tokens", "paragraphs", "paragraphs_skipped",
+                                          "repetitions", "repetitions_anywhere",
+                                          "repeats_per_1k_tokens", "worst_pair_similarity"])
+        w.writeheader()
+        for row in previous:
+            w.writerow(row)
+        for row in rows:
+            w.writerow({"commit": commit, **row})
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--configs", default="greedy,sampled,k8")
@@ -211,6 +242,7 @@ def main() -> None:
     ap.add_argument("--omph", default=str(ROOT / "engine/build"))
     ap.add_argument("--ctx", type=int, default=16384)
     ap.add_argument("--max-tokens", type=int, default=4096)
+    ap.add_argument("--seed", type=int, default=None, help="a fixed sampling seed (the sampler configs)")
     ap.add_argument("--para-min-len", type=int, default=40)
     ap.add_argument("--fingerprint-len", type=int, default=60)
     ap.add_argument("--threshold", type=int, default=3)
@@ -260,6 +292,8 @@ def main() -> None:
                         [{"role": "user", "content": p["user"]}]
                     body = {"messages": msgs, "max_tokens": args.max_tokens, "stream": False,
                             "chat_template_kwargs": {"enable_thinking": True}, **cfg.get("request", {})}
+                if args.seed is not None:
+                    body["seed"] = args.seed
                 try:
                     r = post(url + "/v1/chat/completions", body)
                 except urllib.error.HTTPError as e:
@@ -274,10 +308,12 @@ def main() -> None:
                 repeats_any = score(text, args.para_min_len, args.fingerprint_len, args.threshold, False)[0]
                 tokens = (r["usage"].get("completion_tokens") or 0)
                 per_k = 1000.0 * repeats / (tokens / 1000.0) if tokens else 0.0
-                rows.append({"config": name, "prompt": label, "reasoning_chars": len(reasoning),
+                rows.append({"config": name, "prompt": label, "prompt_tokens": (r["usage"].get("prompt_tokens") or 0),
                              "completion_tokens": tokens, "paragraphs": paras, "paragraphs_skipped": skipped,
                              "repetitions": repeats, "repetitions_anywhere": repeats_any,
                              "repeats_per_1k_tokens": round(per_k, 3), "worst_pair_similarity": round(worst, 3)})
+                if args.out:
+                    write_csv(Path(args.out), rows, commit)
                 if args.dump:
                     d = Path(args.dump)
                     d.mkdir(parents=True, exist_ok=True)
@@ -288,23 +324,7 @@ def main() -> None:
             proc.terminate()
             proc.wait()
     if args.out:
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        previous = []
-        if out.exists():  # the runs accumulate: one CSV per experiment, the commit in every row
-            with out.open(newline="") as f:
-                previous = [r for r in csv.DictReader(f) if r]
-        with out.open("w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["commit", "config", "prompt", "reasoning_chars",
-                                              "completion_tokens", "paragraphs", "paragraphs_skipped",
-                                              "repetitions", "repetitions_anywhere",
-                                              "repeats_per_1k_tokens", "worst_pair_similarity"])
-            w.writeheader()
-            for row in previous:
-                w.writerow(row)
-            for row in rows:
-                w.writerow({"commit": commit, **row})
-        print(f"wrote {out}")
+        write_csv(Path(args.out), rows, commit)
     fail = [r for r in rows if r["repetitions"] > 0]
     print(f"{len(rows)} runs, {len(fail)} with a repetition" +
           (f" ({', '.join(sorted({r['config'] for r in fail}))})" if fail else ""))

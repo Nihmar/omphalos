@@ -1,0 +1,9 @@
+stream,chars,pairs_085,verbatim,worst_pair,first_firing_t3_p40_f60,first_firing_t3_p160_f60,first_firing_t5_p40_f60,first_firing_t5_p160_f60,first_firing_t3_p40_f120,first_firing_t5_p160_f120
+pen-llama-2026-10-04T09:17:56Z.txt,15315,0,0,0.721,,,,,,
+pen-llama-2026-10-04T11:44:19Z.txt,2836,0,0,0.479,,,,,,
+pen-openai-2026-10-04T09:17:56Z.txt,13236,3,0,0.991,,,,,,
+pen-openai-2026-10-04T11:44:19Z.txt,3309,0,0,0.65,,,,,,
+pen-short-2026-10-04T09:17:56Z.txt,5904,2,0,0.943,,,,,,
+pen-short-2026-10-04T11:44:19Z.txt,3514,0,0,0.669,,,,,,
+sampled-2026-10-04T09:17:56Z.txt,14867,1,0,0.965,,,,,,
+sampled-2026-10-04T11:44:19Z.txt,14588,23,13,1.0,8612,8837,,,8612,
