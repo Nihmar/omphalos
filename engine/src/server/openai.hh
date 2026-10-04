@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "text/chat.hh"
 #include "text/json.hh"
 
 namespace omph::server {
@@ -26,6 +27,10 @@ struct Defaults {
 struct Job {
     bool chat = true;             // /v1/chat/completions, else /v1/completions
     std::string prompt;           // the text to tokenize (special tokens parsed when chat)
+    // The chat rendering as structure and content (#292): the server tokenizes
+    // each segment with its own rule, so a message's text cannot inject one of
+    // the template's special tokens.
+    std::vector<text::Segment> prompt_segments;
     std::vector<int32_t> prompt_ids;  // /v1/completions with token ids instead of text
     bool thinking = true;         // the generation opens a <think> block
     bool parse_tools = false;     // tools given (and tool_choice is not "none")

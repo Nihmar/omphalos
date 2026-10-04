@@ -139,7 +139,9 @@ int main(int argc, char ** argv) {
             long long v = 0;
             while (ss >> v) prompt.push_back((int32_t) v);
         } else {
-            prompt = tok.encode(chat ? omph::text::render_chat(omph::text::Json::parse(in)) : in);
+            prompt = chat ? omph::text::tokenize_chat(omph::text::render_chat_segments(omph::text::Json::parse(in)),
+                                                      tok)
+                          : tok.encode(in);
         }
 #ifdef OMPH_VISION
         if (!image_bytes.empty()) {  // encoded on the CPU while the GPU prefills the text before them (#180)
@@ -174,7 +176,8 @@ int main(int argc, char ** argv) {
                 size_t n = 0;
                 while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) body.append(buf, n);
                 std::fclose(f);
-                prompt = tok.encode(omph::text::render_chat(omph::text::Json::parse(body)));
+                prompt = omph::text::tokenize_chat(omph::text::render_chat_segments(omph::text::Json::parse(body)),
+                                                   tok);
             }
             bool first = true;
             const auto res = gen.generate(prompt, req, [&](const int32_t t) {

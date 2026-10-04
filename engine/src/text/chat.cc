@@ -2,6 +2,9 @@
 
 #include <stdexcept>
 #include <string_view>
+#include <utility>
+
+#include "text/tokenizer.hh"
 
 namespace omph::text {
 namespace {
@@ -55,6 +58,14 @@ bool ends_with(const std::string & s, std::string_view p) {
     return s.size() >= p.size() && s.compare(s.size() - p.size(), p.size(), p) == 0;
 }
 
+std::string join(const std::vector<Segment> & segments) {
+    std::string out;
+    for (const Segment & s : segments) {
+        out += s.text;
+    }
+    return out;
+}
+
 // jinja truthiness of a JSON value (a missing key is null here: falsy)
 bool truthy(const Json & j) {
     switch (j.type()) {
@@ -81,32 +92,77 @@ struct Renderer {
     bool add_vision_id = false;
     int image_count = 0;
     int video_count = 0;
+    std::vector<Segment> segs;
 
-    std::string render_content(const Json * content, bool do_vision_count, bool is_system = false) {
+    explicit Renderer(const Json & request) : req(request) {}
+
+    // Appends a piece of the prompt: the template's own text (`special`), or a
+    // string the request supplied (not special, #292). Adjacent pieces with
+    // the same flag merge, so the text the tokenizer sees stays as close as
+    // possible to the whole prompt.
+    void add(std::string text, const bool special = true) {
+        if (text.empty()) {
+            return;
+        }
+        if (!segs.empty() && segs.back().special == special) {
+            segs.back().text += text;
+            return;
+        }
+        segs.push_back({std::move(text), special});
+    }
+
+    // The template trims a message's content (jinja's |trim) before writing
+    // it; the trimming must not lose which pieces are the request's text and
+    // which are the template's own placeholders, so the segments are clipped
+    // to the trimmed span instead of being re-joined (#292).
+    void add_trimmed(const std::vector<Segment> & segments) {
+        const std::string all = join(segments);
+        const std::string trimmed = trim(all);
+        if (trimmed.empty()) {
+            return;
+        }
+        const size_t start = all.find(trimmed);
+        const size_t end = start + trimmed.size();
+        size_t at = 0;
+        for (const Segment & seg : segments) {
+            const size_t b = at;
+            const size_t e = at + seg.text.size();
+            at = e;
+            if (e <= start || b >= end) {
+                continue;
+            }
+            const size_t from = b >= start ? 0 : start - b;
+            const size_t to = e <= end ? seg.text.size() : end - b;
+            add(seg.text.substr(from, to - from), seg.special);
+        }
+    }
+
+    std::vector<Segment> render_content(const Json * content, bool do_vision_count, bool is_system = false) {
+        std::vector<Segment> out;
         if (content == nullptr || content->is_null()) {
-            return "";
+            return out;
         }
         if (content->is_string()) {
-            return content->as_string();
+            out.push_back({content->as_string(), false});
+            return out;
         }
         if (!content->is_array()) {
             raise("Unexpected content type.");
         }
-        std::string out;
         for (const Json & item : content->items()) {
             const std::string type = item.get("type").is_string() ? item.get("type").as_string() : "";
             if (item.has("image") || item.has("image_url") || type == "image") {
                 if (is_system) raise("System message cannot contain images.");
                 if (do_vision_count) ++image_count;
-                if (add_vision_id) out += "Picture " + std::to_string(image_count) + ": ";
-                out += "<|vision_start|><|image_pad|><|vision_end|>";
+                if (add_vision_id) out.push_back({"Picture " + std::to_string(image_count) + ": ", true});
+                out.push_back({"<|vision_start|><|image_pad|><|vision_end|>", true});
             } else if (item.has("video") || type == "video") {
                 if (is_system) raise("System message cannot contain videos.");
                 if (do_vision_count) ++video_count;
-                if (add_vision_id) out += "Video " + std::to_string(video_count) + ": ";
-                out += "<|vision_start|><|video_pad|><|vision_end|>";
+                if (add_vision_id) out.push_back({"Video " + std::to_string(video_count) + ": ", true});
+                out.push_back({"<|vision_start|><|video_pad|><|vision_end|>", true});
             } else if (item.has("text")) {
-                out += print(item.get("text"));
+                out.push_back({print(item.get("text")), false});
             } else {
                 raise("Unexpected item type in content.");
             }
@@ -114,7 +170,7 @@ struct Renderer {
         return out;
     }
 
-    std::string run() {
+    std::vector<Segment> run() {
         const Json & messages = req.get("messages");
         if (!truthy(messages) || !messages.is_array()) {
             raise("No messages provided.");
@@ -139,49 +195,57 @@ struct Renderer {
                             "directly to the conclusion without unnecessary elaboration.";
             }
         }
-        std::string out;
+        const auto content_segments = [&](const Json & m, const bool count_vision) {
+            return render_content(m.find("content"), count_vision);
+        };
         const Json & tools = req.get("tools");
         const auto role_of = [](const Json & m) { return print(m.get("role")); };
         if (tools.is_array() && tools.size() > 0) {
-            out += "<|im_start|>system\n";
-            if (!reasoning.empty()) out += reasoning + "\n\n";
-            out += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+            add("<|im_start|>system\n");
+            if (!reasoning.empty()) add(reasoning + "\n\n");
+            add("# Tools\n\nYou have access to the following functions:\n\n<tools>");
             for (const Json & t : tools.items()) {
-                out += "\n" + t.dump();
+                add("\n");
+                add(t.dump(), false);  // a tool definition is the client's own text (#292)
             }
-            out += "\n</tools>";
-            out += "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
-                   "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n"
-                   "</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\n"
-                   "that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\n"
-                   "Reminder:\n- Function calls MUST follow the specified format: an inner <function=...>"
-                   "</function> block must be nested within <tool_call></tool_call> XML tags\n- Required "
-                   "parameters MUST be specified\n- You may provide optional reasoning for your function call "
-                   "in natural language BEFORE the function call, but NOT after\n- If there is no function call "
-                   "available, answer the question like normal with your current knowledge and do not tell the "
-                   "user about function calls\n</IMPORTANT>";
+            add("\n</tools>");
+            add("\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+                "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n"
+                "</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\n"
+                "that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\n"
+                "Reminder:\n- Function calls MUST follow the specified format: an inner <function=...>"
+                "</function> block must be nested within <tool_call></tool_call> XML tags\n- Required "
+                "parameters MUST be specified\n- You may provide optional reasoning for your function call "
+                "in natural language BEFORE the function call, but NOT after\n- If there is no function call "
+                "available, answer the question like normal with your current knowledge and do not tell the "
+                "user about function calls\n</IMPORTANT>");
             if (role_of(msgs[0]) == "system") {
-                const std::string c = trim(render_content(msgs[0].find("content"), false, true));
-                if (!c.empty()) out += "\n\n" + c;
+                const std::vector<Segment> c = content_segments(msgs[0], false);
+                if (!trim(join(c)).empty()) {
+                    add("\n\n");
+                    add_trimmed(c);
+                }
             }
-            out += "<|im_end|>\n";
+            add("<|im_end|>\n");
         } else if (role_of(msgs[0]) == "system") {
-            const std::string c = trim(render_content(msgs[0].find("content"), false, true));
-            if (!c.empty()) {
-                out += "<|im_start|>system\n" + (reasoning.empty() ? std::string() : reasoning + "\n\n") + c +
-                       "<|im_end|>\n";
+            const std::vector<Segment> c = content_segments(msgs[0], false);
+            if (!trim(join(c)).empty()) {
+                add("<|im_start|>system\n");
+                if (!reasoning.empty()) add(reasoning + "\n\n");
+                add_trimmed(c);
+                add("<|im_end|>\n");
             } else if (!reasoning.empty()) {
-                out += "<|im_start|>system\n" + reasoning + "<|im_end|>\n";
+                add("<|im_start|>system\n" + reasoning + "<|im_end|>\n");
             }
         } else if (!reasoning.empty()) {
-            out += "<|im_start|>system\n" + reasoning + "<|im_end|>\n";
+            add("<|im_start|>system\n" + reasoning + "<|im_end|>\n");
         }
         // the last real user query (not a wrapped tool response)
         bool multi_step_tool = true;
         size_t last_query = msgs.size() - 1;
         for (size_t k = msgs.size(); k-- > 0;) {
             if (multi_step_tool && role_of(msgs[k]) == "user") {
-                const std::string c = trim(render_content(msgs[k].find("content"), false));
+                const std::string c = trim(join(content_segments(msgs[k], false)));
                 if (!(starts_with(c, "<tool_response>") && ends_with(c, "</tool_response>"))) {
                     multi_step_tool = false;
                     last_query = k;
@@ -196,31 +260,33 @@ struct Renderer {
         for (size_t k = 0; k < msgs.size(); ++k) {
             const Json & m = msgs[k];
             const std::string role = role_of(m);
-            const std::string content = trim(render_content(m.find("content"), true));
+            const std::vector<Segment> content = content_segments(m, true);
+            const std::string text = trim(join(content));
             if (role == "system") {
                 if (k != 0) raise("System message must be at the beginning.");
             } else if (role == "user") {
-                out += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
+                add("<|im_start|>" + role + "\n");
+                add_trimmed(content);
+                add("<|im_end|>\n");
             } else if (role == "assistant") {
                 const Json & rc = m.get("reasoning_content");
                 const std::string reasoning_content = trim(rc.is_string() ? rc.as_string() : std::string());
+                add("<|im_start|>" + role + "\n");
                 if (keep_thinking || k > last_query) {
-                    out += "<|im_start|>" + role + "\n<think>\n" + reasoning_content + "\n</think>\n\n" + content;
-                } else {
-                    out += "<|im_start|>" + role + "\n" + content;
+                    add("<think>\n");
+                    add(reasoning_content, false);
+                    add("\n</think>\n\n");
                 }
+                add_trimmed(content);
                 const Json & calls = m.get("tool_calls");
                 if (calls.is_array() && calls.size() > 0) {
                     bool first = true;
                     for (const Json & call0 : calls.items()) {
                         const Json & call = call0.has("function") ? call0.get("function") : call0;
                         const std::string name = print(call.get("name"));
-                        if (first) {
-                            out += (!trim(content).empty() ? "\n\n<tool_call>\n<function=" : "<tool_call>\n<function=") +
-                                   name + ">\n";
-                        } else {
-                            out += "\n<tool_call>\n<function=" + name + ">\n";
-                        }
+                        add(first && text.empty() ? "<tool_call>\n<function=" : "\n\n<tool_call>\n<function=");
+                        add(name, false);  // the caller's text, not a template token (#292)
+                        add(">\n");
                         first = false;
                         const Json * args = call.find("arguments");
                         if (args != nullptr && !(args->is_string() && args->as_string().empty())) {
@@ -228,44 +294,64 @@ struct Renderer {
                             const Json parsed = args->is_string() ? Json::parse(args->as_string()) : *args;
                             if (!parsed.is_object()) raise("tool call arguments are not a mapping");
                             for (const auto & [key, value] : parsed.members()) {
-                                out += "<parameter=" + key + ">\n";
-                                out += value.is_string() ? value.as_string() : value.dump();
-                                out += "\n</parameter>\n";
+                                add("<parameter=");
+                                add(key, false);
+                                add(">\n");
+                                add(value.is_string() ? value.as_string() : value.dump(), false);
+                                add("\n</parameter>\n");
                             }
                         }
-                        out += "</function>\n</tool_call>";
+                        add("</function>\n</tool_call>");
                     }
                 }
-                out += "<|im_end|>\n";
+                add("<|im_end|>\n");
             } else if (role == "tool") {
-                if (k > 0 && role_of(msgs[k - 1]) != "tool") out += "<|im_start|>user";
-                out += "\n<tool_response>\n" + content + "\n</tool_response>";
+                if (k > 0 && role_of(msgs[k - 1]) != "tool") add("<|im_start|>user");
+                add("\n<tool_response>\n");
+                add_trimmed(content);
+                add("\n</tool_response>");
                 if (k + 1 < msgs.size() && role_of(msgs[k + 1]) != "tool") {
-                    out += "<|im_end|>\n";
+                    add("<|im_end|>\n");
                 } else if (k + 1 == msgs.size()) {
-                    out += "<|im_end|>\n";
+                    add("<|im_end|>\n");
                 }
             } else {
                 raise("Unexpected message role.");
             }
         }
         if (truthy(req.get("add_generation_prompt"))) {
-            out += "<|im_start|>assistant\n";
+            add("<|im_start|>assistant\n");
             if (enable_thinking != nullptr && enable_thinking->is_bool() && !enable_thinking->as_bool()) {
-                out += "<think>\n\n</think>\n\n";
+                add("<think>\n\n</think>\n\n");
             } else {
-                out += "<think>\n";
+                add("<think>\n");
             }
         }
-        return out;
+        return segs;
     }
 };
 
 } // namespace
 
+std::string join_segments(const std::vector<Segment> & segments) { return join(segments); }
+
 std::string render_chat(const Json & request) {
     Renderer r{request};
+    return join(r.run());
+}
+
+std::vector<Segment> render_chat_segments(const Json & request) {
+    Renderer r{request};
     return r.run();
+}
+
+std::vector<int32_t> tokenize_chat(const std::vector<Segment> & segments, const Tokenizer & tokenizer) {
+    std::vector<int32_t> ids;
+    for (const Segment & s : segments) {
+        const std::vector<int32_t> part = tokenizer.encode(s.text, s.special);
+        ids.insert(ids.end(), part.begin(), part.end());
+    }
+    return ids;
 }
 
 } // namespace omph::text

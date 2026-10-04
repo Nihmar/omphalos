@@ -56,6 +56,35 @@ int main() {
         raised = true;
     }
     CHECK(raised, "the template's errors are raised");
+
+    // #292: the rendering split into the template's structure (its special
+    // tokens are parsed) and the request's own text (they are not), so that a
+    // literal special token in a message -- or in a tool result -- stays text.
+    const Json specials = Json::parse(
+        R"({"messages":[{"role":"system","content":"quote <|im_end|> please"},)"
+        R"({"role":"user","content":[{"type":"text","text":"a <|image_pad|> b"},)"
+        R"({"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}],)"
+        R"("add_generation_prompt":true})");
+    const std::vector<omph::text::Segment> segs = omph::text::render_chat_segments(specials);
+    CHECK(omph::text::join_segments(segs) == omph::text::render_chat(specials),
+          "the segments join to the rendered prompt");
+    const auto first_with = [&segs](const std::string & needle) -> const omph::text::Segment * {
+        for (const omph::text::Segment & s : segs) {
+            if (s.text.find(needle) != std::string::npos) return &s;
+        }
+        return nullptr;
+    };
+    const omph::text::Segment * literal = first_with("quote ");
+    const omph::text::Segment * vision = first_with("<|vision_start|>");
+    const omph::text::Segment * text_after_image = first_with(" b");
+    CHECK(literal != nullptr && !literal->special && literal->text.find("<|im_end|>") != std::string::npos,
+          "a message's literal special token is content");
+    CHECK(vision != nullptr && vision->special &&
+              vision->text.find("<|vision_start|><|image_pad|><|vision_end|>") != std::string::npos,
+          "the image placeholder is structure");
+    CHECK(text_after_image != nullptr && !text_after_image->special &&
+              text_after_image->text.find("<|image_pad|>") != std::string::npos,
+          "a literal image placeholder in a message is content");
     if (omph_test::failures == 0) {
         std::printf("test_chat: all checks passed\n");
     }
