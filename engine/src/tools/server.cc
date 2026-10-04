@@ -52,6 +52,23 @@ using omph::model::GenerateResult;
 using omph::server::Delta;
 using omph::text::Json;
 
+// The sampling the request actually runs with: the body's, or the server's
+// default when it leaves it out. Printed in the per-request summary so that
+// "which sampling did that client get" is answerable from the log (#284).
+std::string sampling_label(const omph::server::Job & job) {
+    if (job.temperature <= 0.0f) {
+        return "greedy";
+    }
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "temp %.2f top-k %d top-p %.2f min-p %.2f", (double) job.temperature,
+                  job.top_k, (double) job.top_p, (double) job.min_p);
+    std::string label = buf;
+    if (job.seeded) {
+        label += " seed " + std::to_string(job.seed);
+    }
+    return label;
+}
+
 struct Server {
     omph::model::Generator & gen;
     std::string model_id;
@@ -393,9 +410,11 @@ struct Server {
         static const char * kStop[] = {"length", "end of generation", "stop token", "stopped", "context full",
                                        "error"};
         std::fprintf(stderr,
-                     "%s %s: prompt %zu tokens (%lld cached%s%s) in %.0f ms (%.1f t/s); %zu tokens in %.0f ms "
+                     "%s %s: sampling %s; prompt %zu tokens (%lld cached%s%s) in %.0f ms (%.1f t/s); %zu "
+                     "tokens in %.0f ms "
                      "(%.1f t/s, drafts accepted %lld / %lld); stop: %s%s\n",
-                     req.method.c_str(), req.path.c_str(), (size_t) prompt_len, (long long) res.cached_tokens,
+                     req.method.c_str(), req.path.c_str(), sampling_label(job).c_str(), (size_t) prompt_len,
+                     (long long) res.cached_tokens,
                      res.restored ? ", restored" : "", res.saved ? ", previous conversation saved" : "",
                      res.prefill_ms,
                      res.prefill_ms > 0 ? 1000.0 * (double) (res.prompt_tokens - res.cached_tokens) / res.prefill_ms
