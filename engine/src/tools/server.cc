@@ -35,6 +35,7 @@
 #include "runtime/timing.hh"
 #include "server/http.hh"
 #include "server/openai.hh"
+#include "tools/cli.hh"
 #include "text/json.hh"
 #ifdef OMPH_VISION
 #include "vision/encoder.hh"
@@ -44,6 +45,7 @@
 #include <memory>
 #include <stdexcept>
 #include <cstdio>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -483,26 +485,26 @@ int main(int argc, char ** argv) {
             return argv[++i];
         };
         if (!std::strcmp(argv[i], "--host")) host = val();
-        else if (!std::strcmp(argv[i], "--port")) port = std::atoi(val());
-        else if (!std::strcmp(argv[i], "--ctx")) cfg.context = std::atoll(val());
-        else if (!std::strcmp(argv[i], "--chunk")) cfg.chunk = std::atoll(val());
+        else if (!std::strcmp(argv[i], "--port")) port = omph::cli::integer(val(), "--port");
+        else if (!std::strcmp(argv[i], "--ctx")) cfg.context = omph::cli::integer(val(), "--ctx");
+        else if (!std::strcmp(argv[i], "--chunk")) cfg.chunk = omph::cli::integer(val(), "--chunk");
         else if (!std::strcmp(argv[i], "--no-mtp")) cfg.mtp = false;
         else if (!std::strcmp(argv[i], "--dflash")) cfg.dflash = val();
-        else if (!std::strcmp(argv[i], "--cache-ram")) cfg.cache_mib = std::atoll(val());
-        else if (!std::strcmp(argv[i], "--kv-ram")) cfg.kv_ram_mib = std::atoll(val());
+        else if (!std::strcmp(argv[i], "--cache-ram")) cfg.cache_mib = omph::cli::integer(val(), "--cache-ram");
+        else if (!std::strcmp(argv[i], "--kv-ram")) cfg.kv_ram_mib = omph::cli::integer(val(), "--kv-ram");
         else if (!std::strcmp(argv[i], "--alias")) alias = val();
         else if (!std::strcmp(argv[i], "--mmproj")) mmproj = val();
         else if (!std::strcmp(argv[i], "--api-key")) api_key = val();
         else if (!std::strcmp(argv[i], "--cors")) cors = val();
-        else if (!std::strcmp(argv[i], "--temp")) defaults.temperature = (float) std::atof(val());
-        else if (!std::strcmp(argv[i], "--top-k")) defaults.top_k = std::atoi(val());
-        else if (!std::strcmp(argv[i], "--top-p")) defaults.top_p = (float) std::atof(val());
-        else if (!std::strcmp(argv[i], "--min-p")) defaults.min_p = (float) std::atof(val());
-        else if (!std::strcmp(argv[i], "--repeat-penalty")) defaults.repeat_penalty = (float) std::atof(val());
-        else if (!std::strcmp(argv[i], "--repeat-last-n")) defaults.penalty_last_n = std::atoi(val());
-        else if (!std::strcmp(argv[i], "--frequency-penalty")) defaults.frequency_penalty = (float) std::atof(val());
-        else if (!std::strcmp(argv[i], "--presence-penalty")) defaults.presence_penalty = (float) std::atof(val());
-        else if (!std::strcmp(argv[i], "--max-tokens")) defaults.max_tokens = std::atoll(val());
+        else if (!std::strcmp(argv[i], "--temp")) defaults.temperature = (float) omph::cli::number(val(), "--temp");
+        else if (!std::strcmp(argv[i], "--top-k")) defaults.top_k = (int) omph::cli::integer(val(), "--top-k");
+        else if (!std::strcmp(argv[i], "--top-p")) defaults.top_p = (float) omph::cli::number(val(), "--top-p");
+        else if (!std::strcmp(argv[i], "--min-p")) defaults.min_p = (float) omph::cli::number(val(), "--min-p");
+        else if (!std::strcmp(argv[i], "--repeat-penalty")) defaults.repeat_penalty = (float) omph::cli::number(val(), "--repeat-penalty");
+        else if (!std::strcmp(argv[i], "--repeat-last-n")) defaults.penalty_last_n = (int) omph::cli::integer(val(), "--repeat-last-n");
+        else if (!std::strcmp(argv[i], "--frequency-penalty")) defaults.frequency_penalty = (float) omph::cli::number(val(), "--frequency-penalty");
+        else if (!std::strcmp(argv[i], "--presence-penalty")) defaults.presence_penalty = (float) omph::cli::number(val(), "--presence-penalty");
+        else if (!std::strcmp(argv[i], "--max-tokens")) defaults.max_tokens = omph::cli::integer(val(), "--max-tokens");
         else {
             std::fprintf(stderr, "unknown option %s\n", argv[i]);
             return 2;
