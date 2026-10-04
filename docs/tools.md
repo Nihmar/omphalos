@@ -122,6 +122,68 @@ The OpenAI-compatible server: see the
 [README](../README.md#omph-server-in-full) for its options, the request fields
 it reads, the response shape and the serving-relevant `OMPH_*` switches.
 
+## omph-tui
+
+```
+uv run python omph_tui.py [options]
+```
+
+The terminal UI around `omph-server` (#304): pick the server's options in a form
+one tab per group of the tables above, start it, watch its log, and read one row
+per request -- prompt, cached/restored, prefill and decode rates, drafts
+accepted, stop reason -- with the totals in the status line. It reads the
+server's own log, so it also shows the requests another client (pi, curl) sent.
+
+![the wide layout](omph-tui-wide.svg)
+![the narrow layout on a phone](omph-tui-narrow.svg)
+
+| option | default | effect |
+|---|---|---|
+| `--model FILE` | `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph` | the `.omph` to serve |
+| `--profile NAME` | `coding-agent` | the profile to start the form from (see `tools/tui/profiles.py`: `default`, `coding-agent`, `long-context`, `fast`, `vision`) |
+| `--binary PATH` | `engine/build/omph-server` | the server to run |
+| `--exec CMD` | off | run this command instead of the server: a fake server for development |
+| `--demo FILE` | off | replay a saved log instead of running anything |
+| `--poll SECONDS` | `0.1` | how often the UI drains the server's lines |
+| `--demo-delay SECONDS` | `0.05` | the delay between a replayed log's lines |
+| `--screenshot FILE.svg` | off | write a screenshot of the real widgets and exit (how the images above were made) |
+
+Keys -- every action has a letter (a phone's soft keyboard has no F-keys) and a
+button (the title bar, the modals):
+
+| key | action |
+|---|---|
+| `s` / `F2` | start the server with the form's options |
+| `x` / `F3` | stop it (and its process group) |
+| `r` / `F5` | restart |
+| `p` / `F7` | profiles: load a row, `s` saves the current form, `d` deletes |
+| `c` / `F9` | the command that will run, the `OMPH_*` line and the pre-flight checks (model, port, other servers, VRAM estimate) |
+| `y` / `F10` | copy that command to the clipboard |
+| `t` | send a small test prompt to the running server |
+| `e` | the log: everything / errors only |
+| `enter` | details for the selected request (or double click a row) |
+| `1`..`6` | the form's tabs |
+| `?` / `h` | the key list |
+| `ctrl+l` | clear the log |
+| `q` | quit (asks first when the server is running) |
+
+Mouse: tabs, rows, selectors, checkboxes, buttons and the scrollbars all take
+clicks, the wheel scrolls, the second click on a highlighted row opens the
+details; `Shift`+drag is the terminal's own text selection. Nothing requires a
+mouse, and the UI works with mouse reporting off.
+
+A phone over ssh (a 58x30 terminal): the layout stacks the form above the log,
+the table keeps the seven columns that answer "cache hit? how fast? did it
+stop?", the status line drops the model name, and the modals keep their buttons
+on screen -- a button below the last row cannot be tapped. The width is
+re-read on every resize, so a rotated phone reflows.
+
+Testing without a GPU: `--demo` replays a saved log and `--exec` runs any
+command, which is how `tools/tests/test_tui.py` drives the UI headlessly
+(Textual's `Pilot`: clicks, keys, the narrow layout, the modal flows) next to
+`tools/tests/test_tui_log.py` (the log parser) and `test_tui_schema.py` (every
+flag in the form exists in `engine/src/tools/server.cc`).
+
 ## omph-capi-demo
 
 ```

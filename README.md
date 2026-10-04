@@ -277,6 +277,9 @@ engine/build/omph-server $M --ctx 131072 \
 - `--temp`/`--top-p`/... only set what a request leaves out; a client that
   sends its own sampling wins. A sampling field the engine does not implement
   is refused, not ignored (#284).
+- the same options have a terminal UI, `uv run python omph_tui.py` in `tools/`
+  (form, live log, one row per request, `--profile` presets; it works over ssh
+  from a phone): [docs/tools.md](docs/tools.md#omph-tui).
 
 pi (`~/.pi/agent/models.json`) does not know a custom provider is a reasoning
 model, so it sends no temperature and its thinking level does nothing.
