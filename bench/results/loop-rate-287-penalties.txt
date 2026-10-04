@@ -1,0 +1,56 @@
+# #298: do the penalties break the loops? Yes, with a long enough window.
+# Engine 6364d24 (branch feat/298-presence-frequency-penalty), RX 9060 XT, 2026-10-04.
+#
+# The same replay as #287 (tools/pi_session.py + loop_rate.py --pi-session), two
+# cuts of the 2026-10-04 pi session that looped, and llama.cpp's penalties
+# sampler newly implemented (apply_penalties, the same operations as
+# llama_sampler_penalties_apply). The sampler recipe of #285 throughout
+# (temperature 0.6, top_p 0.95, top_k 20), the default mixed K4/K8 KV, one
+# seed (20261004) so the runs are reproducible and paired, 4096 tokens,
+# thinking on, 98k and 45k-token prompts.
+#
+#   uv run python loop_rate.py --configs sampled,pen-llama,pen-openai,pen-short \
+#       --seed 20261004 --ctx 131072 --pi-session <session.jsonl> \
+#       --cuts 2026-10-04T09:17:56Z,2026-10-04T11:44:19Z --max-tokens 4096
+#
+# config     prompt     tokens  paras  pairs(>=0.85)  verbatim  worst  loop-police
+# sampled    09:17:56     4096     62        1            0      0.965     --
+# sampled    11:44:19     4096     75       23           13      1.000   at 59 %
+# pen-llama  09:17:56     4096     62        0            0      0.721     --
+# pen-llama  11:44:19      889     14        0            0      0.479     --
+# pen-openai 09:17:56     3346     48        3            0      0.991     --
+# pen-openai 11:44:19     1017     17        0            0      0.650     --
+# pen-short  09:17:56     2030     19        2            0      0.943     --
+# pen-short  11:44:19     1032     16        0            0      0.669     --
+#
+# pen-llama:  --repeat-penalty 1.1  --repeat-last-n 1024
+# pen-short:  --repeat-penalty 1.1  --repeat-last-n 64     (llama.cpp's default window)
+# pen-openai: --frequency-penalty 0.2 --presence-penalty 0.5 --repeat-last-n 1024
+#
+# Read:
+#
+# 1. The penalties are the simple fix the loops were missing. The 11:44:19
+#    prompt without them repeats paragraph after paragraph: 23 pairs at 0.85
+#    or more, 13 of them verbatim, and loop-police's fingerprint would truncate
+#    at 59 % of the stream. All three settings take it to zero pairs in the
+#    same conditions -- and to 0.48-0.72 worst pair, i.e. the reasoning is not
+#    re-deriving anymore.
+# 2. The window is what matters. llama.cpp's default (64 tokens, pen-short)
+#    leaves 0.943 on the 98k prompt -- it cannot reach a repeated block that is
+#    hundreds of tokens long -- while the same penalty with 1024 leaves 0.721
+#    and no pair at all. `--repeat-penalty 1.1 --repeat-last-n 1024` is the
+#    setting to start from.
+# 3. Presence/frequency (OpenAI's pair) help too, less: no verbatim repeat and
+#    no firing, but 3 pairs at 0.991 on the 98k prompt.
+# 4. The penalized runs also *end*: 889-3346 tokens instead of always hitting
+#    the 4096 cap. The model stops deliberating because its own recent text
+#    cannot be reused, which is the failure mode the user was fighting.
+#
+# Caveats: two prompts, one seed each; the penalties cost the legitimate reuse
+# of identifiers and paths in a coding session, which is why the README says to
+# fall back to 1.05 rather than up when the answers get worse. Nothing here
+# says the penalties fix the *greedy* re-derivation (#287's greedy rows repeat
+# no tokens, only the plan) -- they are for the sampled regime, which is the
+# one that was looping.
+#
+# The two CSVs next to this file are the per-run table and the detector sweep.

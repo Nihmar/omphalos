@@ -105,7 +105,10 @@ engine/build/omph-capi-demo <model.omph> [<mmproj.gguf> <image>]
 # Options: --host --port --ctx --cache-ram MIB (sequence checkpoints in host RAM, #158; default
 # 2048) --kv-ram MIB (whole conversations in host RAM: a prompt that leaves the cached one saves
 # it, one that continues a saved one restores it, #179; default 8192) --mmproj FILE (images as base64 data: URLs, #160) --alias --api-key --cors ORIGIN, request defaults --temp
-# --top-k --top-p --min-p --max-tokens (default greedy: speculative MTP decoding)
+# --top-k --top-p --min-p --max-tokens (default greedy: speculative MTP decoding), and
+# llama.cpp's penalties sampler (#298) --repeat-penalty P --repeat-last-n N --frequency-penalty P
+# --presence-penalty P (defaults 1.0 / 64 / 0 / 0, off; a penalized greedy step gives up the
+# speculative drafts, the device argmax cannot see them)
 engine/build/omph-server <model.omph> [--port 8080]
 
 # full forward pass: prefill + greedy decode (options in the table below)

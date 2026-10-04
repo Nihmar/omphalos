@@ -95,14 +95,20 @@ decode is speculative either way (MTP drafts, plus n-gram drafts when the
 context repeats; `--dflash` switches to the DFlash2 drafter). Sampling fields
 the engine does not implement (`frequency_penalty`, `presence_penalty`,
 `repetition_penalty`, `repeat_penalty`, `logit_bias`) are refused with a 400
-unless they hold their no-op value (0, 1.0, `{}`) -- never dropped in silence
-(#284). A special token written literally in a message's text or in a tool
-result (`<|im_end|>` in a file an agent reads) stays text: only the template's
-own structure is parsed for special tokens (#292). Options:
+unless they hold their no-op value (0, 1.0, `{}`) -- never dropped in silence.
+The three llama.cpp penalties are implemented (#298): `repeat_penalty`
+(`repetition_penalty` is accepted as the vLLM spelling), `frequency_penalty`
+and `presence_penalty`, all over the same `repeat_last_n` window of the last
+tokens of the sequence (64 by default, `--repeat-last-n`), applied to the raw
+logits as llama.cpp's `penalties` sampler does. A special token written
+literally in a message's text or in a tool result (`<|im_end|>` in a file an
+agent reads) stays text: only the template's own structure is parsed for
+special tokens (#292). Options:
 `--port`, `--host`, `--ctx`, `--alias`, `--api-key`, `--cors`, `--cache-ram`
 and `--kv-ram` (sequence checkpoints and whole conversations in pinned host
 RAM), `--mmproj`, `--dflash`, the default sampling (`--temp`, `--top-k`,
-`--top-p`, `--min-p`, `--max-tokens`).
+`--top-p`, `--min-p`, `--max-tokens`, `--repeat-penalty`, `--repeat-last-n`,
+`--frequency-penalty`, `--presence-penalty`).
 
 ### Serving a coding agent
 
@@ -122,6 +128,12 @@ engine/build/omph-server $M --ctx 131072 --temp 0.6 --top-p 0.95 --top-k 20 \
 
 - `--max-tokens` (default: until the context is full) bounds one turn: without
   it a runaway generation can decode the whole 131k.
+- **repetition**: `--repeat-penalty 1.1 --repeat-last-n 1024` (llama.cpp's
+  sampler, #298) is the cheap first thing to try: a window that long covers a
+  repeated paragraph, while the default 64 only covers repeated phrases. It
+  scales the logits of the window's tokens (sign-aware), so it also touches
+  the identifiers a coding session legitimately reuses: lower it to 1.05 if
+  the answers get worse, not the repetition away.
 - thinking is on by default, and `preserve_thinking` (the template's default,
   as in llama.cpp) keeps every earlier reasoning block in the prompt. A client
   turns thinking off with `"chat_template_kwargs": {"enable_thinking": false}`

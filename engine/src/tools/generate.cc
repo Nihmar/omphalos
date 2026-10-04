@@ -80,6 +80,10 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--top-p")) req.sampling.top_p = (float) std::atof(val());
         else if (!std::strcmp(argv[i], "--min-p")) req.sampling.min_p = (float) std::atof(val());
         else if (!std::strcmp(argv[i], "--seed")) req.sampling.seed = std::strtoull(val(), nullptr, 10);
+        else if (!std::strcmp(argv[i], "--repeat-penalty")) req.sampling.repeat_penalty = (float) std::atof(val());
+        else if (!std::strcmp(argv[i], "--repeat-last-n")) req.sampling.penalty_last_n = std::atoi(val());
+        else if (!std::strcmp(argv[i], "--frequency-penalty")) req.sampling.frequency_penalty = (float) std::atof(val());
+        else if (!std::strcmp(argv[i], "--presence-penalty")) req.sampling.presence_penalty = (float) std::atof(val());
         else if (!std::strcmp(argv[i], "--ctx")) cfg.context = std::atoll(val());
         else if (!std::strcmp(argv[i], "--cache-mib")) cfg.cache_mib = std::atoll(val());
         else if (!std::strcmp(argv[i], "--kv-ram")) cfg.kv_ram_mib = std::atoll(val());

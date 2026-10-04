@@ -1,0 +1,2 @@
+commit,config,prompt,prompt_tokens,reasoning_chars,completion_tokens,paragraphs,paragraphs_skipped,repetitions,repetitions_anywhere,repeats_per_1k_tokens,worst_pair_similarity
+fa539f2,sampled,2026-10-04T09:10:35Z,65558,,4096,11,39,0,0,0.0,0.37
