@@ -2,12 +2,16 @@
 """Compare omph-attn (GPU attention block, the engine's kernels) against the golden dump.
 
 usage: uv run python check_gpu_attn.py <model.gguf> <layer> [--kv f32|q8q4|q4q4]
-                                       [--window N] [--chunk N]
+                                       [--window N] [--chunk N] [--verify]
 
 --kv f32 (default) checks every intermediate; with a quantized cache q and k are
 Hadamard-rotated, so only the gate, the attention output and the block output
 are compared. --window 0 sends every key through the quantized blocks;
 --chunk 1 runs the decode path (one token per call, split-K attention).
+--verify runs N = 2..tokens tokens in one call against the decode path with the
+runner's fixed key chunks: bit-identical up to 8 (the engine's own invariant,
+#161 -- a verification's rows are decode steps'), and within --tol up to 16,
+where the kernel leaves the decode path's fixed chunks (#315).
 """
 
 from __future__ import annotations
@@ -43,6 +47,9 @@ def main() -> None:
     ap.add_argument("--kv", choices=("f32", "q8q4", "q4q4"), default="f32")
     ap.add_argument("--window", type=int, default=128)
     ap.add_argument("--chunk", type=int, default=0)
+    ap.add_argument("--verify", action="store_true",
+                    help="N = 2..tokens tokens per call against the decode path, with the "
+                         "runner's key chunks: bit-identical up to 8 (#161)")
     args = ap.parse_args()
     pairs = [p for p in PAIRS if args.kv == "f32" or p[0] not in ROTATED]
     if args.tol is None:
@@ -57,17 +64,22 @@ def main() -> None:
     tokens = int(np.prod(x.shape[:-1]))
     x = x.reshape(tokens, -1)
 
+    def run(prefix: str, chunk: int, key_chunk: int = 0) -> dict[str, np.ndarray]:
+        run_tool([args.tool, args.model, str(il), str(in_path), prefix, str(tokens),
+                  "--trace", "--kv", args.kv, "--window", str(args.window),
+                  "--chunk", str(chunk), "--key-chunk", str(key_chunk)])
+        tensors = {name: np.fromfile(f"{prefix}-{name}.f32", dtype=np.float32)
+                   for name, _ in pairs}
+        tensors["out"] = np.fromfile(f"{prefix}.out.f32", dtype=np.float32)
+        return tensors
+
     with tempfile.TemporaryDirectory() as tmp:
         in_path = Path(tmp) / "in.f32"
         prefix = str(Path(tmp) / "t")
         np.ascontiguousarray(x, dtype=np.float32).tofile(in_path)
-        run_tool([args.tool, args.model, str(il), str(in_path), prefix, str(tokens),
-                        "--trace", "--kv", args.kv, "--window", str(args.window),
-                        "--chunk", str(args.chunk)])
-        got = {}
-        for name, _ in pairs:
-            got[name] = np.fromfile(f"{prefix}-{name}.f32", dtype=np.float32)
-        out = np.fromfile(f"{prefix}.out.f32", dtype=np.float32)
+        traced = run(prefix, args.chunk)
+        got = {name: traced[name] for name, _ in pairs}
+        out = traced["out"]
 
     print(f"kv {args.kv}, window {args.window}, chunk {args.chunk or tokens}, {tokens} tokens")
     worst = (0.0, "")
@@ -88,7 +100,27 @@ def main() -> None:
     worst = max(worst, (rel, "out"), key=lambda t: t[0])
     print(f"  {'out':12} -> attn_output-{il}: rel={rel:.3e}  shape={ref.shape}")
     print(f"worst: {worst[1]} rel={worst[0]:.3e} (tol {args.tol:g})")
-    raise SystemExit(0 if worst[0] <= args.tol else 1)
+    ok = worst[0] <= args.tol
+    if args.verify:
+        # N tokens in one call against N decode steps, both with the runner's
+        # fixed key chunks: the engine's own invariant up to 8 tokens (#161),
+        # and the per-query path's window indices beyond it (#315).
+        with tempfile.TemporaryDirectory() as tmp:
+            in_path = Path(tmp) / "in.f32"
+            np.ascontiguousarray(x, dtype=np.float32).tofile(in_path)
+            ref = run(str(Path(tmp) / "v1"), 1, -1)["attn_gated"]
+            print(f"verify: N tokens in one call against {tokens} decode steps, "
+                  f"key chunks as the runner gives them")
+            for n in range(2, tokens + 1):
+                mine = run(str(Path(tmp) / f"v{n}"), n, -1)["attn_gated"]
+                exact = np.array_equal(mine, ref)
+                rel = rel_diff(mine, ref)
+                good = exact if n <= 8 else rel <= args.tol
+                note = "bit-identical" if exact else f"rel={rel:.3e}"
+                print(f"  {n:2} tokens: {note} (n <= 8 must be bit-identical) "
+                      f"{'ok' if good else 'FAIL'}")
+                ok = ok and good
+    raise SystemExit(0 if ok else 1)
 
 
 if __name__ == "__main__":
