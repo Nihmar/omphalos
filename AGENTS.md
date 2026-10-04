@@ -158,7 +158,10 @@ uv run python loop_rate.py [--configs greedy,sampled,k8,k4-all] [--max-tokens N]
                                                   # --cuts TS to replay a coding agent's own context
                                                   # (tools/pi_session.py rebuilds the request pi sent),
                                                   # through omph-server, scored with loop-police's
-                                                  # paragraph-fingerprint rule; CSV in bench/results
+                                                  # paragraph-fingerprint rule; CSV in bench/results.
+                                                  # --sweep DIR: no run, re-score the --dump files with
+                                                  # a grid of loop-police settings (where each would
+                                                  # truncate) and the 0.85 paragraph pairs it misses
 
 # long-context KV validation (exact f32 KV kept in host RAM as the reference)
 OMPH_KV_HOST=1 engine/build/omph-run <model> <tokens.txt> ref.f32 --logits-tail 512
