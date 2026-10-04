@@ -1124,7 +1124,9 @@ bool gdn_chunk(const GdnStep & a, const int64_t heads, hipStream_t stream) {
     const unsigned conv_groups = (unsigned) ((a.tokens + kConvTokens - 1) / kConvTokens);
     delta_conv_kernel<<<dim3((unsigned) (a.channels / kDeltaS), conv_groups), kDeltaS, 0, stream>>>(a);
     const unsigned gate_groups = (unsigned) ((a.tokens + kGateTokens - 1) / kGateTokens);
-    if (heads % 4 == 0) {
+    // 4 heads per block read a prefill chunk's x once for them; a short call
+    // (a verification) needs the workgroups more (#271: 12 of them at 8 tokens)
+    if (heads % 4 == 0 && a.tokens > kGateTokens) {
         delta_gate_kernel<4><<<dim3((unsigned) (heads / 4), gate_groups), 256, 0, stream>>>(a);
     } else {
         delta_gate_kernel<1><<<dim3((unsigned) heads, gate_groups), 256, 0, stream>>>(a);
