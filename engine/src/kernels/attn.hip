@@ -116,6 +116,9 @@ __global__ __launch_bounds__(kPrepHd) void attn_prep_kernel(const AttnPrep a) {
         rp = {a.mpos[3 * t], a.mpos[3 * t + 1], a.mpos[3 * t + 2], true};
     }
     if (role < a.nh) {
+        if (a.skip_q) {
+            return;
+        }
         const long long h = role;
         const float * src = a.qg + (t * a.nh + h) * 2 * kPrepHd;
         a.gate[(t * a.nh + h) * kPrepHd + d] = src[kPrepHd + d];

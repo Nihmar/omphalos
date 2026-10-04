@@ -55,9 +55,8 @@ bool Runner::attn_layer(const int64_t il, const LayerWeights & L, const int64_t 
     const int64_t kv_out = h_.n_head_kv * h_.head_dim;
     const KvView kv = kv_view(il);
 
-    // kv_only (the MTP KV fill, #124): K and V into the cache, nothing else.
-    // attn_prep still runs its q heads on whatever fused_ holds; nobody reads
-    // their output.
+    // kv_only (the MTP KV fill, #124): K and V into the cache, nothing else --
+    // attn_prep's q blocks are skipped (skip_q), their output is not read.
     const bool grp = kv_only ? grouped(h16_, ne, T, {{&L.attn_k, k_, kv_out}, {&L.attn_v, v_, kv_out}})
                              : grouped(h16_, ne, T,
                                        {{&L.attn_k, k_, kv_out}, {&L.attn_v, v_, kv_out}, {&L.attn_q, fused_, q_out}});
@@ -93,6 +92,7 @@ bool Runner::attn_layer(const int64_t il, const LayerWeights & L, const int64_t 
     for (int c = 0; c < 3; ++c) prep.sections[c] = h_.rope_sections[c];
     prep.eps = (float) h_.eps;
     prep.rotate = kv.quant;
+    prep.skip_q = kv_only;
     if (kv.quant) {
         prep.k_q8 = kv.q.kq;
         prep.k_scales = reinterpret_cast<__half *>(kv.q.ksc);
