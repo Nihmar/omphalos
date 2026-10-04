@@ -152,6 +152,11 @@ uv run python compare_logits.py ref.f32 test.f32  # KL + top-1 agreement over ev
                                                   # position (e.g. OMPH_KV_F32=1 vs default;
                                                   # OMPH_GDN_EXACT=1 vs default for the WY prefill,
                                                   # #240, which check_gpu_gdn's 10 tokens never reach)
+uv run python loop_rate.py [--configs greedy,sampled,k8] [--max-tokens N] [--dump DIR]
+                                                  # #287: repeat rate of a serving configuration:
+                                                  # fixed long-reasoning prompts through omph-server,
+                                                  # scored with loop-police's paragraph-fingerprint
+                                                  # rule; CSV in bench/results
 
 # long-context KV validation (exact f32 KV kept in host RAM as the reference)
 OMPH_KV_HOST=1 engine/build/omph-run <model> <tokens.txt> ref.f32 --logits-tail 512

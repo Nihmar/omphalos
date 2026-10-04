@@ -1,0 +1,5 @@
+commit,config,prompt,reasoning_chars,completion_tokens,paragraphs,paragraphs_skipped,repetitions,repetitions_anywhere,repeats_per_1k_tokens,worst_pair_similarity
+64cd69a,greedy,0,15113,4096,1,21,0,0,0.0,0.0
+64cd69a,greedy,1,16250,4096,58,2,0,0,0.0,0.9
+64cd69a,sampled,0,16023,4096,0,30,0,0,0.0,0.0
+64cd69a,sampled,1,17467,4096,54,0,0,0,0.0,0.684

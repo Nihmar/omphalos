@@ -1,0 +1,32 @@
+# #287: repeat rate of a serving configuration on fixed long-reasoning prompts.
+# Engine 64cd69a (branch test/287-loop-rate-harness, tools/loop_rate.py), RX 9060 XT, 2026-10-04.
+# omph-server --ctx 16384, max_tokens 4096, thinking on (the pi session's regime); the metric is
+# loop-police's semantic detector: blank-line paragraphs >= 40 chars fingerprinted by their first
+# 60 chars (a leading ordered-list counter normalized away), a fingerprint seen 3 times is one
+# repetition. Each run's reasoning was dumped and inspected (not committed).
+#
+# config                          prompt  tokens  paragraphs  fence-skipped  repetitions  worst pair
+# greedy (server default)         p0        4096       1          21             0          -
+# greedy                          p1        4096      58           2             0        0.900
+# temp 0.6 top-p 0.95 top-k 20    p0        4096       0          30             0          -
+# temp 0.6 top-p 0.95 top-k 20    p1        4096      54           0             0        0.684
+#
+# p0 is the CommonMark list-item-interruption deliberation of the pi session of 2026-10-04, p1 a
+# compaction-policy design question (both in loop_rate.py's PROMPTS). Neither configuration repeats
+# a paragraph opening three times, and the only pair above 0.85 similarity is greedy-p1's 0.900:
+# the model restating the question at the start ("We need produce final detailed. Need think. User
+# asks: ...") and at the end ("Double-check user: ...") -- similar content, different 60-char
+# prefix, so the fingerprint never fires.
+#
+# So a fresh single-turn 4k-token run does not reproduce the loops loop-police fired five times on
+# that session. What the session had and this does not: the model's own 4-9k tokens of reasoning
+# from every earlier turn, kept by preserve_thinking, in a 20k-111k prompt -- i.e. the agentic
+# context, which still has to be replayed (#287, open).
+#
+# Two properties of the detector this run made concrete: the fingerprint only sees blank-line
+# paragraphs (greedy p0 wrote one 15k-char wall, 1 paragraph), and an unbalanced ``` fence in a
+# paragraph stops the counting for the rest of the stream (sampled p0: 30 of 30 paragraphs
+# skipped). A repetition score that survives formatting has to be pair-similarity based (the 0.85
+# paragraph rule the loop-police postmortem classifies with), not prefix based.
+#
+# The CSV next to this file is the same table, tagged with the engine commit (PLAN.md §17).
