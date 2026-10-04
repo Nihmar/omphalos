@@ -57,7 +57,7 @@ Priorities, in order: **1) VRAM savings — 2) decode speed — 3) prefill speed
 
 ## Entry points
 
-Model paths used below: `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (local, git-ignored) and the `.omph` file `omph-convert` writes from it (#178). The engine binaries that run the model (`omph-run`, `omph-generate`, `omph-server`, `omph-capi-demo`, the C ABI) load only `<model.omph>`; the validation tools and scripts take the GGUF (they derive the `.omph` next to it, `tools/omph_model.py`).
+Model paths used below: `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (local, git-ignored) and the `.omph` file `omph-convert` writes from it (#178). The options of every binary are documented in [docs/tools.md](./docs/tools.md); this file lists the commands. The engine binaries that run the model (`omph-run`, `omph-generate`, `omph-server`, `omph-capi-demo`, the C ABI) load only `<model.omph>`; the validation tools and scripts take the GGUF (they derive the `.omph` next to it, `tools/omph_model.py`).
 
 ```sh
 # build

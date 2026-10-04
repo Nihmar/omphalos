@@ -68,8 +68,11 @@ echo '{"messages":[{"role":"user","content":"Hi!"}],"add_generation_prompt":true
 engine/build/omph-generate $M --chat --mmproj models/mmproj-Qwen3.8-27B-BF16.gguf \
     --image photo.jpg < request-with-an-image-item.json
 
-# the OpenAI-compatible server on 127.0.0.1:8080
+# the OpenAI-compatible server on 127.0.0.1:8080 (every option in "omph-server in full" below)
 engine/build/omph-server $M [--mmproj models/mmproj-Qwen3.8-27B-BF16.gguf] [--ctx 8192]
+
+# the other binaries (omph-run, omph-tokenize, the validation and benchmark tools):
+# every option is documented in docs/tools.md
 
 # the DFlash2 drafter needs its own .omph too (7 drafts per step, #245)
 engine/build/omph-convert models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
