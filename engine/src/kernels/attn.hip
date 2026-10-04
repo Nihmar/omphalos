@@ -2,6 +2,7 @@
 // RoPE, Hadamard rotation, quantized KV writer) and the GQA-grouped flash
 // attention over either cache (PLAN.md §10.4, §13).
 #include "kernels/attn.hh"
+#include "kernels/shapes.hh"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -19,7 +20,7 @@ constexpr long long kKvBlock = 32;  // quantized KV block along head_dim (PLAN.m
 
 namespace {
 
-constexpr int kPrepHd = 256;  // head_dim: one thread per dimension, 8 waves = 8 quant blocks
+constexpr int kPrepHd = kHeadDim;  // head_dim: one thread per dimension, 8 waves = 8 quant blocks
 
 // Block-wide sum over the 256 threads (8 wave32s).
 __device__ inline float prep_block_sum(float v, float * red) {
@@ -203,9 +204,10 @@ bool attn_prep(const AttnPrep & a, hipStream_t stream) {
 
 namespace {
 
-constexpr int kGqaHd = 256;     // head_dim: one thread per dimension
+constexpr int kGqaHd = kHeadDim;  // head_dim: one thread per dimension
 constexpr int kGqaKb = 16;      // keys per block: 256 threads = 16 keys x 16 chunks
-constexpr int kGqaGroup = 6;    // query heads per KV head (24 / 4): fixed for this model
+// kGqaGroup (query heads per KV head, 24 / 4) comes from kernels/shapes.hh: the
+// model loader checks the metadata against it.
 constexpr int kGqaTargetWgs = 128;  // split the keys until a launch has this many
 constexpr int kGqaMaxSplits = 256;  // the merge kernel's LDS
 constexpr int64_t kDecTargetSplits = 128;  // key chunks at the context capacity (#136, #169)
