@@ -35,6 +35,7 @@ struct EnvOptions {
     bool no_b4 = false;         // OMPH_NO_B4: no NT-token GEMVs (verification, --gemv prefill)
     bool no_group = false;      // OMPH_NO_GROUP: sibling GEMVs as separate launches (#214)
     bool no_swiglu_gemm = false;  // OMPH_NO_SWIGLU_GEMM: the FFN's up GEMM writes f32, then swiglu_f16 (#221)
+    int64_t mtp_window = 16384;  // OMPH_MTP_WINDOW=N: the MTP block attends 16 sinks + the last N..2N positions (0: all; #171)
     int64_t draft_vocab = 98304;  // OMPH_DRAFT_VOCAB=N: MTP drafts over the first N token ids (0: all; #217)
     bool no_bf16_gemv = false;  // OMPH_NO_BF16_GEMV: BF16 weights through the f16 path
     bool no_f16_cache = false;  // OMPH_NO_F16_CACHE: re-convert f16-path weights every call

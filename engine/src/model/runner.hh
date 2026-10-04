@@ -107,6 +107,11 @@ public:
     // Text RoPE position = cache position + delta (<= 0 after images, #160),
     // for every forward without M-RoPE positions, verification and draft.
     void set_rope_delta(int64_t delta) { rope_delta_ = delta; }
+    // MTP window (#171): a prompt of n tokens fills the MTP KV for its last
+    // window only; after a restore to position pos, the window holds nothing
+    // past it (and starts over when pos is before it).
+    void mtp_prompt(const int64_t n) { mtp_fill_from_ = mtp_window_ > 0 ? std::max(n - mtp_window_, kMtpSink) : 0; }
+    void mtp_rewind(int64_t pos);
 
     const HParams & hparams() const { return h_; }
 
@@ -366,6 +371,25 @@ private:
     const float * mtp_hnorm_ = nullptr;
     const float * mtp_head_norm_ = nullptr;
     void * mtp_kq_ = nullptr;   // its own Q8/Q4 cache, no FP16 ring
+    // The MTP cache as a window (#171): mtp_cap_ rows. The first kMtpSink rows
+    // keep positions [0, kMtpSink) for good (the attention sinks: without them
+    // drafts at 100k lost 7 % of the decode speed); row kMtpSink + r holds
+    // position mtp_base_ + r (mtp_base_ >= kMtpSink), and positions up to
+    // mtp_next_ are filled. When a write would pass the last row, the last
+    // mtp_window positions move to the front of the window (no overlap: it holds
+    // two windows). A prompt fills the MTP KV only for its sinks and from
+    // mtp_fill_from_ (its last window); the drafts attend over sinks + window.
+    static constexpr int64_t kMtpSink = 16;
+    int64_t mtp_window_ = 0;  // 0: the whole context
+    int64_t mtp_cap_ = 0;
+    int64_t mtp_base_ = 0;
+    int64_t mtp_next_ = 0;
+    int64_t mtp_fill_from_ = 0;
+    bool mtp_rows(int64_t pos0, int64_t T, bool kv_only);
+    int64_t mtp_row(int64_t pos0) const;
+    static constexpr size_t kMtpHeader = 3 * sizeof(int64_t);
+    // the MTP rows a saved conversation of n positions holds (#179, #171)
+    int64_t mtp_saved_rows(const int64_t n) const { return mtp_window_ > 0 ? mtp_cap_ : n; }
     void * mtp_ks_ = nullptr;
     void * mtp_vq_ = nullptr;
     void * mtp_vs_ = nullptr;

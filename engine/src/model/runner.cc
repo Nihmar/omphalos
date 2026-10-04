@@ -241,10 +241,14 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     // MTP (#124): the block's own cache (Q8/Q4, no ring) and its h buffers.
     if (mtp_) {
         const int64_t nblk = h_.head_dim / 32;
-        alloc(&mtp_kq_, (size_t) kvcap * attn_kv);
-        alloc(&mtp_ks_, (size_t) kvcap * h_.n_head_kv * nblk * 2);
-        alloc(&mtp_vq_, (size_t) kvcap * attn_kv / 2);
-        alloc(&mtp_vs_, (size_t) kvcap * h_.n_head_kv * nblk * 2);
+        // two windows of rows (#171), or the whole context
+        mtp_window_ = env_.mtp_window > 0 && kMtpSink + 2 * env_.mtp_window < kvcap ? std::max<int64_t>(env_.mtp_window, T) : 0;
+        mtp_cap_ = mtp_window_ > 0 ? kMtpSink + 2 * mtp_window_ : kvcap;
+        mtp_base_ = mtp_window_ > 0 ? kMtpSink : 0;
+        alloc(&mtp_kq_, (size_t) mtp_cap_ * attn_kv);
+        alloc(&mtp_ks_, (size_t) mtp_cap_ * h_.n_head_kv * nblk * 2);
+        alloc(&mtp_vq_, (size_t) mtp_cap_ * attn_kv / 2);
+        alloc(&mtp_vs_, (size_t) mtp_cap_ * h_.n_head_kv * nblk * 2);
         alloc(&mtp_hlast_, (size_t) T * ne * 4);
         alloc(&mtp_hin_, (size_t) T * ne * 4);
         alloc(&mtp_pending_, (size_t) ne * 4);
@@ -527,6 +531,8 @@ bool Runner::reset_sequence() {
     }
     last_toks_.clear();
     last_pos0_ = 0;
+    mtp_base_ = mtp_window_ > 0 ? kMtpSink : 0;
+    mtp_next_ = 0;
     rope_delta_ = 0;
     return hipDeviceSynchronize() == hipSuccess || fail("reset failed");
 }
@@ -612,7 +618,7 @@ size_t Runner::kv_prefix_bytes(const int64_t n) const {
     for (const uint8_t k4 : kv_k4_) {
         bytes += (size_t) n * (attn_kv / (k4 ? 2 : 1) + scales + attn_kv / 2 + scales);
     }
-    if (mtp_kq_ != nullptr) bytes += (size_t) n * (attn_kv + scales + attn_kv / 2 + scales);
+    if (mtp_kq_ != nullptr) bytes += kMtpHeader + (size_t) mtp_saved_rows(n) * (attn_kv + scales + attn_kv / 2 + scales);
     if (dfl_tags_ != nullptr) bytes += 2 * dfl_ring_bytes_ + (size_t) dfl_swa_ * 4;
     return bytes;
 }
@@ -645,7 +651,30 @@ bool Runner::kv_prefix_copy(void * host, const int64_t n, const int64_t m, const
              copy(vq + i * max_seq_ * attn_kv / 2, attn_kv / 2) && copy(vs + i * max_seq_ * scales, scales);
     }
     if (ok && mtp_kq_ != nullptr) {
-        ok = copy(mtp_kq_, attn_kv) && copy(mtp_ks_, scales) && copy(mtp_vq_, attn_kv / 2) && copy(mtp_vs_, scales);
+        // a header (window base, its end, the rows saved), then the rows: the
+        // whole window (#171), or the first n positions
+        int64_t hdr[3] = {mtp_base_, mtp_next_, mtp_saved_rows(n)};
+        if (save) {
+            std::memcpy(at, hdr, sizeof(hdr));
+        } else {
+            std::memcpy(hdr, at, sizeof(hdr));
+        }
+        at += kMtpHeader;
+        const int64_t rows = hdr[2];
+        const int64_t take = mtp_window_ > 0 ? rows : std::min(rows, m);
+        const auto part = [&](void * dev, const size_t row) {
+            const size_t bytes = (size_t) take * row;
+            const hipError_t e = save ? hipMemcpyAsync(at, dev, bytes, hipMemcpyDeviceToHost, nullptr)
+                                      : hipMemcpyAsync(dev, at, bytes, hipMemcpyHostToDevice, nullptr);
+            at += (size_t) rows * row;
+            return e == hipSuccess;
+        };
+        ok = part(mtp_kq_, attn_kv) && part(mtp_ks_, scales) && part(mtp_vq_, attn_kv / 2) && part(mtp_vs_, scales);
+        if (!save) {
+            mtp_base_ = hdr[0];
+            mtp_next_ = hdr[1];
+            mtp_rewind(m);
+        }
     }
     if (ok && dfl_tags_ != nullptr) {
         const auto whole = [&](void * dev, const size_t bytes) {
