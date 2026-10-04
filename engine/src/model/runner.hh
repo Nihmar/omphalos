@@ -196,6 +196,11 @@ private:
     // The first `rows` rows of logits_ to the host (synchronous).
     bool copy_logits(float * dst, const int64_t rows);
 
+    // OMPH_CHECK_FINITE: scans the rows this call produced -- the host ones when
+    // the head wrote them, else the device ones (the greedy argmax and the
+    // verification paths) -- and fails on the first value that is not finite.
+    bool check_logits_finite(const int64_t T, const std::vector<float> & logits);
+
     // lm head in vocab chunks, through the f16 dequant + GEMM path: the
     // whole f16 head (248k x 5120, 2.5 GB) would not fit. Writes (T, n_vocab)
     // to `out` on the host, one vocab chunk at a time.

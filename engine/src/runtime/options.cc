@@ -74,6 +74,7 @@ EnvOptions EnvOptions::from_env() {
     o.trace_f16 = flag("OMPH_TRACE_F16");
     o.trace_stage = flag("OMPH_TRACE_STAGE");
     o.spec_check = flag("OMPH_SPEC_CHECK");
+    o.check_finite = flag("OMPH_CHECK_FINITE");
     if (const char * b = std::getenv("OMPH_TEST_BAD_SIDE")) {
         o.test_bad_side = std::atoi(b);
     }

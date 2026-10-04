@@ -249,6 +249,9 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
         if (!lm_head(T, logits, greedy)) {
             return false;
         }
+        if (env_.check_finite && !check_logits_finite(T, logits)) {
+            return false;
+        }
     } else {
         logits.clear();
         if (hipDeviceSynchronize() != hipSuccess) {
@@ -383,6 +386,35 @@ bool Runner::lm_head(const int64_t T, std::vector<float> & logits, int32_t * gre
         return true;
     }
     return head_chunked(h16_, T, logits.data());
+}
+
+bool Runner::check_logits_finite(const int64_t T, const std::vector<float> & logits) {
+    const int64_t rows = !logits.empty() ? (int64_t) (logits.size() / h_.n_vocab)
+                                         : (verifying_ ? T : 1);
+    std::vector<float> staged;
+    const float * host = logits.data();
+    if (logits.empty()) {
+        // the greedy argmax and the verification paths never bring the rows
+        // back: 1 MB per row, and only under the switch
+        staged.resize((size_t) rows * h_.n_vocab);
+        if (!copy_logits(staged.data(), rows)) {
+            return false;
+        }
+        host = staged.data();
+    }
+    for (int64_t r = 0; r < rows; ++r) {
+        const float * row = host + r * h_.n_vocab;
+        for (int64_t j = 0; j < h_.n_vocab; ++j) {
+            if (!std::isfinite(row[j])) {
+                std::fprintf(stderr,
+                             "OMPH_CHECK_FINITE: logits row %lld of %lld is not finite at token "
+                             "id %lld\n",
+                             (long long) r, (long long) rows, (long long) j);
+                return fail("logits are not finite");
+            }
+        }
+    }
+    return true;
 }
 
 // The first `rows` rows of logits_ to the host (synchronous).
