@@ -146,7 +146,7 @@ bool Runner::gdn_layer(const int64_t il, const LayerWeights & L, const int64_t T
     float * conv_b = conv_a + n_conv_f;
     float * conv_cur = conv_flip_[il] ? conv_b : conv_a;
     float * conv_new = conv_flip_[il] ? conv_a : conv_b;
-    float * seq_state = state_cur_[(size_t) il];
+    __half * seq_state = state_cur_[(size_t) il];
     (void) st;
 
     const bool proj_ok =
@@ -189,7 +189,7 @@ bool Runner::gdn_layer(const int64_t il, const LayerWeights & L, const int64_t T
     // and leaves it intact: the first token writes the alternate one, the rest
     // update that; every token records its rank-1 factors, and the first the
     // conv input history, so commit() can roll back to any prefix.
-    float * alt = verifying_ ? state_alt_[(size_t) il] : nullptr;
+    __half * alt = verifying_ ? state_alt_[(size_t) il] : nullptr;
     if (verifying_) {
         step.replay = static_cast<float *>(replay_pool_) +
                       rec_index_[(size_t) il] * spec_max_ *

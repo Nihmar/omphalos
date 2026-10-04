@@ -20,7 +20,7 @@ namespace omph::kernels {
 // value head. Launch t = 0 .. tokens - 1 in order; t = 0 also shifts the conv
 // state from conv_cur into conv_new.
 struct GdnStep {
-    float * state = nullptr;           // (heads, 128, 128)
+    __half * state = nullptr;          // (heads, 128, 128), f16 (#273)
     const float * qkv = nullptr;       // (tokens, channels): q | k | v
     const float * conv_w = nullptr;    // (channels, conv_k)
     const float * conv_cur = nullptr;  // (conv_k - 1, channels)
@@ -45,7 +45,7 @@ struct GdnStep {
     float l2_scale = 0.0f;             // 1 / sqrt(s), also the output scale
     float eps_norm = 0.0f;
     // Speculative verification (#122), all optional:
-    float * state_out = nullptr;       // the updated state goes here instead of `state`
+    __half * state_out = nullptr;       // the updated state goes here instead of `state`
     float * replay = nullptr;          // per token t: gdn_replay_floats(heads, n_kh) floats at
                                        // t * that, the token's rank-1 factors (decay, k, d)
     float * conv_hist = nullptr;       // at t = 0: [conv_cur; qkv] rows, (conv_k - 1 + tokens)
@@ -100,7 +100,7 @@ inline int64_t gdn_replay_floats(const int64_t heads, const int64_t n_kh) {
 // S <- decay S; S <- S + k d^T per token, the float operations of gdn_step in
 // its order, so the result equals the state gdn_step reached after them,
 // bit for bit (#104).
-bool gdn_replay(float * state, const float * replay, int64_t tokens, int64_t heads,
+bool gdn_replay(__half * state, const float * replay, int64_t tokens, int64_t heads,
                 int64_t n_kh, hipStream_t stream);
 
 // conv_dst rows r < conv_k - 1 = conv_hist rows accepted + r: the conv tail after
@@ -113,7 +113,7 @@ bool gdn_conv_select(const float * conv_hist, float * conv_dst, int64_t accepted
 // and gdn_conv_select of its conv tail, the same operations (bit-identical).
 constexpr int kGdnRollbackMax = 64;
 struct GdnRollback {
-    float * state[kGdnRollbackMax];
+    __half * state[kGdnRollbackMax];
     const float * replay[kGdnRollbackMax];
     const float * conv_hist[kGdnRollbackMax];
     float * conv_dst[kGdnRollbackMax];

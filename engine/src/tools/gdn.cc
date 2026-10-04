@@ -214,7 +214,7 @@ int main(int argc, char ** argv) {
         dev_alloc(&out, (size_t) tokens * n_embd * 4);
         dev_alloc(&conv_a, (size_t) (conv_k - 1) * channels * 4);
         dev_alloc(&conv_b, (size_t) (conv_k - 1) * channels * 4);
-        dev_alloc(&state, (size_t) n_vh * s * s * 4);
+        dev_alloc(&state, (size_t) n_vh * s * s * 2);  // f16 (#273)
         if (!ok) {
             return fail("out of VRAM");
         }
@@ -235,7 +235,7 @@ int main(int argc, char ** argv) {
         // gdn_step, one launch per token, `chunk` tokens per call: the conv
         // state flips between its two buffers after each call, as in omph-run
         omph::kernels::GdnStep step;
-        step.state = static_cast<float *>(state);
+        step.state = static_cast<__half *>(state);
         step.conv_w = static_cast<const float *>(conv_w);
         step.w_beta = static_cast<const uint16_t *>(wbeta);
         step.w_alpha = static_cast<const uint16_t *>(walpha);

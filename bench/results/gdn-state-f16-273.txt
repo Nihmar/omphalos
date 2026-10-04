@@ -1,0 +1,24 @@
+# Delta-net state in f16 (#273), 2026-10-04, RX 9060 XT, 160 W cap; base: main b4b2bc2 (f32 state).
+# The state (48 recurrent layers x 48 heads x 128 x 128: 144 MiB in f32, a second copy with speculation) is
+# stored in f16 and computed in f32; multi-token verifications and the rollback replay round it after every
+# token as a decode step's store and reload does, so speculative greedy stays identical to plain greedy.
+#
+# Accuracy: 32k-token wikitext prompt, 512 decode steps forced to the base run's tokens, logits vs the base:
+#   f16 state vs f32 state     KL mean 0.000044  median 0.000003  p99 0.000969  max 0.001935  top-1 100.00 %
+#   (f32 KV vs default KV      KL mean 0.000269  median 0.000018  p99 0.005666  max 0.014592  top-1 99.61 %)
+#
+# VRAM (OMPH_KV_K4=1, --ctx 131072, omph-generate, peak during the run, the desktop subtracted):
+#   MTP      14381 -> 14237 MiB   (-144)
+#   DFlash2  15130 -> 14986 MiB   (-144)
+#
+# Steps, 5 alternating runs (median): plain 41.48 -> 41.02 ms (-1.1 %), MTP step 52.20 -> 51.73 ms (-0.9 %),
+# DFlash2 step 54.31 -> 53.93 ms (-0.7 %).
+#
+# A pitfall found on the way: the compiler fused an fma and the f16 store of its result into one mixed-precision
+# fma (one rounding instead of two) where the f32 value had no other use (the replay, the decode step's
+# store), so rollbacks and verifications stopped matching the decode on rare values (OMPH_KV_K4=1 oracle runs
+# diverged at token 95). Every state rounding and store now materializes the f32 value first.
+#
+# Checks: oracle drafts of 1, 3, 8, 15 tokens with --draft-corrupt 4 and OMPH_SPEC_CHECK=1, default and K4
+# caches: identical to plain greedy; DFlash2 and MTP identical to plain greedy; check_gpu_gdn, check_gpu_run,
+# check_gpu_decode, check_server, check_conversations pass.
