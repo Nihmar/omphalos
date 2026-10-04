@@ -11,6 +11,15 @@ to the last <|im_start|>: a checkpoint point of the saved conversation), and
 with each drafter given by --spec (MTP, DFlash2: their KV and ring are saved
 too).
 
+Also the rewritten history a coding agent produces when it compacts (#286):
+a prompt that shares only the system prompt with the cached conversation,
+diverging in its middle. The tested server restores the checkpoint at the
+system/user boundary and prefills the rewritten rest over the old KV; a
+reference server sees the same prompt cold. Same answer, and the tested one
+really restored (the checkpoint is the first cut, at least 512 tokens in).
+The negative control diverges inside the first message, where no checkpoint
+is usable: the caches must restart and still give the reference answer.
+
     uv run python check_conversations.py [--spec mtp,dflash]
 """
 
@@ -26,12 +35,23 @@ from omph_model import omph_file
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def chat(url: str, msgs: list, thinking: bool) -> tuple[str, int]:
+def chat_full(url: str, msgs: list, thinking: bool, max_tokens: int = 160) -> tuple[dict, int]:
     r = post(url + "/v1/chat/completions",
-             {"messages": msgs, "max_tokens": 160, "temperature": 0,
+             {"messages": msgs, "max_tokens": max_tokens, "temperature": 0,
               "chat_template_kwargs": {"enable_thinking": thinking}})
     m = r["choices"][0]["message"]
-    return m.get("content") or "", r["usage"].get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    return m, r["usage"].get("prompt_tokens_details", {}).get("cached_tokens", 0)
+
+
+def chat(url: str, msgs: list, thinking: bool) -> tuple[str, int]:
+    m, cached = chat_full(url, msgs, thinking)
+    return m.get("content") or "", cached
+
+
+def answer(m: dict) -> tuple[str, str]:
+    """What to compare between two runs: the answer, or the reasoning when the
+    160-token cap is spent inside <think> (thinking on)."""
+    return m.get("content") or "", m.get("reasoning_content") or ""
 
 
 def main() -> None:
@@ -48,6 +68,24 @@ def main() -> None:
     sys_b = "Answer questions about this text.\n\n" + text[300_000:313_000]
     q1 = "In one sentence: what is the first paragraph about?"
     q2 = "Now name one person or place the text mentions."
+    # The rewritten history of #286: the same system prompt, the middle turns
+    # replaced by a summary, then the last question. Its common prefix with the
+    # conversation above is the system prompt, so the tested server must resume
+    # from the first checkpoint (the system/user boundary, >= 512 tokens in) and
+    # prefill the rest; the reference server only ever sees this prompt.
+    sys_c = "Answer questions about this text.\n\n" + text[500_000:513_000]
+    summary = ("Summary of the earlier turns: the first paragraph of the text and a person or "
+               "place it mentions were identified. The reader now asks:")
+    q3 = "In one sentence: what does the last paragraph describe?"
+    hist = [{"role": "system", "content": sys_c}, {"role": "user", "content": q1},
+            {"role": "assistant", "content": "It introduces the subject of the passage."},
+            {"role": "user", "content": q2}]
+    rewritten = [{"role": "system", "content": sys_c}, {"role": "user", "content": summary + " " + q3}]
+    # the negative control: the divergence is inside the first message, no
+    # checkpoint is usable, so the caches have to restart
+    rewritten_neg = [{"role": "system", "content": sys_c.replace("Answer questions about",
+                                                                  "Explain the passage about", 1)}] \
+        + rewritten[1:]
 
     def server(spec: str, log: Path) -> tuple[subprocess.Popen, str]:
         port = free_port()
@@ -70,6 +108,8 @@ def main() -> None:
                 turn2 = [{"role": "system", "content": sys_a}, {"role": "user", "content": q1},
                          {"role": "assistant", "content": a1}, {"role": "user", "content": q2}]
                 ref, _ = chat(url, turn2, thinking)
+                rw_ref, _ = chat_full(url, rewritten, thinking, 384)
+                rw_neg_ref, _ = chat_full(url, rewritten_neg, thinking, 384)
             finally:
                 proc.terminate()
                 proc.wait()
@@ -78,6 +118,9 @@ def main() -> None:
                 a1b, _ = chat(url, [{"role": "system", "content": sys_a}, {"role": "user", "content": q1}], thinking)
                 chat(url, [{"role": "system", "content": sys_b}, {"role": "user", "content": q1}], thinking)
                 got, cached = chat(url, turn2, thinking)
+                chat(url, hist, thinking)  # the conversation that gets compacted
+                rw, rw_cached = chat_full(url, rewritten, thinking, 384)
+                rw_neg, _ = chat_full(url, rewritten_neg, thinking, 384)
             finally:
                 proc.terminate()
                 proc.wait()
@@ -89,6 +132,23 @@ def main() -> None:
             if not ok:
                 failures.append(tag)
                 print("   ref:", json.dumps(ref[:200]), "\n   got:", json.dumps(got[:200]))
+            # #286: the rewritten history, restored from the first checkpoint
+            ok = answer(rw) == answer(rw_ref) and rw_cached >= 512
+            print(f"{'ok  ' if ok else 'FAIL'} {tag}: rewritten history "
+                  f"{'identical' if answer(rw) == answer(rw_ref) else 'DIFFERS'} to the cold prefill, "
+                  f"{rw_cached} prompt tokens resumed", flush=True)
+            if not ok:
+                failures.append(f"{tag} (rewrite)")
+                print("   ref:", json.dumps((answer(rw_ref)[0] or answer(rw_ref)[1])[:200]),
+                      "\n   got:", json.dumps((answer(rw)[0] or answer(rw)[1])[:200]))
+            # and the negative control: no checkpoint usable, the caches restart
+            ok = answer(rw_neg) == answer(rw_neg_ref)
+            print(f"{'ok  ' if ok else 'FAIL'} {tag}: rewrite inside the first message "
+                  f"{'identical' if ok else 'DIFFERS'} to the cold prefill", flush=True)
+            if not ok:
+                failures.append(f"{tag} (rewrite, first message)")
+                print("   ref:", json.dumps((answer(rw_neg_ref)[0] or answer(rw_neg_ref)[1])[:200]),
+                      "\n   got:", json.dumps((answer(rw_neg)[0] or answer(rw_neg)[1])[:200]))
     if failures:
         sys.exit(f"{len(failures)} failure(s)")
     print("all conversation checks passed")
