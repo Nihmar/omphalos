@@ -162,9 +162,16 @@ struct Server {
         }
         omph::model::GenerateRequest greq;
         const int32_t image_pad = tok.find("<|image_pad|>");
-        if (std::count(prompt.begin(), prompt.end(), image_pad) != (std::ptrdiff_t) job.images.size()) {
-            fail(c, 400, "the prompt's image placeholders do not match its images", "invalid_request_error",
-                 "messages");
+        const auto placeholders = std::count(prompt.begin(), prompt.end(), image_pad);
+        if (placeholders != (std::ptrdiff_t) job.images.size()) {
+            // A literal image-pad string in a message's text is tokenized as the
+            // token itself (#292): say so instead of leaving the caller with a
+            // count that does not match anything they sent.
+            fail(c, 400,
+                 "the prompt carries " + std::to_string((long long) placeholders) + " image placeholders and "
+                     "the request " + std::to_string(job.images.size()) + " images; a literal image-pad token "
+                     "in a message's text is tokenized as the token itself (#292)",
+                 "invalid_request_error", "messages");
             return;
         }
         if (!job.images.empty()) {

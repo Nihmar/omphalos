@@ -88,7 +88,8 @@ engine/build/omph-tokenize <model.gguf> --chat-ids < request.json > tokens.txt
 # generation (#152): text, a chat request (--chat) or ids (--prompt-ids) in, streamed text out;
 # greedy uses MTP speculation, --temp/--top-k/--top-p/--min-p/--seed sample, --then FILE a next turn,
 # --repeat N the same request again (resumes from a checkpoint), --cache-mib N (0: no checkpoints),
-# --mmproj FILE --image FILE (one per image item / <|image_pad|>), --force IDS --logits-out FILE
+# --mmproj FILE --image FILE (one per image item, i.e. one per image-pad token), --force IDS
+# --logits-out FILE
 # (teacher-forced logits, validation)
 engine/build/omph-generate <model.omph> --chat --max 256 < request.json
 
@@ -228,6 +229,9 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 ## Working agreements
 
 - PLAN.md is the source of truth for architecture; deviations are proposed in an issue first.
+- A special-token string in *text* (a message, a tool result, a file) is tokenized as that token by
+  the server's prompt rendering today (#292): this file, the docs and the tests avoid writing them
+  literally on purpose.
 - Every performance claim comes with a measurement following PLAN.md §17 (fixed conditions, median of ≥5 runs, results in `bench/`).
 - "Done" means: tree builds, the CPU tests and CI pass, the relevant GPU checks of "Entry points" pass, results reported as measured — never claimed untested.
 - Keep each change scoped to its issue; keep refactors separate from features.
