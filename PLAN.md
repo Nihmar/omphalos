@@ -610,6 +610,7 @@ plus short causal conv1d on q/k/v (keep the conv tail as state), gates/normaliza
 - Decode: **flash-decoding** with split-K over the sequence, GQA-aware (one workgroup per KV head serving its query heads), online softmax, dequantize quantized KV on the fly (§13). With int8 K, quantize Q to int8 and use `dot4`.
 - Prefill: flash-attention style tiles with WMMA; the tokens of the current ubatch can use their FP16 values directly before being quantized into the cache.
 - RoPE / M-RoPE, QK-norm, Hadamard rotation fused into the Q/K projection epilogue (§8.3, §13).
+- **How the cache is read is load-bearing.** A call with at most 16 query tokens — a verification's group of 8 (§12.6), or a prompt's last chunk of 9..16 — reads each query's own keys (the last `window` ones from the FP16 ring, the older ones from the quantized blocks); a longer call reads one shared key range per chunk. Only the per-query form keeps a verification's rows **bit for bit** the decode steps' (#161), and only with the fixed key chunks of #136. Witness: `check_gpu_attn.py --identity-tokens` (2048 tokens, 8 per call against 1: bit-identical; the kernel's own key split gives 4..7·10⁻⁴, #318).
 
 ### 10.5 Prefill GEMM (dequant → WMMA)
 
@@ -804,6 +805,20 @@ Recurrently read and rewritten every token → errors accumulate. Small, fixed-s
 - Struct-of-arrays: quantized values contiguous per (layer, KV head, token block), scales in a separate stream, aligned for 128-bit loads.
 - Flash-decoding dequantizes on the fly; int8 K × int8 Q with `dot4`.
 - Validation at **long context** (16–32k; short prompts hide KV errors): KL divergence vs FP16 KV, needle-in-a-haystack style retrieval tests. Compare against llama.cpp's `-ctk/-ctv` options as a baseline. Our margin over llama.cpp: rotation, FP16 windows, per-layer choice.
+
+### 13.9 Conventions the kernels fix
+
+Two details of the format that only exist in the code, and that belong to the error budget rather
+than to any measurement (#318):
+
+- **V (and K in K4) is quantized with an asymmetric scale.** `sc = amax / 7`, the 4-bit code stored
+  as `q ∈ [0, 15]` and read back as `(q - 8)·sc`: the levels span `[-8/7·amax, +amax]`, covering
+  the observed maximum exactly and overshooting the negative end. llama.cpp's `q4_0` uses
+  `d = amax / 8` symmetrically (`[-amax, +7/8·amax]`). K Q8 is symmetric (`amax / 127`, clamped).
+  The choice was never A/B'd against `amax / 8`: the KLs of §13.5 are the measurements that carry
+  it, so this is what to revisit if the budget is ever re-derived.
+- **KV scales are FP16.** A scale carries ~5·10⁻⁴ of relative error on top of the 8 or 4 levels —
+  under the measured KL, but part of the budget, not free.
 
 ---
 
