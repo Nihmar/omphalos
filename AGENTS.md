@@ -237,9 +237,10 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 ## Working agreements
 
 - PLAN.md is the source of truth for architecture; deviations are proposed in an issue first.
-- A special-token string in *text* (a message, a tool result, a file) is tokenized as that token by
-  the server's prompt rendering today (#292): this file, the docs and the tests avoid writing them
-  literally on purpose.
+- A special-token string in *text* (a message, a tool result, a file) stays text since #292: the
+  rendering is split into the template's structure (parsed for special tokens) and the request's own
+  strings (not), and the server, `omph-generate` and `omph-tokenize --chat-ids` tokenize each part
+  with its own rule. Never join the two back into one string before tokenizing.
 - Every performance claim comes with a measurement following PLAN.md §17 (fixed conditions, median of ≥5 runs, results in `bench/`).
 - "Done" means: tree builds, the CPU tests and CI pass, the relevant GPU checks of "Entry points" pass, results reported as measured — never claimed untested.
 - Keep each change scoped to its issue; keep refactors separate from features.

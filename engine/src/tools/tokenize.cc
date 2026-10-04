@@ -17,6 +17,7 @@
 #include <iterator>
 #include <sstream>
 #include <string>
+#include <optional>
 #include <vector>
 
 int main(int argc, char ** argv) {
@@ -50,7 +51,11 @@ int main(int argc, char ** argv) {
         }
         const omph::gguf::File file(argv[1]);
         const omph::text::Tokenizer tok(file);
-        const std::string text = chat == 2 ? omph::text::render_chat(omph::text::Json::parse(in)) : in;
+        // a chat prompt is rendered as segments: its structure parsed for
+        // special tokens, the request's own text not (#292)
+        const std::optional<std::vector<omph::text::Segment>> segments =
+            chat == 2 ? std::optional(omph::text::render_chat_segments(omph::text::Json::parse(in))) : std::nullopt;
+        const std::string text = chat == 1 ? omph::text::render_chat(omph::text::Json::parse(in)) : in;
         if (decode) {
             std::istringstream ss(in);
             std::vector<int32_t> ids;
@@ -62,7 +67,8 @@ int main(int argc, char ** argv) {
             std::fwrite(decoded.data(), 1, decoded.size(), stdout);
             return 0;
         }
-        const std::vector<int32_t> ids = tok.encode(text, parse_special);
+        const std::vector<int32_t> ids =
+            segments.has_value() ? omph::text::tokenize_chat(*segments, tok) : tok.encode(text, parse_special);
         for (size_t i = 0; i < ids.size(); ++i) {
             std::printf(i ? " %d" : "%d", ids[i]);
         }

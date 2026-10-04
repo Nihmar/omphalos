@@ -166,7 +166,14 @@ struct Server {
             return;
         }
         const omph::text::Tokenizer & tok = gen.tokenizer();
-        const std::vector<int32_t> prompt = job.prompt_ids.empty() ? tok.encode(job.prompt, true) : job.prompt_ids;
+        std::vector<int32_t> prompt;
+        if (!job.prompt_ids.empty()) {
+            prompt = job.prompt_ids;
+        } else if (!job.prompt_segments.empty()) {
+            prompt = omph::text::tokenize_chat(job.prompt_segments, tok);  // #292: text stays text
+        } else {
+            prompt = tok.encode(job.prompt, true);  // a raw completion: the caller owns the tokens
+        }
         for (const int32_t t : prompt) {
             if (t < 0 || t >= tok.size()) {
                 fail(c, 400, "token id " + std::to_string(t) + " out of range", "invalid_request_error", "prompt");

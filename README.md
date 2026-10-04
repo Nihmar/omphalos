@@ -96,7 +96,9 @@ context repeats; `--dflash` switches to the DFlash2 drafter). Sampling fields
 the engine does not implement (`frequency_penalty`, `presence_penalty`,
 `repetition_penalty`, `repeat_penalty`, `logit_bias`) are refused with a 400
 unless they hold their no-op value (0, 1.0, `{}`) -- never dropped in silence
-(#284). Options:
+(#284). A special token written literally in a message's text or in a tool
+result (`<|im_end|>` in a file an agent reads) stays text: only the template's
+own structure is parsed for special tokens (#292). Options:
 `--port`, `--host`, `--ctx`, `--alias`, `--api-key`, `--cors`, `--cache-ram`
 and `--kv-ram` (sequence checkpoints and whole conversations in pinned host
 RAM), `--mmproj`, `--dflash`, the default sampling (`--temp`, `--top-k`,

@@ -260,7 +260,8 @@ Job parse_request(const Json & body, const bool chat, const Defaults & defaults)
     const Json * et = req.find("enable_thinking");
     job.thinking = et == nullptr || et->as_bool();
     try {
-        job.prompt = text::render_chat(req);
+        job.prompt_segments = text::render_chat_segments(req);
+        job.prompt = text::join_segments(job.prompt_segments);
     } catch (const std::runtime_error & e) {
         bad(e.what(), "messages");
     }
