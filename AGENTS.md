@@ -138,7 +138,10 @@ uv run python check_tokenizer.py <model> <llama.cpp>/bin/llama-tokenize [--fuzz 
                                                   # tokenizer vs llama.cpp, token for token
 uv run python check_chat_template.py <model>      # chat template vs jinja2, byte for byte
 uv run python check_conversations.py [--spec mtp,dflash]  # #179: back to a saved conversation:
-                                                  # restored, not prefilled, same answer
+                                                  # restored, not prefilled, same answer;
+                                                  # #286: a rewritten history (a compaction)
+                                                  # resumed from the first checkpoint, against a
+                                                  # cold prefill, plus a no-checkpoint control
 uv run python check_server.py [--url URL]         # omph-server end to end with the openai
                                                   # client (starts ../engine/build/omph-server)
     [--image <llama.cpp>/tools/mtmd/test-1.jpeg]  # ... and images (the server gets --mmproj)
