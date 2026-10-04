@@ -33,7 +33,9 @@
 #include "vision/encoder.hh"
 #endif
 
+#include <algorithm>
 #include <cstdio>
+#include <memory>
 #include <cstdlib>
 #include <stdexcept>
 #include <cstring>
@@ -106,16 +108,15 @@ int main(int argc, char ** argv) {
             std::fclose(f);
             return body;
         };
+        std::vector<std::string> image_bytes;
+#ifdef OMPH_VISION
+        std::unique_ptr<omph::vision::Encoder> vision;
+#endif
         if (!image_paths.empty()) {
 #ifdef OMPH_VISION
             if (mmproj.empty()) throw std::runtime_error("--image needs --mmproj");
-            omph::vision::Encoder enc(mmproj, cfg.model);
-            for (const std::string & path : image_paths) {
-                const double t0 = omph::runtime::now_ms();
-                req.images.push_back(enc.encode(read_file(path)));
-                std::fprintf(stderr, "image %s: %dx%d tokens, encoded in %.0f ms (CPU)\n", path.c_str(),
-                             req.images.back()->nx, req.images.back()->ny, omph::runtime::now_ms() - t0);
-            }
+            vision = std::make_unique<omph::vision::Encoder>(mmproj, cfg.model);
+            for (const std::string & path : image_paths) image_bytes.push_back(read_file(path));
 #else
             throw std::runtime_error("built without vision (configure with OMPH_LLAMA_DIR)");
 #endif
@@ -140,6 +141,24 @@ int main(int argc, char ** argv) {
         } else {
             prompt = tok.encode(chat ? omph::text::render_chat(omph::text::Json::parse(in)) : in);
         }
+#ifdef OMPH_VISION
+        if (!image_bytes.empty()) {  // encoded on the CPU while the GPU prefills the text before them (#180)
+            const int32_t pad = tok.find("<|image_pad|>");
+            const std::vector<int32_t> before(prompt.begin(), std::find(prompt.begin(), prompt.end(), pad));
+            const double t0 = omph::runtime::now_ms();
+            double t_text = 0.0;
+            req.images = vision->encode_all(image_bytes, [&] {
+                if (!gen.prefill(before)) throw std::runtime_error("prefill failed");
+                t_text = omph::runtime::now_ms() - t0;
+            });
+            for (size_t i = 0; i < req.images.size(); ++i) {
+                std::fprintf(stderr, "image %s: %dx%d tokens\n", image_paths[i].c_str(), req.images[i]->nx,
+                             req.images[i]->ny);
+            }
+            std::fprintf(stderr, "images encoded in %.0f ms (CPU), the %zu tokens before them in %.0f ms (GPU)\n",
+                         omph::runtime::now_ms() - t0, before.size(), t_text);
+        }
+#endif
         if (!then_path.empty()) {
             repeat = 2;
         }

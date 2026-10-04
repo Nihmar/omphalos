@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -22,7 +23,9 @@ namespace omph::vision {
 class Encoder {
 public:
     // mmproj: the vision GGUF; model: the text GGUF (only its vocabulary is
-    // read: mtmd tokenizes through it); threads: 0 = all hardware threads.
+    // read: mtmd tokenizes through it); threads: 0 = all hardware threads (#180:
+    // leaving a core to the thread that drives the GPU, PLAN.md §14.3, made the
+    // encode 19 % slower and the concurrent GPU prefill no faster).
     Encoder(const std::string & mmproj, const std::string & model, int threads = 0);
     ~Encoder();
     Encoder(const Encoder &) = delete;
@@ -31,6 +34,12 @@ public:
     // An image file's bytes (JPEG, PNG, BMP, GIF, ...) to its embeddings.
     // Throws std::runtime_error on undecodable input.
     std::shared_ptr<const model::Image> encode(const std::string & bytes);
+    // Every image, in order, on another thread while
+    // `meanwhile` runs on the calling thread -- the GPU prefill of the text
+    // before the first image (#180, PLAN.md §14.6). Throws as encode does,
+    // after `meanwhile` returns.
+    std::vector<std::shared_ptr<const model::Image>> encode_all(const std::vector<std::string> & images,
+                                                                const std::function<void()> & meanwhile);
 
     int64_t n_embd() const { return n_embd_; }
 

@@ -174,15 +174,21 @@ struct Server {
                      "messages");
                 return;
             }
+            // the CPU encodes while the GPU prefills the text before the first image (#180)
+            const std::vector<int32_t> before(prompt.begin(), std::find(prompt.begin(), prompt.end(), image_pad));
             const double t0 = omph::runtime::now_ms();
+            double t_text = 0.0;
             try {
-                for (const std::string & bytes : job.images) greq.images.push_back(vision->encode(bytes));
+                greq.images = vision->encode_all(job.images, [&] {
+                    gen.prefill(before);
+                    t_text = omph::runtime::now_ms() - t0;
+                });
             } catch (const std::runtime_error & e) {
                 fail(c, 400, e.what(), "invalid_request_error", "messages");
                 return;
             }
-            std::fprintf(stderr, "%zu image(s) ready in %.0f ms (CPU)\n", job.images.size(),
-                         omph::runtime::now_ms() - t0);
+            std::fprintf(stderr, "%zu image(s) ready in %.0f ms (CPU), the %zu tokens before them in %.0f ms (GPU)\n",
+                         job.images.size(), omph::runtime::now_ms() - t0, before.size(), t_text);
 #else
             fail(c, 400, "this server was built without vision", "invalid_request_error", "messages");
             return;
