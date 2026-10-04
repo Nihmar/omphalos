@@ -103,12 +103,130 @@ tokens of the sequence (64 by default, `--repeat-last-n`), applied to the raw
 logits as llama.cpp's `penalties` sampler does. A special token written
 literally in a message's text or in a tool result (`<|im_end|>` in a file an
 agent reads) stays text: only the template's own structure is parsed for
-special tokens (#292). Options:
-`--port`, `--host`, `--ctx`, `--alias`, `--api-key`, `--cors`, `--cache-ram`
-and `--kv-ram` (sequence checkpoints and whole conversations in pinned host
-RAM), `--mmproj`, `--dflash`, the default sampling (`--temp`, `--top-k`,
-`--top-p`, `--min-p`, `--max-tokens`, `--repeat-penalty`, `--repeat-last-n`,
-`--frequency-penalty`, `--presence-penalty`).
+special tokens (#292).
+
+### `omph-server` in full
+
+```
+omph-server <model.omph> [options]
+```
+
+What it serves, one request at a time and in the OpenAI wire format:
+`GET /health`, `GET /v1/models`, `GET /v1/models/<alias>`,
+`POST /v1/chat/completions` and `POST /v1/completions` (the three `/v1/*` paths
+are also served without the prefix). The body of a chat request is the
+template's `messages`; a chat's next turn prefills only its new tokens (the
+cache is the engine's,
+[#158](https://github.com/Nihmar/omphalos/issues/158),
+[#179](https://github.com/Nihmar/omphalos/issues/179)), so a client that keeps
+the conversation growing stays fast.
+
+#### Options
+
+| option | default | effect |
+|---|---|---|
+| `--host H` | `127.0.0.1` | address to bind |
+| `--port P` | `8080` | port |
+| `--ctx N` | `8192` | KV capacity in tokens: the hard limit of one conversation. A longer prompt is a 400; VRAM grows with it (~26 KiB per token with the default K/Q8 + V/Q4 cache, 0.87 GB at 32k, [#58](https://github.com/Nihmar/omphalos/issues/58)) |
+| `--chunk N` | `512` | tokens per prefill chunk, i.e. the size of the activation buffers |
+| `--alias NAME` | the file name, minus a `.gguf` suffix | the model id in `/v1/models` and in every response |
+| `--no-mtp` | off | do not load the MTP block: no speculative drafts, -352 MiB of VRAM |
+| `--dflash FILE` | off | draft with a DFlash2 drafter `.omph` (7 drafts per step) instead of the MTP block |
+| `--cache-ram MIB` | `2048` | pinned host RAM for **sequence checkpoints** (`0`: none): an answer that is retried, or a history whose reasoning was dropped, resumes from a checkpoint instead of prefilling again |
+| `--kv-ram MIB` | `8192` | pinned host RAM for **whole conversations** (`0`: none): a prompt that leaves the cached conversation saves it first, one that continues a saved conversation restores it |
+| `--mmproj FILE` | off | the vision encoder: images as base64 `data:` URLs, encoded on the CPU (needs a build with `OMPH_LLAMA_DIR`) |
+| `--api-key KEY` | off | require `Authorization: Bearer KEY` on everything but `/health` |
+| `--cors ORIGIN` | off | allow browser requests from `ORIGIN` (`*` for any), preflight included |
+| `--temp T` | `0` | default temperature; `0` is greedy, the fastest path |
+| `--top-k K` | `0` | default top-k; `0` is off |
+| `--top-p P` | `1` | default top-p; `1` is off |
+| `--min-p P` | `0` | default min-p; `0` is off |
+| `--repeat-penalty P` | `1.0` | default `repeat_penalty`; `1` is off |
+| `--repeat-last-n N` | `64` | the tokens the three penalties look at; `0` is off |
+| `--frequency-penalty P` | `0` | default `frequency_penalty` |
+| `--presence-penalty P` | `0` | default `presence_penalty` |
+| `--max-tokens N` | `-1` | default cap per request; `-1` runs until the context is full |
+
+Every sampling option is only a **default for requests that leave that field
+out**: a client that sends its own wins. Greedy and sampled requests both
+decode speculatively (MTP drafts, or DFlash2's, plus n-gram drafts when the
+context repeats); the one exception is a *penalized greedy* request, whose
+argmax has to run on the host and therefore gives up the drafts.
+
+#### Request fields
+
+The OpenAI fields a request may carry, and what the engine does with them.
+A field the engine knows but does not implement (`logit_bias`), and any value
+out of range or of the wrong type, is refused with a 400 naming it -- never
+dropped in silence ([#284](https://github.com/Nihmar/omphalos/issues/284)).
+
+| field | notes |
+|---|---|
+| `messages` | required for chat: `{role, content, reasoning_content?, tool_calls?}`, `content` a string or a list of parts (`text`, `image_url`). `developer` is read as `system` |
+| `model` | ignored: the server serves the one model it was started with |
+| `tools` | declarations in the OpenAI shape; the template renders them into the prompt, and `<tool_call>` blocks in the answer come back as `tool_calls` |
+| `tool_choice` | only `"none"` (drop the tools from the prompt) |
+| `chat_template_kwargs` | `enable_thinking` (bool: the engine's `<think>` block, on unless turned off), `reasoning_effort` (`xhigh`/`medium`/`low`, the template's own switch, default `xhigh`), `preserve_thinking` (bool, default true: keep the history's reasoning blocks in the prompt) |
+| `reasoning_effort` | top level: `off`/`none`/`minimal` turn thinking off, `low`/`medium`/`xhigh` set it, `high` reads as `xhigh` |
+| `temperature` | `0` (or absent, with no default set) is greedy. Range `[0, 2]` |
+| `top_p`, `top_k`, `min_p` | applied in that order after the penalties; `top_p 1`, `top_k 0`, `min_p 0` are off |
+| `seed` | integer; makes the sampled draw reproducible |
+| `repeat_penalty` | llama.cpp's, `1.0` is off. `repetition_penalty` is accepted as the vLLM spelling |
+| `repeat_last_n` | the window the three penalties look at; `0` is off |
+| `frequency_penalty`, `presence_penalty` | OpenAI's, `[-2, 2]`, in the same window |
+| `max_tokens`, `max_completion_tokens` | positive integer; absent means the server's `--max-tokens` |
+| `stop` | a string or a list of strings; the text from the first hit on is dropped |
+| `stream` | SSE `chat.completion.chunk` / `text_completion` events |
+| `stream_options.include_usage` | adds a final chunk with the `usage` object |
+| `n` | must be `1` (the engine serves one sequence) |
+| `logit_bias` | refused: not implemented. Send `{}` or nothing |
+| `image_url` parts | `data:` URLs only (`data:image/png;base64,...`), one per image item; `--mmproj` is required and its `<|image_pad|>` placeholder must line up with the images. Audio, video and file parts are refused |
+| `prompt` | `/v1/completions`: a string, token ids, or a batch of one -- no chat template, so no reasoning split |
+| `add_generation_prompt` | ignored for chat: the server always appends the assistant's turn (that is what a chat request means here) |
+| `echo` | `/v1/completions`: prepend the prompt to `choices[0].text` |
+
+#### Responses
+
+A chat answer splits at `</think>`: everything before it is
+`choices[0].message.reasoning_content`, everything after it is `.content`, and
+`<tool_call>` blocks in the content become `.tool_calls` (arguments as a JSON
+string, OpenAI's shape). `finish_reason` is `stop` (an end-of-generation token
+or a stop string), `length` (the cap, or the context filling up) or
+`tool_calls`. Streamed and whole answers carry the same text; the streams hold
+back text that may still become a tag or a stop string, so a delta boundary is
+not a token boundary.
+
+The full response also carries llama.cpp's `timings` object (`prompt_n`,
+`prompt_ms`, `predicted_n`, `predicted_ms`, `draft_n`, `draft_n_accepted`) and
+an OpenAI `usage` with `prompt_tokens_details.cached_tokens`: how much of the
+prompt the cache already held, which is what a client can use to tell a
+resumed conversation from a fresh prefill.
+
+Errors are OpenAI-shaped (`{"error": {"message", "type", "param",
+"code"}}`): 400 for a malformed request, a prompt longer than `--ctx`, or
+image placeholders that do not match the images, 401 without the API key, 405
+for a wrong method.
+
+#### Environment
+
+The server passes `OMPH_*` through to the engine. The ones worth knowing when
+serving (the complete list, with the diagnostics and the ablations, is in
+[AGENTS.md](AGENTS.md)):
+
+| variable | effect |
+|---|---|
+| `OMPH_KV_K4_LAYERS=i,j,...\|none` | K in Q4 on those attention layers (0-15), Q8 on the rest; the default is the eight measured least sensitive ([#175](https://github.com/Nihmar/omphalos/issues/175)), `none` is K8 everywhere |
+| `OMPH_KV_K4` | K4 on every layer: the most aggressive cache, measured over llama.cpp's q8_0/q4_0 KL budget (#175): an experiment |
+| `OMPH_KV_F32`, `OMPH_KV_HOST` | exact f32 KV in VRAM / in pinned host RAM (references, much more memory) |
+| `OMPH_KV_WINDOW` | every query reads its last N keys exactly from an FP16 ring (default 128, `0` off) |
+| `OMPH_MTP_WINDOW` | the MTP block's KV window (default 16384: 16 sinks plus the last 16k-32k positions), -150 MiB of VRAM at 128k |
+| `OMPH_DRAFT_VOCAB` | drafts over the first N token ids (default 98304), a few percent faster |
+| `OMPH_NGRAM`, `OMPH_NGRAM_MIN` | n-gram (prompt lookup) drafts instead of the model's (default on; `OMPH_NGRAM=0` off) |
+| `OMPH_DFLASH_KEEP`, `OMPH_DFLASH_PMIN` | how many of DFlash2's 7 drafts to keep |
+| `OMPH_GEMM_MIN` | the token count from which `--gemv` runs take the prefill GEMM path (default 16) |
+| `OMPH_OVERLAP` | a side stream for sibling GEMVs (off by default: the persistent-warp GEMVs fill the GPU alone) |
+| `OMPH_HOST_ARGMAX` | greedy argmax on the host instead of the device |
+| `OMPH_TIMING` | VRAM after load and a per-step timing line on stderr |
 
 ### Serving a coding agent
 
@@ -163,7 +281,8 @@ engine's sampler is the only variable left):
         "thinkingLevelMap": { "off": "off", "low": "low", "medium": "medium", "high": "xhigh" },
         "contextWindow": 131072,
         "maxTokens": 16384,
-        "samplingParams": { "temperature": 0.6, "top_p": 0.95, "top_k": 20 },
+        "samplingParams": { "temperature": 0.6, "top_p": 0.95, "top_k": 20,
+                            "repeat_penalty": 1.1, "repeat_last_n": 1024 },
         "compat": { "thinkingFormat": "qwen-chat-template", "supportsReasoningEffort": false,
                     "supportsDeveloperRole": false, "supportsStore": false,
                     "maxTokensField": "max_tokens" }
