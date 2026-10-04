@@ -378,135 +378,6 @@ int64_t Generator::resume(const std::vector<int32_t> & prompt, GenerateResult & 
     return runner_->reset_sequence() ? 0 : -1;
 }
 
-// Host sampling: temperature, then top-k, min-p and top-p over the tokens
-// within e^-30 of the best (the rest cannot matter), from a seeded generator.
-int32_t Generator::sample(std::vector<float> & logits, const Sampling & s) {
-    if (s.temperature <= 0.0f) {
-        if (s.penalizes()) {  // llama.cpp applies them before the greedy pick too
-            apply_penalties(logits.data(), (int64_t) logits.size(), s);
-        }
-        return (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin());
-    }
-    Dist d;
-    distribution(logits.data(), (int64_t) logits.size(), s, d);
-    return draw(d, -1);
-}
-
-// The kept set without sorting the vocabulary (#197: the full sort of ~10^5
-// candidates cost ~25 ms per row): top-k by selection, min-p by a threshold,
-// top-p over a descending prefix sorted only as far as its mass needs. The
-// kept tokens are in descending order when top-p applies, else in id order.
-void Generator::apply_penalties(float * row, const int64_t nv, const Sampling & s,
-                                const int32_t * extra, const int64_t n_extra) const {
-    const int64_t window = std::max<int64_t>(0, (int64_t) s.penalty_last_n - n_extra);
-    const int64_t from = std::max<int64_t>(0, (int64_t) seq_.size() - window);
-    std::vector<int32_t> ids(seq_.begin() + (std::ptrdiff_t) from, seq_.end());
-    if (n_extra > 0) {
-        ids.insert(ids.end(), extra, extra + n_extra);
-    }
-    std::sort(ids.begin(), ids.end());
-    for (size_t i = 0; i < ids.size();) {
-        size_t j = i;
-        while (j < ids.size() && ids[j] == ids[i]) {
-            ++j;
-        }
-        const int32_t id = ids[i];
-        if (id >= 0 && id < nv) {
-            // llama.cpp's rule: a negative logit is multiplied, a positive one
-            // divided (dividing both would make negative logits more likely)
-            if (s.repeat_penalty != 1.0f) {
-                row[id] = row[id] <= 0.0f ? row[id] * s.repeat_penalty : row[id] / s.repeat_penalty;
-            }
-            row[id] -= s.presence_penalty + (float) (j - i) * s.frequency_penalty;
-        }
-        i = j;
-    }
-}
-
-void Generator::distribution(float * row, const int64_t nv, const Sampling & s, Dist & d,
-                             const int32_t * extra, const int64_t n_extra) const {
-    if (s.penalizes()) {
-        apply_penalties(row, nv, s, extra, n_extra);
-    }
-    const float inv_t = 1.0f / s.temperature;
-    const float best = *std::max_element(row, row + nv);
-    std::vector<std::pair<float, int32_t>> cand;  // (scaled logit, id), in id order
-    cand.reserve(4096);
-    for (int64_t i = 0; i < nv; ++i) {
-        const float z = (row[i] - best) * inv_t;
-        if (z > -30.0f) {
-            cand.emplace_back(z, (int32_t) i);
-        }
-    }
-    const auto higher = [](const auto & a, const auto & b) {
-        return a.first > b.first || (a.first == b.first && a.second < b.second);
-    };
-    if (s.top_k > 0 && (size_t) s.top_k < cand.size()) {
-        std::nth_element(cand.begin(), cand.begin() + s.top_k, cand.end(), higher);
-        cand.resize((size_t) s.top_k);
-        std::sort(cand.begin(), cand.end(), [](const auto & a, const auto & b) { return a.second < b.second; });
-    }
-    double sum = 0.0;
-    for (const auto & c : cand) {
-        sum += std::exp((double) c.first);
-    }
-    if (s.min_p > 0.0f) {  // relative to the best, whose weight is exp(0) = 1
-        const float floor = std::log(s.min_p);
-        cand.erase(std::remove_if(cand.begin(), cand.end(), [&](const auto & c) { return c.first < floor; }),
-                   cand.end());
-    }
-    if (s.top_p < 1.0f) {
-        // the smallest descending prefix whose mass (of all the candidates') reaches top_p
-        size_t sorted = 0;
-        size_t keep = cand.size();
-        double acc = 0.0;
-        for (size_t want = 64;; want *= 4) {
-            const size_t m = std::min(want, cand.size());
-            std::partial_sort(cand.begin() + (std::ptrdiff_t) sorted, cand.begin() + (std::ptrdiff_t) m, cand.end(),
-                              higher);
-            for (; sorted < m; ++sorted) {
-                acc += std::exp((double) cand[sorted].first) / sum;
-                if (acc >= (double) s.top_p) {
-                    keep = sorted + 1;
-                    break;
-                }
-            }
-            if (keep < cand.size() || m == cand.size()) {
-                break;
-            }
-        }
-        cand.resize(keep);
-    }
-    d.ids.resize(cand.size());
-    d.w.resize(cand.size());
-    d.total = 0.0;
-    for (size_t i = 0; i < cand.size(); ++i) {
-        d.ids[i] = cand[i].second;
-        d.w[i] = std::exp((double) cand[i].first);
-        d.total += d.w[i];
-    }
-}
-
-int32_t Generator::draw(const Dist & d, const int32_t skip) {
-    double total = d.total;
-    for (size_t i = 0; i < d.ids.size() && skip >= 0; ++i) {
-        if (d.ids[i] == skip) total -= d.w[i];
-    }
-    if (!(total > 0.0)) {
-        return d.ids.front();  // only `skip` was left (not reached: it was kept with p = 1)
-    }
-    std::uniform_real_distribution<double> u(0.0, total);
-    double r = u(rng_);
-    int32_t last = d.ids.front();
-    for (size_t i = 0; i < d.ids.size(); ++i) {
-        if (d.ids[i] == skip) continue;
-        last = d.ids[i];
-        r -= d.w[i];
-        if (r <= 0.0) return d.ids[i];
-    }
-    return last;
-}
-
 // The prompt with each <|image_pad|> replaced by its image's rows, and the
 // positions: text advances by 1, an image starting at p0 gives its row i
 // (t, h, w) = (p0, p0 + i / nx, p0 + i % nx) and advances by max(nx, ny), as
@@ -605,7 +476,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
     // far, and the acceptance test still keeps plain sampling's distribution.
     const bool dev_argmax = greedy && !req.sampling.penalizes();
     const bool speculate = !(greedy && req.sampling.penalizes());
-    int32_t next = forcing ? (*req.force)[0] : sample(logits, req.sampling);
+    int32_t next = forcing ? (*req.force)[0] : sample_row(logits, req.sampling, seq_, rng_);
     if (forcing && req.forced_logits != nullptr) {
         req.forced_logits->insert(req.forced_logits->end(), logits.begin(), logits.end());
     }
@@ -701,9 +572,9 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
                 while (after < 0) {
                     // the drafts accepted so far in this step are the freshest
                     // tokens of the penalty window (#298)
-                    distribution(rows.data() + a * nv, nv, req.sampling, dist, batch.data(), a + 1);
+                    distribution(rows.data() + a * nv, nv, req.sampling, seq_, dist, batch.data(), a + 1);
                     if (a + 1 == (int64_t) batch.size()) {
-                        after = draw(dist, -1);
+                        after = draw(dist, -1, rng_);
                         break;
                     }
                     const int32_t x = batch[(size_t) a + 1];
@@ -717,7 +588,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
                     if (unit(rng_) < px) {
                         ++a;
                     } else {
-                        after = draw(dist, x);
+                        after = draw(dist, x, rng_);
                     }
                 }
             }
@@ -763,7 +634,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
                 if (res.tokens.size() >= req.force->size()) break;
                 next = (*req.force)[res.tokens.size()];
             } else {
-                next = on_device >= 0 ? on_device : sample(step, req.sampling);
+                next = on_device >= 0 ? on_device : sample_row(step, req.sampling, seq_, rng_);
             }
             go = emit(next);
         }

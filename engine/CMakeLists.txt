@@ -41,6 +41,7 @@ add_library(omphalos SHARED
     src/model/dispatch.cc
     src/model/mtp.cc
     src/model/dflash.cc
+    src/model/sampler.cc
     src/model/generator.cc
     src/kernels/probe.hip
     src/kernels/dequant.hip
