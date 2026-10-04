@@ -58,8 +58,9 @@ struct GenerateResult {
     Stop stop = Stop::Length;
     int64_t prompt_tokens = 0;    // with each image's tokens
     int64_t cached_tokens = 0;    // of the prompt, already in the caches
-    bool restored = false;        // ... from a checkpoint (#158)
-    double checkpoint_ms = 0.0;   // saving / restoring checkpoints (in prefill_ms)
+    bool restored = false;        // ... from a checkpoint (#158) or a saved conversation (#179)
+    bool saved = false;           // the previous conversation went to host RAM (#179)
+    double checkpoint_ms = 0.0;   // saving / restoring checkpoints and conversations (in prefill_ms)
     double prefill_ms = 0.0;
     double decode_ms = 0.0;
     int64_t drafted = 0;
@@ -78,8 +79,12 @@ public:
         std::string dflash;      // a DFlash2 drafter .omph (#245): its drafts (block - 1 per step)
                                  // instead of the MTP block's, which is then not loaded
         int64_t cache_mib = 2048;  // host RAM for sequence checkpoints (#158); 0: none
+        int64_t kv_ram_mib = 8192;  // host RAM for whole conversations (#179); 0: none
     };
     Generator(const Config & config, const omph::runtime::EnvOptions & env);
+    ~Generator();
+    Generator(const Generator &) = delete;
+    Generator & operator=(const Generator &) = delete;
 
     const omph::text::Tokenizer & tokenizer() const { return *tokenizer_; }
     int64_t context() const { return config_.context; }
@@ -134,6 +139,23 @@ private:
     std::vector<int64_t> checkpoint_positions(const std::vector<int32_t> & prompt, int64_t from) const;
     bool save_checkpoint(const std::vector<int32_t> & prompt, int64_t pos);
     void drop_checkpoints(bool all);
+    // Conversations (#179): when a prompt leaves the cached sequence (another
+    // conversation), that sequence goes to pinned host RAM first: its whole
+    // quantized KV and its state at several points -- its end, and its valid
+    // checkpoints (a chat's next turn drops the reasoning, so it continues the
+    // sequence only up to the last <|im_start|>). A later prompt that continues
+    // one of those points restores it with an upload instead of a prefill. LRU
+    // within kv_ram_mib; points before kSnapshotMin are cheaper to prefill.
+    static constexpr int64_t kSnapshotMin = 2048;
+    struct Snapshot {
+        std::vector<int32_t> tokens;
+        void * host = nullptr;          // the KV prefix (kv bytes), then one checkpoint per point
+        size_t bytes = 0;
+        size_t kv = 0;
+        std::vector<int64_t> points;    // ascending
+        uint64_t used = 0;
+    };
+    void save_snapshot(const std::vector<int32_t> & prompt, GenerateResult & res);
 
     Config config_;
     omph::runtime::EnvOptions env_;
@@ -144,6 +166,8 @@ private:
     std::vector<int32_t> seq_;  // the tokens whose KV / state are in the caches
     std::vector<Checkpoint> checkpoints_;
     std::vector<void *> spare_;  // host buffers of evicted checkpoints
+    std::vector<Snapshot> snapshots_;
+    size_t snapshot_total_ = 0;
     size_t max_checkpoints_ = 0;
     size_t n_buffers_ = 0;
     uint64_t clock_ = 0;
