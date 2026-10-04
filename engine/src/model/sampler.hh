@@ -39,7 +39,8 @@ struct Sampling {
 };
 
 // The sampling distribution of one logits row: the kept tokens with
-// unnormalized weights, most likely first, and their total.
+// unnormalized weights (in descending order when top-p applied, else in id
+// order, as distribution() documents) and their total.
 struct Dist {
     std::vector<int32_t> ids;
     std::vector<double> w;

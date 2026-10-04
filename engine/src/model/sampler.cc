@@ -56,14 +56,17 @@ void distribution(float * row, const int64_t nv, const Sampling & s, const std::
         cand.resize((size_t) s.top_k);
         std::sort(cand.begin(), cand.end(), [](const auto & a, const auto & b) { return a.second < b.second; });
     }
-    double sum = 0.0;
-    for (const auto & c : cand) {
-        sum += std::exp((double) c.first);
-    }
     if (s.min_p > 0.0f) {  // relative to the best, whose weight is exp(0) = 1
         const float floor = std::log(s.min_p);
         cand.erase(std::remove_if(cand.begin(), cand.end(), [&](const auto & c) { return c.first < floor; }),
                    cand.end());
+    }
+    // top-p's mass is the mass min-p kept: with the pre-min-p total the two
+    // truncations did not compose (a min_p that removed a lot of mass made
+    // top-p keep more candidates than it asks for).
+    double sum = 0.0;
+    for (const auto & c : cand) {
+        sum += std::exp((double) c.first);
     }
     if (s.top_p < 1.0f) {
         // the smallest descending prefix whose mass (of all the candidates') reaches top_p
