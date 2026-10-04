@@ -2311,6 +2311,9 @@ bool gemv_iq1_m(const void * blocks, const void * x_f16, float * y, const int64_
         k % 256 != 0) {
         return false;
     }
+    if (rows % 16 == 0) {
+        return launch_tiles<qd::TileIq1m, 1>(blocks, x_f16, y, rows, k, stream);  // #275
+    }
     const int64_t n_sub = k / 32;
     const int64_t chunk = n_sub < kIq1mChunkSub ? n_sub : kIq1mChunkSub;
     const size_t smem = 2048 * sizeof(uint64_t) + (size_t) chunk * 64;
@@ -2669,6 +2672,7 @@ bool gemv_multi(const uint32_t type, const void * packed, const void * x_f16, fl
             if (nt == 3) return launch_q6k_ntg<3>(packed, x_f16, y, rows, k, stream);
             return launch_q6k_ntg<4>(packed, x_f16, y, rows, k, stream);
         case 29:  // #226
+            if (rows % 16 == 0) return launch_tiles_n<qd::TileIq1m>(nt, packed, x_f16, y, rows, k, stream);
             if (nt == 2) return launch_iq1m_ntg<2>(packed, x_f16, y, rows, k, stream);
             if (nt == 3) return launch_iq1m_ntg<3>(packed, x_f16, y, rows, k, stream);
             return launch_iq1m_ntg<4>(packed, x_f16, y, rows, k, stream);
@@ -2690,6 +2694,7 @@ bool gemv_tokens(const uint32_t type, const void * packed, const void * x_f16, f
     if (rows % 16 == 0 && type == 17) return launch_tiles_n<qd::TileIq2xs>(nt, packed, x_f16, y, rows, k, stream);
     if (rows % 16 == 0 && type == 16) return launch_tiles_n<qd::TileIq2xxs>(nt, packed, x_f16, y, rows, k, stream);
     if (rows % 16 == 0 && type == 14) return launch_tiles_n<qd::TileQ6k>(nt, packed, x_f16, y, rows, k, stream);
+    if (rows % 16 == 0 && type == 29) return launch_tiles_n<qd::TileIq1m>(nt, packed, x_f16, y, rows, k, stream);
     if (nt <= 4 || k % 256 != 0) {
         return false;  // 2..4: gemv_multi's kernels (and gemv_group); 5..16 below (#244)
     }
@@ -2956,6 +2961,10 @@ bool dequant_repacked(const uint32_t type, const void * packed, void * dst_f16,
         case 14:
             if (rows % 16 == 0) launch(qd::DecQ6kTile::make(base, n_blocks, blocks));
             else launch(qd::DecQ6k::make(base, n_blocks, blocks));
+            break;
+        case 29:
+            if (rows % 16 == 0) launch(qd::DecIq1mTile::make(base, n_blocks, blocks));
+            else launch(qd::DecIq1m::make(base, n_blocks, blocks));
             break;
         default: return false;
     }
