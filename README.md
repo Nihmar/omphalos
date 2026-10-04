@@ -73,7 +73,12 @@ engine/build/omph-server $M [--mmproj models/mmproj-Qwen3.8-27B-BF16.gguf] [--ct
 
 # the DFlash2 drafter needs its own .omph too (7 drafts per step, #245)
 engine/build/omph-convert models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
-engine/build/omph-server $M --dflash models/Qwen3.8-27B-DFlash2-Q4_K_M.omph
+
+# everything on: a 128K context, K4/V4 KV, DFlash2 drafts, n-gram drafts (the
+# default) and images (a vision build); ~15 GiB of VRAM, the desktop included
+OMPH_NGRAM=1 OMPH_KV_K4=1 engine/build/omph-server $M --ctx 131072 \
+    --dflash models/Qwen3.8-27B-DFlash2-Q4_K_M.omph \
+    --mmproj models/mmproj-Qwen3.8-27B-BF16.gguf
 ```
 
 `omph-server` serves `/v1/chat/completions` (streamed or not, with
