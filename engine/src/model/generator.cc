@@ -508,6 +508,13 @@ bool Generator::expand(const std::vector<int32_t> & prompt, const GenerateReques
     return next == req.images.size();
 }
 
+bool Generator::prefill(const std::vector<int32_t> & prefix) {
+    if (prefix.empty() || prefix_of(prefix, seq_, prefix.size())) return true;
+    GenerateRequest req;
+    req.max_tokens = 0;
+    return generate(prefix, req, nullptr).stop != GenerateResult::Stop::Error;
+}
+
 GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, const GenerateRequest & req,
                                    const std::function<bool(int32_t)> & on_token) {
     GenerateResult res;

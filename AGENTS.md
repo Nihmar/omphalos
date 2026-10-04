@@ -92,8 +92,9 @@ engine/build/omph-tokenize <model.gguf> --chat-ids < request.json > tokens.txt
 # (teacher-forced logits, validation)
 engine/build/omph-generate <model.omph> --chat --max 256 < request.json
 
-# the C ABI (include/omphalos.h, #154) from plain C: load, chat, tokenize, generate
-engine/build/omph-capi-demo <model.omph>
+# the C ABI (include/omphalos.h, #154) from plain C: load, chat, tokenize, generate; with an mmproj
+# and an image, one more turn about it (images in omph_generate_params, #180)
+engine/build/omph-capi-demo <model.omph> [<mmproj.gguf> <image>]
 
 # OpenAI-compatible server (#156): /v1/chat/completions, /v1/completions, /v1/models, /health;
 # streamed or not, reasoning_content / tool_calls; one request at a time on 127.0.0.1:8080.

@@ -99,6 +99,29 @@ Encoder::Encoder(const std::string & mmproj, const std::string & model, const in
     n_embd_ = (int64_t) pd;
 }
 
+std::vector<std::shared_ptr<const model::Image>> Encoder::encode_all(const std::vector<std::string> & images,
+                                                                     const std::function<void()> & meanwhile) {
+    std::vector<std::shared_ptr<const model::Image>> out(images.size());
+    std::exception_ptr err;
+    std::thread th([&] {
+        try {
+            for (size_t i = 0; i < images.size(); ++i) out[i] = encode(images[i]);
+        } catch (...) {
+            err = std::current_exception();
+        }
+    });
+    std::exception_ptr err2;
+    try {
+        if (meanwhile) meanwhile();
+    } catch (...) {
+        err2 = std::current_exception();
+    }
+    th.join();
+    if (err) std::rethrow_exception(err);
+    if (err2) std::rethrow_exception(err2);
+    return out;
+}
+
 Encoder::~Encoder() {
     if (ctx_ != nullptr) mtmd_free(ctx_);
     if (vocab_ != nullptr) llama_model_free(vocab_);

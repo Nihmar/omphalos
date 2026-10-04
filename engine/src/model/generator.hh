@@ -95,6 +95,10 @@ public:
     // within their common prefix (#158), else the caches restart.
     GenerateResult generate(const std::vector<int32_t> & prompt, const GenerateRequest & request,
                             const std::function<bool(int32_t)> & on_token);
+    // Prefills a text-only prompt prefix into the caches, generating nothing,
+    // unless the cached sequence already starts with it: the text before a
+    // prompt's first image while the CPU encodes it (#180). False on error.
+    bool prefill(const std::vector<int32_t> & prefix);
     // The request being generated, its counters so far (drafted, accepted):
     // valid inside on_token only (progress reports, #231).
     const GenerateResult & running() const { return *running_; }

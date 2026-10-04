@@ -57,6 +57,8 @@ typedef struct {
     int64_t kv_ram_mib;      /* pinned host RAM for whole conversations: a prompt that leaves
                                 the cached conversation saves it, one that continues a saved
                                 one restores it without a prefill (default 8192, 0: none) */
+    const char * mmproj_path; /* the vision encoder GGUF, run on the CPU (default NULL: no
+                                 images; needs a build with vision, OMPH_LLAMA_DIR) */
 } omph_engine_params;
 
 void omph_engine_params_default(omph_engine_params * p);
@@ -86,6 +88,12 @@ typedef struct {
     int speculative;      /* MTP drafts, greedy or sampled (default 1) */
     const int32_t * stop; /* extra stop tokens */
     size_t n_stop;
+    /* images (file bytes: JPEG, PNG, ...), one per <|image_pad|> of the prompt, in
+       order (the engine needs mmproj_path); encoded on the CPU while the GPU prefills
+       the text before the first one */
+    const char * const * images;
+    const size_t * image_sizes;
+    size_t n_images;
 } omph_generate_params;
 
 #define OMPH_STOP_LENGTH 0
