@@ -16,6 +16,7 @@ value ignored) is a ``bool`` and is **only ever written as ``NAME=1``**: writing
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 
 GROUPS = ("model", "sampling", "drafting", "cache", "vision", "advanced")
@@ -98,8 +99,8 @@ SCHEMA: tuple[Option, ...] = (
          choices=("2,4,5,6,7,9,11,15", "none", "2,5,7,15"), note="the default is the measured mix"),
     _opt("kv_k4", "cache", "env", "OMPH_KV_K4", "bool", False,
          "K4 on every layer: an experiment, over the q8_0/q4_0 KL budget"),
-    _opt("kv_window", "cache", "env", "OMPH_KV_WINDOW", "int", 128,
-         "the exact FP16 window of the quantized cache; 0 is off"),
+    _opt("kv_window", "cache", "env", "OMPH_KV_WINDOW", "int", 512,
+         "the exact FP16 window of the quantized cache; 0 is off", note="512 since #318"),
     _opt("kv_f32", "cache", "env", "OMPH_KV_F32", "bool", False, "exact f32 KV in VRAM (reference)"),
     _opt("kv_host", "cache", "env", "OMPH_KV_HOST", "bool", False, "exact f32 KV in pinned host RAM (reference)"),
     # --- advanced
@@ -178,9 +179,11 @@ def build_command(values: dict[str, object], binary: str = "engine/build/omph-se
 
 
 def format_command(env: dict[str, str], argv: list[str], width: int = 96) -> str:
-    """The shell line, wrapped for a terminal."""
-    prefix = " ".join(f"{k}={v}" for k, v in env.items())
-    parts = ([prefix] if prefix else []) + argv
+    """The shell line, wrapped for a terminal. Every word is quoted for the
+    shell: a pasted `--cors *` must not glob, and a path or an alias with a
+    space must survive (#347)."""
+    prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+    parts = ([prefix] if prefix else []) + [shlex.quote(a) for a in argv]
     lines, line = [], ""
     for part in parts:
         if line and len(line) + 1 + len(part) > width:

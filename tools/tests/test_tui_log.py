@@ -23,6 +23,18 @@ PROGRESS = "  2048 tokens, 39.1 t/s (last 3 s: 40.7 t/s), drafts accepted 71 %"
 PREFILL = "  prefill 12288 / 98255 tokens, 820.4 t/s"
 PROGRESS_PLAIN = "  512 tokens, 41.8 t/s (last 3 s: 41.8 t/s)"
 LISTEN = "error: cannot listen on 127.0.0.1:7070: Address already in use"
+# The summary since c435ca5 (#318) names the checkpoints' time: the regex must
+# take it and the pre-#318 shape (#347).
+REQUEST_CHECKPOINTS = ("POST /v1/chat/completions: sampling greedy; prompt 378 tokens (63 cached) "
+                       "in 370 ms (checkpoints 0 ms, 850.4 t/s); 48 tokens in 249 ms "
+                       "(193.1 t/s, drafts accepted 45 / 53); stop: length")
+REQUEST_CHECKPOINTS_USED = ("POST /v1/chat/completions: sampling greedy; prompt 45206 tokens (45193 cached, "
+                            "restored) in 4270 ms (checkpoints 3900 ms, 3560.6 t/s); 889 tokens in 21268 ms "
+                            "(41.8 t/s, drafts accepted 612 / 1611); stop: end of generation")
+BAD_VALUE = "--ctx wants an integer, got 'abc'"
+UNKNOWN = "unknown option --nope"
+REQUEST_ERROR = "POST /v1/chat/completions: a prompt is required"
+ABLATION = "omphalos: ablation active: OMPH_SKIP_FFN -- results are not the engine's"
 
 
 def test_ready() -> None:
@@ -51,6 +63,18 @@ def test_request_resumed_and_gone() -> None:
     assert gone["client_gone"] and gone["stop"] == "stopped"
 
 
+def test_request_with_checkpoints() -> None:
+    """#318 added "(checkpoints N ms, ...)" to the summary; before #347 every
+    such line fell through as raw, so the live row never finished."""
+    f = log.parse_line(REQUEST_CHECKPOINTS).fields
+    assert f["prompt_tokens"] == 378 and f["cached_tokens"] == 63
+    assert abs(f["prefill_tps"] - 850.4) < 0.1 and f["accepted"] == 45 and f["drafted"] == 53
+    f = log.parse_line(REQUEST_CHECKPOINTS_USED).fields
+    assert f["restored"] and f["stop"] == "end of generation" and abs(f["prefill_tps"] - 3560.6) < 0.1
+    # and the pre-#318 lines still parse (the fixtures of the other tests)
+    assert log.parse_line(REQUEST).kind == "request"
+
+
 def test_progress() -> None:
     f = log.parse_line(PROGRESS).fields
     assert (f["tokens"], f["tps"], f["accepted_pct"]) == (2048, 39.1, 71.0)
@@ -70,6 +94,19 @@ def test_error_and_raw() -> None:
     ev = log.parse_line(LISTEN)
     assert ev.kind == "error" and "Address already in use" in ev.fields["message"]
     assert log.parse_line("").kind == "raw"
+
+
+def test_errors_without_the_error_prefix() -> None:
+    """"errors only" used to count only "^error: ", so a refused option, an
+    exception while serving and the ablation banner were hidden (#347)."""
+    assert log.parse_line(BAD_VALUE).kind == "error"
+    assert log.parse_line(UNKNOWN).kind == "error"
+    ev = log.parse_line(REQUEST_ERROR)
+    assert ev.kind == "error" and ev.fields["message"] == "a prompt is required"
+    assert log.parse_line(ABLATION).kind == "warn"
+    assert log.parse_line(ABLATION).fields["ablation"].startswith("OMPH_SKIP_FFN")
+    # the request summary starts the same way but is not an error
+    assert log.parse_line(REQUEST).kind == "request"
 
 
 def test_json_events() -> None:
