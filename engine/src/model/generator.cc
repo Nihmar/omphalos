@@ -249,14 +249,16 @@ void Generator::save_snapshot(const std::vector<int32_t> & prompt, GenerateResul
         }
         snap.points.push_back(pts[q].pos);
     }
+    if (!ok) {
+        // The snapshots it would have merged stay valid: they used to be freed
+        // before this check, losing every saved conversation (#337).
+        (void) hipHostFree(host);
+        return;
+    }
     for (size_t q = merged.size(); q-- > 0;) {  // their points live on in snap
         (void) hipHostFree(snapshots_[merged[q]].host);
         snapshot_total_ -= snapshots_[merged[q]].bytes;
         snapshots_.erase(snapshots_.begin() + (std::ptrdiff_t) merged[q]);
-    }
-    if (!ok) {
-        (void) hipHostFree(host);
-        return;
     }
     while (!snapshots_.empty() && snapshot_total_ + bytes > budget) {  // the least recently used go
         auto lru = std::min_element(snapshots_.begin(), snapshots_.end(),
@@ -390,8 +392,27 @@ bool Generator::prefill(const std::vector<int32_t> & prefix) {
     return generate(prefix, req, nullptr).stop != GenerateResult::Stop::Error;
 }
 
-GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, const GenerateRequest & req,
+// A mid-request throw -- a lazy device allocation, a kernel wrapper's
+// runtime_error, the caller's on_token, bad_alloc -- must not leave seq_
+// naming chunks the caches no longer match (feed absorbed some, the state
+// advanced), nor a verification armed with a verify_argmax_ that points at a
+// dead vector: reset everything so the next request starts cold instead of
+// answering from a state that never was (#337).
+GenerateResult Generator::generate(const std::vector<int32_t> & prompt, const GenerateRequest & req,
                                    const std::function<bool(int32_t)> & on_token) {
+    try {
+        return generate_inner(prompt, req, on_token);
+    } catch (...) {
+        seq_.clear();
+        drop_checkpoints(true);
+        runner_->abort_verification();
+        (void) runner_->reset_sequence();  // the conv tails / delta-net / conv_flip_
+        throw;
+    }
+}
+
+GenerateResult Generator::generate_inner(const std::vector<int32_t> & prompt_ids, const GenerateRequest & req,
+                                         const std::function<bool(int32_t)> & on_token) {
     GenerateResult res;
     running_ = &res;
     Expanded ex;

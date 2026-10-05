@@ -36,6 +36,11 @@ public:
     bool begin_events();
     bool event(const std::string & data);
 
+    // True once begin_events() wrote the stream's headers: an exception from
+    // then on has to end the event stream, not start a second HTTP response
+    // (#337).
+    bool streaming() const { return streaming_; }
+
     // True once the client closed (or reset) the connection: the request in
     // flight has nowhere to write its answer and must stop (#338). A poll of a
     // socket with nothing to read.
@@ -48,6 +53,7 @@ private:
     bool write_all(const std::string & bytes);
     std::string head(int status, const std::string & content_type, int64_t length) const;
     int fd_;
+    bool streaming_ = false;
 };
 
 class Listener {

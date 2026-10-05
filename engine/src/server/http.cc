@@ -118,7 +118,8 @@ bool Connection::respond(const int status, const std::string & content_type, con
 bool Connection::begin_events() {
     std::string h = head(200, "text/event-stream", -1);
     h.insert(h.size() - 2, "Cache-Control: no-cache\r\nX-Accel-Buffering: no\r\n");
-    return write_all(h);
+    streaming_ = write_all(h);
+    return streaming_;
 }
 
 bool Connection::event(const std::string & data) { return write_all("data: " + data + "\n\n"); }

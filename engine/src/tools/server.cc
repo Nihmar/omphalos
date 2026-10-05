@@ -590,7 +590,15 @@ int main(int argc, char ** argv) {
                 server.handle(conn, req);
             } catch (const std::exception & e) {  // the next request still gets served
                 std::fprintf(stderr, "%s %s: %s\n", req.method.c_str(), req.path.c_str(), e.what());
-                server.fail(conn, 500, e.what(), "server_error");
+                if (conn.streaming()) {
+                    // The event stream's headers are out: an error event and the
+                    // end of the stream, never a second HTTP response in it (#337).
+                    conn.event(omph::server::sanitize_utf8(
+                        omph::server::error_body(e.what(), "server_error").dump()));
+                    conn.event("[DONE]");
+                } else {
+                    server.fail(conn, 500, e.what(), "server_error");
+                }
             }
         }
     } catch (const std::exception & e) {
