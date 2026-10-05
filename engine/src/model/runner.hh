@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <initializer_list>
 #include <map>
 #include <memory>
@@ -161,7 +162,11 @@ public:
     // Keeps the first `accepted` (1 .. T) tokens of the last verification:
     // swaps in the advanced states when all are kept, else replays the kept
     // prefix onto the old ones and restores the FP16-ring slots of the rest.
-    bool commit(int64_t accepted);
+    // `drafts_accepted`: the drafts the verification accepted (-1: accepted-1,
+    // the usual case where every committed token was verified). A run stopped
+    // by an end-of-generation still accepted the drafts it did not commit, and
+    // the drafter's keep rates must not count those as rejections (#340).
+    bool commit(int64_t accepted, int64_t drafts_accepted = -1);
 
     // --- MTP drafting (#124), with `mtp` set at construction ---
     // The MTP KV is filled automatically: after every forward the runner keeps
@@ -184,6 +189,22 @@ public:
     // The next verification's drafts came from elsewhere (n-gram, #199): no length statistics.
     void dflash_no_draft() { dfl_drafted_ = 0; }
     int64_t spec_max() const { return spec_max_; }
+
+    // A request's own drafter state: the draft-vocabulary switch, the keep
+    // rates and the every-eighth-step counter start over, so the same seed
+    // gives the same text on a fresh and on a warm server (#340).
+    void draft_reset() {
+        draft_oov_ = 0.0;
+        dfl_steps_ = 0;
+        dfl_drafted_ = 0;
+        std::fill(dfl_keep_.begin(), dfl_keep_.end(), 1.0);  // optimistic, as at load
+    }
+
+    // OMPH_DRAFT_VOCAB rounded down to the head-tile height (#340): a length the
+    // tiled GEMV refuses must not break every draft. 0: no truncation.
+    int64_t draft_vocab_rows() const {
+        return env_.draft_vocab > 0 ? env_.draft_vocab - env_.draft_vocab % 16 : 0;
+    }
 
 private:
     bool checkpoint_copy(void * host, bool save);

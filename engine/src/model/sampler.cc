@@ -72,12 +72,28 @@ void PenaltyWindow::reset(const std::vector<int32_t> & seq, const int64_t penalt
 }
 
 void PenaltyWindow::next(const std::vector<int32_t> & seq, const int32_t extra) {
+    if (last_n_ <= 0) {
+        // a zero-length window holds nothing (llama.cpp: penalties off)
+        added_.clear();
+        extras_ = 0;
+        v_.clear();
+        return;
+    }
     ++extras_;
     // the sequence's part of the window holds all of it while it is shorter
     // than what the drafts leave it: then nothing is dropped
     const int64_t len = std::min<int64_t>(end_, std::max<int64_t>(0, last_n_ - extras_));
     for (const int64_t want = end_ - len; first_ < want; ++first_) {
         add(seq[(size_t) first_], -1);
+    }
+    // More accepted drafts than the window holds (#340): the oldest extras
+    // leave too, so the window stays exactly `last_n_` tokens. Before this the
+    // window grew with the accepted drafts (row 5 of a step with 6 accepted
+    // n-gram drafts penalized 6 tokens where plain sampling penalizes 4).
+    while (extras_ > last_n_ && !added_.empty()) {
+        add(added_.front(), -1);
+        added_.erase(added_.begin());
+        --extras_;
     }
     add(extra, 1);
     added_.push_back(extra);

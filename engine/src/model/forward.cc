@@ -255,6 +255,11 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
                                      1.0f, nullptr)) {
             return fail("mtp h failed");
         }
+    }
+    // The tokens this forward carried: commit() reads them to update the
+    // draft-vocabulary switch. MTP and DFlash2 both need it (#340: the DFlash
+    // path never set last_toks_, so its switch saw the prompt only).
+    if (mtp_ || dflash_on()) {
         last_toks_ = toks;
         last_pos0_ = start_pos;
     }
