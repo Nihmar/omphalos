@@ -9,7 +9,8 @@ picks the KV cache: k8q4 (the default: omphalos' own mix, llama.cpp q8_0 /
 q4_0) or k4q4 (omphalos OMPH_KV_K4=1, llama.cpp q4_0 / q4_0); k4q4 runs are
 tagged so. The generation runs until the model stops (context 64K, no thinking
 budget). Temperature 1 samples with Qwen's recommended top_k 20, top_p 0.95,
-min_p 0 and a fixed seed on both engines; temperature 0 is greedy.
+min_p 0 and a fixed seed on both engines; temperature 0 is greedy. --omph-env
+NAME=VALUE sets one more omph-server switch (e.g. OMPH_NGRAM=0, #262).
 
     uv run python pelican.py --llama-server <llama.cpp>/build-hip/bin/llama-server \\
         --out ../bench/results/pelican-229
@@ -135,6 +136,9 @@ def server_cmd(engine: str, args, port: int, spec: str) -> list[str]:
 def run_config(engine: str, spec: str, args, prompt: str, prompt_n: int, out: Path, rows: list) -> None:
     name = config_name(engine, spec, args.kv)
     env = {**os.environ, **({"OMPH_KV_K4": "1"} if engine == "omphalos" and args.kv == "k4q4" else {})}
+    if engine == "omphalos" and args.omph_env:
+        name, _, value = args.omph_env.partition("=")
+        env[name] = value
     idle = wait_vram_idle()
     port = free_port()
     url = f"http://127.0.0.1:{port}"
@@ -161,7 +165,8 @@ def run_config(engine: str, spec: str, args, prompt: str, prompt_n: int, out: Pa
                                         str(out / f"{tag}.svg")], capture_output=True, text=True, check=False)
                     png = f"{tag}.png" if r.returncode == 0 else ""
                 row = {
-                    "run": tag, "engine": engine, "mtp": spec == "mtp", "spec": spec, "kv": args.kv, "temperature": temp,
+                    "run": tag, "engine": engine, "mtp": spec == "mtp", "spec": spec, "kv": args.kv,
+                    "temperature": temp, "omph_env": args.omph_env,
                     "tokens": tm["predicted_n"], "thinking_closed": THINK_END in text,
                     "total_s": round(wall, 1),
                     "prefill_tps": round(tm["prompt_n"] / tm["prompt_ms"] * 1000, 1) if tm["prompt_ms"] else 0,
@@ -224,6 +229,8 @@ def main() -> None:
     ap.add_argument("--drafter", default=str(ROOT / "models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"),
                     help="the DFlash2 drafter GGUF (omphalos reads the .omph next to it)")
     ap.add_argument("--engines", default="omphalos,llama")
+    ap.add_argument("--omph-env", default="",
+                    help="extra environment for omph-server, e.g. OMPH_NGRAM=0 (#262)")
     ap.add_argument("--only", default="", help="only these runs, e.g. omphalos-mtp-t0,llama-plain-t1")
     args = ap.parse_args()
     args.temps = [float(t) for t in args.temps.split(",")]
