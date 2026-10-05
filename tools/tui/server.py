@@ -2,9 +2,12 @@
 
 The rules the process handling follows, learned the hard way during the #287
 runs: the child gets its own session, so a `SIGTERM` reaches the whole group;
-the TUI always kills what it started (two orphan servers held 12 GB of VRAM
-each until they were hunted down); and the queue the reader thread fills is the
-only thing the UI thread touches, so nothing is called across threads.
+PR_SET_PDEATHSIG makes the kernel kill it when the TUI dies, whatever killed
+the TUI (#347); the TUI always kills what it started (two orphan servers held
+12 GB of VRAM each until they were hunted down); the reader decodes bytes it
+cannot read instead of dying (a full 64 KiB pipe would block the server's
+fprintf); and the queue the reader thread fills is the only thing the UI thread
+touches, so nothing is called across threads.
 
 The child's environment starts from the shell's **without any `OMPH_*`**: the
 form is the only place those switches come from, so a stale `OMPH_SKIP_ATTN` (or
@@ -18,6 +21,7 @@ import os
 import queue
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterable
@@ -33,6 +37,21 @@ def read(path: Path) -> str | None:
         return path.read_text().strip()
     except OSError:
         return None
+
+
+def pdeathsig() -> None:
+    """Set PR_SET_PDEATHSIG in the child, before exec: the kernel SIGTERMs it
+    when this process dies, SIGKILL of the TUI included (#347). The child is in
+    a new session, so the terminal's SIGHUP never reaches it."""
+    import ctypes
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG = 1
+            return
+    except (OSError, AttributeError):
+        return
+    if os.getppid() == 1:  # the parent died between the fork and the prctl
+        os._exit(1)
 
 
 def other_servers() -> list[int]:
@@ -144,7 +163,10 @@ class ServerProcess:
         full_env = {**{k: v for k, v in os.environ.items() if not k.startswith("OMPH_")}, **self.env}
         self.proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-            env=full_env, start_new_session=True,
+            env=full_env, start_new_session=True, errors="replace",
+            # PLW1509: the fork window is real, but the alternative is an orphan
+            # holding 12 GB of VRAM when the TUI is SIGKILLed (#347).
+            preexec_fn=pdeathsig if sys.platform == "linux" else None,  # noqa: PLW1509
         )
         self.started_at = time.monotonic()
         threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()

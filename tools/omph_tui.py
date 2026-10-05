@@ -25,6 +25,7 @@ import argparse
 import csv
 import queue
 import shlex
+import signal
 import threading
 import time
 from collections.abc import Iterable
@@ -268,11 +269,25 @@ class ProfileScreen(ModalScreen):
         return str(self.table.coordinate_to_cell_key((self.table.cursor_row, 0)).row_key.value)
 
     def action_save(self) -> None:
-        name = self._cursor_name()
-        if not name or name in profiles.PRESETS:
+        name = self._cursor_name() or "my-profile"
+        if name in profiles.PRESETS:
             name = "my-profile"  # a preset is a recipe to start from, not to overwrite
+        if name in profiles.load() and name not in profiles.PRESETS:
+            # a saved profile would be replaced: ask first (#347)
+            def answer(overwrite) -> None:
+                if overwrite:
+                    self._write(name)
+            self.app.push_screen(ConfirmOverwrite(name), answer)
+            return
+        self._write(name)
+
+    def _write(self, name: str) -> None:
         path = profiles.save(name, self.current)
-        self.app.notify(f"saved {name} to {path}")
+        if path is None:
+            # never overwrite a file this build cannot parse (#347)
+            self.app.notify(f"cannot save: {profiles.PROFILES_PATH} is not readable JSON", severity="error")
+        else:
+            self.app.notify(f"saved {name} to {path}")
 
     def action_delete(self) -> None:
         """`d` (the docs say so) or the delete button."""
@@ -333,6 +348,29 @@ class ConfirmQuit(ModalScreen):
     @on(Button.Pressed)
     def _buttons(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "btn-quit")
+
+
+class ConfirmOverwrite(ModalScreen):
+    """`s` on a saved profile replaces it: ask first (#347). The presets are
+    never overwritten, only the user's own profiles."""
+
+    BINDINGS: ClassVar = [Binding("escape", "dismiss", "cancel"), Binding("n", "dismiss", "no")]
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.profile = name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="modal"):
+            yield Static(f"the profile {self.profile} exists", classes="modal-title")
+            with VerticalScroll(id="modal-body"):
+                yield Static(f"Overwrite {self.profile} with the form's values?")
+            yield Horizontal(Button("overwrite", id="btn-overwrite", variant="error"),
+                             Button("cancel", id="btn-cancel"), id="modal-buttons")
+
+    @on(Button.Pressed)
+    def _buttons(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "btn-overwrite")
 
 
 class CommandScreen(ModalScreen):
@@ -483,6 +521,8 @@ class OmphTui(App):
         self.poll = poll
         self.demo_delay = demo_delay
         self.server = srv.ServerProcess()
+        import atexit
+        atexit.register(self.server.stop)  # a crash or an exit() must not leave it behind (#347)
         self.requests: list[dict] = []
         self.live_row: object | None = None
         self.live_phase: str | None = None
@@ -652,8 +692,9 @@ class OmphTui(App):
             self.finish_request(event)
         elif event.kind == "progress":
             self.update_live(event)
-        if event.kind == "error" or not self.errors_only:
-            style = {"error": "red", "ready": "green", "progress": "cyan", "request": ""}.get(event.kind, "dim")
+        if event.kind in ("error", "warn") or not self.errors_only:
+            style = {"error": "red", "warn": "yellow", "ready": "green", "progress": "cyan", "request": ""}.get(
+                event.kind, "dim")
             text = escape(event.text)
             self.logview.write(f"[{style}]{text}[/{style}]" if style else text)
 
@@ -983,6 +1024,19 @@ def main() -> None:
         import asyncio
         asyncio.run(shoot())
         return
+
+    # A terminal hangup or a `kill` must stop the child: the default action of
+    # these signals would skip on_unmount and leave the server holding VRAM
+    # (#347). PR_SET_PDEATHSIG in server.py covers SIGKILL, which no handler
+    # can.
+    def _signal(signum, _frame) -> None:
+        app.exit()
+
+    for _sig in (signal.SIGHUP, signal.SIGTERM):
+        try:
+            signal.signal(_sig, _signal)
+        except (ValueError, OSError):
+            pass
     app.run()
 
 

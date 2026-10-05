@@ -21,11 +21,14 @@ from dataclasses import dataclass, field
 READY = re.compile(r"^omph-server: (?P<model>.+?) on http://(?P<host>[^:]+):(?P<port>\d+) "
                    r"\(context (?P<context>\d+)\)$")
 # "POST /v1/chat/completions: sampling temp 0.60 ...; prompt 98255 tokens (0 cached, restored) in
-#  146815 ms (669.2 t/s); 4096 tokens in 104232 ms (39.3 t/s, drafts accepted 2762 / 10939); stop: length"
+#  146815 ms (checkpoints 0 ms, 669.2 t/s); 4096 tokens in 104232 ms (39.3 t/s, drafts accepted
+#  2762 / 10939); stop: length"
+# The checkpoints time is optional: #318 added it, and a pre-#318 line (and
+# every test written against one) must keep parsing (#347).
 REQUEST = re.compile(
     r"^(?P<method>GET|POST) (?P<path>[^:]+): sampling (?P<sampling>[^;]*); "
     r"prompt (?P<prompt_tokens>\d+) tokens \((?P<cached_tokens>\d+) cached(?P<flags>[^)]*)\) "
-    r"in (?P<prefill_ms>[\d.]+) ms \((?P<prefill_tps>[\d.]+) t/s\); "
+    r"in (?P<prefill_ms>[\d.]+) ms \((?:checkpoints [\d.]+ ms, )?(?P<prefill_tps>[\d.]+) t/s\); "
     r"(?P<completion_tokens>\d+) tokens in (?P<decode_ms>[\d.]+) ms "
     r"\((?P<decode_tps>[\d.]+) t/s, drafts accepted (?P<accepted>\d+) / (?P<drafted>\d+)\); "
     r"stop: (?P<stop>.*)$")
@@ -36,11 +39,20 @@ PROGRESS = re.compile(r"^  (?P<tokens>\d+) tokens, (?P<tps>[\d.]+) t/s "
                       r"\(last 3 s: (?P<last_tps>[\d.]+) t/s\)(, drafts accepted (?P<accepted_pct>[\d.]+) %)?$")
 # "error: cannot listen on 127.0.0.1:7070: Address already in use"
 FAILED = re.compile(r"^error: (?P<message>.*)$")
+# A tool's refused argument (cli.hh): "--ctx wants an integer, got 'x'"
+BAD_VALUE = re.compile(r"^--[\w-]+ wants an (?:unsigned )?(?:integer|number), got '.*'$")
+# "unknown option --x" (server.cc, and the same line in attn / gdn / generate)
+UNKNOWN_OPTION = re.compile(r"^unknown option(?: or missing value)?:? --\S+$")
+# An exception while serving a request (server.cc): the summary starts the same
+# way but always puts "sampling " after the colon.
+REQUEST_ERROR = re.compile(r"^(?:GET|POST) /\S+: (?!sampling )(?P<message>.+)$")
+# "omphalos: ablation active: OMPH_SKIP_FFN -- results are not the engine's"
+ABLATION = re.compile(r"^omphalos: ablation active: (?P<names>.*)$")
 
 
 @dataclass
 class Event:
-    kind: str                    # ready | request | progress | error | raw
+    kind: str                    # ready | request | progress | error | warn | raw
     text: str                    # what the log pane shows
     fields: dict = field(default_factory=dict)
 
@@ -102,6 +114,18 @@ def parse_line(line: str) -> Event:
     m = FAILED.match(stripped)
     if m:
         return Event("error", stripped, fields={"message": m["message"]})
+
+    # Not prefixed with "error: ", but a request or a tool invocation failed:
+    # "errors only" used to hide all of these (#347).
+    if BAD_VALUE.match(stripped) or UNKNOWN_OPTION.match(stripped):
+        return Event("error", stripped, fields={"message": stripped})
+    m = REQUEST_ERROR.match(stripped)
+    if m:
+        return Event("error", stripped, fields={"message": m["message"]})
+    m = ABLATION.match(stripped)
+    if m:
+        # not an error, but never to hide: the numbers are not the engine's
+        return Event("warn", stripped, fields={"ablation": m["names"]})
 
     return Event("raw", line)
 

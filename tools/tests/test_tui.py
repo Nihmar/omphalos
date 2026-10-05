@@ -412,3 +412,51 @@ def test_save_does_not_clobber_a_preset(tmp_path, monkeypatch) -> None:
     assert "coding-agent" not in raw, "the preset was written into the user's file"
     assert raw["my-profile"]["ctx"] == 8192
     assert profiles.load()["coding-agent"] == profiles.PRESETS["coding-agent"], "the preset changed"
+
+
+def test_save_asks_before_overwriting_a_saved_profile(tmp_path, monkeypatch) -> None:
+    """#347: `s` on a user profile replaced it silently, and the cursor starts
+    on row 0."""
+    monkeypatch.setattr(profiles, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(profiles, "PROFILES_PATH", tmp_path / "profiles.json")
+    values = {**schema.defaults(), "model": "m.omph", "ctx": 4096}
+    profiles.save("mine", values)
+    fixture(tmp_path)
+
+    async def run() -> None:
+        app = make_app(tmp_path)
+        async with app.run_test(size=(140, 46)) as pilot:
+            await pilot.pause(0.2)
+            app.push_screen(omph_tui.ProfileScreen(values))
+            await pilot.pause(0.2)
+            table = app.screen.query_one("#profiles", DataTable)
+            rows = [str(table.coordinate_to_cell_key((i, 0)).row_key.value) for i in range(table.row_count)]
+            table.focus()
+            table.move_cursor(row=rows.index("mine"))
+            await pilot.press("s")
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, omph_tui.ConfirmOverwrite), "the save asked first"
+            await pilot.press("n")
+            await pilot.pause(0.2)
+            assert not isinstance(app.screen, omph_tui.ConfirmOverwrite)
+
+    asyncio.run(run())
+    assert "mine" in profiles.load(), "the cancelled save did not touch the profile"
+
+
+def test_errors_only_keeps_an_error_without_the_prefix(tmp_path) -> None:
+    """#347: only \"^error: \" counted, so a refused option was hidden."""
+    fixture(tmp_path)
+
+    async def run() -> None:
+        app = make_app(tmp_path)
+        async with app.run_test(size=(140, 46)) as pilot:
+            await pilot.pause(0.2)
+            app.errors_only = True
+            seen: list = []
+            app.logview.write = lambda *a, **k: seen.append(a)
+            app.on_line("--ctx wants an integer, got 'abc'")
+            app.on_line(PROGRESS)  # a progress line is hidden
+            assert len(seen) == 1 and "wants an integer" in str(seen[0][0])
+
+    asyncio.run(run())
