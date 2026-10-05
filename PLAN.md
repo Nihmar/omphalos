@@ -782,7 +782,7 @@ Errors in K change the pre-softmax scores (i.e. *where* the model looks); errors
 
 ### 13.4 FP16 windows
 
-- **Recent window:** last N tokens (e.g. 64–128) kept in FP16, quantized in blocks as the window fills. **Measured (M5, #61):** 128 tokens take the KL from 0.00174 to 0.00090 nats at 16k (and remove a 0.27-nat outlier) for 8.4 MB; on by default in the Q8/Q4 mode. Better quality where it matters most, and allows **per-channel K quantization over groups of tokens** (KIVI-style), more accurate than per-token for K.
+- **Recent window:** last N tokens kept in FP16, quantized in blocks as the window fills. **Measured (M5, #61):** 128 tokens take the KL from 0.00174 to 0.00090 nats at 16k (and remove a 0.27-nat outlier) for 8.4 MB. **Measured again at 256 and 512 (#318, `bench/results/fp16-window-318.txt`):** the curve keeps going — with the mixed K4/K8 cache at 16k, 128 / 256 / 512 give KL mean 0.00356 / 0.00255 / 0.00147, p99 0.032 / 0.026 / 0.011 and top-1 97.9 / 98.1 / 98.8 %, for 8.6 / 16.9 / 34.5 MB of ring, and the decode step (16k) measures 42.7 ms at both 128 and 512: the weights dominate, so the window is nearly free. **Default 512 since #318.** It also makes the mixed K4/K8 cache as accurate as K8 everywhere with the old window (0.00147 against 0.00148) for 26 MB instead of K8's ~0.4 GB at 106k — the trade #297 is about. The remaining outliers (max 0.02–0.09) are positions reaching far outside any window: the initial-token row below is what would address them.
 - **Initial tokens:** first few positions in FP16 (they often receive a lot of attention; gated attention should reduce this "sink" effect, but keeping a few in FP16 is almost free).
 
 ### 13.5 Mixed precision per layer

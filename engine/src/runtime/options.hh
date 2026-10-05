@@ -21,7 +21,12 @@ struct EnvOptions {
     static constexpr uint64_t kDefaultK4Layers = (1u << 2) | (1u << 4) | (1u << 5) | (1u << 6) |
                                                  (1u << 7) | (1u << 9) | (1u << 11) | (1u << 15);
     uint64_t kv_k4_layers = kDefaultK4Layers;
-    int64_t kv_window = 128;    // OMPH_KV_WINDOW=N: FP16 ring of the last N tokens (0 = off)
+    // OMPH_KV_WINDOW=N: the FP16 ring holds the last N tokens (0 = off). 512 since
+    // #318: at 16k it halves the mixed K4/K8 cache's KL against the exact f32 one
+    // (0.00356 -> 0.00147 mean, top-1 97.9 -> 98.8 %) for ~26 MB of VRAM and no
+    // measurable step time (bench/results/fp16-window-318.txt); 256 and 128 are the
+    // points below it, OMPH_KV_WINDOW=128 the pre-#318 behaviour.
+    int64_t kv_window = 512;
 
     // --- decode paths (A/B switches)
     bool overlap = false;       // OMPH_OVERLAP: a side stream for sibling GEMVs (#71; off by default, #189)
