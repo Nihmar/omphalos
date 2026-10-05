@@ -1,6 +1,7 @@
 #include "vision/encoder.hh"
 
 #include "format/gguf.hh"
+#include "format/sha256.hh"
 
 #include <llama.h>
 #include <mtmd-helper.h>
@@ -25,13 +26,8 @@ void quiet(ggml_log_level level, const char * text, void *) {
 
 } // namespace
 
-uint64_t content_hash(const std::string & bytes) {
-    uint64_t h = 1469598103934665603ull;
-    for (const char c : bytes) {
-        h ^= (uint8_t) c;
-        h *= 1099511628211ull;
-    }
-    return h;
+std::string content_digest(const std::string & bytes) {
+    return omph::format::sha256_hex(reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size());
 }
 
 Encoder::Encoder(const std::string & mmproj, const std::string & model, const int threads) {
@@ -128,10 +124,10 @@ Encoder::~Encoder() {
 }
 
 std::shared_ptr<const model::Image> Encoder::encode(const std::string & bytes) {
-    const uint64_t hash = content_hash(bytes);
+    const std::string digest = content_digest(bytes);
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = cache_.begin(); it != cache_.end(); ++it) {
-        if ((*it)->hash == hash) {
+        if ((*it)->digest == digest) {
             cache_.splice(cache_.begin(), cache_, it);
             return cache_.front();
         }
@@ -189,7 +185,7 @@ std::shared_ptr<const model::Image> Encoder::encode(const std::string & bytes) {
     if (!err.empty()) {
         throw std::runtime_error(err);
     }
-    image->hash = hash;
+    image->digest = digest;
     cache_.push_front(image);
     cache_bytes_ += image->embd.size() * 4;
     while (cache_bytes_ > kCacheBytes && cache_.size() > 1) {

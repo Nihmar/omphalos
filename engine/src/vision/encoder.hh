@@ -53,7 +53,8 @@ private:
     size_t cache_bytes_ = 0;
 };
 
-// FNV-1a of a byte string (the image cache key and token identity).
-uint64_t content_hash(const std::string & bytes);
+// SHA-256 of a byte string (lowercase hex): the image cache key and the
+// identity the placeholder ids are derived from (#339).
+std::string content_digest(const std::string & bytes);
 
 } // namespace omph::vision

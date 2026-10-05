@@ -277,9 +277,12 @@ void Generator::save_snapshot(const std::vector<int32_t> & prompt, GenerateResul
 int64_t Generator::resume(const std::vector<int32_t> & prompt, GenerateResult & res) {
     size_t common = 0;
     while (common < seq_.size() && common < prompt.size() && seq_[common] == prompt[common]) ++common;
-    if (!seq_.empty() && common == seq_.size() && common < prompt.size()) {
-        return (int64_t) common;
-    }
+    // The caches already hold seq_ up to `common` for free when it is a prefix
+    // of the prompt -- but that is not a reason to stop looking: prefill() fed
+    // the text before an image while the CPU encoded it (#180), leaving seq_
+    // shorter than a saved conversation the prompt continues (#339).
+    const bool extends = !seq_.empty() && common == seq_.size() && common < prompt.size();
+    const int64_t free_reach = extends ? (int64_t) common : 0;
 
     Checkpoint * best = nullptr;
     for (Checkpoint & c : checkpoints_) {
@@ -289,10 +292,14 @@ int64_t Generator::resume(const std::vector<int32_t> & prompt, GenerateResult & 
         }
     }
     // a point of a saved conversation (#179) the prompt continues, when it
-    // reaches further than the checkpoints
+    // reaches further than the checkpoints -- or further than what the caches
+    // already hold (#339)
     Snapshot * snap = nullptr;
     size_t at = 0;
     int64_t reach = best != nullptr ? (int64_t) best->tokens.size() : 0;
+    if (free_reach > reach) {
+        reach = free_reach;
+    }
     for (Snapshot & s : snapshots_) {
         for (size_t q = 0; q < s.points.size(); ++q) {
             const int64_t p = s.points[q];
@@ -317,6 +324,9 @@ int64_t Generator::resume(const std::vector<int32_t> & prompt, GenerateResult & 
         snap->used = ++clock_;
         seq_.assign(snap->tokens.begin(), snap->tokens.begin() + reach);
         return reach;
+    }
+    if (extends) {
+        return free_reach;  // already in the caches, no restore and no reset
     }
     if (best != nullptr) {
         const double t0 = omph::runtime::now_ms();
@@ -357,7 +367,7 @@ bool Generator::expand(const std::vector<int32_t> & prompt, const GenerateReques
         if (im == nullptr || im->nx <= 0 || im->ny <= 0 || (int64_t) im->embd.size() != im->n_tokens() * ne) {
             return false;
         }
-        const int32_t id = -1 - (int32_t) (im->hash & 0x3fffffff);
+        const int32_t id = im->placeholder_id();
         for (int64_t i = 0; i < im->n_tokens(); ++i) {
             out.tokens.push_back(id);
             out.image_of.push_back(im);
