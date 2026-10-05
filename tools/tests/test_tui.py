@@ -298,6 +298,21 @@ def test_preflight_catches_the_wrong_model_file(tmp_path) -> None:
     assert 14.0 < est < 15.6, f"11.3 GiB of weights + 3.3 GiB of KV at 128k, got {est:.2f}"
 
 
+def test_the_dflash_default_is_the_repos_when_it_exists(tmp_path) -> None:
+    """The form pre-fills the model path; it should pre-fill the DFlash2 drafter
+    the same way, but only when the file is there (it is optional)."""
+    missing = tmp_path / "nope.omph"
+    assert omph_tui.default_dflash(missing) == ""
+    present = tmp_path / "d.omph"
+    present.write_text("x")
+    assert omph_tui.default_dflash(present) == str(present)
+    # precedence: --dflash, then the profile's drafter, then the repo's
+    assert omph_tui.resolve_dflash("/cli.omph", "/profile.omph", "/repo.omph") == "/cli.omph"
+    assert omph_tui.resolve_dflash(None, "/profile.omph", "/repo.omph") == "/profile.omph"
+    assert omph_tui.resolve_dflash(None, "", "/repo.omph") == "/repo.omph"
+    assert omph_tui.resolve_dflash("", "/profile.omph", "/repo.omph") == "", "--dflash '' turns it off"
+
+
 def test_preflight_does_not_call_our_own_child_another_server(tmp_path, monkeypatch) -> None:
     """#328: the F9 preflight must not warn about the app's own server."""
     monkeypatch.setattr(srv, "other_servers", lambda: [123, 456])
