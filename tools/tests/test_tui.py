@@ -12,7 +12,7 @@ from pathlib import Path
 from textual.widgets import Button, DataTable, TabbedContent
 
 import omph_tui
-from tui import log, schema
+from tui import log, profiles, schema
 from tui import server as srv
 
 READY = "omph-server: m.omph on http://127.0.0.1:7070 (context 131072)"
@@ -221,6 +221,52 @@ def test_quit_asks_before_killing_a_running_server(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_stop_is_off_the_ui_thread(tmp_path) -> None:
+    """#328: stop() waits up to 4 s for SIGTERM; on the UI thread that freezes
+    the interface, so it runs in a worker."""
+    fixture(tmp_path)
+
+    async def run() -> None:
+        app = make_app(tmp_path, exec_command="sleep 30")
+        async with app.run_test(size=(140, 46)) as pilot:
+            await pilot.pause(0.2)
+            await pilot.press("s")
+            await pilot.pause(0.5)
+            assert app.server.running()
+            await pilot.press("x")
+            deadline = time.monotonic() + 5
+            while app.server.running() and time.monotonic() < deadline:
+                await pilot.pause(0.1)
+            assert not app.server.running(), "the worker killed the child"
+
+    asyncio.run(run())
+
+
+def test_d_deletes_a_profile(tmp_path, monkeypatch) -> None:
+    """docs/tools.md promises `d`; it was only a button (#328)."""
+    monkeypatch.setattr(profiles, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(profiles, "PROFILES_PATH", tmp_path / "profiles.json")
+    fixture(tmp_path)
+    profiles.save("mine", {**schema.defaults(), "ctx": 4096})
+    values = {**schema.defaults(), "model": "m.omph"}
+
+    async def run() -> None:
+        app = make_app(tmp_path)
+        async with app.run_test(size=(140, 46)) as pilot:
+            await pilot.pause(0.2)
+            app.push_screen(omph_tui.ProfileScreen(values))
+            await pilot.pause(0.2)
+            table = app.screen.query_one("#profiles", DataTable)
+            rows = [str(table.coordinate_to_cell_key((i, 0)).row_key.value) for i in range(table.row_count)]
+            table.focus()
+            table.move_cursor(row=rows.index("mine"))
+            await pilot.press("d")
+            await pilot.pause(0.2)
+
+    asyncio.run(run())
+    assert "mine" not in profiles.load()
+
+
 def test_process_lines_and_the_group_kill(tmp_path) -> None:
     proc = srv.ServerProcess()
     proc.start(["/bin/sh", "-c", "echo hello; sleep 30"])
@@ -250,3 +296,104 @@ def test_preflight_catches_the_wrong_model_file(tmp_path) -> None:
     assert any(level == "err" and label == "model" for level, label, _ in missing)
     est = srv.vram_estimate({**schema.defaults(), "ctx": 131072})
     assert 14.0 < est < 15.6, f"11.3 GiB of weights + 3.3 GiB of KV at 128k, got {est:.2f}"
+
+
+def test_preflight_does_not_call_our_own_child_another_server(tmp_path, monkeypatch) -> None:
+    """#328: the F9 preflight must not warn about the app's own server."""
+    monkeypatch.setattr(srv, "other_servers", lambda: [123, 456])
+    values = {**schema.defaults(), "model": str(tmp_path / "m.omph"), "port": 1}
+    (tmp_path / "m.omph").write_text("x")
+    checks = {label: (level, detail) for level, label, detail in srv.preflight(values, {123, 456})}
+    assert checks["servers"][0] == "ok"
+    checks = {label: (level, detail) for level, label, detail in srv.preflight(values, {123})}
+    assert checks["servers"][0] == "warn" and "456" in checks["servers"][1]
+
+
+def test_copy_json_of_a_request(tmp_path) -> None:
+    """#328: the raw self-reference made json.dumps raise Circular reference."""
+    import json
+    fixture(tmp_path)
+
+    async def run() -> None:
+        app = make_app(tmp_path)
+        async with app.run_test(size=(140, 46)) as pilot:
+            await pilot.pause(0.4)
+            app.open_details(0)
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, omph_tui.DetailScreen)
+            app.screen.action_copy_json()
+            payload = json.loads(app.last_copied)
+            assert payload["prompt_tokens"] == 98255 and payload["completion_tokens"] == 4096
+
+    asyncio.run(run())
+
+
+def test_export_keeps_every_number(tmp_path) -> None:
+    """#328: the fieldnames were the display names, so every numeric column
+    (t/s, drafts, out) came out empty."""
+    import csv
+    fixture(tmp_path)
+    out = tmp_path / "requests.csv"
+
+    async def run() -> None:
+        app = make_app(tmp_path)
+        async with app.run_test(size=(140, 46)) as pilot:
+            await pilot.pause(0.4)
+            app.action_export(str(out))
+
+    asyncio.run(run())
+    rows = list(csv.DictReader(out.open()))
+    assert len(rows) == 2
+    first = rows[0]
+    assert first["prompt_tokens"] == "98255" and first["completion_tokens"] == "4096"
+    assert float(first["prefill_tps"]) > 600 and float(first["decode_tps"]) > 30
+    assert first["drafts"] == "2762/10939" and first["stop"] == "length"
+    assert rows[1]["restored"] == "True"
+
+
+def test_the_child_does_not_inherit_omph_switches(tmp_path, monkeypatch) -> None:
+    """#328: a stale ablation in the shell must not reach the server behind the
+    form's back."""
+    monkeypatch.setenv("OMPH_SKIP_ATTN", "1")
+    monkeypatch.setenv("OMPH_KV_F32", "1")
+    proc = srv.ServerProcess()
+    proc.start(["/bin/sh", "-c", "env | grep '^OMPH_' || echo none"])
+    lines = []
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            kind, payload = proc.queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if kind == "exit":
+            break
+        if kind == "line":
+            lines.append(payload)
+    assert lines and lines[-1] == "none", f"the shell's OMPH_* leaked in: {lines}"
+
+
+def test_save_does_not_clobber_a_preset(tmp_path, monkeypatch) -> None:
+    """#328: `s` on a selected preset used to overwrite the recipe."""
+    monkeypatch.setattr(profiles, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(profiles, "PROFILES_PATH", tmp_path / "profiles.json")
+    values = {**schema.defaults(), "model": "m.omph", "ctx": 8192}
+    fixture(tmp_path)
+
+    async def run() -> None:
+        app = make_app(tmp_path)
+        async with app.run_test(size=(140, 46)) as pilot:
+            await pilot.pause(0.2)
+            app.push_screen(omph_tui.ProfileScreen(values))
+            await pilot.pause(0.2)
+            table = app.screen.query_one("#profiles", DataTable)
+            rows = [str(table.coordinate_to_cell_key((i, 0)).row_key.value) for i in range(table.row_count)]
+            table.focus()
+            table.move_cursor(row=rows.index("coding-agent"))
+            await pilot.press("s")  # save while a preset is selected
+            await pilot.pause(0.2)
+
+    asyncio.run(run())
+    raw = __import__("json").loads(profiles.PROFILES_PATH.read_text())
+    assert "coding-agent" not in raw, "the preset was written into the user's file"
+    assert raw["my-profile"]["ctx"] == 8192
+    assert profiles.load()["coding-agent"] == profiles.PRESETS["coding-agent"], "the preset changed"

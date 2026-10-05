@@ -24,6 +24,7 @@ import queue
 import shlex
 import threading
 import time
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
@@ -47,10 +48,8 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
 )
-from textual.widgets._data_table import CellDoesNotExist
-from textual.widgets._select import (
-    InvalidSelectValueError,  # not exported by textual.widgets here
-)
+from textual.widgets.data_table import CellDoesNotExist
+from textual.widgets.select import InvalidSelectValueError
 
 import tui.log as logmod
 import tui.server as srv
@@ -174,15 +173,18 @@ class DetailScreen(ModalScreen):
 
     def action_copy_json(self) -> None:
         import json
-        self.app.copy_to_clipboard(json.dumps(self.row.get("raw", self.row), default=str))
-        self.app.last_copied = json.dumps(self.row.get("raw", self.row), default=str)  # for the tests
+        payload = {k: v for k, v in self.row.items() if k != "raw"}
+        text = json.dumps(payload, default=str)
+        self.app.copy_to_clipboard(text)
+        self.app.last_copied = text  # for the tests
         self.app.notify("request copied as JSON")
 
 
 class ProfileScreen(ModalScreen):
     """F7: load, save or delete a profile. Click a row (or enter) to load."""
 
-    BINDINGS: ClassVar = [Binding("escape", "dismiss", "cancel"), Binding("s", "save", "save")]
+    BINDINGS: ClassVar = [Binding("escape", "dismiss", "cancel"), Binding("s", "save", "save"),
+                          Binding("d", "delete", "delete")]
 
     def __init__(self, current: dict) -> None:
         super().__init__()
@@ -229,10 +231,7 @@ class ProfileScreen(ModalScreen):
         elif event.button.id == "btn-save":
             self.action_save()
         elif event.button.id == "btn-delete":
-            name = self._cursor_name()
-            if name and profiles.delete(name):
-                self.app.notify(f"deleted {name}")
-                self.dismiss("refresh")
+            self.action_delete()
         elif event.button.id == "btn-load":
             name = self._cursor_name()
             if name:
@@ -244,9 +243,18 @@ class ProfileScreen(ModalScreen):
         return str(self.table.coordinate_to_cell_key((self.table.cursor_row, 0)).row_key.value)
 
     def action_save(self) -> None:
-        name = self._cursor_name() or "my-profile"
+        name = self._cursor_name()
+        if not name or name in profiles.PRESETS:
+            name = "my-profile"  # a preset is a recipe to start from, not to overwrite
         path = profiles.save(name, self.current)
         self.app.notify(f"saved {name} to {path}")
+
+    def action_delete(self) -> None:
+        """`d` (the docs say so) or the delete button."""
+        name = self._cursor_name()
+        if name and profiles.delete(name):
+            self.app.notify(f"deleted {name}")
+            self.dismiss("refresh")
 
 
 class HelpScreen(ModalScreen):
@@ -307,11 +315,14 @@ class CommandScreen(ModalScreen):
 
     BINDINGS: ClassVar = [Binding("escape", "dismiss", "close"), Binding("c", "copy", "copy")]
 
-    def __init__(self, values: dict, binary: str, exec_command: str | None) -> None:
+    def __init__(self, values: dict, binary: str, exec_command: str | None,
+                 exclude_pids: Iterable[int] = ()) -> None:
         super().__init__()
         self.values = values
         self.binary = binary
         self.exec_command = exec_command
+        # the preflight must not call the app's own child "another omph-server"
+        self.exclude_pids = set(exclude_pids)
         self.show_defaults = False
 
     def command(self) -> tuple[dict, list]:
@@ -337,7 +348,7 @@ class CommandScreen(ModalScreen):
         text = schema.format_command(env, argv)
         self.query_one("#command-text", Static).update(escape(text))
         lines = []
-        for level, label, detail in srv.preflight(self.values):
+        for level, label, detail in srv.preflight(self.values, self.exclude_pids):
             mark = {"ok": "[green]ok[/green]", "warn": "[yellow]warn[/yellow]", "err": "[red]err[/red]"}[level]
             lines.append(f"{mark} {label}: {detail}")
         self.query_one("#preflight", Static).update("\n".join(lines))
@@ -449,6 +460,7 @@ class OmphTui(App):
         self.server = srv.ServerProcess()
         self.requests: list[dict] = []
         self.live_row: object | None = None
+        self.live_phase: str | None = None
         self.errors_only = False
         self.last_copied = ""
         self.started_at: float | None = None
@@ -543,6 +555,7 @@ class OmphTui(App):
         env, argv = self.command()
         self.requests.clear()
         self.live_row = None
+        self.live_phase = None
         self.table.clear()
         self.ready_at = None
         try:
@@ -564,12 +577,28 @@ class OmphTui(App):
         if not self.server.running():
             self.notify("not running")
             return
-        self.server.stop()
+        self._stop_then()
+
+    def _stop_then(self, done=None) -> None:
+        """SIGTERM, then up to 4 s of waiting: off the UI thread, so F3/F5 do not
+        freeze the interface while the child goes away."""
+        def work() -> None:
+            self.server.stop()
+            self.call_from_thread(self._stopped, done)
+        self.run_worker(work, thread=True, group="stop")
+
+    def _stopped(self, done) -> None:
+        if not self.is_running:
+            return
         self.logview.write("[yellow]stopped[/yellow]")
+        if done is not None:
+            done()
 
     def action_restart(self) -> None:
-        self.action_stop()
-        self.action_start()
+        if self.server.running():
+            self._stop_then(self.action_start)
+        else:
+            self.action_start()
 
     # --- events
 
@@ -607,7 +636,6 @@ class OmphTui(App):
         table = self.table
         f = dict(event.fields)
         f["time"] = datetime.now(tz=UTC).astimezone().strftime("%H:%M:%S")
-        f["raw"] = f
         self.requests.append(f)
         index = len(self.requests)
         row = self.row_values(f, index)
@@ -619,6 +647,7 @@ class OmphTui(App):
             self.live_row = None
         else:
             table.add_row(*row, key=f"r{index}")
+        self.live_phase = None
 
     def update_live(self, event) -> None:
         table = self.table
@@ -634,6 +663,7 @@ class OmphTui(App):
                          "prefill": where, "decode_tps": "", "stop": "[cyan]prefilling[/cyan]"}
                 self.live_row = table.add_row(*[cells.get(key, "") for _, key in self.columns],
                                               key=f"r{len(self.requests) + 1}")
+                self.live_phase = "prefill"
             else:
                 self._update_live_cell("prefill", where)
             return
@@ -646,12 +676,16 @@ class OmphTui(App):
                      "stop": "[cyan]in flight[/cyan]"}
             self.live_row = table.add_row(*[cells.get(key, "") for _, key in self.columns],
                                           key=f"r{len(self.requests) + 1}")
+            self.live_phase = "decode"
             return
         try:
             self._update_live_cell("out", tokens)
             self._update_live_cell("decode_tps", tps)
             if f.get("accepted_pct") is not None:
                 self._update_live_cell("acc", f"{f['accepted_pct']:.0f} %")
+            if self.live_phase == "prefill":  # the prefill's row now reports the decode
+                self._update_live_cell("stop", "[cyan]in flight[/cyan]")
+                self.live_phase = "decode"
         except CellDoesNotExist as exc:
             self.log.debug(f"live row not updated: {exc}")
 
@@ -698,6 +732,7 @@ class OmphTui(App):
         for i, row in enumerate(self.requests, 1):
             table.add_row(*self.row_values(row, i), key=f"r{i}")
         self.live_row = None  # rebuilt by the next progress line
+        self.live_phase = None
 
     def refresh_chips(self) -> None:
         if not self.is_mounted or not self.chips.is_mounted:
@@ -773,7 +808,8 @@ class OmphTui(App):
         def chosen(what) -> None:
             if what == "start":
                 self.action_start()
-        self.push_screen(CommandScreen(self.collect(), self.binary, self.exec_command), chosen)
+        own = {self.server.proc.pid} if self.server.running() and self.server.proc else set()
+        self.push_screen(CommandScreen(self.collect(), self.binary, self.exec_command, own), chosen)
 
     def action_copy(self) -> None:
         env, argv = self.command()
@@ -782,18 +818,37 @@ class OmphTui(App):
         self.last_copied = text
         self.notify("command copied")
 
-    def action_export(self) -> None:
+    def action_export(self, path: str | None = None) -> None:
         if not self.requests:
             self.notify("no requests yet", severity="warning")
             return
-        path = Path("omph-tui-requests-" + datetime.now(tz=UTC).astimezone().strftime("%Y%m%d-%H%M%S") + ".csv")
-        with path.open("w", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=[name for name, _ in COLS][1:] + ["prompt_tokens", "cached_tokens"],
-                                    extrasaction="ignore")
+        if path is None:
+            path = "omph-tui-requests-" + datetime.now(tz=UTC).astimezone().strftime("%Y%m%d-%H%M%S") + ".csv"
+        out = Path(path)
+        # the cell keys, so every column a row has is in the file; the formatted
+        # cells plus the numbers the bench results use
+        fields = (["#"] + [key for _, key in COLS if key != "num"]
+                  + ["prompt_tokens", "cached_tokens", "prefill_ms", "completion_tokens", "decode_ms",
+                     "drafted", "accepted", "restored", "client_gone"])
+        with out.open("w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
             for i, row in enumerate(self.requests, 1):
-                writer.writerow({"#": i, **{k: v for k, v in row.items() if k != "raw"}})
-        self.notify(f"exported {path}")
+                cells = self.cell_values(row, i)
+                writer.writerow({
+                    "#": i,
+                    **{k: cells.get(k, "") for k in fields if k in cells},
+                    "prompt_tokens": row.get("prompt_tokens"),
+                    "cached_tokens": row.get("cached_tokens"),
+                    "prefill_ms": row.get("prefill_ms"),
+                    "completion_tokens": row.get("completion_tokens"),
+                    "decode_ms": row.get("decode_ms"),
+                    "drafted": row.get("drafted"),
+                    "accepted": row.get("accepted"),
+                    "restored": bool(row.get("restored")),
+                    "client_gone": bool(row.get("client_gone")),
+                })
+        self.notify(f"exported {out}")
 
     def action_details(self) -> None:
         self.open_details(self.table.cursor_row)
@@ -801,6 +856,10 @@ class OmphTui(App):
     def action_test_prompt(self) -> None:
         values = self.collect()
         host, port = values.get("host") or "127.0.0.1", int(values.get("port") or 8080)
+        headers = {"content-type": "application/json"}
+        key = str(values.get("api_key") or "")
+        if key:  # the server rejects an unauthenticated request otherwise
+            headers["authorization"] = f"Bearer {key}"
         self.logview.write(f"[dim]test prompt -> http://{host}:{port}/v1/chat/completions[/dim]")
 
         def work() -> None:
@@ -810,7 +869,7 @@ class OmphTui(App):
             body = _json.dumps({"messages": [{"role": "user", "content": "Say OK"}], "max_tokens": 8,
                                 "chat_template_kwargs": {"enable_thinking": False}}).encode()
             req = urllib.request.Request(f"http://{host}:{port}/v1/chat/completions", data=body,
-                                         headers={"content-type": "application/json"})
+                                         headers=headers)
             t0 = time.monotonic()
             try:
                 with urllib.request.urlopen(req, timeout=600) as resp:

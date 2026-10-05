@@ -5,6 +5,11 @@ runs: the child gets its own session, so a `SIGTERM` reaches the whole group;
 the TUI always kills what it started (two orphan servers held 12 GB of VRAM
 each until they were hunted down); and the queue the reader thread fills is the
 only thing the UI thread touches, so nothing is called across threads.
+
+The child's environment starts from the shell's **without any `OMPH_*`**: the
+form is the only place those switches come from, so a stale `OMPH_SKIP_ATTN` (or
+any other ablation) in the shell cannot silently reach the server, and what the
+command preview shows is what runs.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 KIB_PER_TOKEN = 26 * 1024        # the default K/Q8 + V/Q4 cache, #58's 0.87 GB at 32k
@@ -30,7 +36,7 @@ def read(path: Path) -> str | None:
 
 
 def other_servers() -> list[int]:
-    """Pids of omph-server processes that are not ours (a stray one eats VRAM)."""
+    """Pids of every omph-server process (the caller filters out its own)."""
     out = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -80,9 +86,10 @@ def vram_estimate(values: dict) -> float:
     return weights + kv + extra
 
 
-def preflight(values: dict) -> list[tuple[str, str, str]]:
+def preflight(values: dict, exclude_pids: Iterable[int] = ()) -> list[tuple[str, str, str]]:
     """(level, label, detail) checks to show before starting: level is
-    'ok', 'warn' or 'err'."""
+    'ok', 'warn' or 'err'. ``exclude_pids`` are processes that are ours (the app's
+    own child), not "another omph-server"."""
     checks: list[tuple[str, str, str]] = []
     model = str(values.get("model") or "")
     if not model:
@@ -102,7 +109,7 @@ def preflight(values: dict) -> list[tuple[str, str, str]]:
     host, port = str(values.get("host") or "127.0.0.1"), int(values.get("port") or 8080)
     checks.append(("ok", "port", f"{host}:{port} free") if port_free(host, port)
                   else ("err", "port", f"{host}:{port} is in use"))
-    others = other_servers()
+    others = [pid for pid in other_servers() if pid not in set(exclude_pids)]
     checks.append(("warn", "servers", f"another omph-server is running: {others}") if others
                   else ("ok", "servers", "no other omph-server"))
     est = vram_estimate(values)
@@ -125,22 +132,21 @@ class ServerProcess:
         self.started_at: float | None = None
         self.argv: list[str] = []
         self.env: dict[str, str] = {}
-        self._stopping = False
 
     def running(self) -> bool:
-        return self.proc is not None and self.proc.poll() is None
+        proc = self.proc  # stop() runs on a worker thread and clears it (#328)
+        return proc is not None and proc.poll() is None
 
     def start(self, argv: list[str], env: dict[str, str] | None = None) -> None:
         self.stop()
         self.argv = list(argv)
         self.env = dict(env or {})
-        full_env = {**os.environ, **self.env}
+        full_env = {**{k: v for k, v in os.environ.items() if not k.startswith("OMPH_")}, **self.env}
         self.proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
             env=full_env, start_new_session=True,
         )
         self.started_at = time.monotonic()
-        self._stopping = False
         threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
         self.queue.put(("started", {"pid": self.proc.pid, "argv": self.argv, "env": self.env}))
 
@@ -156,7 +162,6 @@ class ServerProcess:
         if proc is None or proc.poll() is not None:
             self.proc = None
             return
-        self._stopping = True
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
