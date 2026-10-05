@@ -3,7 +3,8 @@
 Each of the 164 problems is one user message ("complete this function", the
 prompt in a ```python block), rendered once with the GGUF's chat template by
 omph-tokenize (thinking on, reasoning effort xhigh: the template's default) and
-sent as the same raw prompt to either engine's completion endpoint, greedy:
+sent as the same raw prompt to either engine's completion endpoint, greedy (or
+sampled with --temp > 0):
 
 1. up to --think-budget tokens (default 8192) of generation from the open
    <think>;
@@ -20,6 +21,11 @@ the filesystem read-only except a private /tmp, a --timeout per problem.
 none) or dflash (both: the DFlash2 drafter of --drafter, 7 drafts, #245); --kv
 the KV cache: k8q4 (omphalos' default mix, llama.cpp q8_0 / q4_0) or k4q4
 (omphalos OMPH_KV_K4=1, llama.cpp q4_0 / q4_0).
+
+--temp 0 (the default) is greedy; a positive temperature samples with Qwen's
+recommended top_k 20, top_p 0.95, min_p 0 and a fixed seed (--seed), the same
+parameters on either engine (#261). The output file is appended to and a
+rerun skips the problems already there, so a sampled run uses its own --out.
 
     uv run python humaneval.py --engine omphalos --out he-omph.jsonl
     uv run python humaneval.py --engine llama --out he-llama.jsonl \\
@@ -48,6 +54,7 @@ ROOT = HERE.parent
 INSTRUCTION = ("Complete the following Python function. Reply with the complete function (with any imports "
                "it needs) in a single ```python code block.\n\n```python\n{}```")
 THINK_END = "</think>"
+SEED = 261  # the sampled runs' fixed seed (#261)
 
 
 def render(tokenize: str, model: str, prompt: str) -> str:
@@ -56,40 +63,42 @@ def render(tokenize: str, model: str, prompt: str) -> str:
                           check=True).stdout
 
 
-def complete(engine: str, url: str, prompt: str, max_tokens: int) -> tuple[str, bool, dict]:
+def complete(engine: str, url: str, prompt: str, max_tokens: int, samp: dict) -> tuple[str, bool, dict]:
     """The generated text, whether it stopped on the token limit, and the timings."""
     if engine == "omphalos":
-        r = post(url + "/v1/completions", {"prompt": prompt, "max_tokens": max_tokens, "temperature": 0})
+        r = post(url + "/v1/completions", {"prompt": prompt, "max_tokens": max_tokens, **samp})
         text, tm = r["choices"][0]["text"], r["timings"]
         limit = r["choices"][0].get("finish_reason") == "length"
     else:
-        r = post(url + "/completion", {"prompt": prompt, "n_predict": max_tokens, "temperature": 0, "top_k": 1,
-                                       "cache_prompt": True})
+        s = {**samp, **({"top_k": 1} if samp["temperature"] == 0 else {})}
+        r = post(url + "/completion", {"prompt": prompt, "n_predict": max_tokens, "cache_prompt": True, **s})
         text, tm = r["content"], r["timings"]
         limit = bool(r.get("stopped_limit")) or r.get("stop_type") == "limit"
     return text, limit, {"prompt_n": tm["prompt_n"], "prompt_ms": tm["prompt_ms"], "predicted_n": tm["predicted_n"],
-                         "predicted_ms": tm["predicted_ms"]}
+                         "predicted_ms": tm["predicted_ms"], "drafts": tm.get("draft_n", 0),
+                         "accepted": tm.get("draft_n_accepted", 0)}
 
 
-def solve(engine: str, url: str, prompt: str, budget: int, answer_tokens: int) -> dict:
+def solve(engine: str, url: str, prompt: str, budget: int, answer_tokens: int, samp: dict) -> dict:
     t0 = time.time()
-    out, limit, tm = complete(engine, url, prompt, budget)
+    out, limit, tm = complete(engine, url, prompt, budget, samp)
     timings = [tm]
     capped = False
     if THINK_END not in out and limit:
         capped = True  # the thinking budget ran out: close it and ask for the answer
         out += "\n" + THINK_END + "\n\n"
-        more, limit, tm = complete(engine, url, prompt + out, answer_tokens)
+        more, limit, tm = complete(engine, url, prompt + out, answer_tokens, samp)
         out += more
         timings.append(tm)
     elif limit:
-        more, limit, tm = complete(engine, url, prompt + out, answer_tokens)  # the answer was cut: continue it
+        more, limit, tm = complete(engine, url, prompt + out, answer_tokens, samp)  # the answer was cut: continue it
         out += more
         timings.append(tm)
     thinking, _, answer = out.partition(THINK_END)
     return {"thinking": thinking, "answer": answer, "capped": capped, "answer_cut": limit,
             "predicted_n": sum(t["predicted_n"] for t in timings),
             "predicted_ms": sum(t["predicted_ms"] for t in timings),
+            "drafts": sum(t["drafts"] for t in timings), "accepted": sum(t["accepted"] for t in timings),
             "prompt_n": sum(t["prompt_n"] for t in timings), "prompt_ms": sum(t["prompt_ms"] for t in timings),
             "wall_s": round(time.time() - t0, 1)}
 
@@ -129,6 +138,11 @@ def main() -> None:
     ap.add_argument("--omph-env", default="", help="extra environment for omph-server, e.g. OMPH_KV_K4_LAYERS=none")
     ap.add_argument("--llama-server", default="")
     ap.add_argument("--spec", default="default", choices=["default", "dflash"])
+    ap.add_argument("--temp", type=float, default=0.0, help="0 is greedy (the default); >0 samples (#261)")
+    ap.add_argument("--top-k", type=int, default=20, help="with --temp > 0")
+    ap.add_argument("--top-p", type=float, default=0.95, help="with --temp > 0")
+    ap.add_argument("--min-p", type=float, default=0.0, help="with --temp > 0")
+    ap.add_argument("--seed", type=int, default=SEED, help="the sampled runs' seed")
     ap.add_argument("--drafter", default=str(ROOT / "models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"),
                     help="the DFlash2 drafter GGUF (omphalos reads the .omph next to it)")
     ap.add_argument("--kv", default="k8q4", choices=["k8q4", "k4q4"])
@@ -147,6 +161,9 @@ def main() -> None:
         with open(args.out) as f:
             done = {json.loads(line)["task_id"] for line in f}
     tokenize = f"{args.omph}/omph-tokenize"
+    samp: dict = {"temperature": args.temp, "seed": args.seed}
+    if args.temp > 0:
+        samp.update({"top_k": args.top_k, "top_p": args.top_p, "min_p": args.min_p})
     port = free_port()
     url = f"http://127.0.0.1:{port}"
     env = dict(os.environ)
@@ -175,11 +192,13 @@ def main() -> None:
             if pb["task_id"] in done:
                 continue
             prompt = render(tokenize, args.model, pb["prompt"])
-            res = solve(args.engine, url, prompt, args.think_budget, args.answer_tokens)
+            res = solve(args.engine, url, prompt, args.think_budget, args.answer_tokens, samp)
             code = extract(res["answer"])
             program = f"{pb['prompt']}\n\n{code}\n\n{pb['test']}\n\ncheck({pb['entry_point']})\n"
             ok, err = run_sandboxed(program, args.timeout)
             row = {"task_id": pb["task_id"], "engine": args.engine, "omph_env": args.omph_env, "passed": ok,
+                   "temperature": args.temp, "seed": args.seed, "drafts": res["drafts"],
+                   "accepted": res["accepted"],
                    "error": "" if ok else err, "capped": res["capped"], "answer_cut": res["answer_cut"],
                    "thinking_chars": len(res["thinking"]), "completion": code, "answer": res["answer"],
                    "thinking": res["thinking"],
@@ -201,9 +220,12 @@ def main() -> None:
     passed = sum(r["passed"] for r in rows)
     tok = sum(r["predicted_n"] for r in rows)
     ms = sum(r["predicted_ms"] for r in rows)
+    drafted = sum(r.get("drafts", 0) for r in rows)
+    accepted = sum(r.get("accepted", 0) for r in rows)
     print(f"{args.engine}: pass@1 {passed} / {n} = {100 * passed / max(n, 1):.1f} %, "
           f"{sum(r['capped'] for r in rows)} thinking capped, {sum(r['answer_cut'] for r in rows)} answers cut, "
-          f"{tok} tokens generated at {tok / ms * 1000 if ms else 0:.1f} t/s")
+          f"{tok} tokens generated at {tok / ms * 1000 if ms else 0:.1f} t/s, "
+          f"drafts accepted {accepted} / {drafted} = {100 * accepted / max(drafted, 1):.0f} %")
 
 
 if __name__ == "__main__":
