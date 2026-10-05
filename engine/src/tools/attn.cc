@@ -6,8 +6,8 @@
 //   in.f32: tokens x n_embd, row-major float32 (the layer's attn_norm input)
 //   --kv: the cache, as in omph-run (f32 = OMPH_KV_F32, q8q4 = default,
 //         q4q4 = OMPH_KV_K4); --window: the FP16 window of the quantized cache
-//         (128 as in omph-run; 0 makes every key go through the quantized
-//         blocks); --chunk: tokens per call (1 = the decode path, with the
+//         (512 as in omph-run since #318; 0 makes every key go through the
+//         quantized blocks); --chunk: tokens per call (1 = the decode path, with the
 //         split-K attention), all of them by default; --key-chunk N: keys per
 //         split, fixed (the runner's, #136/#161); -1 asks for the runner's own
 //         value for a KV capacity of --ctx positions (8192, the runner's
@@ -91,7 +91,7 @@ int main(int argc, char ** argv) {
     const int64_t tokens = std::atoll(argv[5]);
     bool trace = false;
     std::string kv_mode = "f32";
-    int64_t window = 128;
+    int64_t window = 512;  // the engine's default since #318
     int64_t chunk = 0;
     int64_t key_chunk = 0;    // 0: the kernel's own split; < 0: the engine's (#136)
     int64_t key_ctx = 8192;   // the KV capacity --key-chunk -1 mirrors (omph-run's default)

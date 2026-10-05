@@ -30,7 +30,7 @@ namespace {
 constexpr int64_t kNh = 24;
 constexpr int64_t kNkv = 4;
 constexpr int64_t kHd = 256;
-constexpr int64_t kWindow = 128;
+constexpr int64_t kWindow = 512;  // the engine's default since #318
 
 std::vector<int64_t> list(const char * s) {
     std::vector<int64_t> v;

@@ -6,7 +6,8 @@ usage: uv run python check_gpu_attn.py <model.gguf> <layer> [--kv f32|q8q4|q4q4]
 
 --kv f32 (default) checks every intermediate; with a quantized cache q and k are
 Hadamard-rotated, so only the gate, the attention output and the block output
-are compared. --window 0 sends every key through the quantized blocks;
+are compared. --window (512 since #318, the engine's default) sizes the FP16 ring, and 0 sends
+every key through the quantized blocks;
 --chunk 1 runs the decode path (one token per call, split-K attention).
 --key-chunk -1 (default) makes both comparisons use the runner's fixed key chunks
 (#136/#161) for a --ctx-position cache, as the engine does, instead of the
@@ -53,7 +54,9 @@ def main() -> None:
                          "0.15 with a quantized cache (its end-to-end KL is validated "
                          "separately, #58 / #61)")
     ap.add_argument("--kv", choices=("f32", "q8q4", "q4q4"), default="f32")
-    ap.add_argument("--window", type=int, default=128)
+    ap.add_argument("--window", type=int, default=512,
+                    help="the FP16 ring's slots (512: the engine's default since #318; 0: "
+                         "every key through the quantized blocks)")
     ap.add_argument("--chunk", type=int, default=0)
     ap.add_argument("--key-chunk", type=int, default=-1,
                     help="-1 (default): the runner's fixed key chunks, as the engine gives "

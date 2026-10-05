@@ -216,7 +216,8 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_SPEC_CHECK` | diagnostics | check every speculative rollback: the replay bit-exact against `gdn_step`, the FP16 ring restored (slow) |
 | `OMPH_TRACE_ALLOC` / `OMPH_TRACE_F16` / `OMPH_TRACE_STAGE` | diagnostics | f16-scratch allocations / matmuls falling back to the f16 path / f16 staging and cache hits |
 | `OMPH_KV_F32` | KV | exact f32 cache in VRAM (reference) |
-| `OMPH_KV_HOST` | KV | exact f32 cache in pinned host RAM (long-context reference) |
+| `OMPH_KV_HOST` | KV | exact f32 cache in pinned host RAM (long-context reference); each layer's cache is staged into VRAM, in a pair of buffers of its own when one fits (`OMPH_HOST_STAGE_MIB`), so a call uploads only the rows it adds: 49 vs 127 ms per step at 16k, 20 vs 24 ms/token speculating at 2.6k, bit-identical either way (#316/#318, `bench/results/host-kv-stage-316.txt`) |
+| `OMPH_HOST_STAGE_MIB=N` | KV | VRAM `OMPH_KV_HOST` may use for the per-layer staging pairs (0, the default: what is free once everything else is allocated, leaving 512 MiB; negative: the shared buffer only, the pre-#318 behaviour) |
 | `OMPH_KV_K4` | KV | K in V's Q4 format too (#81, experiment) |
 | `OMPH_KV_K4_LAYERS=i,j,...\|none` | KV | K4 on those attention layers (0-15), the rest Q8. Default: 2, 4, 5, 6, 7, 9, 11, 15, the least sensitive ones (#175, PLAN.md §13.5, `bench/results/k4-per-layer-175.txt`); `none`: K8 everywhere (the pre-#175 cache) |
 | `OMPH_KV_WINDOW=N` | KV | every query reads its last N keys exactly from an FP16 ring of N + 15 slots (default 128, 0 = off; #161) |

@@ -64,6 +64,10 @@ def main() -> None:
     ap.add_argument("--mmproj", default=str(ROOT / "models/mmproj-Qwen3.8-27B-BF16.gguf"))
     ap.add_argument("--image", required=True)
     ap.add_argument("--question", default="Describe this image in two sentences.")
+    ap.add_argument("--prefix", default="",
+                    help="a text file whose tokens precede the image: about 700 tokens put the "
+                         "image's positions across a prefill chunk boundary (512), which is where "
+                         "the M-RoPE slice per chunk is exercised (#318)")
     ap.add_argument("--dumper", default=str(HERE / "native/dump_mtmd_logits"))
     ap.add_argument("--omph", default=str(ROOT / "engine/build"))
     args = ap.parse_args()
@@ -73,8 +77,12 @@ def main() -> None:
         t = Path(tmp)
         results = {}
         for kind in ("text", "image"):
-            content = ([{"type": "image"}, {"type": "text", "text": args.question}] if kind == "image"
-                       else args.question)
+            prefix = Path(args.prefix).read_text() if args.prefix else ""
+            parts = ([{"type": "text", "text": prefix}] if prefix else [])
+            if kind == "image":
+                parts.append({"type": "image"})
+            parts.append({"type": "text", "text": args.question})
+            content = parts if len(parts) > 1 else args.question
             req = json.dumps({"messages": [{"role": "user", "content": content}],
                               "add_generation_prompt": True, "enable_thinking": False})
             img = ["--mmproj", args.mmproj, "--image", args.image] if kind == "image" else []
@@ -82,7 +90,7 @@ def main() -> None:
             (t / "force.ids").write_text(ids)
             # the same prompt for llama.cpp: mtmd adds the vision tags itself
             marker = "<__media__>" if kind == "image" else ""
-            (t / "prompt.txt").write_text(f"<|im_start|>user\n{marker}{args.question}<|im_end|>\n"
+            (t / "prompt.txt").write_text(f"<|im_start|>user\n{prefix}{marker}{args.question}<|im_end|>\n"
                                           "<|im_start|>assistant\n<think>\n\n</think>\n\n")
             run([args.dumper, args.model, args.mmproj, str(t / "prompt.txt"), str(t / "ref.f32"),
                  str(t / "ref.tok"), *([args.image] if kind == "image" else [])],

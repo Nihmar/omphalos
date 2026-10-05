@@ -1,0 +1,37 @@
+# #318: the FP16 window's size -- 128 (the default so far) against 256 and 512.
+# Engine 7c9f3fa (branch chore/318-review-followups), RX 9060 XT 16 GB, 2026-10-04.
+# KL(exact f32 KV in VRAM || test) over the last 512 positions (tools/compare_logits.py);
+# prompt = PLAN.md's text tokenized (26863 tokens), truncated with --tokens; the default
+# cache (K4 on the eight least sensitive layers, V Q4) unless noted. The ring's VRAM is
+# 2 * n_kv * (window + 15) * kv_out * 2 bytes = 8.6 / 16.9 / 34.5 MB at 128 / 256 / 512.
+#
+# 16384 tokens, the default mixed K4/K8:
+#   window   KL mean   median    p99       max       top-1
+#   128      0.003560  0.001390  0.032030  0.151215  97.85 %
+#   256      0.002548  0.001115  0.025535  0.044403  98.05 %
+#   512      0.001472  0.000548  0.010594  0.023748  98.83 %
+#
+# 16384 tokens, K8 everywhere (OMPH_KV_K4_LAYERS=none):
+#   128      0.001481  0.000644  0.008812  0.048886  98.63 %
+#   512      0.000512  0.000223  0.003223  0.008440  99.61 %
+#
+# 8192 tokens, the default mixed K4/K8:
+#   128      0.002056  0.000089  0.026460  0.094163  99.22 %
+#   256      0.001716  0.000058  0.015591  0.081377  99.41 %
+#   512      0.001173  0.000025  0.013705  0.093713  99.61 %
+#
+# Decode step, 16384 tokens, --gemv --generate 5 (last four steps, same session, fan reduced):
+#   128: 42.67 / 42.70 ms      512: 42.72 / 42.80 ms      (+0.1 %, under the run-to-run noise)
+# The step is 12.4 GB of weights against ~0.4 GB of KV: the window's extra f16 reads
+# (~25 MB/step at 512, 16k) are invisible, and the same holds for a prefill.
+#
+# Notes
+# - The window is the cheapest quality knob measured so far: at 16k, K4 mixed with window 512
+#   (0.001472) is as accurate as K8 everywhere with window 128 (0.001481) -- at +26 MB rather
+#   than the ~0.4 GB K8 costs at a 106k context (#175). Directly relevant to #297.
+# - The median is nearly exact at 512 (2.5e-5 at 8k) while `max` stays 0.02-0.09: the outliers
+#   are positions whose attention reaches far outside any window (the early ones), which is the
+#   "initial tokens in FP16" idea of PLAN.md 13.4 -- not implemented, and now with a number
+#   attached.
+# - The default is 512 after this measurement (runtime/options.hh): OMPH_KV_WINDOW=128 restores
+#   the old behaviour, and 0 keeps the pre-window cache (every key quantized) for the ablations.

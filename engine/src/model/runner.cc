@@ -192,6 +192,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         kv_v_ = mem_.host(bytes, "cannot allocate the host KV cache");
         alloc(&kv_stage_k_, (size_t) kvcap * attn_kv * 4);
         alloc(&kv_stage_v_, (size_t) kvcap * attn_kv * 4);
+        kv_stage_.assign((size_t) h_.n_layer, HostStage{});
     } else if (!kv_q8q4_) {
         alloc(&kv_k_, (size_t) n_kv * kvcap * attn_kv * 4);
         alloc(&kv_v_, (size_t) n_kv * kvcap * attn_kv * 4);
@@ -504,6 +505,51 @@ void Runner::watch_step_end() {
         slow_steps_ = 0;
         step_ref_ = 0.9 * step_ref_ + 0.1 * ms;
     }
+}
+
+// OMPH_KV_HOST's staging decision for one layer (#316). Called at a layer's first
+// attention, so every other buffer (weights, activations, scratch) is already
+// allocated and `hipMemGetInfo` says what is really free. One pair of buffers per
+// layer, holding its whole f32 cache: then a call uploads only the rows it adds.
+// A layer that does not get one keeps the shared buffers, which are refilled from
+// row 0 on every call -- correct, just slower (see layers.cc's comment).
+Runner::HostStage * Runner::host_stage(const int64_t il) {
+    if (!kv_host_ || il < 0 || (size_t) il >= kv_stage_.size()) {
+        return nullptr;
+    }
+    HostStage & s = kv_stage_[(size_t) il];
+    if (!s.tried) {
+        s.tried = true;
+        if (!kv_stage_budget_set_) {
+            kv_stage_budget_set_ = true;
+            if (env_.host_stage_mib < 0) {
+                kv_stage_budget_ = 0;  // staging off
+            } else {
+                size_t free_bytes = 0;
+                size_t total_bytes = 0;
+                if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+                    (void) hipGetLastError();
+                    free_bytes = 0;
+                }
+                const size_t margin = (size_t) 512 << 20;  // the lazily allocated buffers
+                const size_t fits = free_bytes > margin ? free_bytes - margin : 0;
+                const size_t want = (size_t) env_.host_stage_mib << 20;
+                kv_stage_budget_ = want > 0 ? std::min(want, fits) : fits;
+            }
+        }
+        const size_t bytes = (size_t) max_seq_ * h_.n_head_kv * h_.head_dim * 4;
+        if (bytes > 0 && kv_stage_budget_ >= 2 * bytes) {
+            // one allocation for both: a partial pair would be VRAM held until the
+            // runner dies (and the shared buffers still work)
+            void * pair = mem_.try_device(2 * bytes);
+            if (pair != nullptr) {
+                s.k = static_cast<float *>(pair);
+                s.v = static_cast<float *>(pair) + bytes / 4;
+                kv_stage_budget_ -= 2 * bytes;
+            }
+        }
+    }
+    return s.k != nullptr ? &s : nullptr;
 }
 
 bool Runner::reset_sequence() {
