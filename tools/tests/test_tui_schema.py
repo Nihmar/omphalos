@@ -8,7 +8,7 @@ from pathlib import Path
 from tui import profiles, schema
 
 SERVER_CC = Path(__file__).resolve().parents[2] / "engine/src/tools/server.cc"
-OPTIONS_HH = Path(__file__).resolve().parents[2] / "engine/src/runtime/options.hh"
+OPTIONS_CC = Path(__file__).resolve().parents[2] / "engine/src/runtime/options.cc"
 
 
 def test_every_flag_exists_in_the_server() -> None:
@@ -27,10 +27,19 @@ def test_every_server_flag_is_in_the_schema() -> None:
     assert parsed - known == set(), f"server flags missing from the TUI: {sorted(parsed - known)}"
 
 
-def test_every_env_exists_in_the_engine() -> None:
-    source = OPTIONS_HH.read_text()
+def test_every_env_is_classified_like_the_engine() -> None:
+    """A switch the engine reads with flag() (set = on, the value is ignored)
+    must be a bool in the TUI, and one read with getenv() must not be: typing
+    OMPH_KV_F32=0 and calling it "off" would turn it on (#328)."""
+    source = OPTIONS_CC.read_text()
+    flag_envs = set(re.findall(r'flag\("(OMPH_[A-Z0-9_]+)"\)', source))
+    value_envs = set(re.findall(r'getenv\("(OMPH_[A-Z0-9_]+)"\)', source))
+    assert flag_envs and value_envs, "the options parser changed shape; fix this test"
     for o in schema.ENVS:
-        assert o.name in source, f"{o.name} is in the TUI schema but not in runtime/options.hh"
+        assert o.name in flag_envs or o.name in value_envs, f"{o.name} is not read in options.cc"
+        assert not (o.name in flag_envs and o.name in value_envs), f"{o.name} is both a flag and a value"
+        assert (o.type == "bool") == (o.name in flag_envs), \
+            f"{o.name}: engine flag()={o.name in flag_envs}, schema type={o.type}"
 
 
 def test_command_of_the_defaults_is_minimal() -> None:
@@ -54,6 +63,22 @@ def test_include_defaults_shows_everything() -> None:
     env, argv = schema.build_command({**schema.defaults(), "model": "m.omph"}, include_defaults=True)
     assert "--ctx" in argv and "--top-k" in argv
     assert "OMPH_MTP_WINDOW" in env
+
+
+def test_include_defaults_never_writes_a_false_flag_env() -> None:
+    """#328: OMPH_OVERLAP=0 enables OMPH_OVERLAP (flag()), so a flag env must
+    only ever appear as "1"."""
+    source = OPTIONS_CC.read_text()
+    flag_envs = set(re.findall(r'flag\("(OMPH_[A-Z0-9_]+)"\)', source))
+    env, _ = schema.build_command({**schema.defaults(), "model": "m.omph"}, include_defaults=True)
+    for name in flag_envs:
+        assert name not in env, f"{name} is a flag env but the default command writes {name}={env[name]!r}"
+
+
+def test_a_flag_env_is_written_as_one() -> None:
+    env, _ = schema.build_command({**schema.defaults(), "model": "m.omph",
+                                   "kv_f32": True, "overlap": True})
+    assert env["OMPH_KV_F32"] == "1" and env["OMPH_OVERLAP"] == "1"
 
 
 def test_bools_and_empty_strings() -> None:

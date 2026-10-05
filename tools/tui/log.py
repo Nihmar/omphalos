@@ -42,7 +42,6 @@ FAILED = re.compile(r"^error: (?P<message>.*)$")
 class Event:
     kind: str                    # ready | request | progress | error | raw
     text: str                    # what the log pane shows
-    id: int | None = None        # the request id, assigned by the app
     fields: dict = field(default_factory=dict)
 
 
@@ -117,10 +116,14 @@ def _from_json(obj: dict) -> Event:
     if kind == "request_start":
         return Event("raw", f"start {obj.get('path', '')}", fields=dict(obj))
     if kind == "progress":
-        f = {"tokens": obj.get("tokens"), "tps": obj.get("t_s"), "last_tps": obj.get("t_s")}
+        tokens = obj.get("tokens")
+        tps = obj.get("t_s")
+        f = {"tokens": tokens, "tps": tps, "last_tps": tps}
         if obj.get("drafted"):
             f["accepted_pct"] = 100.0 * (obj.get("accepted") or 0) / obj["drafted"]
-        text = f"  {f['tokens']} tokens, {f['tps']:.1f} t/s"
+        text = f"  {tokens if tokens is not None else '?'} tokens"
+        if tps is not None:
+            text += f", {tps:.1f} t/s"
         if f.get("accepted_pct") is not None:
             text += f", drafts accepted {f['accepted_pct']:.0f} %"
         return Event("progress", text, fields=f)
