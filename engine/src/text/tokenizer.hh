@@ -23,6 +23,14 @@ public:
     // "<|im_start|>") become their ids; user-defined ones always do.
     std::vector<int32_t> encode(std::string_view text, bool parse_special = true) const;
 
+    // encode(), but a special token is recognized only where `allow` permits
+    // it, as bits: 1 = user-defined (#think), 2 = control, 3 = both, 0 = none.
+    // The chat template (#292) marks its structure both and the request's own
+    // text none, so one call tokenizes the joined text: the pre-tokenizer runs
+    // across the segment boundaries (#344), while no text can inject a token.
+    // `allow` may be shorter than `text`: the bytes past it allow nothing.
+    std::vector<int32_t> encode_masked(std::string_view text, const std::vector<uint8_t> & allow) const;
+
     // The bytes of the tokens, concatenated (they may end in the middle of a
     // UTF-8 sequence). Control tokens are written as their text when
     // `special`, else dropped.

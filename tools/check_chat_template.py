@@ -2,13 +2,19 @@
 rendered by jinja2 the way HF transformers renders it (#150): byte for byte, on a suite of
 requests, including the ones the template rejects.
 
-usage: uv run python check_chat_template.py <model.gguf>
+With a second argument (llama.cpp's llama-tokenize), the chat *ids* of the same rendering are
+compared too, for the requests whose own text holds no added-token string (#344: the engine keeps
+`<tool_response>` text, llama.cpp turns it into a token). This is what catches a pre-tokenizer cut
+at a segment boundary: "...does." + "\n" must tokenize like llama.cpp's one-pass rendering.
+
+usage: uv run python check_chat_template.py <model.gguf> [<llama-tokenize>]
 """
 
 import json
 import pathlib
 import subprocess
 import sys
+import tempfile
 
 import jinja2
 import jinja2.ext
@@ -103,10 +109,44 @@ def jinja_render(tpl: str, req: dict) -> str:
     return env.from_string(tpl).render(**req)
 
 
+def has_request_specials(req: dict) -> bool:
+    """Whether the request's own strings hold an added-token marker: those cases
+    are not id-compared (the engine keeps them text since #292, llama.cpp does
+    not, #344)."""
+    markers = ("<|", "|>", "<think>", "</think>", "<tool_call>", "</tool_call>",
+               "<tool_response>", "</tool_response>")
+
+    def strings(x):
+        if isinstance(x, str):
+            yield x
+        elif isinstance(x, dict):
+            for v in x.values():
+                yield from strings(v)
+        elif isinstance(x, list):
+            for v in x:
+                yield from strings(v)
+
+    return any(m in s for s in strings(req) for m in markers)
+
+
+def llama_ids(llama: str, model: str, text: str) -> list[int]:
+    with tempfile.NamedTemporaryFile("wb", suffix=".txt", delete=False) as f:
+        f.write(text.encode())
+        path = f.name
+    try:
+        p = subprocess.run([llama, "-m", model, "-f", path, "--ids", "--no-escape", "--log-disable"],
+                           capture_output=True, check=True)
+        return [int(t) for t in p.stdout.decode().strip().strip("[]").split(",") if t.strip()]
+    finally:
+        pathlib.Path(path).unlink()
+
+
 def main() -> int:
     model = sys.argv[1]
+    llama = sys.argv[2] if len(sys.argv) > 2 else None
     tpl = template(model)
     bad = 0
+    ids_checked = 0
     for name, req in CASES.items():
         try:
             ref = jinja_render(tpl, req)
@@ -123,7 +163,22 @@ def main() -> int:
             print(f"MISMATCH {name}:")
             print("  jinja :", repr(ref) if ref is not None else "error: " + ref_err)
             print("  engine:", repr(mine) if mine is not None else "error: " + p.stderr.decode().strip())
-    print(f"{len(CASES)} requests: {bad} mismatches")
+            continue
+        if llama is None or has_request_specials(req) or "<|image_pad|>" in ref or \
+                "<|video_pad|>" in ref or "<__media__>" in ref:
+            continue  # no ids comparison for these
+        ref_ids = llama_ids(llama, model, ref)
+        q = subprocess.run([str(ENGINE), model, "--chat-ids"], input=json.dumps(req).encode(),
+                           capture_output=True, check=False)
+        mine_ids = [int(x) for x in q.stdout.split()] if q.returncode == 0 else None
+        ids_checked += 1
+        if mine_ids != ref_ids:
+            bad += 1
+            print(f"IDS MISMATCH {name}: engine {len(mine_ids or [])} ids, llama.cpp {len(ref_ids)}")
+            if mine_ids is not None and len(mine_ids) == len(ref_ids):
+                first = next((i for i, (a, b) in enumerate(zip(mine_ids, ref_ids, strict=True)) if a != b), 0)
+                print(f"  first at {first}: engine {mine_ids[first:first + 6]}, llama {ref_ids[first:first + 6]}")
+    print(f"{len(CASES)} requests: {bad} mismatches ({ids_checked} id comparisons)")
     return 1 if bad else 0
 
 

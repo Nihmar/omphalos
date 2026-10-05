@@ -141,7 +141,8 @@ uv run python check_gpu_decode.py [--gemv]        # greedy decode vs the NumPy r
                                                   # (cached in models/golden/cpu; --refresh)
 uv run python check_tokenizer.py <model> <llama.cpp>/bin/llama-tokenize [--fuzz N]
                                                   # tokenizer vs llama.cpp, token for token
-uv run python check_chat_template.py <model>      # chat template vs jinja2, byte for byte
+uv run python check_chat_template.py <model>      # chat template vs jinja2, byte for byte; with a
+    # second argument (llama-tokenize) the chat ids of the same renderings too (#344)
 uv run python check_conversations.py [--spec mtp,dflash] [--image FILE]  # #179: back to a saved
                                                   # conversation: restored, not prefilled, same answer;
                                                   # #339 with --image: the text prefill while the CPU
@@ -257,7 +258,11 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 - A special-token string in *text* (a message, a tool result, a file) stays text since #292: the
   rendering is split into the template's structure (parsed for special tokens) and the request's own
   strings (not), and the server, `omph-generate` and `omph-tokenize --chat-ids` tokenize each part
-  with its own rule. Never join the two back into one string before tokenizing.
+  with its own rule. Never join the two back into one string before tokenizing. Since #344 the
+  tokenizer is called once on the joined text with a per-byte mask (structure: specials parsed;
+  request strings: none, user-defined added tokens included), so the pre-tokenizer is not cut at
+  the segment boundaries. Plain tokenization (`omph-tokenize` on text, `encode()`) keeps llama.cpp's
+  rule: a user-defined added token is parsed even with `--no-parse-special`, a control one is not.
 - Every performance claim comes with a measurement following PLAN.md §17 (fixed conditions, median of ≥5 runs, results in `bench/`).
 - "Done" means: tree builds, the CPU tests and CI pass, the relevant GPU checks of "Entry points" pass, results reported as measured — never claimed untested.
 - Keep each change scoped to its issue; keep refactors separate from features.

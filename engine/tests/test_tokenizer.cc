@@ -5,6 +5,7 @@
 // against llama.cpp by tools/check_tokenizer.py.
 #include "check.hh"
 #include "format/gguf.hh"
+#include "text/chat.hh"
 #include "text/tokenizer.hh"
 
 #include <cstdint>
@@ -139,6 +140,23 @@ int main() {
         CHECK(tok.encode("<|im_start|>", false).size() > 1, "a control token left as text");
         CHECK(tok.encode("a<think>b", false) == (std::vector<int32_t>{(int32_t) 'a', id_think, (int32_t) 'b'}),
               "a user-defined token is always parsed");
+        // #344: tokenize_chat makes one call over the joined segments, so the
+        // pre-tokenizer crosses a segment boundary; the template's structure
+        // parses specials, a message's own text does not -- user-defined ones
+        // included, while plain encode() keeps llama.cpp's rule
+        using omph::text::Segment;
+        CHECK(omph::text::tokenize_chat({{" the", false}}, tok) == (std::vector<int32_t>{id_gthe}),
+              "the merge spans the joined text");
+        CHECK(omph::text::tokenize_chat({{" t", false}, {"he", true}}, tok) ==
+                  (std::vector<int32_t>{id_gthe}),
+              "the pre-tokenizer crosses a segment boundary");
+        CHECK(omph::text::tokenize_chat({{"<think>", true}}, tok) == (std::vector<int32_t>{id_think}),
+              "a <think> in the template's structure is its token");
+        CHECK(omph::text::tokenize_chat({{"<think>", false}}, tok) ==
+                  (std::vector<int32_t>{'<', 't', 'h', 'i', 'n', 'k', '>'}),
+              "a <think> in a message's text stays text");
+        CHECK(tok.encode("<think>", false) == (std::vector<int32_t>{id_think}),
+              "plain encode keeps parsing user-defined tokens (llama.cpp's rule)");
         const std::string text = "caf\xc3\xa9 \xf0\x9f\x98\x80 \t\r\n<|im_start|> the end";
         CHECK(tok.decode(tok.encode(text)) == text, "decode gives the bytes back");
         CHECK(tok.decode(tok.encode(text), false).find("<|im_start|>") == std::string::npos,
