@@ -65,6 +65,35 @@ bool Generator::is_eog(const int32_t id) const {
     return std::find(eog_.begin(), eog_.end(), id) != eog_.end();
 }
 
+namespace {
+// One position of two sequences: the ids equal, and when they are negative (an
+// image's rows) the digests of that occurrence equal too (#363).
+bool token_equal(const std::vector<int32_t> & a, const std::vector<std::string> & ai, const size_t i,
+                 const std::vector<int32_t> & b, const std::vector<std::string> & bi) {
+    if (a[i] != b[i]) {
+        return false;
+    }
+    if (a[i] >= 0) {
+        return true;
+    }
+    const size_t idx = (size_t) (-1 - a[i]);
+    return idx < ai.size() && idx < bi.size() && ai[idx] == bi[idx];
+}
+
+bool prefix_equal(const std::vector<int32_t> & a, const std::vector<std::string> & ai,
+                  const std::vector<int32_t> & b, const std::vector<std::string> & bi, const size_t n) {
+    if (n > a.size() || n > b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (!token_equal(a, ai, i, b, bi)) {
+            return false;
+        }
+    }
+    return true;
+}
+} // namespace
+
 // Runs toks[from..] at positions from.. in prefill chunks; the last chunk's
 // logits row ends in last_logits. A chunk also ends at each of `cuts`, where
 // a checkpoint is saved.
@@ -100,7 +129,12 @@ bool Generator::feed(const Expanded & p, const GenerateRequest & req, const int6
         }
         if (cut) {
             const double t0 = omph::runtime::now_ms();
-            if (!save_checkpoint(toks, end)) return false;
+            // the prefix's image occurrences, for the checkpoint's digest table (#363)
+            std::vector<std::string> images;
+            for (size_t k = 0; k < p.images.size() && p.image_start[k] < end; ++k) {
+                images.push_back(p.images[k]);
+            }
+            if (!save_checkpoint(toks, end, std::move(images))) return false;
             res.checkpoint_ms += omph::runtime::now_ms() - t0;
         }
         if (req.on_prefill && !req.on_prefill(end - from, n - from)) {
@@ -112,9 +146,11 @@ bool Generator::feed(const Expanded & p, const GenerateRequest & req, const int6
 }
 
 // The cached sequence still holds the checkpoint's tokens: its KV positions
-// are the ones the checkpoint's state was computed with.
+// are the ones the checkpoint's state was computed with. The images of its
+// prefix are compared by digest, not only by their occurrence ids (#363).
 bool Generator::valid(const Checkpoint & c) const {
-    return c.tokens.size() <= seq_.size() && std::equal(c.tokens.begin(), c.tokens.end(), seq_.begin());
+    return c.tokens.size() <= seq_.size() &&
+           prefix_equal(c.tokens, c.images, seq_, seq_images_, c.tokens.size());
 }
 
 // Where to save checkpoints in toks[from..]: before <|im_start|> tokens (a
@@ -142,7 +178,8 @@ std::vector<int64_t> Generator::checkpoint_positions(const std::vector<int32_t> 
     return cuts;
 }
 
-bool Generator::save_checkpoint(const std::vector<int32_t> & toks, const int64_t pos) {
+bool Generator::save_checkpoint(const std::vector<int32_t> & toks, const int64_t pos,
+                                std::vector<std::string> images) {
     void * buf = nullptr;
     if (checkpoints_.size() >= max_checkpoints_) {  // the least recently used goes
         auto lru = std::min_element(checkpoints_.begin(), checkpoints_.end(),
@@ -164,7 +201,8 @@ bool Generator::save_checkpoint(const std::vector<int32_t> & toks, const int64_t
         spare_.push_back(buf);
         return false;
     }
-    checkpoints_.push_back({std::vector<int32_t>(toks.begin(), toks.begin() + pos), buf, ++clock_});
+    checkpoints_.push_back(
+        {std::vector<int32_t>(toks.begin(), toks.begin() + pos), buf, ++clock_, std::move(images)});
     return true;
 }
 
@@ -174,31 +212,27 @@ void Generator::drop_checkpoints(const bool all) {
     for (size_t i = checkpoints_.size(); i-- > 0;) {
         const Checkpoint & c = checkpoints_[i];
         const size_t m = std::min(c.tokens.size(), seq_.size());
-        if (all || !std::equal(c.tokens.begin(), c.tokens.begin() + m, seq_.begin())) {
+        if (all || !prefix_equal(c.tokens, c.images, seq_, seq_images_, m)) {
             spare_.push_back(c.host);
             checkpoints_.erase(checkpoints_.begin() + (std::ptrdiff_t) i);
         }
     }
 }
 
-namespace {
-bool prefix_of(const std::vector<int32_t> & a, const std::vector<int32_t> & b, const size_t n) {
-    return n <= a.size() && n <= b.size() && std::equal(a.begin(), a.begin() + (std::ptrdiff_t) n, b.begin());
-}
-} // namespace
-
 // Before a prompt that does not continue the cached sequence overwrites it:
 // that sequence to host RAM (#179), with its state at its end and at its valid
 // checkpoints, unless it is short or already saved. Saved conversations it
 // extends are merged into it (their points kept); the least recently used go
 // past the budget.
-void Generator::save_snapshot(const std::vector<int32_t> & prompt, GenerateResult & res) {
+void Generator::save_snapshot(const std::vector<int32_t> & prompt, const std::vector<std::string> & images,
+                              GenerateResult & res) {
     const int64_t n = (int64_t) seq_.size();
-    if (config_.kv_ram_mib <= 0 || n < kSnapshotMin || prefix_of(seq_, prompt, (size_t) n)) {
+    if (config_.kv_ram_mib <= 0 || n < kSnapshotMin || prefix_equal(seq_, seq_images_, prompt, images, (size_t) n)) {
         return;
     }
     for (Snapshot & s : snapshots_) {  // already saved at this point
-        if (prefix_of(seq_, s.tokens, (size_t) n) && std::count(s.points.begin(), s.points.end(), n) > 0) {
+        if (prefix_equal(seq_, seq_images_, s.tokens, s.images, (size_t) n) &&
+            std::count(s.points.begin(), s.points.end(), n) > 0) {
             s.used = ++clock_;
             return;
         }
@@ -220,7 +254,7 @@ void Generator::save_snapshot(const std::vector<int32_t> & prompt, GenerateResul
     std::vector<size_t> merged;
     for (size_t k = 0; k < snapshots_.size(); ++k) {
         const Snapshot & s = snapshots_[k];
-        if (!prefix_of(s.tokens, seq_, s.tokens.size())) continue;
+        if (!prefix_equal(s.tokens, s.images, seq_, seq_images_, s.tokens.size())) continue;
         merged.push_back(k);
         for (size_t q = 0; q < s.points.size(); ++q) {
             pts.push_back({s.points[q], static_cast<const uint8_t *>(s.host) + s.kv + q * cp});
@@ -238,7 +272,7 @@ void Generator::save_snapshot(const std::vector<int32_t> & prompt, GenerateResul
         (void) hipGetLastError();
         return;  // no pinned memory: the conversation will be prefilled again
     }
-    Snapshot snap{seq_, host, bytes, kv, {}, ++clock_};
+    Snapshot snap{seq_, host, bytes, kv, {}, ++clock_, seq_images_};
     bool ok = runner_->kv_prefix_save(host, n);
     for (size_t q = 0; q < pts.size() && ok; ++q) {
         void * dst = static_cast<uint8_t *>(host) + kv + q * cp;
@@ -275,10 +309,15 @@ void Generator::save_snapshot(const std::vector<int32_t> & prompt, GenerateResul
 
 // Brings the caches to the longest usable prefix of `prompt`: the cached
 // sequence when the prompt extends it, else the latest valid checkpoint
-// within their common prefix, else nothing. Returns its length.
-int64_t Generator::resume(const std::vector<int32_t> & prompt, GenerateResult & res) {
+// within their common prefix, else nothing. Returns its length. Prefixes with
+// images compare the digests of each occurrence (#363).
+int64_t Generator::resume(const std::vector<int32_t> & prompt, const std::vector<std::string> & images,
+                          GenerateResult & res) {
     size_t common = 0;
-    while (common < seq_.size() && common < prompt.size() && seq_[common] == prompt[common]) ++common;
+    while (common < seq_.size() && common < prompt.size() &&
+           token_equal(seq_, seq_images_, common, prompt, images)) {
+        ++common;
+    }
     // The caches already hold seq_ up to `common` for free when it is a prefix
     // of the prompt -- but that is not a reason to stop looking: prefill() fed
     // the text before an image while the CPU encoded it (#180), leaving seq_
@@ -305,7 +344,8 @@ int64_t Generator::resume(const std::vector<int32_t> & prompt, GenerateResult & 
     for (Snapshot & s : snapshots_) {
         for (size_t q = 0; q < s.points.size(); ++q) {
             const int64_t p = s.points[q];
-            if (p > reach && p < (int64_t) prompt.size() && prefix_of(s.tokens, prompt, (size_t) p)) {
+            if (p > reach && p < (int64_t) prompt.size() &&
+                prefix_equal(s.tokens, s.images, prompt, images, (size_t) p)) {
                 snap = &s;
                 at = q;
                 reach = p;
@@ -319,12 +359,15 @@ int64_t Generator::resume(const std::vector<int32_t> & prompt, GenerateResult & 
             !runner_->checkpoint_restore(static_cast<const uint8_t *>(snap->host) + snap->kv +
                                          at * runner_->checkpoint_bytes())) {
             seq_.clear();  // the KV may be half overwritten: start over
+            seq_images_.clear();
             return runner_->reset_sequence() ? 0 : -1;
         }
         res.checkpoint_ms += omph::runtime::now_ms() - t0;
         res.restored = true;
         snap->used = ++clock_;
         seq_.assign(snap->tokens.begin(), snap->tokens.begin() + reach);
+        // the whole table: entries past reach are unreferenced (#363)
+        seq_images_ = snap->images;
         return reach;
     }
     if (extends) {
@@ -338,10 +381,12 @@ int64_t Generator::resume(const std::vector<int32_t> & prompt, GenerateResult & 
             best->used = ++clock_;
             runner_->mtp_rewind((int64_t) best->tokens.size());
             seq_.resize(best->tokens.size());
+            seq_images_ = best->images;
             return (int64_t) seq_.size();
         }
     }
     seq_.clear();
+    seq_images_.clear();
     return runner_->reset_sequence() ? 0 : -1;
 }
 
@@ -369,7 +414,9 @@ bool Generator::expand(const std::vector<int32_t> & prompt, const GenerateReques
         if (im == nullptr || im->nx <= 0 || im->ny <= 0 || (int64_t) im->embd.size() != im->n_tokens() * ne) {
             return false;
         }
-        const int32_t id = im->placeholder_id();
+        const int32_t id = -1 - (int32_t) out.images.size();  // this occurrence's index (#363)
+        out.images.push_back(im->digest);
+        out.image_start.push_back((int64_t) out.tokens.size());
         for (int64_t i = 0; i < im->n_tokens(); ++i) {
             out.tokens.push_back(id);
             out.image_of.push_back(im);
@@ -386,7 +433,8 @@ bool Generator::expand(const std::vector<int32_t> & prompt, const GenerateReques
 }
 
 bool Generator::prefill(const std::vector<int32_t> & prefix) {
-    if (prefix.empty() || prefix_of(prefix, seq_, prefix.size())) return true;
+    static const std::vector<std::string> kNoImages;
+    if (prefix.empty() || prefix_equal(prefix, kNoImages, seq_, seq_images_, prefix.size())) return true;
     GenerateRequest req;
     req.max_tokens = 0;
     return generate(prefix, req, nullptr).stop != GenerateResult::Stop::Error;
@@ -404,6 +452,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt, const Ge
         return generate_inner(prompt, req, on_token);
     } catch (...) {
         seq_.clear();
+        seq_images_.clear();
         drop_checkpoints(true);
         runner_->abort_verification();
         (void) runner_->reset_sequence();  // the conv tails / delta-net / conv_flip_
@@ -429,8 +478,8 @@ GenerateResult Generator::generate_inner(const std::vector<int32_t> & prompt_ids
     rng_.seed(req.sampling.seed);
     runner_->draft_reset();  // a request's drafter starts over: the same seed, the same text (#340)
     const double t0 = omph::runtime::now_ms();
-    save_snapshot(prompt, res);
-    const int64_t from = resume(prompt, res);
+    save_snapshot(prompt, ex.images, res);
+    const int64_t from = resume(prompt, ex.images, res);
     runner_->mtp_prompt((int64_t) prompt.size());
     if (from < 0) {
         drop_checkpoints(true);
@@ -442,11 +491,13 @@ GenerateResult Generator::generate_inner(const std::vector<int32_t> & prompt_ids
     runner_->set_rope_delta(0);  // text-only prompts; with images every chunk has its positions
     if (!feed(ex, req, from, logits, checkpoint_positions(prompt, from), res)) {
         seq_.clear();
+        seq_images_.clear();
         drop_checkpoints(true);
         res.stop = GenerateResult::Stop::Error;
         return res;
     }
     seq_ = prompt;
+    seq_images_ = ex.images;
     drop_checkpoints(false);
     // generated tokens: RoPE position = cache position + delta (0 without images)
     runner_->set_rope_delta(ex.rope_end - (int64_t) prompt.size());
@@ -648,6 +699,7 @@ GenerateResult Generator::generate_inner(const std::vector<int32_t> & prompt_ids
     }
     if (res.stop == GenerateResult::Stop::Error) {
         seq_.clear();  // the caches are in an unknown state: start over next time
+        seq_images_.clear();
         drop_checkpoints(true);
     }
     res.decode_ms = omph::runtime::now_ms() - t1;

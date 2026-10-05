@@ -31,14 +31,32 @@ again from that early point.
 import argparse
 import base64
 import json
+import struct
 import subprocess
 import sys
+import tempfile
+import zlib
 from pathlib import Path
 
 from niah import free_port, post, wait_health
 from omph_model import omph_file
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def solid_png(size: int = 64, rgb: tuple[int, int, int] = (220, 40, 160)) -> bytes:
+    """A tiny solid-colour PNG: a second image whose bytes (and so digest) are
+    different from the one under --image, for the #363 case."""
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    raw = b"".join(b"\x00" + bytes(rgb) * size for _ in range(size))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw))
+            + chunk(b"IEND", b""))
 
 
 def chat_full(url: str, msgs: list, thinking: bool, max_tokens: int = 160) -> tuple[dict, int]:
@@ -77,6 +95,8 @@ def main() -> None:
     ap.add_argument("--mmproj", default=str(ROOT / "models/mmproj-Qwen3.8-27B-BF16.gguf"))
     ap.add_argument("--image", default=None,
                     help="also check an image conversation (#339), e.g. llama.cpp's tools/mtmd/test-1.jpeg")
+    ap.add_argument("--image2", default=None,
+                    help="a second, different image for the #363 case (default: a generated solid PNG)")
     args = ap.parse_args()
 
     text = Path(args.text).read_text()
@@ -182,6 +202,18 @@ def main() -> None:
         if not Path(args.mmproj).exists():
             sys.exit(f"--image needs the vision encoder: {args.mmproj} does not exist")
         url_data = "data:image/jpeg;base64," + base64.b64encode(image.read_bytes()).decode()
+        if args.image2 is not None:
+            second_bytes = Path(args.image2).read_bytes()
+        else:
+            # a generated solid PNG: different bytes, so a different digest
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                f.write(solid_png())
+                second_path = Path(f.name)
+            second_bytes = second_path.read_bytes()
+            second_path.unlink()
+        if second_bytes == image.read_bytes():
+            sys.exit("--image2 is the same file as --image: the #363 case needs a different digest")
+        second_data = "data:image/png;base64," + base64.b64encode(second_bytes).decode()
         # a long text before the image: the conversation must reach kSnapshotMin
         # (2048 tokens) to be saved at all, and `before` (the early prefill) must
         # be long enough that restoring a few more tokens is visibly different.
@@ -189,6 +221,10 @@ def main() -> None:
                  {"role": "user", "content": [
                      {"type": "image_url", "image_url": {"url": url_data}},
                      {"type": "text", "text": "In one sentence: what is in this image?"}]}]
+        second = [{"role": "system", "content": sys_a},
+                  {"role": "user", "content": [
+                      {"type": "image_url", "image_url": {"url": second_data}},
+                      {"type": "text", "text": "In one sentence: what is in this image?"}]}]
         q_year = "Which year is this about?"
 
         def ask(url: str, msgs: list) -> tuple[str, int, int]:
@@ -232,6 +268,41 @@ def main() -> None:
             if not ok:
                 failures.append(f"{tag} (image)")
                 print("   ref:", json.dumps(ref[:200]), "\n   got:", json.dumps(got[:200]))
+            # #363: a *different* image at the same position must not reuse the
+            # first one's KV (the digests are compared, not only the ids): the
+            # cold reference with image2 must be reproduced, and image2's rows
+            # prefilled (only the shared text before them is restored).
+            proc, url = server(spec, log, args.mmproj)
+            try:
+                ref_a2, _, _ = ask(url, second)
+                turn2 = second + [{"role": "assistant", "content": ref_a2},
+                                  {"role": "user", "content": q_year}]
+                ref_second, _, _ = ask(url, turn2)
+            finally:
+                proc.terminate()
+                proc.wait()
+            proc, url = server(spec, log, args.mmproj)
+            try:
+                ask(url, first)
+                chat(url, [{"role": "system", "content": sys_b}, {"role": "user", "content": q1}], False)
+                turn2 = second + [{"role": "assistant", "content": ref_a2},
+                                  {"role": "user", "content": q_year}]
+                got_second, cached_second, prompt_second = ask(url, turn2)
+            finally:
+                proc.terminate()
+                proc.wait()
+            fresh_second = prompt_second - cached_second
+            # the restore must stop before image2's rows: at least the image's
+            # place shorter than the image1 conversation's restore (with an id
+            # collision it would reach just as far)
+            ok = got_second == ref_second and cached_second + 256 <= cached
+            print(f"{'ok  ' if ok else 'FAIL'} {tag}: another image at the same position "
+                  f"{'identical' if got_second == ref_second else 'DIFFERS'} to the cold prefill, "
+                  f"{cached_second} prompt tokens resumed ({fresh_second} prefilled, "
+                  f"image1 restored {cached}, #363)", flush=True)
+            if not ok:
+                failures.append(f"{tag} (image2)")
+                print("   ref:", json.dumps(ref_second[:200]), "\n   got:", json.dumps(got_second[:200]))
     if failures:
         sys.exit(f"{len(failures)} failure(s)")
     print("all conversation checks passed")
