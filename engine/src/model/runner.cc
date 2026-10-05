@@ -1107,7 +1107,7 @@ void Runner::observe_draft(const int32_t * toks, const int64_t n) {
     }
 }
 
-bool Runner::commit(const int64_t accepted) {
+bool Runner::commit(const int64_t accepted, const int64_t drafts_accepted) {
     const int64_t T = verify_tokens_;
     if (T == 0 || accepted < 1 || accepted > T) {
         return fail("commit: no verification, or accepted out of range");
@@ -1115,6 +1115,9 @@ bool Runner::commit(const int64_t accepted) {
     if ((int64_t) last_toks_.size() >= accepted) {
         observe_draft(last_toks_.data(), accepted);  // the verified tokens kept
     }
+    // the drafts the model accepted, not the ones this run committed: an
+    // end-of-generation can stop the run before some of them are kept (#340)
+    const int64_t kept_drafts = drafts_accepted >= 0 ? drafts_accepted : accepted - 1;
     check_tokens_ = T;
     verify_tokens_ = 0;
     if (env_.spec_check && !check_replay()) {
@@ -1126,7 +1129,7 @@ bool Runner::commit(const int64_t accepted) {
                 std::swap(state_cur_[(size_t) il], state_alt_[(size_t) il]);
             }
         }
-        dflash_observe(accepted - 1);
+        dflash_observe(kept_drafts);
         return (!mtp_ || mtp_fill(accepted)) && dflash_inject(verify_pos0_, accepted);
     }
     const int64_t n_kh = h_.ssm_n_kh;
@@ -1191,7 +1194,7 @@ bool Runner::commit(const int64_t accepted) {
             }
         }
     }
-    dflash_observe(accepted - 1);
+    dflash_observe(kept_drafts);
     return (!mtp_ || mtp_fill(accepted)) && dflash_inject(verify_pos0_, accepted);
 }
 

@@ -74,7 +74,8 @@ void Runner::dflash_load() {
     if (dfl_ne_ != h_.n_embd || meta_i(f, "dflash.attention.head_count") != kHeads ||
         meta_i(f, "dflash.attention.head_count_kv") != kKvHeads || meta_i(f, "dflash.attention.key_length") != kHd ||
         meta_i(f, "dflash.conv_kernel_size") != 2 || meta_i(f, "dflash.selector_rank") != kRank ||
-        meta_i(f, "dflash.selector_top_k") != kTopK || block < 2 || block > 16 || dfl_swa_ <= 0 ||
+        meta_i(f, "dflash.selector_top_k") != kTopK || block < 2 || block > omph::kernels::kMaxBlock ||
+        dfl_swa_ <= 0 ||
         dfl_swa_ > 2048 || dfl_ne_ % dfl_group_ != 0) {
         throw std::runtime_error("drafter: unsupported shape (this engine runs Qwen3.8-27B-DFlash2)");
     }
@@ -240,6 +241,7 @@ bool Runner::dflash_draft(const int32_t token, const int64_t pos, const int64_t 
     const int64_t B = dfl_block_;
     int64_t n = std::min<int64_t>(k, B - 1);
     if (!dflash_on() || n <= 0) {
+        dfl_drafted_ = 0;  // nothing drafted: the keep rates see no step (#340)
         return dflash_on() || fail("drafter: not loaded");
     }
     // adaptive length: the positions still worth their verification
@@ -250,7 +252,6 @@ bool Runner::dflash_draft(const int32_t token, const int64_t pos, const int64_t 
         }
         n = m;
     }
-    dfl_drafted_ = n;
     const int64_t ne = dfl_ne_;
     std::vector<int32_t> toks((size_t) B, dfl_mask_);
     toks[0] = token;
@@ -269,10 +270,10 @@ bool Runner::dflash_draft(const int32_t token, const int64_t pos, const int64_t 
     // text stays inside them, as MTP's drafts (#217): the head's Q4_K tiles hold
     // those rows first, so one tile GEMV reads that fraction of the 682 MiB.
     const GemvEntry * hg = head_.gemv;
-    const int64_t nv = env_.draft_vocab > 0 && env_.draft_vocab < h_.n_vocab && env_.draft_vocab % 16 == 0 &&
-                               use_gemv_ && draft_oov_ < kDraftOovMax && hg != nullptr && hg->type == 12 &&
-                               hg->rows == h_.n_vocab
-                           ? env_.draft_vocab
+    const int64_t dv = draft_vocab_rows();  // OMPH_DRAFT_VOCAB in head tiles (#340)
+    const int64_t nv = dv > 0 && dv < h_.n_vocab && use_gemv_ && draft_oov_ < kDraftOovMax && hg != nullptr &&
+                               hg->type == 12 && hg->rows == h_.n_vocab
+                           ? dv
                            : h_.n_vocab;
     const void * hx = static_cast<const uint8_t *>(h16_) + ne * 2;
     if (!rms_norm(static_cast<const float *>(x_), dfl_out_norm_, static_cast<float *>(cur_), B, ne, dfl_eps_, 1.0f,
@@ -315,6 +316,9 @@ bool Runner::dflash_draft(const int32_t token, const int64_t pos, const int64_t 
         pred = best;
         drafts.push_back(ids[(size_t) (i * kTopK + pred)]);
     }
+    // What was really drafted, the OMPH_DFLASH_PMIN cut included: the previous
+    // step's count or the full n would record those positions as rejections (#340).
+    dfl_drafted_ = (int64_t) drafts.size();
     return true;
 }
 

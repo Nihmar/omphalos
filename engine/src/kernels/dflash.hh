@@ -9,6 +9,11 @@
 
 namespace omph::kernels {
 
+// The block attention runs at most this many query rows (kMaxQ = 4 query heads
+// per KV head, T <= 8): a drafter whose block_size does not fit is refused at
+// load (#340).
+constexpr int kMaxBlock = 8;
+
 // T rows of x (f32, row stride ld_x) into feat (f16, row stride ld_f) at
 // column col: one target layer's hidden states into the drafter's features.
 bool dflash_capture(const float * x, int64_t T, int64_t n, int64_t ld_x, __half * feat, int64_t ld_f, int64_t col,

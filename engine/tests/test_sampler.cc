@@ -112,7 +112,7 @@ void test_penalty_window() {
     s.repeat_penalty = 1.15f;
     s.presence_penalty = 0.2f;
     s.frequency_penalty = 0.05f;
-    s.penalty_last_n = 37;
+    s.penalty_last_n = 3;  // shorter than the drafts a step can accept (#340)
     const int64_t nv = 24;
     const std::vector<double> w = [] {
         std::vector<double> v(24);
@@ -147,10 +147,12 @@ void test_penalty_window() {
             pen.apply(got.data(), nv, s);
             again.apply(twin.data(), nv, s);
             // the row's window: the last `penalty_last_n - (r + 1)` tokens of
-            // the sequence, plus the r + 1 drafts accepted so far
+            // the sequence, plus the newest drafts (never more than
+            // penalty_last_n of them, #340)
             const int64_t keep = std::max<int64_t>(0, s.penalty_last_n - (r + 1));
             std::vector<int32_t> win(seq.end() - std::min<int64_t>(keep, (int64_t) seq.size()), seq.end());
-            win.insert(win.end(), extra.begin(), extra.begin() + r + 1);
+            const int64_t extras = std::min<int64_t>(r + 1, s.penalty_last_n);
+            win.insert(win.end(), extra.begin() + (r + 1 - extras), extra.begin() + (r + 1));
             penalties_ref(want.data(), nv, s, win);
             bool equal = got == twin;
             for (int64_t i = 0; i < nv && equal; ++i) {
@@ -162,6 +164,41 @@ void test_penalty_window() {
             }
         }
     }
+}
+
+// A step that accepted more drafts than the window holds must not grow the
+// window past penalty_last_n (#340): llama.cpp's sampler sees exactly the last
+// `penalty_last_n` tokens of the row's sequence.
+void test_penalty_window_overflow() {
+    Sampling s;
+    s.repeat_penalty = 1.5f;
+    s.presence_penalty = 0.25f;
+    s.frequency_penalty = 0.1f;
+    s.penalty_last_n = 2;
+    const int64_t nv = 12;
+    const std::vector<double> w = {1.0, 0.5, 2.0, 0.8, 0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.9, 1.1};
+    const std::vector<int32_t> seq = {5, 3, 1};       // longer than the window
+    const int32_t extras[5] = {7, 7, 2, 9, 2};        // accepted drafts of one step
+    omph::model::PenaltyWindow pen;
+    pen.reset(seq, s.penalty_last_n);
+    for (const int32_t e : extras) {
+        pen.next(seq, e);
+    }
+    std::vector<float> got = row_of(w, nv);
+    std::vector<float> want = got;
+    pen.apply(got.data(), nv, s);
+    // two tokens of window total: the newest two drafts, nothing of the sequence
+    penalties_ref(want.data(), nv, s, {extras[3], extras[4]});
+    bool equal = true;
+    for (int64_t i = 0; i < nv; ++i) {
+        equal = equal && got[i] == want[i];
+    }
+    CHECK(equal, "the window grew past penalty_last_n");
+    // the third-newest draft left the window: token 2 counted once (it is the
+    // newest) and token 7 is not in the window at all; the repeat penalty
+    // divides a positive logit, as llama.cpp does
+    CHECK(got[7] == (float) std::log(0.4), "a dropped draft is still penalized");
+    CHECK(std::fabs(got[2] - (float) (std::log(2.0) / 1.5 - 0.25 - 0.1)) < 1e-5f, "the newest draft: %f", got[2]);
 }
 
 void test_top_k() {
@@ -332,6 +369,7 @@ void test_top_p_zero() {
 int main() {
     test_penalties();
     test_penalty_window();
+    test_penalty_window_overflow();
     test_top_k();
     test_min_p();
     test_top_p();

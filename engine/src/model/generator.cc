@@ -389,6 +389,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
         return res;
     }
     rng_.seed(req.sampling.seed);
+    runner_->draft_reset();  // a request's drafter starts over: the same seed, the same text (#340)
     const double t0 = omph::runtime::now_ms();
     save_snapshot(prompt, res);
     const int64_t from = resume(prompt, res);
@@ -428,8 +429,10 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
     if (forcing && req.forced_logits != nullptr) {
         req.forced_logits->insert(req.forced_logits->end(), logits.begin(), logits.end());
     }
-    // a token decided: report it, and say whether to go on
-    const auto emit = [&](const int32_t t) {
+    // a token decided: report it, and say whether to go on. `at` is the
+    // position the token will occupy: an accepted draft is emitted before it is
+    // committed, so seq_.size() is not it (#340).
+    const auto emit = [&](const int32_t t, const int64_t at) {
         res.tokens.push_back(t);
         const bool cont = on_token ? on_token(t) : true;
         if (is_eog(t)) {
@@ -448,7 +451,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
             res.stop = GenerateResult::Stop::Length;
             return false;
         }
-        if ((int64_t) seq_.size() + 1 >= config_.context) {
+        if (at + 1 >= config_.context) {
             res.stop = GenerateResult::Stop::ContextFull;
             return false;
         }
@@ -458,7 +461,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
         res.stop = GenerateResult::Stop::Length;
         return res;
     }
-    bool go = emit(next);
+    bool go = emit(next, (int64_t) seq_.size());
     if (req.speculative && (config_.mtp || runner_->dflash_on()) && !forcing && speculate) {
         // Speculative decoding (#122, #124): draft k tokens with the MTP block (or DFlash2, #245),
         // verify [next, drafts] in one forward, keep the drafts the model
@@ -484,10 +487,16 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
         std::vector<int32_t> hist(seq_);
         while (go) {
             const int64_t pos = (int64_t) seq_.size();
-            const int64_t k = std::min<int64_t>(config_.draft_k, config_.context - pos - 1);
+            // Drafting past the token budget only verifies tokens nobody will
+            // read (#340): at most what the cap still allows, minus one for the
+            // step's own `after`.
+            const int64_t budget = std::max<int64_t>(0, req.max_tokens - (int64_t) res.tokens.size() - 1);
+            const int64_t k = std::min<int64_t>(config_.draft_k,
+                                                std::min(budget, config_.context - pos - 1));
             std::vector<int32_t> batch{next};
             std::vector<int32_t> drafts;
-            const int64_t kn = std::min<int64_t>(runner_->spec_max() - 1, config_.context - pos - 1);
+            const int64_t kn = std::min<int64_t>(std::min(runner_->spec_max() - 1, budget),
+                                                 config_.context - pos - 1);
             if (env_.ngram && kn > 0) {
                 hist.push_back(next);
                 ngram.propose(hist, kn, drafts);
@@ -557,13 +566,15 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
             // drafted after it would sit in the cached sequence, #160).
             int64_t keep = a + 1;
             for (int64_t j = 1; j <= a; ++j) {
-                if (!emit(batch[(size_t) j])) {
+                if (!emit(batch[(size_t) j], pos + j)) {
                     keep = j;
                     go = false;
                     break;
                 }
             }
-            if (!runner_->commit(keep)) {
+            // `a` drafts were verified accepted, even when the run stops before
+            // committing them all: the drafter's keep rates must see that (#340)
+            if (!runner_->commit(keep, a)) {
                 res.stop = GenerateResult::Stop::Error;
                 break;
             }
@@ -571,7 +582,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
             hist.insert(hist.end(), batch.begin(), batch.begin() + keep);
             if (go) {
                 next = after;
-                go = emit(next);
+                go = emit(next, (int64_t) seq_.size());
             }
         }
     } else {
@@ -594,7 +605,7 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt_ids, cons
             } else {
                 next = on_device >= 0 ? on_device : sample_row(step, req.sampling, seq_, rng_);
             }
-            go = emit(next);
+            go = emit(next, (int64_t) seq_.size());
         }
     }
     if (res.stop == GenerateResult::Stop::Error) {

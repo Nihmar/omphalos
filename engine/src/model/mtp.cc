@@ -157,10 +157,11 @@ bool Runner::mtp_block(const int32_t * toks, const float * h_in, const int64_t p
     // stays inside them (draft_oov_). Validation (logits) and the other head
     // types read it whole.
     const GemvEntry * hg = head_.gemv;
-    const int64_t nv = logits == nullptr && env_.draft_vocab > 0 && env_.draft_vocab < h_.n_vocab && use_gemv_ &&
+    const int64_t dv = draft_vocab_rows();  // OMPH_DRAFT_VOCAB in head tiles (#340)
+    const int64_t nv = logits == nullptr && dv > 0 && dv < h_.n_vocab && use_gemv_ &&
                                draft_oov_ < kDraftOovMax &&
                                hg != nullptr && hg->type == 12 && hg->rows == h_.n_vocab
-                           ? env_.draft_vocab
+                           ? dv
                            : h_.n_vocab;
     if (nv < h_.n_vocab
             ? !omph::kernels::gemv_q4k_prefix(head_.dev, h16_, static_cast<float *>(logits_), h_.n_vocab, nv, ne,

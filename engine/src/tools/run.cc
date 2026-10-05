@@ -171,7 +171,10 @@ int main(int argc, char ** argv) {
         // Long prompts run in chunks: the activation buffers are sized by the
         // chunk, the KV cache by the whole sequence. Without this, a 8k prompt
         // needs ~3 GB of activations on top of the weights and does not fit.
-        const int64_t total_len = (int64_t) toks.size() + generate + 8;
+        // The KV must hold the whole sequence, and the last verification reads
+        // 1 + draft_k tokens starting one before the last generated one (#340:
+        // the +8 used to fail for --draft-mtp 10 and above).
+        const int64_t total_len = (int64_t) toks.size() + generate + std::max<int64_t>(draft_k, 7) + 1;
         int64_t act_chunk = total_len < 512 ? total_len : 512;
         if (max_tokens > 0 && max_tokens < act_chunk) {
             act_chunk = max_tokens;
