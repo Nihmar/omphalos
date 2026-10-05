@@ -143,7 +143,10 @@ uv run python check_tokenizer.py <model> <llama.cpp>/bin/llama-tokenize [--fuzz 
                                                   # tokenizer vs llama.cpp, token for token
 uv run python check_chat_template.py <model>      # chat template vs jinja2, byte for byte
 uv run python check_conversations.py [--spec mtp,dflash]  # #179: back to a saved conversation:
-                                                  # restored, not prefilled, same answer;
+                                                  # restored, not prefilled, same answer
+uv run python check_warm_server.py [--mmproj FILE]  # #200: nothing leaks between requests: a warm
+    # server's answers (10 prompts, fresh-vs-warm, 2 shuffled orders, 4 configurations) and a
+    # canary sentence; needs one server start per prompt for the fresh references (~20 min);
                                                   # #286: a rewritten history (a compaction)
                                                   # resumed from the first checkpoint, against a
                                                   # cold prefill, plus a no-checkpoint control
