@@ -17,6 +17,13 @@ Generator::Generator(const Config & config, const omph::runtime::EnvOptions & en
     if (config_.chunk <= 0 || config_.context <= 0) {
         throw std::runtime_error("generator: chunk and context must be positive");
     }
+    if (std::min(config_.chunk, config_.context) < 16) {
+        // The n-gram drafts verify up to 16 tokens by default (#199): a smaller
+        // activation or KV would make enable_speculation below throw with an
+        // internal-sounding message (#343).
+        throw std::runtime_error("generator: the prefill chunk (and the context) must be at least 16 "
+                                 "tokens: a verification reads up to 16");
+    }
     file_ = std::make_unique<omph::gguf::File>(config_.model);
     tokenizer_ = std::make_unique<omph::text::Tokenizer>(*file_);
     // The decode configuration: repacked weights for the GEMVs, one logits

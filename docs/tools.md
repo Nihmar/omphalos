@@ -191,9 +191,10 @@ flag in the form exists in `engine/src/tools/server.cc`).
 omph-capi-demo <model.omph> [<mmproj.gguf> <image>]
 ```
 
-Exercises `include/omphalos.h` from plain C: engine load, tokenize, render a
-chat, generate with a token callback, and -- with an mmproj and an image -- one
-more turn about the image. No options.
+Exercises `include/omphalos.h` from plain C: engine load, tokenize, tokenize a
+chat request (`omph_chat_tokenize`, the #292 safe path), generate with a token
+callback, and -- with an mmproj and an image -- one more turn about the image.
+No options.
 
 ## omph-run
 

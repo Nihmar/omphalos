@@ -36,13 +36,15 @@ int omph_self_test(void);
  * One engine is used by one thread at a time. Functions return 0 (or a
  * count) on success and a negative OMPH_E* code on error; the message is
  * then in omph_engine_last_error(). Functions that fill a buffer return the
- * number of elements written, or -(needed) when `cap` is too small.
+ * number of elements written, or OMPH_E_SPACE with the needed element count
+ * in `*needed` (when `needed` is not NULL).
  */
 
 #define OMPH_E_ARG (-1)      /* bad argument */
 #define OMPH_E_LOAD (-2)     /* the model could not be loaded */
 #define OMPH_E_RUN (-3)      /* the GPU run failed */
 #define OMPH_E_TEMPLATE (-4) /* the chat request is invalid / rejected by the template */
+#define OMPH_E_SPACE (-5)    /* a buffer was too small; see the `needed` output */
 
 typedef struct omph_engine omph_engine;
 
@@ -68,15 +70,25 @@ void omph_engine_free(omph_engine * e);
 const char * omph_engine_last_error(const omph_engine * e);
 int64_t omph_engine_context(const omph_engine * e);
 
-/* text -> ids; parse_special: control tokens written in the text become ids */
+/* text -> ids; parse_special: control tokens written in the text become ids.
+ * For a chat request's own text use omph_chat_tokenize: this one parses
+ * special tokens everywhere, so untrusted text could inject them (#292). */
 int64_t omph_tokenize(omph_engine * e, const char * text, size_t len, int parse_special,
-                      int32_t * ids, size_t cap);
+                      int32_t * ids, size_t cap, size_t * needed);
 /* ids -> bytes (not NUL-terminated); special: write control tokens' text */
 int64_t omph_detokenize(omph_engine * e, const int32_t * ids, size_t n, int special, char * out,
-                        size_t cap);
+                        size_t cap, size_t * needed);
 /* a chat request (JSON: messages, tools, add_generation_prompt, enable_thinking,
- * reasoning_effort, ...) -> the prompt text (not NUL-terminated) */
-int64_t omph_chat_render(omph_engine * e, const char * request_json, char * out, size_t cap);
+ * reasoning_effort, ...) -> the prompt text (not NUL-terminated). The structure
+ * is tokenized with its special tokens parsed, the request's own strings are
+ * not: prefer omph_chat_tokenize, which is the #292 safe path. */
+int64_t omph_chat_render(omph_engine * e, const char * request_json, char * out, size_t cap,
+                         size_t * needed);
+/* a chat request -> its prompt ids, the #292 way: the template's structure is
+ * tokenized with special tokens parsed, a message's text without (a literal
+ * "<|im_end|>" in a message or a tool result stays text) */
+int64_t omph_chat_tokenize(omph_engine * e, const char * request_json, int32_t * ids, size_t cap,
+                           size_t * needed);
 
 typedef struct {
     int64_t max_tokens;   /* default 256 */
