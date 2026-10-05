@@ -1,6 +1,7 @@
 #include "text/tokenizer.hh"
 
 #include <algorithm>
+#include <queue>
 #include <stdexcept>
 
 #include "text/unicode_tables.hh"
@@ -252,41 +253,81 @@ int32_t Tokenizer::find(const std::string_view text) const {
 // lowest merge rank merged, the leftmost on ties, until none is in the merges
 // (llama.cpp's priority-queue order). A final symbol outside the vocabulary
 // falls back to its bytes' tokens.
+//
+// A doubly linked list of symbols and a heap of the adjacent pairs by rank
+// (#345): the pre-tokenizer hands a whole run of whitespace or punctuation as
+// one word, and rescanning every pair for the best rank after every merge was
+// O(n^2) (a 1 MB run took minutes).
 void Tokenizer::bpe(const std::string_view word, std::vector<int32_t> & out) const {
-    std::vector<std::string> sym;
-    sym.reserve(word.size());
-    for (const char ch : word) {
-        sym.push_back(byte_sym_[(uint8_t) ch]);
+    const size_t n = word.size();
+    if (n == 0) {
+        return;
     }
-    const auto rank = [&](const size_t k) {
-        const auto it = merge_rank_.find(sym[k] + " " + sym[k + 1]);
+    struct Node {
+        std::string s;
+        size_t prev = SIZE_MAX;
+        size_t next = SIZE_MAX;
+        bool dead = false;
+    };
+    std::vector<Node> nodes(n);
+    for (size_t k = 0; k < n; ++k) {
+        nodes[k].s = byte_sym_[(uint8_t) word[k]];
+        nodes[k].prev = k > 0 ? k - 1 : SIZE_MAX;
+        nodes[k].next = k + 1 < n ? k + 1 : SIZE_MAX;
+    }
+    const auto rank_of = [&](const size_t k) {
+        const size_t j = nodes[k].next;
+        if (j == SIZE_MAX) {
+            return INT32_MAX;
+        }
+        const auto it = merge_rank_.find(nodes[k].s + " " + nodes[j].s);
         return it == merge_rank_.end() ? INT32_MAX : it->second;
     };
-    std::vector<int32_t> ranks(sym.size() > 1 ? sym.size() - 1 : 0);
-    for (size_t k = 0; k + 1 < sym.size(); ++k) {
-        ranks[k] = rank(k);
+    struct Item {
+        int32_t rank;
+        size_t left;
+    };
+    const auto later = [](const Item & a, const Item & b) {
+        // the heap's top: the lowest rank, the leftmost pair on a tie
+        return a.rank != b.rank ? a.rank > b.rank : a.left > b.left;
+    };
+    std::priority_queue<Item, std::vector<Item>, decltype(later)> heap(later);
+    for (size_t k = 0; k + 1 < n; ++k) {
+        const int32_t r = rank_of(k);
+        if (r != INT32_MAX) {
+            heap.push({r, k});
+        }
     }
-    while (!ranks.empty()) {
-        size_t best = 0;
-        for (size_t k = 1; k < ranks.size(); ++k) {
-            if (ranks[k] < ranks[best]) {
-                best = k;
+    while (!heap.empty()) {
+        const Item top = heap.top();
+        heap.pop();
+        Node & left = nodes[top.left];
+        if (left.dead || left.next == SIZE_MAX || rank_of(top.left) != top.rank) {
+            continue;  // stale: the pair is gone, or its rank changed
+        }
+        const size_t right = left.next;
+        left.s += nodes[right].s;
+        nodes[right].dead = true;
+        left.next = nodes[right].next;
+        if (left.next != SIZE_MAX) {
+            nodes[left.next].prev = top.left;
+        }
+        if (left.prev != SIZE_MAX) {
+            const int32_t r = rank_of(left.prev);
+            if (r != INT32_MAX) {
+                heap.push({r, left.prev});
             }
         }
-        if (ranks[best] == INT32_MAX) {
-            break;
-        }
-        sym[best] += sym[best + 1];
-        sym.erase(sym.begin() + (std::ptrdiff_t) best + 1);
-        ranks.erase(ranks.begin() + (std::ptrdiff_t) best);
-        if (best + 1 < sym.size()) {
-            ranks[best] = rank(best);
-        }
-        if (best > 0) {
-            ranks[best - 1] = rank(best - 1);
+        const int32_t r = rank_of(top.left);
+        if (r != INT32_MAX) {
+            heap.push({r, top.left});
         }
     }
-    for (const std::string & s : sym) {
+    for (const Node & node : nodes) {
+        if (node.dead) {
+            continue;
+        }
+        const std::string & s = node.s;
         const auto it = ids_.find(s);
         if (it != ids_.end()) {
             out.push_back(it->second);

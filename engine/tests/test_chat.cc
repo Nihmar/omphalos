@@ -6,6 +6,7 @@
 #include "text/chat.hh"
 #include "text/json.hh"
 
+#include <chrono>
 #include <clocale>
 #include <cstdio>
 #include <stdexcept>
@@ -36,7 +37,30 @@ int main() {
     CHECK(roundtrip("[2.5, 1e16, 1.5e-05, 0.0001, 100.0, 1e-07, -0.5, 123456789]") ==
               "[2.5, 1e+16, 1.5e-05, 0.0001, 100.0, 1e-07, -0.5, 123456789]",
           "Python float repr");
-    CHECK(roundtrip(R"("😀\/")") == "\"\xf0\x9f\x98\x80/\"", "surrogate pair, escaped slash");
+    CHECK(roundtrip(R"("😀\/")") == "\"\xf0\x9f\x98\x80/\"", "a literal emoji, escaped slash");
+    CHECK(roundtrip(R"("\ud83d\ude00\/")") == "\"\xf0\x9f\x98\x80/\"", "an escaped surrogate pair");
+    // a lone surrogate stays the code unit (invalid UTF-8, as json.loads'
+    // surrogatepass would); a response sanitizes it at its boundary (#338)
+    CHECK(roundtrip(R"("\ud800")") == "\"\xed\xa0\x80\"", "a lone high surrogate");
+    // integer literals stay exact beyond 2^53 (#345)
+    CHECK(roundtrip("[9007199254740993, -9223372036854775808, 9223372036854775807]") ==
+              "[9007199254740993, -9223372036854775808, 9223372036854775807]",
+          "int64 literals, 2^53 and beyond");
+    // a body with many keys parses in linear time (#345: one linear set() per member)
+    {
+        std::string big = "{";
+        for (int k = 0; k < 50000; ++k) {
+            if (k) big += ",";
+            big += "\"k" + std::to_string(k) + "\":" + std::to_string(k);
+        }
+        big += "}";
+        const auto t0 = std::chrono::steady_clock::now();
+        const Json parsed = Json::parse(big);
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        CHECK(parsed.size() == 50000 && parsed.get("k49999").as_int64() == 49999, "a large object");
+        CHECK(ms < 1000.0, "50000 keys in %.1f ms", ms);
+    }
     CHECK(roundtrip(R"({"k":1,"k":2})") == "{\"k\": 2}", "a duplicate key: the last value wins");
     CHECK(roundtrip(" { } ") == "{}" && roundtrip("[]") == "[]", "empty containers");
     CHECK(throws("{\"a\":}") && throws("[1,]") && throws("\"x") && throws("1 2") && throws("tru"),
