@@ -1,0 +1,53 @@
+# #255: the remaining launch-count items, measured. The swiglu fusion in the down
+# GEMV is bit-identical and much slower -- a trap the issue's list does not warn
+# about. Engine 376ac09 (main), RX 9060 XT 16 GB, 2026-10-05.
+#
+# Launches per step today (rocprofv3 --kernel-trace, the difference between an
+# 8-step and a 4-step run of omph-run --gemv, golden prompt), plain decode:
+#   GEMV            258   (one grouped launch per projection, ~4 per layer)
+#   add_rms_norm    129   (~2 per layer)
+#   swiglu           64   (1 per layer)
+#   delta-net        48   (1 per GDN layer)
+#   attention        48   (prep / dec-or-merge / merge per attention layer)
+#   ----------------------------------------------------------------
+#   total           553   (713 before #255's first two items)
+#
+# What #255 already removed (bench/results/group-all-nt-255.txt): the sibling GEMV
+# groups at 1..16 tokens (148 launches, -1.6..-1.8 % end to end, both bit-identical)
+# and the rollback (gdn_replay + gdn_conv_select over all layers in one kernel,
+# 96 launches -> 1).
+#
+# Remaining item measured here: "swiglu into the down GEMV's x loads" (64 launches).
+#
+# Implementation tried: `tiles_body` (the WMMA tile GEMV body) computes the swiglu
+# from the f32 gate/up projections in place of loading the f16 activation that
+# swiglu_f16 wrote, in a new tile entry (`gemv_tiles_swiglu`) and `matmul_swiglu`,
+# wired into the FFN's decode path, with OMPH_NO_SWIGLU_GEMV as the A/B switch.
+#
+# Correctness: perfect. The decode logits are bit-identical (`cmp`, the same forced
+# tokens) and the MTP and DFlash2 runs produce identical tokens; the launch count
+# drops from 553 to 489 per step (the swiglu kernels are 0).
+#
+# Speed: -46..-55 %, i.e. it is 20-22 ms/step *slower*.
+#   plain (128 steps, median step gpu):     41.1  -> 63.5 ms
+#   MTP --draft-mtp 3 (128 tokens):         22.4  -> 32.8 ms/token
+#   DFlash2 --dflash (128 tokens):          21.2  -> 31.0 ms/token
+#   (3 alternating runs for plain, 2 for the others; the spread inside a
+#   configuration is 0.01-0.4 ms, so the difference is the change, not noise)
+#
+# Why: the tile body reads its B operand per (k-block, sub-block, group-of-8) in
+# the inner loop, and every lane of a 2-row-half computes that operand itself --
+# so the same activation element is turned into a swiglu 16..64 times (per lane
+# half, per output tile, per k-split) instead of once for all of them. The
+# separate swiglu_f16 kernel computes each of the 17408 elements exactly once with
+# the whole grid in parallel: 64 launches/step, ~0.1 ms total. The launch it saves
+# is worth ~0.35 ms; making the fusion pay would need the activation staged (and
+# the swiglu computed once) into LDS first, which does not fit beside the tiles.
+#
+# Conclusion for the three items the issue lists as left: the swiglu one is a trap
+# as stated (bit-identical, correct, much slower); the other two are worth <1 % of
+# a step each (the norms need a whole hidden row to normalize, which no row-sliced
+# GEMV tile has -- so fusing them into the producing projection means a grid-wide
+# reduction, not an epilogue; the delta-net verification's 96 launches are the
+# largest of the three and the most delicate code to touch). Measured, all three
+# are dwarfed by what #255's first two items already took.
