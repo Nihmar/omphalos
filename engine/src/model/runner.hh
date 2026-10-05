@@ -533,7 +533,7 @@ private:
     void * kv_vs_ = nullptr;
     void * kv_k16_ = nullptr;
     void * kv_v16_ = nullptr;
-    int64_t kv_window_ = 0;  // Q8/Q4 mode: 128 unless OMPH_KV_WINDOW says otherwise
+    int64_t kv_window_ = 0;  // Q8/Q4 mode: 512 unless OMPH_KV_WINDOW says otherwise
     int64_t kv_ring_ = 0;    // the FP16 ring's slots: window + kKvRingExtra (#161)
     bool kv_q8q4_ = false;
     // K stored as Q4 per attention layer (#81, #175), and each layer's offset
@@ -572,6 +572,9 @@ private:
     bool kv_stage_budget_set_ = false;
     // The layer's own staging, or null to go through the shared buffers.
     HostStage * host_stage(int64_t il);
+    // The shared pair, allocated at the first layer that has no pair of its
+    // own (#342); returns its K half (the V half follows at `bytes`).
+    void * kv_shared_stage(size_t bytes);
     void * dev_weights_ = nullptr;
     void * x_ = nullptr;
     void * cur_ = nullptr;

@@ -28,7 +28,8 @@ struct EnvOptions {
     uint64_t kv_k4_layers = kDefaultK4Layers;
     // OMPH_KV_WINDOW=N: the FP16 ring holds the last N tokens (0 = off). 512 since
     // #318: at 16k it halves the mixed K4/K8 cache's KL against the exact f32 one
-    // (0.00356 -> 0.00147 mean, top-1 97.9 -> 98.8 %) for ~26 MB of VRAM and no
+    // (0.00356 -> 0.00147 mean, top-1 97.9 -> 98.8 %) for ~25 MiB of VRAM (the
+    // ring alone: the speculation backup holds spec_max rows since #342) and no
     // measurable step time (bench/results/fp16-window-318.txt); 256 and 128 are the
     // points below it, OMPH_KV_WINDOW=128 the pre-#318 behaviour.
     int64_t kv_window = 512;

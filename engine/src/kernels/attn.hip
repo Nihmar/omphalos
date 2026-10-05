@@ -1228,15 +1228,22 @@ int gqa_splits(const int64_t tokens, const int64_t seq, const int64_t nkv,
 
 namespace {
 
-// grid: (count, layers, 2 = k / v); a block copies one ring row.
+// grid: (count, layers, 2 = k / v); a block copies one row, from the source
+// slot (src_first + i) % src_ring to the destination slot
+// (dst_first + i) % dst_ring. The two rings differ for the speculation backup:
+// the source is the real ring, the destination a compact spec_max-row buffer
+// (#342).
 __global__ void kv_ring_copy_kernel(const uint4 * __restrict__ src_k, const uint4 * __restrict__ src_v,
                                     uint4 * __restrict__ dst_k, uint4 * __restrict__ dst_v,
-                                    const long long ring, const long long row_vec,
-                                    const long long pos_first) {
-    const long long slot = (pos_first + blockIdx.x) % ring;
-    const long long off = ((long long) blockIdx.y * ring + slot) * row_vec;
-    const uint4 * src = (blockIdx.z == 0 ? src_k : src_v) + off;
-    uint4 * dst = (blockIdx.z == 0 ? dst_k : dst_v) + off;
+                                    const long long src_ring, const long long src_first,
+                                    const long long dst_ring, const long long dst_first,
+                                    const long long row_vec) {
+    const long long s = (src_first + blockIdx.x) % src_ring;
+    const long long d = (dst_first + blockIdx.x) % dst_ring;
+    const uint4 * src = (blockIdx.z == 0 ? src_k : src_v) +
+                        ((long long) blockIdx.y * src_ring + s) * row_vec;
+    uint4 * dst = (blockIdx.z == 0 ? dst_k : dst_v) +
+                  ((long long) blockIdx.y * dst_ring + d) * row_vec;
     for (long long i = threadIdx.x; i < row_vec; i += blockDim.x) {
         dst[i] = src[i];
     }
@@ -1245,11 +1252,12 @@ __global__ void kv_ring_copy_kernel(const uint4 * __restrict__ src_k, const uint
 } // namespace
 
 bool kv_ring_copy(const void * src_k, const void * src_v, void * dst_k, void * dst_v,
-                  const int64_t layers, const int64_t ring, const int64_t row_bytes,
-                  const int64_t pos_first, const int64_t count, hipStream_t stream) {
+                  const int64_t layers, const int64_t src_ring, const int64_t src_first,
+                  const int64_t dst_ring, const int64_t dst_first, const int64_t row_bytes,
+                  const int64_t count, hipStream_t stream) {
     if (src_k == nullptr || src_v == nullptr || dst_k == nullptr || dst_v == nullptr ||
-        layers <= 0 || ring <= 0 || row_bytes <= 0 || row_bytes % 16 != 0 || pos_first < 0 ||
-        count < 0 || count > ring) {
+        layers <= 0 || src_ring <= 0 || dst_ring <= 0 || row_bytes <= 0 || row_bytes % 16 != 0 ||
+        src_first < 0 || dst_first < 0 || count < 0 || count > src_ring || count > dst_ring) {
         return false;
     }
     if (count == 0) {
@@ -1258,8 +1266,9 @@ bool kv_ring_copy(const void * src_k, const void * src_v, void * dst_k, void * d
     const dim3 grid((unsigned) count, (unsigned) layers, 2);
     kv_ring_copy_kernel<<<grid, 128, 0, stream>>>(
         static_cast<const uint4 *>(src_k), static_cast<const uint4 *>(src_v),
-        static_cast<uint4 *>(dst_k), static_cast<uint4 *>(dst_v), (long long) ring,
-        (long long) (row_bytes / 16), (long long) pos_first);
+        static_cast<uint4 *>(dst_k), static_cast<uint4 *>(dst_v), (long long) src_ring,
+        (long long) src_first, (long long) dst_ring, (long long) dst_first,
+        (long long) (row_bytes / 16));
     return hipGetLastError() == hipSuccess;
 }
 

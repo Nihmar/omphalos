@@ -35,3 +35,8 @@
 #   attached.
 # - The default is 512 after this measurement (runtime/options.hh): OMPH_KV_WINDOW=128 restores
 #   the old behaviour, and 0 keeps the pre-window cache (every key quantized) for the ablations.
+# - Correction (#342): the "+26 MB" of the window-512 row counted the ring alone. The
+#   server always speculates, and the speculation kept a full-ring-sized backup of the
+#   FP16 ring: at window 512 that was another 34.5 MB, so the real cost of 512 over 128
+#   was ~48 MiB, not 26 MB. Since #342 the backup holds spec_max (16) rows -- ~1 MiB
+#   whatever the window -- and the window's marginal cost is back to ~25 MiB.
