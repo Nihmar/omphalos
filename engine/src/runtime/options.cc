@@ -15,6 +15,9 @@ bool flag(const char * name) { return std::getenv(name) != nullptr; }
 EnvOptions EnvOptions::from_env() {
     EnvOptions o;
     o.kv_host = flag("OMPH_KV_HOST");
+    if (const char * m = std::getenv("OMPH_HOST_STAGE_MIB")) {
+        o.host_stage_mib = std::atoll(m) < 0 ? -1 : std::atoll(m);
+    }
     o.kv_f32 = flag("OMPH_KV_F32");
     o.kv_k4 = flag("OMPH_KV_K4");
     if (const char * l = std::getenv("OMPH_KV_K4_LAYERS")) {

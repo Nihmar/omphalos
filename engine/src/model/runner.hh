@@ -247,6 +247,7 @@ private:
         bool k_q4 = false;
         float * k_f32 = nullptr;
         float * v_f32 = nullptr;
+        int64_t layer = -1;  // the stack's layer (OMPH_KV_HOST staging), -1: the MTP block
     };
     KvView kv_view(int64_t il) const;
 
@@ -533,6 +534,23 @@ private:
     void * attn_work_ = nullptr;  // split-K partials of attention_gqa
     size_t attn_work_bytes_ = 0;
     void * kv_stage_v_ = nullptr;
+    // OMPH_KV_HOST's per-layer staging (#316): one f32 copy of a layer's K and V,
+    // so a call uploads only the rows it adds. The shared pair above is refilled
+    // from row 0 for every layer of every call, because the layers overwrite each
+    // other's rows -- 8 KiB per token per layer of PCIe traffic per call. A layer
+    // gets one when a --ctx-sized pair fits in what is free after everything else
+    // is allocated (host_stage decides, at the first call of that layer).
+    struct HostStage {
+        float * k = nullptr;
+        float * v = nullptr;
+        int64_t rows = 0;    // rows [0, rows) hold this layer's cache as staged
+        bool tried = false;
+    };
+    std::vector<HostStage> kv_stage_;
+    size_t kv_stage_budget_ = 0;
+    bool kv_stage_budget_set_ = false;
+    // The layer's own staging, or null to go through the shared buffers.
+    HostStage * host_stage(int64_t il);
     void * dev_weights_ = nullptr;
     void * x_ = nullptr;
     void * cur_ = nullptr;

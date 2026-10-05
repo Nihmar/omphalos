@@ -34,6 +34,7 @@ Runner::KvView Runner::kv_view(const int64_t il) const {
         return v;
     }
     const int64_t kv_out = h_.n_head_kv * h_.head_dim;
+    v.layer = il;
     v.quant = kv_q8q4_;
     if (kv_q8q4_) {
         v.q = quant_kv(il);
@@ -309,23 +310,49 @@ bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T
         return false;
     }
     if (kv_host_) {
-        // The whole prefix, on every call, for this layer: the staging buffer is
-        // shared by the attention layers, so the rows the previous layer left in
-        // it are not this layer's -- a per-layer row counter cannot tell what is
-        // already staged (tried and caught by the bit check in #315). Uploading
-        // only what a call adds needs either per-layer staging buffers (VRAM:
-        // ~0.8 GB per layer at 98k, so only up to ~16k fits) or a key offset in
-        // attention_gqa, staging the keys in pieces and accumulating the splits.
-        // As it is, the cost is 8 KiB of host-to-device traffic per token per
-        // layer: measured 55 vs 42 ms per step at 2.6k tokens, i.e. ~12 ms of
-        // PCIe against 42 ms of GPU, growing with the context (#315).
-        const size_t bytes = (size_t) (pos0 + T) * kv_out * 4;
-        if (hipMemcpy(kv_stage_k_, k_cache, bytes, hipMemcpyHostToDevice) != hipSuccess ||
-            hipMemcpy(kv_stage_v_, v_cache, bytes, hipMemcpyHostToDevice) != hipSuccess) {
-            return false;
+        // The layer's own staging when it has one (#316): only the rows this call
+        // adds are uploaded. Between two calls of this layer nothing else writes
+        // its rows (the other layers have their own caches), except this call's
+        // own [pos0, pos0 + T) -- so a pos0 below what is staged means the
+        // sequence was rewound (a rejected draft, a checkpoint) and those rows
+        // were just rewritten over the garbage a rollback leaves: re-upload from
+        // pos0, not from 0. Everything below pos0 is unchanged.
+        if (Runner::HostStage * st = host_stage(kv_in.layer); st != nullptr) {
+            const int64_t want = pos0 + T;
+            if (pos0 < st->rows) {
+                st->rows = pos0;
+            }
+            if (st->rows < want) {
+                const size_t from = (size_t) st->rows * kv_out * 4;
+                const size_t bytes = (size_t) (want - st->rows) * kv_out * 4;
+                if (hipMemcpy(static_cast<uint8_t *>(static_cast<void *>(st->k)) + from,
+                              k_cache + st->rows * kv_out, bytes, hipMemcpyHostToDevice) != hipSuccess ||
+                    hipMemcpy(static_cast<uint8_t *>(static_cast<void *>(st->v)) + from,
+                              v_cache + st->rows * kv_out, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+                    return false;
+                }
+                st->rows = want;
+            }
+            k_cache = st->k;
+            v_cache = st->v;
+        } else {
+            // No staging of its own: the whole prefix, on every call, for this
+            // layer. The shared buffer cannot be kept across calls, because the
+            // other layers overwrite its rows with theirs (a per-layer row
+            // counter cannot tell what is already staged: tried and caught by the
+            // bit check in #315). That costs 8 KiB of host-to-device traffic per
+            // token per layer: measured 55 vs 42 ms per step at 2.6k tokens, i.e.
+            // ~12 ms of PCIe against 42 ms of GPU, growing with the context.
+            // Final fix when the pairs do not fit: a key offset in attention_gqa,
+            // staging the keys in pieces and accumulating the splits (#316).
+            const size_t bytes = (size_t) (pos0 + T) * kv_out * 4;
+            if (hipMemcpy(kv_stage_k_, k_cache, bytes, hipMemcpyHostToDevice) != hipSuccess ||
+                hipMemcpy(kv_stage_v_, v_cache, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+                return false;
+            }
+            k_cache = static_cast<float *>(kv_stage_k_);
+            v_cache = static_cast<float *>(kv_stage_v_);
         }
-        k_cache = static_cast<float *>(kv_stage_k_);
-        v_cache = static_cast<float *>(kv_stage_v_);
     }
     omph::kernels::KvCache kv;
     kv.k_f32 = k_cache;

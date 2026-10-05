@@ -12,6 +12,11 @@ namespace omph::runtime {
 struct EnvOptions {
     // --- KV cache
     bool kv_host = false;       // OMPH_KV_HOST: exact f32 cache in pinned host RAM (reference)
+    // OMPH_HOST_STAGE_MIB=N: how much VRAM OMPH_KV_HOST may use for a per-layer
+    // f32 copy of the cache (instead of one buffer the layers overwrite, refilled
+    // per call: 8 KiB per token per layer, #316). 0: as much as fits after
+    // everything else is allocated, leaving 512 MiB free; negative: off.
+    int64_t host_stage_mib = 0;
     bool kv_f32 = false;        // OMPH_KV_F32: exact f32 cache in VRAM instead of K Q8 / V Q4
     bool kv_k4 = false;         // OMPH_KV_K4: K in V's Q4 format too (#81, experiment)
     // K4 on these attention layers (0-based over the 16 attention layers, bit i),

@@ -1,0 +1,30 @@
+# #316/#318: OMPH_KV_HOST's staging. Engine 7c9f3fa (branch chore/318-review-followups),
+# RX 9060 XT 16 GB, 2026-10-04, fan reduced (compare within the session). Prompt = PLAN.md
+# tokenized (26863 tokens), truncated with --tokens; `step gpu` from OMPH_TIMING=1.
+#
+# The old shared staging buffer re-uploads a layer's whole prefix [0, pos0 + T) on every call,
+# for every attention layer (the layers overwrite each other's rows, so nothing can be reused):
+# 8 KiB of host-to-device traffic per token per layer. The per-layer buffers hold a layer's
+# whole f32 cache in VRAM and upload only the rows a call adds, so the per-step cost and the
+# chunked prefill's quadratic re-upload both go away. A layer gets a pair when a --ctx-sized
+# one fits in what is free once everything else is allocated (OMPH_HOST_STAGE_MIB caps it, 0 =
+# automatic, negative = off); otherwise that layer keeps the shared buffer, as before.
+#
+# step gpu, 4-token greedy decode (the last two steps of each run):
+#   tokens   shared buffer (OMPH_HOST_STAGE_MIB=1)   per-layer staging   OMPH_KV_F32 (reference)
+#   2600     55.0 ms                                 43.5 ms             42.4 ms
+#   16384    126.7 ms                                49.3 ms             48.3 ms
+#
+# The speculative decode (omph-generate, MTP drafts, 2600 tokens, --ctx 8192):
+#   shared buffer 24.27 ms/token      per-layer staging 19.92 ms/token     (-18 %)
+#
+# The prefill changes little below ~8k (2877 -> 2869 ms at 2600 tokens: the PCIe is ~1.5 % of a
+# compute-bound prefill); it is the chunked prefill of a long prompt, where the shared buffer
+# re-uploads the growing prefix per chunk, that this removes.
+#
+# Correctness: the last 1 MB of logits (--last-logits) are bit-identical (cmp) between per-layer
+# staging, the shared buffer and OMPH_KV_F32, at 2600 and 16384 tokens, with the plain greedy
+# decode and with MTP speculation. The rollback case is why: a rejected draft leaves rows in the
+# host cache that a later step rewrites, so the resync re-uploads from pos0 (not from row 0),
+# which keeps it incremental and exact. The first attempt at this (a per-layer row counter over
+# the *shared* buffer, #315) was wrong and the same bit check caught it at the first byte.
