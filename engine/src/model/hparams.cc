@@ -60,6 +60,16 @@ HParams read_hparams(const omph::gguf::File & f) {
     if (f.find("qwen35.rope.dimension_sections") != nullptr) {
         const std::vector<int64_t> sec = f.int_array("qwen35.rope.dimension_sections");
         for (size_t i = 0; i < 3 && i < sec.size(); ++i) h.rope_sections[i] = (int) sec[i];
+        // The engine maps the first three sections and gives every pair past
+        // them position 0: the three must cover n_rot / 2 exactly and the
+        // fourth must be 0 (Qwen3.8: 11 + 11 + 10 + 0 = 32 = 64 / 2), or an
+        // image-free prompt would rotate differently than llama.cpp (#346).
+        const int64_t rest = sec.size() > 3 ? sec[3] : 0;
+        if (rest != 0 || (int64_t) h.rope_sections[0] + h.rope_sections[1] + h.rope_sections[2] !=
+                             h.n_rot / 2) {
+            throw std::runtime_error(
+                "hparams: unsupported M-RoPE sections (t + h + w must be n_rot / 2 and the fourth 0)");
+        }
     }
     // the vocab comes from the embedding table; trailing MTP blocks (the
     // nextn.* group, ignored by the normal decode path) are not part of the

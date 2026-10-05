@@ -1259,9 +1259,12 @@ bool untiles_via(const void * tiles, const int64_t rows, const int64_t blocks, c
 // ------------------------------------------------------- the engine's layout
 
 uint32_t engine_layout(const uint32_t type, const int64_t rows) {
-    if (type == 21 || type == 18 ||
-        ((type == 23 || type == 12 || type == 22 || type == 10 || type == 17 || type == 16 || type == 14 || type == 29) &&
-         rows % 16 == 0)) {
+    // IQ3_S / IQ3_XXS too only when the rows are a multiple of 16 (#346): the
+    // tile layout's size is 0 otherwise, and this used to ask for it anyway
+    // (omph-convert then failed "does not fit")
+    if ((type == 21 || type == 18 || type == 23 || type == 12 || type == 22 || type == 10 || type == 17 ||
+         type == 16 || type == 14 || type == 29) &&
+        rows % 16 == 0) {
         return 2;
     }
     return repacked_bytes(type, 1) > 0 ? 1 : 0;

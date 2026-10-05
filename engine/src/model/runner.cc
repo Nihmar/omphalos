@@ -98,7 +98,12 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
             if (t.layout != omph::gguf::kLayoutGguf) {
                 // the engine's layout of the type (format/repack.hh): IQ3_S tiles, else the repack
                 const int64_t k = (int64_t) t.ne[0];
-                const int64_t rows = t.ne.size() >= 2 ? (int64_t) t.ne[1] : 1;
+                // the same row count omph-convert computed (#346: ne[1] alone
+                // missed the higher dimensions of a 3-D quantized tensor)
+                const int64_t bb = (int64_t) omph::format::quant_block_bytes(t.type);
+                const int64_t rows = bb > 0 && k % 256 == 0
+                                         ? (int64_t) (t.nbytes / (uint64_t) bb) / (k / 256)
+                                         : 1;
                 if (t.layout != omph::format::engine_layout(t.type, rows) ||
                     t.stored != (uint64_t) omph::format::engine_layout_bytes(t.type, rows, k)) {
                     throw std::runtime_error(name + ": not in this engine's layout (reconvert with omph-convert)");
@@ -106,7 +111,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 GemvEntry e;
                 e.off = total;
                 e.bytes = (size_t) t.stored;
-                e.rows = (int64_t) t.ne[1];
+                e.rows = rows;
                 e.k = (int64_t) t.ne[0];
                 e.type = t.type;
                 gems_[name] = e;

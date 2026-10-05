@@ -330,12 +330,12 @@ constexpr int64_t kIq1mTileBytes = 896;
 // ------------------------------------------------------- the engine's layout
 //
 // The layout the engine's kernels read a tensor of `type` in (format version 5,
-// #178, #219, #244, #253): 2 (WMMA tiles) for IQ3_S, IQ3_XXS and, rows a multiple of 16, IQ4_XS, Q4_K, IQ2_S, Q2_K,
-// IQ2_XS, IQ2_XXS, Q6_K and IQ1_M (rows
-// a multiple of 16), 1 (the repacked layout above) for the other types with
-// one, 0 (the GGUF bytes) otherwise; its size, and the conversions both ways
-// (rows x k weights, row-major). Takes the rows: a tensor whose rows are not a
-// multiple of 16 keeps the repacked layout.
+// #178, #219, #244, #253): 2 (WMMA tiles) for IQ3_S, IQ3_XXS, IQ4_XS, Q4_K,
+// IQ2_S, Q2_K, IQ2_XS, IQ2_XXS, Q6_K and IQ1_M when the rows are a multiple of
+// 16, 1 (the repacked layout above) for the other types with one, 0 (the GGUF
+// bytes) otherwise; its size, and the conversions both ways (rows x k weights,
+// row-major). Takes the rows: a tensor whose rows are not a multiple of 16
+// keeps the repacked layout.
 uint32_t engine_layout(uint32_t type, int64_t rows);
 int64_t engine_layout_bytes(uint32_t type, int64_t rows, int64_t k);
 bool to_engine_layout(uint32_t type, const void * gguf, int64_t rows, int64_t k, std::vector<uint8_t> & dst);

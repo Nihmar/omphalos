@@ -169,8 +169,15 @@ uint64_t type_nbytes(uint32_t type, const std::vector<uint64_t> & ne) {
     if (info == nullptr || ne.empty() || ne[0] % info->block != 0) {
         return 0;
     }
-    uint64_t n = ne[0] / info->block * info->bytes;
+    const uint64_t rows = ne[0] / info->block;
+    if (info->bytes != 0 && rows > UINT64_MAX / info->bytes) {
+        return 0;  // would wrap: the file's bounds check must not be bypassed (#346)
+    }
+    uint64_t n = rows * info->bytes;
     for (size_t d = 1; d < ne.size(); ++d) {
+        if (ne[d] != 0 && n > UINT64_MAX / ne[d]) {
+            return 0;  // the product would wrap (e.g. ne = {256, 2^60 + 1}) (#346)
+        }
         n *= ne[d];
     }
     return n;
@@ -257,6 +264,13 @@ File::File(const std::string & path) {
             for (size_t i = 0; i < tensors_.size(); ++i) {
                 tensors_[i].layout = (uint32_t) layouts[i];
                 tensors_[i].stored = (uint64_t) stored[i];
+                // A tensor the engine reads as raw GGUF bytes must occupy
+                // exactly them: runner.cc copies nbytes of the token embedding
+                // while the upload uses stored, so a smaller stored would read
+                // past the tensor (#346).
+                if (tensors_[i].layout == kLayoutGguf && tensors_[i].stored != tensors_[i].nbytes) {
+                    fail("tensor " + tensors_[i].name + ": GGUF layout with a mismatched stored size");
+                }
             }
         }
         uint64_t alignment = 32;  // ggml default
