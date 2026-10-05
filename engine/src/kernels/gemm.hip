@@ -400,6 +400,106 @@ __global__ __launch_bounds__(256) void gemm_tiles_kernel(const uint8_t * __restr
     }
 }
 
+// WMMA tiles, 2 x 8 per wave (#326): a workgroup = 8 waves x 32 rows (256 rows)
+// x 128 tokens. Each wave owns two 16-row tiles (all 8 waves one distinct
+// pair, so the decode is not duplicated) and all 8 token tiles, i.e. 16
+// accumulators like the kernel above; a B operand read from LDS then feeds two
+// WMMAs instead of one (0.5 reads per WMMA against 1.0). The smaller token
+// tile also halves the x buffer (20 KB against 40 KB), which takes occupancy
+// from 1 to 2 workgroups per WGP. Measured 55.7 -> 60.0 TFLOPS on IQ3_S
+// ffn_up at 512 tokens, +2 to +8 % on the other tile types (Q4_K keeps the
+// kernel above: its decode is cheap and the two weight blocks cost it more
+// than the halved B reads gain); every output bit-identical
+// (bench/gemm/tile2.hip).
+constexpr int kG2Tok = 128;   // tokens per workgroup
+constexpr int kG2XLd = 40;    // halves per staged token row (32 + 8 pad)
+template <class TD, bool SWI>
+__global__ __launch_bounds__(256) void gemm_tiles2_kernel(const uint8_t * __restrict__ wt,
+                                                         const _Float16 * __restrict__ x, float * __restrict__ y,
+                                                         const long long blocks, const int tokens,
+                                                         const long long ldy, const Epi epi) {
+    __shared__ __attribute__((aligned(16))) uint8_t tab[TD::kLds];
+    __shared__ _Float16 xs[2][kG2Tok * kG2XLd];
+    const int tid = (int) threadIdx.x;
+    TD::init(tab);
+    const int lane = tid & 31;
+    const int wv = tid >> 5;
+    const int h = lane >> 4;
+    const long long tile = (long long) blockIdx.y * 16 + wv * 2;
+    const long long n0 = (long long) blockIdx.x * kG2Tok;
+    const long long k = blocks * 256;
+    const long long tx = n0 + tid < tokens ? n0 + tid : 0;
+    const uint4 * xrow = reinterpret_cast<const uint4 *>(x + tx * k);
+    const auto stage = [&](const long long s, _Float16 * buf) {
+        if (tid >= kG2Tok) {
+            return;
+        }
+        const uint4 * src = xrow + s * 4;
+        uint4 * dst = reinterpret_cast<uint4 *>(buf + tid * kG2XLd);
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = src[3];
+    };
+    float8 acc[2][8];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            acc[i][j] = float8{};
+        }
+    }
+    stage(0, xs[0]);
+    __syncthreads();
+    int buf = 0;
+    for (long long b = 0; b < blocks; ++b) {
+        const typename TD::Blk kb[2] = {TD::load(wt + (tile * blocks + b) * TD::kBytes, lane),
+                                        TD::load(wt + ((tile + 1) * blocks + b) * TD::kBytes, lane)};
+#pragma unroll 1
+        for (int sb = 0; sb < 8; ++sb) {
+            const half8 a[2][2] = {{TD::frag(tab, kb[0], sb, 0, h), TD::frag(tab, kb[0], sb, 1, h)},
+                                   {TD::frag(tab, kb[1], sb, 0, h), TD::frag(tab, kb[1], sb, 1, h)}};
+#pragma unroll
+            for (int gl = 0; gl < 2; ++gl) {
+                if (gl == 0) {
+                    const long long s = b * 8 + sb;
+                    if (s + 1 < blocks * 8) {
+                        stage(s + 1, xs[buf ^ 1]);  // the next sub-block's x
+                    }
+                }
+                const _Float16 * cur = xs[buf];
+                half8 bv[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    bv[j] = *reinterpret_cast<const half8 *>(
+                        cur + (j * 16 + (lane & 15)) * kG2XLd + h * 16 + gl * 8);
+                }
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a[i][gl], bv[j], acc[i][j]);
+                    }
+                }
+                if (gl == 1) {
+                    __syncthreads();  // this x buffer is consumed, the next one written
+                    buf ^= 1;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const long long t = n0 + j * 16 + (lane & 15);
+            if (t < tokens) {
+                store8<SWI>(acc[i][j], y, epi, t * ldy + (tile + i) * 16 + h * 8);
+            }
+        }
+    }
+}
+
 } // namespace
 
 bool gemm_f16(const void * w, const void * x, float * y, const int64_t n_out, const int64_t k,
@@ -452,38 +552,52 @@ bool gemm_q_impl(const uint32_t type, const void * packed, const void * x, float
         gemm_tiles_kernel<decltype(td), SWI><<<grid, 256, 0, stream>>>(
             base, static_cast<const _Float16 *>(x), y, blocks, (int) tokens, (long long) ldy, epi);
     };
+    // 2 x 8 rows/tokens per wave (#326); needs a whole 256-row workgroup
+    const auto tiles2 = [&](const auto td) {
+        const dim3 grid((unsigned) ((tokens + kG2Tok - 1) / kG2Tok), (unsigned) (n_out / 256));
+        gemm_tiles2_kernel<decltype(td), SWI><<<grid, 256, 0, stream>>>(
+            base, static_cast<const _Float16 *>(x), y, blocks, (int) tokens, (long long) ldy, epi);
+    };
     switch (type) {
         case 21:
-            if (n_out % 128 == 0) {  // the tile GEMM (#178)
+            if (n_out % 256 == 0) {  // the 2 x 8 tile GEMM (#326)
+                tiles2(qd::TileIq3s{});
+            } else if (n_out % 128 == 0) {  // the tile GEMM (#178)
                 tiles(qd::TileIq3s{});
             } else {
                 launch(qd::DecIq3sTile::make(base, n_blocks, blocks));
             }
             break;
         case 18:
-            if (n_out % 128 == 0) {  // #219
+            if (n_out % 256 == 0) {  // #326
+                tiles2(qd::TileIq3xxs{});
+            } else if (n_out % 128 == 0) {  // #219
                 tiles(qd::TileIq3xxs{});
             } else {
                 launch(qd::DecIq3xxsTile::make(base, n_blocks, blocks));
             }
             break;
         case 16:  // #253
-            if (n_out % 128 == 0) tiles(qd::TileIq2xxs{});
+            if (n_out % 256 == 0) tiles2(qd::TileIq2xxs{});
+            else if (n_out % 128 == 0) tiles(qd::TileIq2xxs{});
             else if (n_out % 16 == 0) launch(qd::DecIq2xxsTile::make(base, n_blocks, blocks));
             else launch(qd::DecIq2xxs::make(base, n_blocks, blocks));
             break;
         case 17:  // #253
-            if (n_out % 128 == 0) tiles(qd::TileIq2xs{});
+            if (n_out % 256 == 0) tiles2(qd::TileIq2xs{});
+            else if (n_out % 128 == 0) tiles(qd::TileIq2xs{});
             else if (n_out % 16 == 0) launch(qd::DecIq2xsTile::make(base, n_blocks, blocks));
             else launch(qd::DecIq2xs::make(base, n_blocks, blocks));
             break;
         case 22:  // #253
-            if (n_out % 128 == 0) tiles(qd::TileIq2s{});
+            if (n_out % 256 == 0) tiles2(qd::TileIq2s{});
+            else if (n_out % 128 == 0) tiles(qd::TileIq2s{});
             else if (n_out % 16 == 0) launch(qd::DecIq2sTile::make(base, n_blocks, blocks));
             else launch(qd::DecIq2s::make(base, n_blocks, blocks));
             break;
         case 23:  // the tiles (#244) when rows % 16 == 0, the GEMM's tile kernel when % 128
-            if (n_out % 128 == 0) tiles(qd::TileIq4xs{});
+            if (n_out % 256 == 0) tiles2(qd::TileIq4xs{});
+            else if (n_out % 128 == 0) tiles(qd::TileIq4xs{});
             else if (n_out % 16 == 0) launch(qd::DecIq4xsTile::make(base, n_blocks, blocks));
             else launch(qd::DecIq4xs::make(base, n_blocks, blocks));
             break;
@@ -493,17 +607,20 @@ bool gemm_q_impl(const uint32_t type, const void * packed, const void * x, float
             else launch(qd::DecQ4k::make(base, n_blocks, blocks));
             break;
         case 10:  // #253
-            if (n_out % 128 == 0) tiles(qd::TileQ2k{});
+            if (n_out % 256 == 0) tiles2(qd::TileQ2k{});
+            else if (n_out % 128 == 0) tiles(qd::TileQ2k{});
             else if (n_out % 16 == 0) launch(qd::DecQ2kTile::make(base, n_blocks, blocks));
             else launch(qd::DecQ2k::make(base, n_blocks, blocks));
             break;
         case 14:  // #258
-            if (n_out % 128 == 0) tiles(qd::TileQ6k{});
+            if (n_out % 256 == 0) tiles2(qd::TileQ6k{});
+            else if (n_out % 128 == 0) tiles(qd::TileQ6k{});
             else if (n_out % 16 == 0) launch(qd::DecQ6kTile::make(base, n_blocks, blocks));
             else launch(qd::DecQ6k::make(base, n_blocks, blocks));
             break;
         case 29:  // #275
-            if (n_out % 128 == 0) tiles(qd::TileIq1m{});
+            if (n_out % 256 == 0) tiles2(qd::TileIq1m{});
+            else if (n_out % 128 == 0) tiles(qd::TileIq1m{});
             else if (n_out % 16 == 0) launch(qd::DecIq1mTile::make(base, n_blocks, blocks));
             else launch(qd::DecIq1m::make(base, n_blocks, blocks));
             break;
