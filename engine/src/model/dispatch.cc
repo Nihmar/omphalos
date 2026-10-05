@@ -195,7 +195,9 @@ bool Runner::matmul(const Mat & m, const void * x16, float * y, const int64_t n_
     }
     x16 = q8_input(x16, k, T);
     // Repacked weights: one GEMM that decodes the W tiles into LDS itself, no
-    // f16 copy of the weight (#141); bit-identical to the path below.
+    // f16 copy of the weight (#141). The tiles' kernels apply the scales in f16
+    // for some types and walk k in another order than the f16 path below, so an
+    // OMPH_NO_FUSED_GEMM A/B differs by ULPs (#341), not bit for bit.
     if (!env_.no_fused_gemm && g != nullptr && g->rows == n_out && g->k == k) {
         timer_gemm_.start();
         const bool ok = omph::kernels::gemm_q(g->type, m.dev, x16, y, n_out, k, T, n_out,

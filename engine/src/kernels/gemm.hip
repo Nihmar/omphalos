@@ -580,49 +580,41 @@ bool gemm_q_impl(const uint32_t type, const void * packed, const void * x, float
         case 16:  // #253
             if (n_out % 256 == 0) tiles2(qd::TileIq2xxs{});
             else if (n_out % 128 == 0) tiles(qd::TileIq2xxs{});
-            else if (n_out % 16 == 0) launch(qd::DecIq2xxsTile::make(base, n_blocks, blocks));
-            else launch(qd::DecIq2xxs::make(base, n_blocks, blocks));
+            else launch(qd::DecIq2xxsTile::make(base, n_blocks, blocks));
             break;
         case 17:  // #253
             if (n_out % 256 == 0) tiles2(qd::TileIq2xs{});
             else if (n_out % 128 == 0) tiles(qd::TileIq2xs{});
-            else if (n_out % 16 == 0) launch(qd::DecIq2xsTile::make(base, n_blocks, blocks));
-            else launch(qd::DecIq2xs::make(base, n_blocks, blocks));
+            else launch(qd::DecIq2xsTile::make(base, n_blocks, blocks));
             break;
         case 22:  // #253
             if (n_out % 256 == 0) tiles2(qd::TileIq2s{});
             else if (n_out % 128 == 0) tiles(qd::TileIq2s{});
-            else if (n_out % 16 == 0) launch(qd::DecIq2sTile::make(base, n_blocks, blocks));
-            else launch(qd::DecIq2s::make(base, n_blocks, blocks));
+            else launch(qd::DecIq2sTile::make(base, n_blocks, blocks));
             break;
         case 23:  // the tiles (#244) when rows % 16 == 0, the GEMM's tile kernel when % 128
             if (n_out % 256 == 0) tiles2(qd::TileIq4xs{});
             else if (n_out % 128 == 0) tiles(qd::TileIq4xs{});
-            else if (n_out % 16 == 0) launch(qd::DecIq4xsTile::make(base, n_blocks, blocks));
-            else launch(qd::DecIq4xs::make(base, n_blocks, blocks));
+            else launch(qd::DecIq4xsTile::make(base, n_blocks, blocks));
             break;
         case 12:
             if (n_out % 128 == 0) tiles(qd::TileQ4k{});
-            else if (n_out % 16 == 0) launch(qd::DecQ4kTile::make(base, n_blocks, blocks));
-            else launch(qd::DecQ4k::make(base, n_blocks, blocks));
+            else launch(qd::DecQ4kTile::make(base, n_blocks, blocks));
             break;
         case 10:  // #253
             if (n_out % 256 == 0) tiles2(qd::TileQ2k{});
             else if (n_out % 128 == 0) tiles(qd::TileQ2k{});
-            else if (n_out % 16 == 0) launch(qd::DecQ2kTile::make(base, n_blocks, blocks));
-            else launch(qd::DecQ2k::make(base, n_blocks, blocks));
+            else launch(qd::DecQ2kTile::make(base, n_blocks, blocks));
             break;
         case 14:  // #258
             if (n_out % 256 == 0) tiles2(qd::TileQ6k{});
             else if (n_out % 128 == 0) tiles(qd::TileQ6k{});
-            else if (n_out % 16 == 0) launch(qd::DecQ6kTile::make(base, n_blocks, blocks));
-            else launch(qd::DecQ6k::make(base, n_blocks, blocks));
+            else launch(qd::DecQ6kTile::make(base, n_blocks, blocks));
             break;
         case 29:  // #275
             if (n_out % 256 == 0) tiles2(qd::TileIq1m{});
             else if (n_out % 128 == 0) tiles(qd::TileIq1m{});
-            else if (n_out % 16 == 0) launch(qd::DecIq1mTile::make(base, n_blocks, blocks));
-            else launch(qd::DecIq1m::make(base, n_blocks, blocks));
+            else launch(qd::DecIq1mTile::make(base, n_blocks, blocks));
             break;
         default: return false;
     }

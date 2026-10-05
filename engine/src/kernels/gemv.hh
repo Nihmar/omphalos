@@ -82,10 +82,11 @@ bool gemv_bf16(const void * w, const void * x_f16, float * y, int64_t rows, int6
 // NT = 2..4 tokens per weight read for a repacked tensor of `type` (#126):
 // x_f16 holds the NT activation vectors back to back (stride k), y the NT
 // result vectors (stride rows). False for a type without the form.
-// 1..16 tokens of a type with WMMA tile kernels (IQ3_S, IQ3_XXS, #178) in one
-// launch, and 5..16 tokens of the other repacked types (#244: their 1..4-token
-// bodies back to back on each block's rows); every row bit-identical to the
-// single-token call. False otherwise (nothing issued).
+// 1..16 tokens of a type with WMMA tile kernels (IQ3_S, IQ3_XXS, IQ4_XS, Q4_K,
+// IQ2_S, Q2_K, IQ2_XS, IQ2_XXS, Q6_K, IQ1_M; #178, #244, #253, #258, #275) in
+// one launch, and 5..16 tokens of the other repacked types (#244: their
+// 1..4-token bodies back to back on each block's rows); every row bit-identical
+// to the single-token call. False otherwise (nothing issued).
 bool gemv_tokens(uint32_t type, const void * packed, const void * x_f16, float * y, int64_t rows, int64_t k,
                  int nt, hipStream_t stream);
 
@@ -93,9 +94,10 @@ bool gemv_multi(uint32_t type, const void * packed, const void * x_f16, float * 
                 int64_t k, int nt, hipStream_t stream);
 
 // The sibling GEMVs of one input (2..kGemvGroupMax tensors, the same k) for
-// NT = 4 tokens (a speculative verification) in one launch (#214): each
-// member's results as gemv_multi / gemv_tokens give them, bit for bit. False
-// (nothing issued) for another token count or a member type without a body.
+// NT = 1..16 tokens (a speculative verification) in one launch (#214, #255):
+// each member's results as gemv_multi / gemv_tokens give them, bit for bit.
+// False (nothing issued) for another token count or a member type without a
+// body.
 constexpr int kGemvGroupMax = 3;
 struct GemvGroupItem {
     uint32_t type;
@@ -107,9 +109,9 @@ struct GemvGroupItem {
 bool gemv_group(const GemvGroupItem * items, int n, const void * x_f16, int nt, hipStream_t stream);
 
 // f16 rows (rows x k, row-major) of a tensor in its repacked layout, for the
-// GEMM path of a --gemv runner (M8). Bit-identical to dequantize() on the
-// GGUF bytes. False for a type without a repacked layout (IQ1_M's is the GGUF
-// bytes themselves: use dequantize()).
+// GEMM path of a --gemv runner (M8). False for a type without a repacked
+// layout: use dequantize() on the GGUF bytes (IQ1_M's GGUF layout, when its
+// rows are not a multiple of 16, is the only one left in this model).
 // Rows row0 .. row0 + nrows - 1 only (nrows < 0: to the end), written from dst_f16.
 bool dequant_repacked(uint32_t type, const void * packed, void * dst_f16, int64_t rows, int64_t k,
                       hipStream_t stream, int64_t row0 = 0, int64_t nrows = -1);
