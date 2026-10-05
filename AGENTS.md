@@ -142,8 +142,10 @@ uv run python check_gpu_decode.py [--gemv]        # greedy decode vs the NumPy r
 uv run python check_tokenizer.py <model> <llama.cpp>/bin/llama-tokenize [--fuzz N]
                                                   # tokenizer vs llama.cpp, token for token
 uv run python check_chat_template.py <model>      # chat template vs jinja2, byte for byte
-uv run python check_conversations.py [--spec mtp,dflash]  # #179: back to a saved conversation:
-                                                  # restored, not prefilled, same answer
+uv run python check_conversations.py [--spec mtp,dflash] [--image FILE]  # #179: back to a saved
+                                                  # conversation: restored, not prefilled, same answer;
+                                                  # #339 with --image: the text prefill while the CPU
+                                                  # encodes must not shadow the saved conversation
 uv run python check_warm_server.py [--mmproj FILE]  # #200: nothing leaks between requests: a warm
     # server's answers (10 prompts, fresh-vs-warm, 2 shuffled orders, 4 configurations) and a
     # canary sentence; needs one server start per prompt for the fresh references (~20 min);

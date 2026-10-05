@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <random>
@@ -21,14 +22,29 @@
 namespace omph::model {
 
 // An encoded image (#160): nx x ny embedding rows (n_embd floats each, row
-// major), and its content hash (the identity of its positions in the cache).
+// major), and the SHA-256 of the bytes it was decoded from -- the identity of
+// its rows and the encoder's cache key (#339: FNV's low bits were easy to
+// collide on purpose).
 struct Image {
     std::vector<float> embd;
     int nx = 0;
     int ny = 0;
-    uint64_t hash = 0;
+    std::string digest;  // lowercase hex of the bytes, 64 characters
+    // The token id of each of the image's rows: negative, so it can never be a
+    // vocabulary token, and derived from the digest. A collision needs ~2^31
+    // candidate images, not FNV's low-bit algebra (#339).
+    int32_t placeholder_id() const;
     int64_t n_tokens() const { return (int64_t) nx * ny; }
 };
+
+inline int32_t Image::placeholder_id() const {
+    if (digest.size() < 8) {
+        return -1;
+    }
+    // the first 8 hex digits, one 31-bit slice (never the sign bit)
+    const unsigned long v = std::strtoul(digest.substr(0, 8).c_str(), nullptr, 16);
+    return -1 - (int32_t) (v & 0x7fffffffu);
+}
 
 struct GenerateRequest {
     int64_t max_tokens = 256;

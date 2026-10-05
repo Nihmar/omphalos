@@ -20,10 +20,16 @@ really restored (the checkpoint is the first cut, at least 512 tokens in).
 The negative control diverges inside the first message, where no checkpoint
 is usable: the caches must restart and still give the reference answer.
 
-    uv run python check_conversations.py [--spec mtp,dflash]
+With --image, a second conversation with an image (#339): the server prefills
+the text before the image while the CPU encodes it (#180), and the saved
+conversation must still be restored on the next turn instead of prefilled
+again from that early point.
+
+    uv run python check_conversations.py [--spec mtp,dflash] [--image FILE]
 """
 
 import argparse
+import base64
 import json
 import subprocess
 import sys
@@ -68,6 +74,9 @@ def main() -> None:
     ap.add_argument("--drafter", default=str(ROOT / "models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"))
     ap.add_argument("--omph", default=str(ROOT / "engine/build"))
     ap.add_argument("--text", default=str(ROOT / "models/datasets/wikitext-2-raw/wiki.train.raw"))
+    ap.add_argument("--mmproj", default=str(ROOT / "models/mmproj-Qwen3.8-27B-BF16.gguf"))
+    ap.add_argument("--image", default=None,
+                    help="also check an image conversation (#339), e.g. llama.cpp's tools/mtmd/test-1.jpeg")
     args = ap.parse_args()
 
     text = Path(args.text).read_text()
@@ -94,11 +103,13 @@ def main() -> None:
                                                                   "Explain the passage about", 1)}] \
         + rewritten[1:]
 
-    def server(spec: str, log: Path) -> tuple[subprocess.Popen, str]:
+    def server(spec: str, log: Path, mmproj: str | None = None) -> tuple[subprocess.Popen, str]:
         port = free_port()
         cmd = [f"{args.omph}/omph-server", omph_file(args.model), "--port", str(port), "--ctx", "16384"]
         if spec == "dflash":
             cmd += ["--dflash", omph_file(args.drafter)]
+        if mmproj:
+            cmd += ["--mmproj", mmproj]
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=open(log, "w"))  # noqa: SIM115
         url = f"http://127.0.0.1:{port}"
         wait_health(url, proc)
@@ -161,6 +172,66 @@ def main() -> None:
                 failures.append(f"{tag} (rewrite, first message)")
                 print("   ref:", json.dumps(answer_text(rw_neg_ref)[:200]),
                       "\n   got:", json.dumps(answer_text(rw_neg)[:200]))
+
+    # #339: a saved conversation with an image. The server prefills the text
+    # before the first image while the CPU encodes it (#180); the next turn must
+    # still restore the saved conversation, not prefill everything again from
+    # that early point.
+    if args.image is not None:
+        image = Path(args.image)
+        if not Path(args.mmproj).exists():
+            sys.exit(f"--image needs the vision encoder: {args.mmproj} does not exist")
+        url_data = "data:image/jpeg;base64," + base64.b64encode(image.read_bytes()).decode()
+        # a long text before the image: the conversation must reach kSnapshotMin
+        # (2048 tokens) to be saved at all, and `before` (the early prefill) must
+        # be long enough that restoring a few more tokens is visibly different.
+        first = [{"role": "system", "content": sys_a},
+                 {"role": "user", "content": [
+                     {"type": "image_url", "image_url": {"url": url_data}},
+                     {"type": "text", "text": "In one sentence: what is in this image?"}]}]
+        q_year = "Which year is this about?"
+
+        def ask(url: str, msgs: list) -> tuple[str, int, int]:
+            r = post(url + "/v1/chat/completions",
+                     {"messages": msgs, "max_tokens": 160, "temperature": 0,
+                      "chat_template_kwargs": {"enable_thinking": False}})
+            usage = r["usage"]
+            return (r["choices"][0]["message"].get("content") or "",
+                    usage.get("prompt_tokens_details", {}).get("cached_tokens", 0),
+                    usage.get("prompt_tokens", 0))
+
+        for spec in args.spec.split(","):
+            tag = f"{spec}, image"
+            log = Path(f"/tmp/check_conversations-{spec}-image.log")
+            proc, url = server(spec, log, args.mmproj)
+            try:
+                ref_a, _, _ = ask(url, first)
+                turn = first + [{"role": "assistant", "content": ref_a},
+                                {"role": "user", "content": q_year}]
+                ref, _, _ = ask(url, turn)
+            finally:
+                proc.terminate()
+                proc.wait()
+            proc, url = server(spec, log, args.mmproj)
+            try:
+                a, _, _ = ask(url, first)
+                chat(url, [{"role": "system", "content": sys_b}, {"role": "user", "content": q1}], False)
+                turn = first + [{"role": "assistant", "content": a}, {"role": "user", "content": q_year}]
+                got, cached, prompt = ask(url, turn)
+            finally:
+                proc.terminate()
+                proc.wait()
+            lines = log.read_text()
+            # the whole conversation is restored: only the new turn is prefilled,
+            # not the image's rows and the text before them again (#339)
+            fresh = prompt - cached
+            ok = got == ref and fresh < 128 and "restored" in lines
+            print(f"{'ok  ' if ok else 'FAIL'} {tag}: next turn "
+                  f"{'identical' if got == ref else 'DIFFERS'} to the cold prefill, "
+                  f"{cached} prompt tokens resumed ({fresh} prefilled)", flush=True)
+            if not ok:
+                failures.append(f"{tag} (image)")
+                print("   ref:", json.dumps(ref[:200]), "\n   got:", json.dumps(got[:200]))
     if failures:
         sys.exit(f"{len(failures)} failure(s)")
     print("all conversation checks passed")
