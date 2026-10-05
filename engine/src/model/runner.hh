@@ -167,6 +167,16 @@ public:
     // by an end-of-generation still accepted the drafts it did not commit, and
     // the drafter's keep rates must not count those as rejections (#340).
     bool commit(int64_t accepted, int64_t drafts_accepted = -1);
+    // A request that unwinds between verify() and commit() (a thrown kernel
+    // wrapper, bad_alloc) leaves the verification armed, with verify_argmax_
+    // pointing at a caller's vector that is about to die: the generator's
+    // unwind guard disarms it before starting over (#337).
+    void abort_verification() {
+        verifying_ = false;
+        verify_tokens_ = 0;
+        verify_argmax_ = nullptr;
+        inputs_ = nullptr;
+    }
 
     // --- MTP drafting (#124), with `mtp` set at construction ---
     // The MTP KV is filled automatically: after every forward the runner keeps

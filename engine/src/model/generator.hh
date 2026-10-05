@@ -109,7 +109,8 @@ public:
     // Generates after `prompt`. on_token(id) gets every generated token as it
     // is decided; returning false stops (Stop::Callback). The prompt continues
     // the cached sequence when it starts with it, else the latest checkpoint
-    // within their common prefix (#158), else the caches restart.
+    // within their common prefix (#158), else the caches restart. A throw
+    // anywhere inside leaves the caches reset, not half-advanced (#337).
     GenerateResult generate(const std::vector<int32_t> & prompt, const GenerateRequest & request,
                             const std::function<bool(int32_t)> & on_token);
     // Prefills a text-only prompt prefix into the caches, generating nothing,
@@ -123,6 +124,9 @@ public:
 private:
     const GenerateResult * running_ = nullptr;
     bool is_eog(int32_t id) const;
+    // generate(), without the unwind guard (#337)
+    GenerateResult generate_inner(const std::vector<int32_t> & prompt, const GenerateRequest & request,
+                                  const std::function<bool(int32_t)> & on_token);
     // A prompt with its images expanded: an image's positions hold ids
     // derived from its hash (negative: never a vocabulary token), so prefix
     // reuse sees which image is where; M-RoPE positions when there are images.
