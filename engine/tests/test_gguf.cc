@@ -93,6 +93,11 @@ bool rejects(const std::vector<uint8_t> & bytes, const char * what) {
 } // namespace
 
 int main() {
+    // #346: a tensor size whose 64-bit product would wrap is 0, so the file
+    // check refuses it instead of accepting a truncated size
+    CHECK(omph::gguf::type_nbytes(12, {256, 2}) == 288, "a Q4_K size");
+    CHECK(omph::gguf::type_nbytes(12, {256, (1ull << 60) + 1}) == 0, "an overflowing Q4_K size");
+    CHECK(omph::gguf::type_nbytes(12, {256, 0}) == 0, "a zero dimension");
     // F32 [4] at 0 (16 B), Q4_K [256, 2] at 32 (2 x 144 B)
     const std::vector<Tensor> good = {{"a.weight", {4}, 0, 0}, {"b.weight", {256, 2}, 12, 32}};
     const uint64_t data = 32 + 288;
