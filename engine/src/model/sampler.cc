@@ -105,10 +105,15 @@ void distribution(float * row, const int64_t nv, const Sampling & s, const Penal
     const float best = *std::max_element(row, row + nv);
     std::vector<std::pair<float, int32_t>> cand;  // (scaled logit, id), in id order
     cand.reserve(4096);
-    for (int64_t i = 0; i < nv; ++i) {
-        const float z = (row[i] - best) * inv_t;
-        if (z > -30.0f) {
-            cand.emplace_back(z, (int32_t) i);
+    // A subnormal temperature (1e-39, #336) gives inv_t = inf and z = NaN for
+    // the best token: nothing passes the cut. Skip the fill then; the fallback
+    // below keeps the best token alone.
+    if (std::isfinite(inv_t) && inv_t > 0.0f) {
+        for (int64_t i = 0; i < nv; ++i) {
+            const float z = (row[i] - best) * inv_t;
+            if (z > -30.0f) {
+                cand.emplace_back(z, (int32_t) i);
+            }
         }
     }
     const auto higher = [](const auto & a, const auto & b) {
@@ -153,6 +158,15 @@ void distribution(float * row, const int64_t nv, const Sampling & s, const Penal
         }
         cand.resize(keep);
     }
+    if (cand.empty()) {
+        // Nothing survived: inv_t was not a positive finite number, min_p > 1,
+        // or the row holds no finite value. Keep the greedy pick alone, p = 1
+        // (the host rule of argmax_finite, #336).
+        d.ids.assign(1, argmax_finite(row, nv));
+        d.w.assign(1, 1.0);
+        d.total = 1.0;
+        return;
+    }
     d.ids.resize(cand.size());
     d.w.resize(cand.size());
     d.total = 0.0;
@@ -164,6 +178,9 @@ void distribution(float * row, const int64_t nv, const Sampling & s, const Penal
 }
 
 int32_t draw(const Dist & d, const int32_t skip, std::mt19937_64 & rng) {
+    if (d.ids.empty()) {
+        return 0;  // distribution() never leaves the set empty (#336); do not fault
+    }
     double total = d.total;
     for (size_t i = 0; i < d.ids.size() && skip >= 0; ++i) {
         if (d.ids[i] == skip) total -= d.w[i];

@@ -251,6 +251,21 @@ def run_image_checks(url: str, image: Path) -> None:
         check(False, "image: undecodable data rejected")
     except openai.BadRequestError:
         check(True, "image: undecodable data: 400")
+    # The n-gram drafts copy tokens of the sequence (#199): the text before an
+    # image is repeated by the model, and its continuation (the image's
+    # negative placeholder ids) must be cut, not verified (#334). Before the fix
+    # this read the embedding table out of bounds and aborted the server.
+    phrase = ("The silver wombat carries a lantern through the violet cave at midnight, "
+              "and the pangolin follows the river to the sea.")
+    q_echo = [{"role": "user", "content": [
+        {"type": "text", "text": f"Repeat this exact sentence, and nothing else: {phrase} {phrase}"},
+        {"type": "image_url", "image_url": {"url": data}},
+        {"type": "text", "text": "Now repeat the sentence."}]}]
+    r3 = client.chat.completions.create(model=model, messages=q_echo, max_tokens=48, extra_body=no_think)
+    text3 = r3.choices[0].message.content or ""
+    check(len(text3) > 0, f"image: the n-gram drafts did not crash the server ({text3!r})")
+    assert r3.usage is not None
+    check(r3.usage.completion_tokens > 0, "image: the n-gram case generated something")
 
 
 if __name__ == "__main__":

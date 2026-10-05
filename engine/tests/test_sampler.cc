@@ -271,6 +271,60 @@ void test_draw() {
     for (int i = 0; i < 100; ++i) {
         CHECK(omph::model::draw(d, 0, rng) == 1, "skip does not exclude the token");
     }
+    // a set that is empty anyway must not fault (distribution() never leaves one, #336)
+    Dist empty;
+    CHECK(omph::model::draw(empty, -1, rng) == 0, "the empty draw must not fault");
+}
+
+// An empty candidate set used to reach draw()'s front() (#336): a subnormal
+// temperature, a min_p above 1, or a row with no finite value. All three must
+// fall back to the greedy token alone, p = 1.
+void test_empty_candidates() {
+    const std::vector<double> w = {1.0, 0.6, 0.3, 0.1};
+    // temperature 1e-39: 1/t is +inf, every scaled logit is NaN or -inf
+    Sampling sub;
+    sub.temperature = 1e-39f;
+    std::vector<float> row = row_of(w);
+    Dist d;
+    omph::model::distribution(row.data(), (int64_t) row.size(), sub, {}, d);
+    CHECK(d.ids.size() == 1 && d.ids[0] == 0, "a subnormal temperature kept %zu candidates", d.ids.size());
+    CHECK(d.total == 1.0, "the fallback is not a point mass: %f", d.total);
+    std::mt19937_64 rng(5);
+    CHECK(omph::model::draw(d, -1, rng) == 0, "the point mass draws its token");
+    // min_p > 1 removes everything (the C ABI refuses it, distribution is the backstop)
+    Sampling mp;
+    mp.temperature = 1.0f;
+    mp.min_p = 1.5f;
+    std::vector<float> row2 = row_of(w);
+    Dist d2;
+    omph::model::distribution(row2.data(), (int64_t) row2.size(), mp, {}, d2);
+    CHECK(d2.ids.size() == 1 && d2.ids[0] == 0, "min_p > 1 kept %zu candidates", d2.ids.size());
+    // a row with no finite value: id 0, the host's all-non-finite rule
+    Sampling plain;
+    plain.temperature = 1.0f;
+    std::vector<float> nan_row = {std::nanf(""), INFINITY, -INFINITY};
+    Dist d3;
+    omph::model::distribution(nan_row.data(), (int64_t) nan_row.size(), plain, {}, d3);
+    CHECK(d3.ids.size() == 1 && d3.ids[0] == 0, "an all-non-finite row kept %zu candidates", d3.ids.size());
+    CHECK(omph::model::sample_row(nan_row, plain, {}, rng) == 0, "the all-NaN row must give id 0");
+}
+
+// top_p 0 keeps the single most likely token, as llama.cpp does; the server
+// used to turn it into 1.0 (#336).
+void test_top_p_zero() {
+    Sampling s;
+    s.temperature = 1.0f;
+    s.top_p = 0.0f;
+    std::vector<float> row = row_of({1.0, 0.8, 0.2});
+    Dist d;
+    omph::model::distribution(row.data(), (int64_t) row.size(), s, {}, d);
+    CHECK(d.ids.size() == 1 && d.ids[0] == 0, "top_p 0 kept %zu candidates", d.ids.size());
+    CHECK(d.total == 1.0, "top_p 0 is not a point mass: %f", d.total);
+    // and the most likely token, not the first id
+    std::vector<float> row2 = row_of({1.0, 2.0, 0.5});
+    Dist d2;
+    omph::model::distribution(row2.data(), (int64_t) row2.size(), s, {}, d2);
+    CHECK(d2.ids.size() == 1 && d2.ids[0] == 1, "top_p 0 must keep the argmax");
 }
 
 } // namespace
@@ -285,6 +339,8 @@ int main() {
     test_temperature();
     test_argmax_finite();
     test_draw();
+    test_empty_candidates();
+    test_top_p_zero();
     if (omph_test::failures == 0) {
         std::printf("test_sampler: ok\n");
     }

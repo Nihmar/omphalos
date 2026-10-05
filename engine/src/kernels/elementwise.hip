@@ -168,18 +168,6 @@ __global__ void q8_roundtrip_kernel(const __half * __restrict__ x, __half * __re
 constexpr int kArgmaxThreads = 1024;
 constexpr int kArgmaxBlocks = 64;
 
-__device__ inline unsigned long long argmax_key(const float v, const unsigned i) {
-    if (!__builtin_isfinite(v)) {
-        // never wins: the packed key of a non-finite value is 0, the smallest
-        // (a row with none leaves the kernel's initial 0, whose index is 0)
-        return 0;
-    }
-    uint32_t u = __float_as_uint(v);
-    u = u == 0x80000000u ? 0u : u;  // -0.0 ties with +0.0
-    const uint32_t ord = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-    return ((unsigned long long) ord << 32) | (0xffffffffu - i);
-}
-
 __global__ __launch_bounds__(kArgmaxThreads) void argmax_kernel(const float * __restrict__ x,
                                                                const long long n,
                                                                unsigned long long * key) {
@@ -187,7 +175,7 @@ __global__ __launch_bounds__(kArgmaxThreads) void argmax_kernel(const float * __
     unsigned long long best = 0;
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += (long long) gridDim.x * blockDim.x) {
-        const unsigned long long k = argmax_key(x[i], (unsigned) i);
+        const unsigned long long k = argmax_key_pack(x[i], (unsigned) i);
         best = k > best ? k : best;
     }
 #pragma unroll

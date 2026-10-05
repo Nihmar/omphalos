@@ -165,6 +165,13 @@ int omph_generate(omph_engine * e, const int32_t * prompt, const size_t n, const
     omph_generate_params def;
     omph_generate_params_default(&def);
     const omph_generate_params & gp = p != nullptr ? *p : def;
+    // The sampler trusts its parameters: an empty candidate set (min_p > 1,
+    // temperature NaN) falls back to a single token, which is not what the
+    // caller asked for (#336).
+    if (!(gp.temperature >= 0.0f) || !(gp.top_p >= 0.0f) || gp.top_p > 1.0f ||
+        !(gp.min_p >= 0.0f) || gp.min_p > 1.0f || gp.top_k < 0) {
+        return (int) fail(e, OMPH_E_ARG, "sampling parameters out of range");
+    }
     try {
         omph::model::GenerateRequest req;
         req.max_tokens = gp.max_tokens;
