@@ -73,3 +73,48 @@
 #   seq      T=1    T=8      (issue: 241/474 at 32k, 539/1208 at 100k)
 #   32768    250    464
 #   100000   718    1296
+
+================================================================================
+# #270, second pass (2026-10-05, engine 96c6757): the key-split softmax scoped,
+# and a fresh baseline with the window-512 default and the K4/V4 cache.
+# (This section is appended; the measurements above stand.)
+#
+# Fresh baseline, `omph-attn-bench --k4 --tokens 1,2,4,8 --iters 30` (K4/V4,
+# window 512, 1152 B of KV per position):
+#   seq      T=1     T=2     T=4     T=8
+#   32768    243.5   239.4   303.3   482.5 us
+#   100000   545.1   560.4   797.4  1214.6 us
+#   identity: 0 of 28 multi-token rows differ from the single-token call.
+# T=2 is at or below T=1 (the KV pass amortizes at NRT=1), and the cost steps at
+# the NRT transitions: +64 us into NRT=2 and +179 us into NRT=3 at 32k, matching
+# the K8/V4 T sweep above.
+#
+# Why the key-split softmax has no safe win. The restructure the issue kept as its
+# specification - "P stays in f16, the partials of the scores disappear" - would
+# need one of:
+#   - one wave per row tile with all 256 dims (scores straight in registers, no
+#     part): O alone is 16 rows x 256 dims / 32 lanes = 128 VGPRs, over the budget;
+#     at NRT=3 it would evict the waves that hide the load latency, which is the
+#     effect every failed experiment above measured.
+#   - a cross-wave reduction without LDS: there is no cross-wave shuffle, and the
+#     dependency is all-to-all (each wave's 64 dims contribute to every row's
+#     score), so writing only the owner's rows loses part of the sum. The writes
+#     are already bank-conflict-free: the two half-wave rows land in complementary
+#     banks, so there is no hidden conflict to remove either.
+#   - f16 score partials (half of part's LDS): this changes the score arithmetic.
+#     Both the T=1 and the T=8 path would change together, so the identity witness
+#     would still hold, but the decode step's own numbers would move - the one
+#     thing the reference path must not do.
+# "V dequantized straight into the P V operand layout, without vt" was not tried:
+# the B operand wants 8 consecutive keys of one dim per lane, the cache holds 16
+# consecutive dims of one key, and the transpose is what vt is for; a direct gather
+# would be uncoalesced and, reused across the row tiles only via registers, is the
+# same register trade the swiglu fusion lost on (#255).
+#
+# Verdict: the T=1 case is at the DRAM wall (545 us at 100k = one 166 MB pass at
+# 211 GB/s of the ~270 practical); the T=8 excess (~670 us at 100k, ~240 us at 32k)
+# is the score/softmax/O work exposed by the register/LDS budget the dim-split
+# imposes. Every cheap lever is measured and lost, and the remaining one changes
+# the decode arithmetic. The 4-8 % of a step at 64k+ does not justify that; the
+# issue stays closed as specified, to be reopened only with a different kernel
+# shape and a new identity witness.
