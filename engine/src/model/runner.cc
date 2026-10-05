@@ -136,12 +136,21 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     // layer, ~770 MiB, #93). A --gemv runner only needs it for long
     // multi-token runs (prefill chunks), so it allocates it on first use.
     size_t scratch_bytes = 1 << 20;
-    for (const omph::gguf::TensorInfo & t : file_.tensors()) {
-        if (t.ne.size() < 2 || t.type == 0 || t.name.rfind("blk.", 0) != 0 || !in_stack(t.name)) {
-            continue;  // f32 vectors, embedding / head
+    const auto account = [&](const omph::gguf::File & f, const bool drafter) {
+        for (const omph::gguf::TensorInfo & t : f.tensors()) {
+            if (t.ne.size() < 2 || t.type == 0) {
+                continue;  // f32 vectors, embedding / head
+            }
+            if (!drafter && (t.name.rfind("blk.", 0) != 0 || !in_stack(t.name))) {
+                continue;
+            }
+            const int64_t rows = stage_rows((int64_t) t.ne[1], (int64_t) t.ne[0]);
+            scratch_bytes = std::max(scratch_bytes, (((size_t) rows * t.ne[0] * 2) + 255) & ~(size_t) 255);
         }
-        const int64_t rows = stage_rows((int64_t) t.ne[1], (int64_t) t.ne[0]);
-        scratch_bytes = std::max(scratch_bytes, (((size_t) rows * t.ne[0] * 2) + 255) & ~(size_t) 255);
+    };
+    account(file_, false);
+    if (dft_file_ != nullptr) {
+        account(*dft_file_, true);  // its fc / gate / blk tensors are staged too (#341)
     }
     // Allocated on first use: with the fused GEMM (#141) only a weight of a
     // type without a decoder ever needs it.
@@ -768,11 +777,9 @@ const void * Runner::q8_input(const void * x16, const int64_t k, const int64_t T
     return q;
 }
 
-// Device pointer to the original GGUF bytes of a tensor that was not
-// repacked (or whose repacked layout is the GGUF bytes, IQ1_M).
+// Device pointer to the original GGUF bytes of a tensor that was not repacked.
 const void * Runner::raw_bytes(const std::string & name) {
-    const auto it = gems_.find(name);
-    if (it != gems_.end() && it->second.type != 29) {
+    if (gems_.find(name) != gems_.end()) {
         throw std::runtime_error("raw bytes of the repacked " + name + " are not kept");
     }
     return static_cast<const uint8_t *>(dev_weights_) + off_.at(name);
@@ -825,7 +832,9 @@ int64_t Runner::stage_rows(const int64_t n_out, const int64_t k) const {
 }
 
 void * Runner::stage_w(const std::string & name, const int64_t row0, int64_t nrows) {
-    const omph::gguf::TensorInfo * t = file_.tensor(name);
+    // The drafter's tensors live in the drafter file, under their dflash. name
+    // (#341): resolve() is the one place that knows both files.
+    const omph::gguf::TensorInfo * t = resolve(name).t;
     if (t == nullptr) {
         throw std::runtime_error("missing tensor " + name);
     }
@@ -878,10 +887,12 @@ void * Runner::stage_w(const std::string & name, const int64_t row0, int64_t nro
         }
         std::fprintf(stderr, "] type=%u\n", t->type);
     }
-    // repacked weights straight from their layout, at the bandwidth bound and
-    // bit-identical to dequantizing the GGUF bytes (M8)
+    // Repacked weights straight from their layout, at the bandwidth bound.
+    // IQ1_M is repacked too since #275: the GGUF-block dequant this used to
+    // run on its tile bytes decoded garbage (#341). The GGUF path is only for
+    // a tensor without a repacked layout.
     const auto g = gems_.find(name);
-    const bool ok = g != gems_.end() && g->second.type != 29
+    const bool ok = g != gems_.end()
                         ? omph::kernels::dequant_repacked(g->second.type,
                                                           static_cast<const uint8_t *>(dev_weights_) +
                                                               g->second.off,
