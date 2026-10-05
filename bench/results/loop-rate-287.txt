@@ -30,3 +30,7 @@
 # paragraph rule the loop-police postmortem classifies with), not prefix based.
 #
 # The CSV next to this file is the same table, tagged with the engine commit (PLAN.md §17).
+
+# Metric fix (#348): the repeats_per_1k_tokens column was written per million
+# generated tokens (1000x); the values in the CSV have been divided by 1000.
+# tools/loop_rate.py computes per 1000 since that fix.

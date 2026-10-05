@@ -54,6 +54,13 @@ def answer(m: dict) -> tuple[str, str]:
     return m.get("content") or "", m.get("reasoning_content") or ""
 
 
+def answer_text(m: dict) -> str:
+    """The answer for a one-line report: content, or the reasoning when the
+    content is empty (thinking on, the cap inside <think>)."""
+    content, reasoning = answer(m)
+    return content or reasoning
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--spec", default="mtp,dflash")
@@ -104,10 +111,12 @@ def main() -> None:
             log = Path(f"/tmp/check_conversations-{spec}.log")
             proc, url = server(spec, log)
             try:
-                a1, _ = chat(url, [{"role": "system", "content": sys_a}, {"role": "user", "content": q1}], thinking)
+                a1m, _ = chat_full(url, [{"role": "system", "content": sys_a},
+                                         {"role": "user", "content": q1}], thinking)
+                a1 = a1m.get("content") or ""
                 turn2 = [{"role": "system", "content": sys_a}, {"role": "user", "content": q1},
                          {"role": "assistant", "content": a1}, {"role": "user", "content": q2}]
-                ref, _ = chat(url, turn2, thinking)
+                refm, _ = chat_full(url, turn2, thinking)
                 rw_ref, _ = chat_full(url, rewritten, thinking, 384)
                 rw_neg_ref, _ = chat_full(url, rewritten_neg, thinking, 384)
             finally:
@@ -115,9 +124,10 @@ def main() -> None:
                 proc.wait()
             proc, url = server(spec, log)
             try:
-                a1b, _ = chat(url, [{"role": "system", "content": sys_a}, {"role": "user", "content": q1}], thinking)
+                a1bm, _ = chat_full(url, [{"role": "system", "content": sys_a},
+                                          {"role": "user", "content": q1}], thinking)
                 chat(url, [{"role": "system", "content": sys_b}, {"role": "user", "content": q1}], thinking)
-                got, cached = chat(url, turn2, thinking)
+                gotm, cached = chat_full(url, turn2, thinking)
                 chat(url, hist, thinking)  # the conversation that gets compacted
                 rw, rw_cached = chat_full(url, rewritten, thinking, 384)
                 rw_neg, _ = chat_full(url, rewritten_neg, thinking, 384)
@@ -125,13 +135,15 @@ def main() -> None:
                 proc.terminate()
                 proc.wait()
             lines = log.read_text()
-            ok = a1b == a1 and got == ref and cached >= 2048 and "previous conversation saved" in lines \
-                and "restored" in lines
-            print(f"{'ok  ' if ok else 'FAIL'} {tag}: turn 2 {'identical' if got == ref else 'DIFFERS'}, "
+            ok = answer(a1bm) == answer(a1m) and answer(gotm) == answer(refm) and cached >= 2048 \
+                and "previous conversation saved" in lines and "restored" in lines
+            print(f"{'ok  ' if ok else 'FAIL'} {tag}: turn 2 "
+                  f"{'identical' if answer(gotm) == answer(refm) else 'DIFFERS'}, "
                   f"{cached} prompt tokens restored", flush=True)
             if not ok:
                 failures.append(tag)
-                print("   ref:", json.dumps(ref[:200]), "\n   got:", json.dumps(got[:200]))
+                print("   ref:", json.dumps(answer_text(refm)[:200]),
+                      "\n   got:", json.dumps(answer_text(gotm)[:200]))
             # #286: the rewritten history, restored from the first checkpoint
             ok = answer(rw) == answer(rw_ref) and rw_cached >= 512
             print(f"{'ok  ' if ok else 'FAIL'} {tag}: rewritten history "
@@ -139,16 +151,16 @@ def main() -> None:
                   f"{rw_cached} prompt tokens resumed", flush=True)
             if not ok:
                 failures.append(f"{tag} (rewrite)")
-                print("   ref:", json.dumps((answer(rw_ref)[0] or answer(rw_ref)[1])[:200]),
-                      "\n   got:", json.dumps((answer(rw)[0] or answer(rw)[1])[:200]))
+                print("   ref:", json.dumps(answer_text(rw_ref)[:200]),
+                      "\n   got:", json.dumps(answer_text(rw)[:200]))
             # and the negative control: no checkpoint usable, the caches restart
             ok = answer(rw_neg) == answer(rw_neg_ref)
             print(f"{'ok  ' if ok else 'FAIL'} {tag}: rewrite inside the first message "
                   f"{'identical' if ok else 'DIFFERS'} to the cold prefill", flush=True)
             if not ok:
                 failures.append(f"{tag} (rewrite, first message)")
-                print("   ref:", json.dumps((answer(rw_neg_ref)[0] or answer(rw_neg_ref)[1])[:200]),
-                      "\n   got:", json.dumps((answer(rw_neg)[0] or answer(rw_neg)[1])[:200]))
+                print("   ref:", json.dumps(answer_text(rw_neg_ref)[:200]),
+                      "\n   got:", json.dumps(answer_text(rw_neg)[:200]))
     if failures:
         sys.exit(f"{len(failures)} failure(s)")
     print("all conversation checks passed")

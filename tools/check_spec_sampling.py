@@ -15,6 +15,7 @@ implementation gives p-values spread over (0, 1), a biased one p ~ 0.
 import argparse
 import random
 import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -67,6 +68,9 @@ def main() -> None:
     ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--max-tokens", type=int, default=4)
     ap.add_argument("--rounds", type=int, default=2000)
+    ap.add_argument("--min-positions", type=int, default=2,
+                    help="positions the run must have scored: fewer means the sequences were empty or "
+                         "shorter than the check (#348)")
     ap.add_argument("--model", default=str(ROOT / "models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"))
     ap.add_argument("--omph", default=str(ROOT / "engine/build"))
     args = ap.parse_args()
@@ -86,11 +90,13 @@ def main() -> None:
     rng = random.Random(197)
     print(f"{args.n} samples per mode, temperature {args.temp}, top_p {args.top_p}")
     worst = 1.0
+    positions = 0
     for pos in range(args.max_tokens):
         a = [s[pos] for s in pt if len(s) > pos]
         b = [s[pos] for s in st if len(s) > pos]
         if len(a) < args.n // 2 or len(b) < args.n // 2:
             break
+        positions += 1
         half = len(a) // 2
         base = tvd(a[:half], a[half:])
         p = permutation_p(a, b, args.rounds, rng)
@@ -99,7 +105,17 @@ def main() -> None:
               f"(plain half vs half {base:.3f}), permutation p = {p:.3f}")
     joint = permutation_p([hash(s) for s in plain], [hash(s) for s in spec], args.rounds, rng)
     print(f"whole continuations: {len(set(plain) | set(spec))} distinct, permutation p = {joint:.3f}")
-    print("PASS" if min(worst, joint) > 0.01 else "FAIL: the distributions differ")
+    # An empty or short run must fail, not pass on identical hashes (#348).
+    enough = positions >= min(args.min_positions, args.max_tokens)
+    if not enough:
+        print(f"FAIL: only {positions} position(s) with {args.n // 2}+ samples, wanted "
+              f"{min(args.min_positions, args.max_tokens)}")
+    elif min(worst, joint) <= 0.01:
+        print("FAIL: the distributions differ")
+    else:
+        print("PASS")
+        return
+    sys.exit(1)
 
 
 if __name__ == "__main__":

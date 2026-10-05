@@ -86,3 +86,7 @@
 #
 # Both CSVs next to this file are the same tables, per run, tagged with the
 # engine commit.
+
+# Metric fix (#348): the repeats_per_1k_tokens column was written per million
+# generated tokens (1000x); the values in the CSV have been divided by 1000.
+# tools/loop_rate.py computes per 1000 since that fix.

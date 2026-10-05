@@ -307,8 +307,10 @@ def main() -> None:
                                                        args.threshold, True)
                 repeats_any = score(text, args.para_min_len, args.fingerprint_len, args.threshold, False)[0]
                 tokens = (r["usage"].get("completion_tokens") or 0)
-                per_k = 1000.0 * repeats / (tokens / 1000.0) if tokens else 0.0
+                # repetitions per 1000 generated tokens (was written per million, #348)
+                per_k = repeats / (tokens / 1000.0) if tokens else 0.0
                 rows.append({"config": name, "prompt": label, "prompt_tokens": (r["usage"].get("prompt_tokens") or 0),
+                             "reasoning_chars": len(reasoning),
                              "completion_tokens": tokens, "paragraphs": paras, "paragraphs_skipped": skipped,
                              "repetitions": repeats, "repetitions_anywhere": repeats_any,
                              "repeats_per_1k_tokens": round(per_k, 3), "worst_pair_similarity": round(worst, 3)})

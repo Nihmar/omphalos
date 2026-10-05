@@ -1,6 +1,6 @@
 commit,config,prompt,prompt_tokens,reasoning_chars,completion_tokens,paragraphs,paragraphs_skipped,repetitions,repetitions_anywhere,repeats_per_1k_tokens,worst_pair_similarity
 6364d24,sampled,2026-10-04T09:17:56Z,98255,,4096,62,8,0,0,0.0,0.965
-6364d24,sampled,2026-10-04T11:44:19Z,45205,,4096,75,5,3,3,732.422,1.0
+6364d24,sampled,2026-10-04T11:44:19Z,45205,,4096,75,5,3,3,0.732,1.0
 6364d24,pen-llama,2026-10-04T09:17:56Z,98255,,4096,62,10,0,0,0.0,0.721
 6364d24,pen-llama,2026-10-04T11:44:19Z,45205,,889,14,1,0,0,0.0,0.479
 6364d24,pen-openai,2026-10-04T09:17:56Z,98255,,3346,48,13,0,0,0.0,0.991

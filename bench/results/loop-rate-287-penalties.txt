@@ -54,3 +54,7 @@
 # one that was looping.
 #
 # The two CSVs next to this file are the per-run table and the detector sweep.
+
+# Metric fix (#348): the repeats_per_1k_tokens column was written per million
+# generated tokens (1000x); the values in the CSV have been divided by 1000.
+# tools/loop_rate.py computes per 1000 since that fix.
