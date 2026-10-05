@@ -31,32 +31,9 @@ size_t partial_suffix(const std::string & s, const std::string & tag) {
 
 // invalid UTF-8 (a byte-level token sequence that never completes a
 // character) to U+FFFD, so that responses stay valid JSON text
-std::string sanitize_utf8(const std::string & s) {
-    std::string out;
-    out.reserve(s.size());
-    for (size_t i = 0; i < s.size();) {
-        const auto b = (uint8_t) s[i];
-        size_t len = b < 0x80 ? 1 : (b >> 5) == 0x6 ? 2 : (b >> 4) == 0xE ? 3 : (b >> 3) == 0x1E ? 4 : 0;
-        bool ok = len > 0 && i + len <= s.size();
-        for (size_t k = 1; ok && k < len; ++k) {
-            ok = ((uint8_t) s[i + k] & 0xC0) == 0x80;
-        }
-        if (ok && len > 1) {  // overlong forms and surrogates
-            uint32_t cp = b & (0x7F >> len);
-            for (size_t k = 1; k < len; ++k) cp = (cp << 6) | ((uint8_t) s[i + k] & 0x3F);
-            static const uint32_t kMin[5] = {0, 0, 0x80, 0x800, 0x10000};
-            ok = cp >= kMin[len] && cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF);
-        }
-        if (ok) {
-            out.append(s, i, len);
-            i += len;
-        } else {
-            out += "\xEF\xBF\xBD";
-            ++i;
-        }
-    }
-    return out;
-}
+// (sanitize_utf8 is defined below, outside the anonymous namespace, and
+// declared in the header: the server sanitizes every JSON body and every SSE
+// payload, #338)
 
 double number(const Json & body, const char * key, double lo, double hi, double fallback) {
     const Json * v = body.find(key);
@@ -189,6 +166,34 @@ void parse_sampling(const Json & body, const Defaults & d, Job & job) {
 }
 
 } // namespace
+
+// See the header: a byte-level token sequence can end mid-character.
+std::string sanitize_utf8(const std::string & s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        const auto b = (uint8_t) s[i];
+        size_t len = b < 0x80 ? 1 : (b >> 5) == 0x6 ? 2 : (b >> 4) == 0xE ? 3 : (b >> 3) == 0x1E ? 4 : 0;
+        bool ok = len > 0 && i + len <= s.size();
+        for (size_t k = 1; ok && k < len; ++k) {
+            ok = ((uint8_t) s[i + k] & 0xC0) == 0x80;
+        }
+        if (ok && len > 1) {  // overlong forms and surrogates
+            uint32_t cp = b & (0x7F >> len);
+            for (size_t k = 1; k < len; ++k) cp = (cp << 6) | ((uint8_t) s[i + k] & 0x3F);
+            static const uint32_t kMin[5] = {0, 0, 0x80, 0x800, 0x10000};
+            ok = cp >= kMin[len] && cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF);
+        }
+        if (ok) {
+            out.append(s, i, len);
+            i += len;
+        } else {
+            out += "\xEF\xBF\xBD";
+            ++i;
+        }
+    }
+    return out;
+}
 
 Job parse_request(const Json & body, const bool chat, const Defaults & defaults) {
     if (!body.is_object()) bad("the request body must be a JSON object");

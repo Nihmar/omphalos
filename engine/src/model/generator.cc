@@ -96,8 +96,8 @@ bool Generator::feed(const Expanded & p, const GenerateRequest & req, const int6
             if (!save_checkpoint(toks, end)) return false;
             res.checkpoint_ms += omph::runtime::now_ms() - t0;
         }
-        if (req.on_prefill) {
-            req.on_prefill(end, n);
+        if (req.on_prefill && !req.on_prefill(end - from, n - from)) {
+            return false;  // the client went away: the caches are mid-chunk
         }
         off = end;
     }

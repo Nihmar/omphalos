@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 
@@ -18,6 +19,18 @@ namespace {
 
 constexpr size_t kMaxHead = 64 << 10;
 constexpr size_t kMaxBody = 64 << 20;
+// A client that stalls must not hold the one-connection server (#338): one
+// recv() may block this long, and reading a whole request (headers + body)
+// has a deadline of its own, so a byte-every-few-seconds client cannot keep
+// the server forever.
+constexpr int kRecvTimeoutMs = 10'000;
+constexpr int kRequestDeadlineMs = 120'000;
+
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 const char * reason(const int status) {
     switch (status) {
@@ -25,11 +38,13 @@ const char * reason(const int status) {
         case 204: return "No Content";
         case 400: return "Bad Request";
         case 401: return "Unauthorized";
+        case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 408: return "Request Timeout";
         case 411: return "Length Required";
         case 413: return "Payload Too Large";
+        case 415: return "Unsupported Media Type";
         case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
@@ -108,19 +123,36 @@ bool Connection::begin_events() {
 
 bool Connection::event(const std::string & data) { return write_all("data: " + data + "\n\n"); }
 
+bool Connection::client_gone() {
+    char peek = 0;
+    const ssize_t n = ::recv(fd_, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n > 0) {
+        return false;  // nothing says the client stopped reading
+    }
+    if (n == 0) {
+        return true;   // orderly shutdown (or a half-close: it is not waiting for us)
+    }
+    return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+}
+
 bool Connection::read(Request & req) {
     // a client that stalls must not hold the server (one connection at a time)
-    timeval tv{30, 0};
+    timeval tv{kRecvTimeoutMs / 1000, (kRecvTimeoutMs % 1000) * 1000};
     ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ::setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     const int one = 1;
     ::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    const int64_t deadline = now_ms() + kRequestDeadlineMs;
     std::string data;
     char buf[16384];
     size_t end = std::string::npos;
     while ((end = data.find("\r\n\r\n")) == std::string::npos) {
         if (data.size() > kMaxHead) {
             respond(431, "application/json", error_json("request headers too large"));
+            return false;
+        }
+        if (now_ms() > deadline) {
+            respond(408, "application/json", error_json("the request timed out"));
             return false;
         }
         const ssize_t n = ::recv(fd_, buf, sizeof(buf), 0);
@@ -180,6 +212,10 @@ bool Connection::read(Request & req) {
     }
     req.body = data.substr(end + 4);
     while (req.body.size() < length) {
+        if (now_ms() > deadline) {
+            respond(408, "application/json", error_json("the request timed out"));
+            return false;
+        }
         const ssize_t n = ::recv(fd_, buf, std::min(sizeof(buf), length - req.body.size()), 0);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {

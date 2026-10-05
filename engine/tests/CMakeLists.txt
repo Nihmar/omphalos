@@ -22,7 +22,7 @@ target_compile_options(omph_format PRIVATE -Wall -Wextra)
 
 enable_testing()
 foreach(t test_repack test_gguf test_omph test_tokenizer test_chat test_openai test_sampler test_hparams
-           test_ngram test_argmax)
+           test_ngram test_argmax test_server_access)
     add_executable(${t} ${t}.cc)
     target_link_libraries(${t} PRIVATE omph_format)
     target_compile_options(${t} PRIVATE -Wall -Wextra)

@@ -56,8 +56,9 @@ def wait_health(url: str, proc: subprocess.Popen | None, timeout: float) -> None
     sys.exit("omph-server did not come up")
 
 
-def raw_post(url: str, path: str, body: bytes) -> tuple[int, dict]:
-    req = urllib.request.Request(url + path, data=body, headers={"Content-Type": "application/json"})
+def raw_post(url: str, path: str, body: bytes, headers: dict | None = None) -> tuple[int, dict]:
+    req = urllib.request.Request(url + path, data=body,
+                                 headers={"Content-Type": "application/json", **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             return r.status, json.loads(r.read())
@@ -225,6 +226,44 @@ def run_checks(url: str) -> None:
             check(True, f"{what}: 400")
     code, body = raw_post(url, "/v1/embeddings", b"{}")
     check(code == 404 and "error" in body, "unknown endpoint: 404")
+    # #338: the access checks
+    code, body = raw_post(url, "/v1/completions", b'{"prompt":"hi","max_tokens":1}',
+                          {"Content-Type": "text/plain"})
+    check(code == 415 and "error" in body, f"a text/plain POST: {code}")
+    code, body = raw_post(url, "/v1/completions", b'{"prompt":"hi","max_tokens":1}',
+                          {"Host": "evil.example"})
+    check(code == 403 and "error" in body, f"a rebinding Host: {code}")
+    # #338: a lone surrogate the JSON parser combined into CESU-8 cannot come
+    # back as invalid UTF-8 (json.loads would raise on the raw bytes)
+    code, body = raw_post(url, "/v1/completions", b'{"prompt":"\\ud800","max_tokens":1,"echo":true}')
+    echoed = body.get("choices", [{}])[0].get("text", "")
+    check(code == 200 and "\ufffd" in echoed, f"a lone surrogate in the echo: {echoed!r}")
+    run_abandon_checks(url)
+
+
+def run_abandon_checks(url: str) -> None:
+    """#338: a non-streamed request whose client is gone must stop; the server
+    is free for the next connection (it serves one at a time)."""
+    import socket
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    host, port = parts.hostname or "127.0.0.1", parts.port or 80
+    body = json.dumps({"prompt": "Repeat the word spam forever, one per line:", "max_tokens": 4096})
+    sock = socket.create_connection((host, port), timeout=10)
+    sock.sendall(f"POST /v1/completions HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                 f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}".encode())
+    time.sleep(2.0)  # it is generating by now
+    sock.close()
+    t0 = time.monotonic()
+    ok = False
+    while time.monotonic() - t0 < 15:
+        try:
+            with urllib.request.urlopen(url + "/health", timeout=2) as r:
+                ok = r.status == 200
+                break
+        except (urllib.error.URLError, ConnectionError, TimeoutError):
+            time.sleep(0.5)
+    check(ok, f"an abandoned request stopped ({time.monotonic() - t0:.1f} s until the next one)")
 
 
 def run_image_checks(url: str, image: Path) -> None:

@@ -36,6 +36,11 @@ public:
     bool begin_events();
     bool event(const std::string & data);
 
+    // True once the client closed (or reset) the connection: the request in
+    // flight has nowhere to write its answer and must stop (#338). A poll of a
+    // socket with nothing to read.
+    bool client_gone();
+
     // added to every response (CORS)
     std::vector<std::pair<std::string, std::string>> extra_headers;
 

@@ -155,6 +155,17 @@ flag and the value it got (`--top-p 0.95--top-k`, a flag pasted without its
 space, used to set `top_p` to 0.95 and ignore the rest; #306) -- a typo cannot
 configure a run half-way.
 
+A request's `Host` must be the address the server is bound to, or `localhost` /
+a loopback literal: a DNS-rebinding page presents its own name and gets a 403.
+A wildcard bind (`--host 0.0.0.0`) accepts any `Host`, since it cannot name
+itself. POSTs must say `Content-Type: application/json` (a `text/plain` POST is
+a CORS-simple request a web page could send without a preflight), the `--api-key`
+comparison is constant-time and the scheme is case-insensitive, and a client
+that hangs up stops the request within a token or a prefill chunk -- streamed or
+not, instead of decoding to the context's end. Reading a request allows 10 s per
+`recv` and 2 minutes in total, so an idle preconnect or a byte-dribbling client
+cannot hold the one-connection server ([#338](https://github.com/Nihmar/omphalos/issues/338)).
+
 Every sampling option is only a **default for requests that leave that field
 out**: a client that sends its own wins. Greedy and sampled requests both
 decode speculatively (MTP drafts, or DFlash2's, plus n-gram drafts when the

@@ -33,6 +33,7 @@
 #include "model/generator.hh"
 #include "runtime/options.hh"
 #include "runtime/timing.hh"
+#include "server/access.hh"
 #include "server/http.hh"
 #include "server/openai.hh"
 #include "tools/cli.hh"
@@ -85,6 +86,8 @@ std::string sampling_label(const omph::server::Job & job) {
 struct Server {
     omph::model::Generator & gen;
     std::string model_id;
+    std::string host;
+    int port = 0;
     std::string api_key;
     std::string cors;
     omph::server::Defaults defaults;
@@ -96,7 +99,9 @@ struct Server {
     static Json str(const std::string & s) { return Json::string(s); }
 
     bool reply(omph::server::Connection & c, const int status, const Json & body) {
-        return c.respond(status, "application/json", body.dump());
+        // every string that reaches a response is valid UTF-8, whatever byte
+        // sequence a tokenizer or a JSON escape put in it (#338)
+        return c.respond(status, "application/json", omph::server::sanitize_utf8(body.dump()));
     }
     bool fail(omph::server::Connection & c, const int status, const std::string & message,
               const std::string & type = "invalid_request_error", const std::string & param = "") {
@@ -116,6 +121,12 @@ struct Server {
         if (!cors.empty()) {
             c.extra_headers = {{"Access-Control-Allow-Origin", cors}};
         }
+        if (const std::string * h = req.header("host"); h != nullptr && !omph::server::host_allowed(*h, host)) {
+            fail(c, 403, "the Host header does not match where this server is bound (" + host +
+                             "), so a page that resolved its own name here cannot drive it",
+                 "invalid_request_error");
+            return;
+        }
         if (req.method == "OPTIONS") {  // CORS preflight
             if (!cors.empty()) {
                 c.extra_headers.emplace_back("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -134,7 +145,7 @@ struct Server {
         }
         if (!api_key.empty()) {
             const std::string * auth = req.header("authorization");
-            if (auth == nullptr || *auth != "Bearer " + api_key) {
+            if (auth == nullptr || !omph::server::bearer_key_ok(*auth, api_key)) {
                 fail(c, 401, "invalid API key", "authentication_error");
                 return;
             }
@@ -159,6 +170,13 @@ struct Server {
         if (path == "/chat/completions" || path == "/completions") {
             if (req.method != "POST") {
                 fail(c, 405, "use POST");
+                return;
+            }
+            // A text/plain POST from a web page is a CORS-simple request: it
+            // would start a generation and evict or save conversations (#338).
+            const std::string * ct = req.header("content-type");
+            if (ct == nullptr || !omph::server::json_content_type(*ct)) {
+                fail(c, 415, "Content-Type: application/json is required");
                 return;
             }
             complete(c, req, path == "/chat/completions");
@@ -257,19 +275,26 @@ struct Server {
         greq.sampling.frequency_penalty = job.frequency_penalty;
         greq.sampling.presence_penalty = job.presence_penalty;
         greq.sampling.penalty_last_n = job.penalty_last_n;
+        bool client_gone = false;  // the socket says the client is gone (#338)
         // A 20 s - 2.5 min prefill with no output looks like a hang (#310): one
         // line every 3 s, the same shape as the decode progress below.
         {
             const double t0 = omph::runtime::now_ms();
             double t_last = t0;
-            greq.on_prefill = [&greq, t0, t_last](const int64_t done, const int64_t total) mutable {
+            greq.on_prefill = [&c, &client_gone, t0, t_last](const int64_t done,
+                                                             const int64_t total) mutable {
+                if (c.client_gone()) {  // the abandoned request stops here, not an hour later (#338)
+                    client_gone = true;
+                    return false;
+                }
                 const double now = omph::runtime::now_ms();
                 if (done < total && now - t_last < 3000.0) {
-                    return;
+                    return true;
                 }
                 t_last = now;
                 std::fprintf(stderr, "  prefill %lld / %lld tokens, %.1f t/s\n", (long long) done,
                              (long long) total, done > 0 && now > t0 ? 1000.0 * (double) done / (now - t0) : 0.0);
+                return true;
             };
         }
 
@@ -316,10 +341,16 @@ struct Server {
         std::string reasoning, content, echo;
         std::vector<omph::server::ToolCall> calls;
         if (job.echo) {
-            echo = job.prompt_ids.empty() ? job.prompt : tok.decode(job.prompt_ids, false);
+            // a decode of arbitrary ids can end mid-character: the response must stay JSON (#338)
+            echo = omph::server::sanitize_utf8(job.prompt_ids.empty() ? job.prompt
+                                                                     : tok.decode(job.prompt_ids, false));
         }
-        bool gone = false;  // the client closed the stream
+        bool gone = false;         // the client closed the stream
         int n_streamed_calls = 0;
+        // every SSE payload is a JSON body too: the same UTF-8 guarantee
+        const auto event = [&c](const Json & body) {
+            return c.event(omph::server::sanitize_utf8(body.dump()));
+        };
         const auto send = [&](const Delta & d) {
             if (!job.stream) {
                 reasoning += d.reasoning;
@@ -329,25 +360,25 @@ struct Server {
             }
             if (gone || d.empty()) return;
             if (!chat) {
-                gone = !c.event(chunk(str(d.content), Json()).dump());
+                gone = !event(chunk(str(d.content), Json()));
                 return;
             }
             if (!d.reasoning.empty()) {
                 Json delta = Json::object();
                 delta.set("reasoning_content", str(d.reasoning));
-                gone = gone || !c.event(chunk(std::move(delta), Json()).dump());
+                gone = gone || !event(chunk(std::move(delta), Json()));
             }
             if (!d.content.empty()) {
                 Json delta = Json::object();
                 delta.set("content", str(d.content));
-                gone = gone || !c.event(chunk(std::move(delta), Json()).dump());
+                gone = gone || !event(chunk(std::move(delta), Json()));
             }
             for (const auto & call : d.calls) {
                 Json delta = Json::object();
                 Json arr = Json::array();
                 arr.push(call_json(call, n_streamed_calls++, true));
                 delta.set("tool_calls", std::move(arr));
-                gone = gone || !c.event(chunk(std::move(delta), Json()).dump());
+                gone = gone || !event(chunk(std::move(delta), Json()));
             }
         };
         if (job.stream) {
@@ -356,9 +387,9 @@ struct Server {
                 Json delta = Json::object();
                 delta.set("role", str("assistant"));
                 delta.set("content", str(""));
-                gone = !c.event(chunk(std::move(delta), Json()).dump());
+                gone = !event(chunk(std::move(delta), Json()));
             } else if (!gone && !echo.empty()) {
-                gone = !c.event(chunk(str(echo), Json()).dump());
+                gone = !event(chunk(str(echo), Json()));
             }
         }
         GenerateResult res;
@@ -367,6 +398,9 @@ struct Server {
             double t_first = 0.0, t_last = 0.0;
             int64_t n = 0, n_last = 0;
             res = gen.generate(prompt, greq, [&](const int32_t t) {
+                if (!client_gone && c.client_gone()) {
+                    client_gone = true;  // a non-streamed request has no send() to fail (#338)
+                }
                 const double now = omph::runtime::now_ms();
                 if (n++ == 0) t_first = t_last = now;
                 if (now - t_last >= 3000.0) {
@@ -382,7 +416,7 @@ struct Server {
                     n_last = n;
                 }
                 send(parser.push(tok.piece(t, false)));
-                return !gone && !parser.stopped();
+                return !gone && !client_gone && !parser.stopped();
             });
             send(parser.finish());
         }
@@ -410,16 +444,16 @@ struct Server {
         if (job.stream) {
             if (!gone) {
                 if (error) {
-                    c.event(omph::server::error_body("generation failed", "server_error").dump());
+                    event(omph::server::error_body("generation failed", "server_error"));
                 } else {
                     Json last = chunk(chat ? Json::object() : str(""), finish);
                     last.set("timings", timings);
-                    c.event(last.dump());
+                    event(last);
                     if (job.include_usage) {
                         Json u = frame(chat ? "chat.completion.chunk" : "text_completion");
                         u.set("choices", Json::array());
                         u.set("usage", usage);
-                        c.event(u.dump());
+                        event(u);
                     }
                 }
                 c.event("[DONE]");
@@ -470,7 +504,8 @@ struct Server {
                      res.tokens.size(), res.decode_ms,
                      res.decode_ms > 0 ? 1000.0 * completion_tokens / res.decode_ms : 0.0,
                      (long long) res.accepted, (long long) res.drafted,
-                     parser.stopped() ? "stop string" : kStop[(int) res.stop], gone ? " (client gone)" : "");
+                     parser.stopped() ? "stop string" : kStop[(int) res.stop],
+                     (gone || client_gone) ? " (client gone)" : "");
     }
 };
 
@@ -530,7 +565,7 @@ int main(int argc, char ** argv) {
     try {
         omph::server::Listener listener(host, port);  // fail before the minute of loading
         omph::model::Generator gen(cfg, omph::runtime::EnvOptions::from_env());
-        Server server{gen, alias.empty() ? default_id(cfg.model) : alias, api_key, cors, defaults};
+        Server server{gen, alias.empty() ? default_id(cfg.model) : alias, host, port, api_key, cors, defaults};
 #ifdef OMPH_VISION
         std::unique_ptr<omph::vision::Encoder> vision;
         if (!mmproj.empty()) {
