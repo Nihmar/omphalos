@@ -1,0 +1,42 @@
+# #270: the verification attention's cost, and the two cheap hypotheses measured.
+# Engine b0c82ec (main, plus the two experiments tried and reverted), RX 9060 XT 16 GB, 2026-10-05.
+# `omph-attn-bench`, K8/V4, one layer per call, the WMMA decode kernel: 1664 B of KV per position,
+# `T` tokens per call (T x 6 rows in ceil(T*6/16) 16-row tiles), the fixed key chunks of #136.
+#
+# T sweep, the current kernel (one workgroup per kv head and split, NRT row tiles):
+#   seq        T=1   T=2   T=3   T=4   T=6    T=8    one KV pass (the floor)
+#   32768      207   219   312   323   454    479    207 us (54 MB at 263 GB/s)
+#   65536      407    -     -     -     -     848    407
+#   100000     615   645   869   906  1272   1217    615 us (166 MB at 270 GB/s)
+#
+# The marginal cost of a row tile jumps at the NRT transitions: at 32k +12 us for the second tile of
+# the same NRT (T=1 -> T=2), then +93 us going into NRT=2 and +310 us into NRT=3; at 100k +30, +224,
+# +365. Same work per row, 25x the marginal cost: the workgroup's registers and LDS grow with NRT
+# and its residency drops (the issue's diagnosis, now with numbers).
+#
+# Experiment 1 -- one row tile per workgroup (the issue's "first try": grid.x = the tiles, NRT=1):
+#   32768  T=8:  479 -> 535  (+12 %)      100000 T=8: 1217 -> 1578 (+30 %)      T=1 unchanged
+# Each extra workgroup re-reads the whole cache, and the L2 does not serve the second read (the
+# workgroups drift apart over the ~6000 key tiles, and the tiles are 100+ KB per key across the four
+# kv heads): the marginal cost of a workgroup is a full KV pass (~600 us at 100k). Rejected.
+#
+# Experiment 2 -- 8 waves instead of 4 (half the output accumulators per thread, twice the loads in
+# flight per barrier; the row tiles stay in one workgroup, so the KV is still read once):
+#   32768  T=1: 207.6 vs 206.9      T=8: 480.6 vs 479.4
+#   65536  T=1: 408.3 vs 406.9      T=8: 851.8 vs 848.4
+#   100000 T=1: 625.1 vs 614.3      T=8: 1323.1 vs 1216.6
+# Within 1 % at 32k and 64k, +2 % and +9 % at 100k: its `part` LDS array doubles (24 KB for NRT=3)
+# and at 100k the kernel is already at the bandwidth wall, where fewer resident workgroups hurt.
+# Rejected. (A first reading of these runs compared against the *older* `engine/build` binary, whose
+# window was 128: that 17 % was the window change of #318, not the waves.)
+#
+# Where the cost actually is
+# - One token at 100k: 615 us = 166 MB of KV at 270 GB/s = one pass at the practical DRAM
+#   bandwidth (the weights' step runs at ~295 GB/s). Optimal: nothing to gain there, and nothing
+#   gained by either experiment.
+# - Eight tokens: the same 166 MB would do. The extra ~600 us is the score/softmax/accumulate work
+#   (24 KB of `part` written and read per key tile with NRT=3) *exposed* rather than overlapped.
+#   Ceiling: ~600 us per layer-call at 100k = ~9.7 ms of the ~62 ms speculative step (16 %),
+#   realistically half of it. Reaching it needs the next key tile's loads in flight during the
+#   current one's LDS/WMMA work -- a double-buffered `vt` and a hierarchical softmax reduction --
+#   not a different launch shape: both cheap hypotheses are measured and rejected above.
