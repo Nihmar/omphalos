@@ -6,7 +6,6 @@
 #pragma once
 
 #include <cstdint>
-#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <random>
@@ -30,21 +29,8 @@ struct Image {
     int nx = 0;
     int ny = 0;
     std::string digest;  // lowercase hex of the bytes, 64 characters
-    // The token id of each of the image's rows: negative, so it can never be a
-    // vocabulary token, and derived from the digest. A collision needs ~2^31
-    // candidate images, not FNV's low-bit algebra (#339).
-    int32_t placeholder_id() const;
     int64_t n_tokens() const { return (int64_t) nx * ny; }
 };
-
-inline int32_t Image::placeholder_id() const {
-    if (digest.size() < 8) {
-        return -1;
-    }
-    // the first 8 hex digits, one 31-bit slice (never the sign bit)
-    const unsigned long v = std::strtoul(digest.substr(0, 8).c_str(), nullptr, 16);
-    return -1 - (int32_t) (v & 0x7fffffffu);
-}
 
 struct GenerateRequest {
     int64_t max_tokens = 256;
@@ -127,13 +113,17 @@ private:
     // generate(), without the unwind guard (#337)
     GenerateResult generate_inner(const std::vector<int32_t> & prompt, const GenerateRequest & request,
                                   const std::function<bool(int32_t)> & on_token);
-    // A prompt with its images expanded: an image's positions hold ids
-    // derived from its hash (negative: never a vocabulary token), so prefix
-    // reuse sees which image is where; M-RoPE positions when there are images.
+    // A prompt with its images expanded: an image's positions hold the id
+    // `-1 - its occurrence index` (negative: never a vocabulary token), and
+    // the digests table says which image each index is; prefix reuse compares
+    // the digests, not only the ids (#363). M-RoPE positions when there are
+    // images.
     struct Expanded {
         std::vector<int32_t> tokens;
         std::vector<const Image *> image_of;  // per position: its image, or null
         std::vector<int64_t> image_row;       // per position: the row in its image
+        std::vector<std::string> images;      // per image occurrence: its digest (#363)
+        std::vector<int64_t> image_start;     // per occurrence: its first position (#363)
         std::vector<int32_t> mpos;            // 3 per position, or empty (text only)
         int64_t rope_end = 0;                 // the RoPE position after the prompt
     };
@@ -141,16 +131,19 @@ private:
     bool feed(const Expanded & p, const GenerateRequest & req, int64_t from,
               std::vector<float> & last_logits, const std::vector<int64_t> & cuts, GenerateResult & res);
     // Sequence checkpoints (#158): the state after tokens[0, pos), in pinned
-    // host RAM; valid while seq_ starts with `tokens`.
+    // host RAM; valid while seq_ starts with `tokens` -- images compared by
+    // their digests (#363).
     struct Checkpoint {
         std::vector<int32_t> tokens;
         void * host = nullptr;
         uint64_t used = 0;  // LRU clock
+        std::vector<std::string> images;  // the prefix's image occurrences, in order
     };
     bool valid(const Checkpoint & c) const;
-    int64_t resume(const std::vector<int32_t> & prompt, GenerateResult & res);
+    int64_t resume(const std::vector<int32_t> & prompt, const std::vector<std::string> & images,
+                   GenerateResult & res);
     std::vector<int64_t> checkpoint_positions(const std::vector<int32_t> & prompt, int64_t from) const;
-    bool save_checkpoint(const std::vector<int32_t> & prompt, int64_t pos);
+    bool save_checkpoint(const std::vector<int32_t> & prompt, int64_t pos, std::vector<std::string> images);
     void drop_checkpoints(bool all);
     // Conversations (#179): when a prompt leaves the cached sequence (another
     // conversation), that sequence goes to pinned host RAM first: its whole
@@ -167,8 +160,10 @@ private:
         size_t kv = 0;
         std::vector<int64_t> points;    // ascending
         uint64_t used = 0;
+        std::vector<std::string> images;  // the sequence's image occurrences, in order (#363)
     };
-    void save_snapshot(const std::vector<int32_t> & prompt, GenerateResult & res);
+    void save_snapshot(const std::vector<int32_t> & prompt, const std::vector<std::string> & images,
+                       GenerateResult & res);
 
     Config config_;
     omph::runtime::EnvOptions env_;
@@ -177,6 +172,10 @@ private:
     std::unique_ptr<Runner> runner_;
     std::vector<int32_t> eog_;
     std::vector<int32_t> seq_;  // the tokens whose KV / state are in the caches
+    // The digest of each image occurrence in seq_ (index = -1 - id, #363):
+    // prefix matching compares these, so a different image at the same set of
+    // positions never reuses the other one's KV.
+    std::vector<std::string> seq_images_;
     std::vector<Checkpoint> checkpoints_;
     std::vector<void *> spare_;  // host buffers of evicted checkpoints
     std::vector<Snapshot> snapshots_;
