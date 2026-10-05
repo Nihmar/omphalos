@@ -1,0 +1,21 @@
+# #237: the largest usable context, one line per configuration (01_desktop included).
+# check_max_context.py: VRAM/GTT after load and peak over one prompt + decode;
+# --cache-ram 0 (no host checkpoints), greedy.
+ctx 196608, k4, mtp, prompt 195584, generate 256, largest that loaded with MTP (screen 01): load 15679 MiB, peak 15696 MiB (gtt 268 -> 268), prefill 382.5 s (511 t/s), decode 14.9 ms/token, prompt+generated 195584+256, stop length, wall 386 s
+ctx 217088, k4, mtp, prompt 216064, generate 256, largest that loaded with MTP (screen 01): load 16039 MiB, peak 16056 MiB (gtt 268 -> 268), prefill 447.6 s (483 t/s), decode 44.6 ms/token, prompt+generated 216064+256, stop length, wall 459 s
+ctx 172032, k4, dflash, prompt 171008, generate 256, largest that loaded with DFlash2 (screen 01): load 16002 MiB, peak 16018 MiB (gtt 268 -> 268), prefill 316.2 s (541 t/s), decode 20.8 ms/token, prompt+generated 171008+256, stop length, wall 322 s
+ctx 180224, mixed, mtp, prompt 179200, generate 256, largest that loaded with the default (mixed K4/K8) cache and MTP: load 16095 MiB, peak 16112 MiB (gtt 268 -> 268), prefill 329.7 s (544 t/s), decode 34.3 ms/token, prompt+generated 179200+256, stop length, wall 338 s
+ctx 204800, k4, mtp, prompt 203776, generate 256, between the fast 196k and the loading-only 217k: load 15823 MiB, peak 15841 MiB (gtt 268 -> 274), prefill 407.7 s (500 t/s), decode 27.1 ms/token, prompt+generated 203776+256, stop length, wall 415 s
+#
+# Findings (#237)
+# - The load sweep (comment of 2026-10-04 on the issue): the largest --ctx that *loads* is
+#   262144 plain / 217088 MTP / 176128 DFlash2 with K4/V4, and 196608-229376 plain / 180224
+#   MTP / 155648 DFlash2 with the default mixed cache. Loading is not usability: above
+#   ~15.7 GiB total the decode degrades sharply (27.1 ms/token at 204800, 44.6 at 217088,
+#   against 14.9 at 196608), with GTT flat and the peak only ~17 MiB over load.
+# - Retrieval (tools/niah.py, one 190341-token haystack, 4 needles at 25/50/75/100 %,
+#   OMPH_KV_K4=1, --ctx 196608): 4/4 found, prefill 517 t/s, VRAM peak 15703 MiB. Positions
+#   past 128k work.
+# - The comfortably usable maximum is therefore ~196k with K4/V4 + MTP (~15.3 GiB, 67 t/s
+#   decode); the contexts above it load but pay 1.8-3x the decode. The desktop's own VRAM
+#   is evicted above ~15.6 GiB (load sweep), which is where the degradation starts.

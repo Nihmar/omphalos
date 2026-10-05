@@ -771,6 +771,8 @@ Illustrative (16 attention layers, 4 KV heads, head_dim 256 — **placeholders**
 
 At long contexts attention decode is bound by KV reads → smaller KV is also **faster**.
 
+**Usable maximum on 16 GB (measured, #237, `bench/results/max-context-237.txt`):** with K4/V4 (K and V Q4 on every layer) and MTP a 196k-token prompt loads at 15.3 GiB, prefills at 511 t/s and decodes at 67 t/s, and a 190k NIAH haystack (4 needles at 25/50/75/100 %) finds 4/4 — positions past 128k work. The contexts that *load* go further (217k with MTP, 176k with DFlash2, 262k plain, all K4/V4) but past ~15.7 GiB total the decode degrades (27 ms/token at 205k, 45 at 217k against 15 at 196k) as the driver evicts the desktop: loading is not usability. The default mixed K4/K8 cache reaches 180k with MTP (15.7 GiB, 34 ms/token).
+
 ### 13.2 K is more sensitive than V
 
 Errors in K change the pre-softmax scores (i.e. *where* the model looks); errors in V are averaged by the weighted sum. K also tends to have outlier channels that break block quantization. Default: **K Q8, V Q4**.
