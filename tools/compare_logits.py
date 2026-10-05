@@ -2,13 +2,16 @@
 """Compare two omph-run logits dumps: KL(ref || test) per position and top-1 agreement.
 
 usage: uv run python compare_logits.py <ref.f32> <test.f32> [--vocab N | --model M.gguf]
-                                       [--skip N]
+                                       [--skip N] [--max-kl KL] [--min-top1 FRAC]
 
 Both files are (tokens, vocab) f32, as written by omph-run. The vocabulary size
 comes from --vocab, or from the model's token_embd with --model, or defaults
 to this model's 248320. `--skip` drops the first N positions (the earliest ones
 see almost no context and dominate nothing, but they can be excluded when
-comparing long-context behaviour).
+comparing long-context behaviour). `--max-kl` / `--min-top1` turn the report
+into a check: the exit code is 1 when the mean KL is above, or the top-1
+agreement below, the given bound; a non-finite value in either dump always
+fails (it used to print "KL mean nan" and exit 0, #348).
 """
 
 import argparse
@@ -32,6 +35,10 @@ def main() -> int:
     ap.add_argument("--vocab", type=int, default=None)
     ap.add_argument("--model", default=None, help="take the vocabulary size from this GGUF")
     ap.add_argument("--skip", type=int, default=0)
+    ap.add_argument("--max-kl", type=float, default=None,
+                    help="exit 1 when the mean KL exceeds this")
+    ap.add_argument("--min-top1", type=float, default=None,
+                    help="exit 1 when the top-1 agreement (0..1) is below this")
     args = ap.parse_args()
 
     vocab = args.vocab
@@ -62,6 +69,13 @@ def main() -> int:
         return 1
     ref = ref[args.skip :]
     test = test[args.skip :]
+    # A NaN anywhere poisons every row it is in: the max, the softmax and the
+    # argmax. Fail at once instead of reporting "KL mean nan" (#348).
+    for name, arr in (("ref", ref), ("test", test)):
+        if not np.isfinite(arr).all():
+            bad = int(np.size(arr) - np.isfinite(arr).sum())
+            print(f"{name}: {bad} non-finite logits", file=sys.stderr)
+            return 1
 
     kl = np.empty(len(ref))
     for i in range(len(ref)):  # row by row: a (512, 248320) f64 block is 1 GB
@@ -74,6 +88,16 @@ def main() -> int:
     print(f"KL mean {kl.mean():.6f}  median {np.median(kl):.6f}  "
           f"p99 {np.percentile(kl, 99):.6f}  max {kl.max():.6f} nats")
     print(f"top-1 agreement {top1 * 100:.2f} %")
+    failed = []
+    if args.max_kl is not None and kl.mean() > args.max_kl:
+        failed.append(f"KL mean {kl.mean():.6f} > --max-kl {args.max_kl}")
+    if args.min_top1 is not None and top1 < args.min_top1:
+        failed.append(f"top-1 {top1 * 100:.2f} % < --min-top1 {args.min_top1 * 100:.2f} %")
+    if failed:
+        print("FAIL: " + "; ".join(failed))
+        return 1
+    if args.max_kl is not None or args.min_top1 is not None:
+        print("PASS")
     return 0
 
 

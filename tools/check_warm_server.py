@@ -15,7 +15,10 @@ back on it twice in shuffled orders, and requires:
   * the greedy answers identical token for token (text and completion_tokens)
     to the fresh ones, and to each other across orders and configurations that
     must not change the numbers (the mixed K4/K8 default is compared within
-    itself: it does change them, by design);
+    itself: it does change them, by design); the text compared is
+    reasoning_content + content (thinking on spends the whole budget inside
+    <think>), and the 2k family runs with enable_thinking false so the answer
+    itself is compared too (#348);
   * the seeded-sampling request identical too (its random stream restarts from
     the request's seed);
   * a canary sentence planted in one prompt that never appears in a later
@@ -97,8 +100,15 @@ class Server:
 
 
 def ask(url: str, item: dict, timeout: float = 1800) -> tuple[str, int]:
-    """The answer's text and its completion_tokens (-1 when unreported)."""
+    """The answer's text and its completion_tokens (-1 when unreported).
+
+    The text is reasoning_content followed by content: with thinking on and a
+    small max_tokens the whole budget goes into <think>, so comparing content
+    alone compared two empty strings on every chat prompt (#348).
+    """
     body = {"max_tokens": item["max_tokens"], "temperature": item.get("temperature", 0)}
+    if "enable_thinking" in item:
+        body["chat_template_kwargs"] = {"enable_thinking": item["enable_thinking"]}
     for k in ("repeat_penalty", "repeat_last_n"):
         if k in item:
             body[k] = item[k]
@@ -108,11 +118,13 @@ def ask(url: str, item: dict, timeout: float = 1800) -> tuple[str, int]:
         body["seed"] = item["seed"]
     if item["kind"] == "chat":
         r = post(url + "/v1/chat/completions", {**body, "messages": item["messages"]}, timeout)
-        text = r["choices"][0]["message"].get("content") or ""
+        m = r["choices"][0]["message"]
+        text = (m.get("reasoning_content") or "") + (m.get("content") or "")
     else:
         r = post(url + "/v1/completions", {**body, "prompt": item["prompt"]}, timeout)
         text = r["choices"][0]["text"]
-    return text, int(r.get("usage", {}).get("completion_tokens", -1) or -1)
+    tokens = r.get("usage", {}).get("completion_tokens")
+    return text, -1 if tokens is None else int(tokens)
 
 
 def data_url(path: Path) -> str:
@@ -136,17 +148,17 @@ def make_prompts(args, text: str, tokenize: str, model: str, fresh_2k: str | Non
     ctx2k = "Answer questions about this text.\n\n" + text[100_000:100_000 + chars2k]
     q1 = "In one sentence: what is this text about?"
     q2 = "Name one thing it mentions."
-    items.append({"tag": "2k", "kind": "chat", "max_tokens": 32,
+    items.append({"tag": "2k", "kind": "chat", "max_tokens": 32, "enable_thinking": False,
                   "messages": [{"role": "system", "content": ctx2k}, {"role": "user", "content": q1}]})
     # shares the whole 2k prefix with the request above: the cache has to be reused
-    items.append({"tag": "2k-other", "kind": "chat", "max_tokens": 32,
+    items.append({"tag": "2k-other", "kind": "chat", "max_tokens": 32, "enable_thinking": False,
                   "messages": [{"role": "system", "content": ctx2k}, {"role": "user", "content": q2}]})
     # the same request again: the second one resumes from a saved conversation
-    items.append({"tag": "2k-retry", "kind": "chat", "max_tokens": 32,
+    items.append({"tag": "2k-retry", "kind": "chat", "max_tokens": 32, "enable_thinking": False,
                   "messages": [{"role": "system", "content": ctx2k}, {"role": "user", "content": q2}]})
     # the next turn of that conversation, with the fresh answer in it
     if fresh_2k is not None:
-        items.append({"tag": "2k-turn2", "kind": "chat", "max_tokens": 32,
+        items.append({"tag": "2k-turn2", "kind": "chat", "max_tokens": 32, "enable_thinking": False,
                       "messages": [{"role": "system", "content": ctx2k}, {"role": "user", "content": q1},
                                    {"role": "assistant", "content": fresh_2k},
                                    {"role": "user", "content": "In one sentence: and what is the last paragraph about?"}]})
@@ -163,7 +175,7 @@ def make_prompts(args, text: str, tokenize: str, model: str, fresh_2k: str | Non
                   "messages": [{"role": "system", "content": ctx2k},
                                {"role": "user", "content": "Repeat the words of the text's first "
                                                            "sentence, one after another."}]})
-    items.append({"tag": "canary", "kind": "chat", "max_tokens": 48,
+    items.append({"tag": "canary", "kind": "chat", "max_tokens": 48, "enable_thinking": False,
                   "messages": [{"role": "user",
                                 "content": f"Repeat this sentence exactly, then say done: the password is {CANARY}."}]})
     if args.long_tokens:
