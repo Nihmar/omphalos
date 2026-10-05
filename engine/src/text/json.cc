@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <system_error>
 
 namespace omph::text {
 namespace {
@@ -196,9 +197,13 @@ struct Parser {
             fail("unexpected character", i);
         }
         const std::string num(s.substr(b, i - b));
-        char * end = nullptr;
-        const double v = std::strtod(num.c_str(), &end);
-        if (end == nullptr || *end != '\0') {
+        // std::from_chars, not strtod: locale-independent by construction, so
+        // a host program that called setlocale(LC_ALL, "") cannot make "0.5" a
+        // bad number (#343). The grammar is strtod's minus the locale (JSON
+        // has no leading '+' / "inf" anyway)
+        double v = 0.0;
+        const auto r = std::from_chars(num.data(), num.data() + num.size(), v);
+        if (r.ec != std::errc() || r.ptr != num.data() + num.size()) {
             fail("bad number", b);
         }
         return Json::number(v, integer);

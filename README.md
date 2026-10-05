@@ -373,5 +373,5 @@ engine's sampler is the only variable left):
 }
 ```
 
-`engine/examples/capi_demo.c` shows the C ABI: load, tokenize, render a chat,
-generate with a token callback.
+`engine/examples/capi_demo.c` shows the C ABI: load, tokenize, tokenize a chat
+request (`omph_chat_tokenize`), generate with a token callback.

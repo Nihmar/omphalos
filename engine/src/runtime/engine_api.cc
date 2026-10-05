@@ -43,11 +43,17 @@ int64_t fail(omph_engine * e, const int64_t code, const std::string & msg) {
     return code;
 }
 
-// copies n elements, or returns -(n) when they do not fit
+// copies n elements, or returns OMPH_E_SPACE with n in *needed (#343: the
+// return value used to be -(n), where n == 1..4 collided with the OMPH_E*
+// codes and left a stale error message)
 template <typename T>
-int64_t copy_out(const T * src, const size_t n, T * dst, const size_t cap) {
+int64_t copy_out(omph_engine * e, const T * src, const size_t n, T * dst, const size_t cap,
+                 size_t * needed) {
+    if (needed != nullptr) {
+        *needed = n;
+    }
     if (n > cap || (dst == nullptr && n > 0)) {
-        return -(int64_t) n;
+        return fail(e, OMPH_E_SPACE, "buffer too small");
     }
     if (n > 0) {
         std::memcpy(dst, src, n * sizeof(T));
@@ -111,33 +117,50 @@ const char * omph_engine_last_error(const omph_engine * e) { return e != nullptr
 int64_t omph_engine_context(const omph_engine * e) { return e != nullptr ? e->gen->context() : 0; }
 
 int64_t omph_tokenize(omph_engine * e, const char * text, const size_t len, const int parse_special,
-                      int32_t * ids, const size_t cap) {
+                      int32_t * ids, const size_t cap, size_t * needed) {
     if (e == nullptr || (text == nullptr && len > 0)) return fail(e, OMPH_E_ARG, "bad argument");
     try {
         const std::vector<int32_t> v =
             e->gen->tokenizer().encode(std::string_view(text != nullptr ? text : "", len), parse_special != 0);
-        return copy_out(v.data(), v.size(), ids, cap);
+        return copy_out(e, v.data(), v.size(), ids, cap, needed);
     } catch (const std::exception & ex) {
         return fail(e, OMPH_E_ARG, ex.what());
     }
 }
 
 int64_t omph_detokenize(omph_engine * e, const int32_t * ids, const size_t n, const int special, char * out,
-                        const size_t cap) {
+                        const size_t cap, size_t * needed) {
     if (e == nullptr || (ids == nullptr && n > 0)) return fail(e, OMPH_E_ARG, "bad argument");
     try {
         const std::string s = e->gen->tokenizer().decode(std::vector<int32_t>(ids, ids + n), special != 0);
-        return copy_out(s.data(), s.size(), out, cap);
+        return copy_out(e, s.data(), s.size(), out, cap, needed);
     } catch (const std::exception & ex) {
         return fail(e, OMPH_E_ARG, ex.what());
     }
 }
 
-int64_t omph_chat_render(omph_engine * e, const char * request_json, char * out, const size_t cap) {
+int64_t omph_chat_render(omph_engine * e, const char * request_json, char * out, const size_t cap,
+                         size_t * needed) {
     if (e == nullptr || request_json == nullptr) return fail(e, OMPH_E_ARG, "bad argument");
     try {
         const std::string s = omph::text::render_chat(omph::text::Json::parse(request_json));
-        return copy_out(s.data(), s.size(), out, cap);
+        return copy_out(e, s.data(), s.size(), out, cap, needed);
+    } catch (const std::exception & ex) {
+        return fail(e, OMPH_E_TEMPLATE, ex.what());
+    }
+}
+
+int64_t omph_chat_tokenize(omph_engine * e, const char * request_json, int32_t * ids, const size_t cap,
+                           size_t * needed) {
+    if (e == nullptr || request_json == nullptr) return fail(e, OMPH_E_ARG, "bad argument");
+    try {
+        // render_chat_segments splits the template's structure from the
+        // request's own strings, and tokenize_chat parses special tokens only
+        // in the structure (#292): the C ABI's safe path, the one omph-server
+        // and omph-generate use
+        const std::vector<int32_t> v = omph::text::tokenize_chat(
+            omph::text::render_chat_segments(omph::text::Json::parse(request_json)), e->gen->tokenizer());
+        return copy_out(e, v.data(), v.size(), ids, cap, needed);
     } catch (const std::exception & ex) {
         return fail(e, OMPH_E_TEMPLATE, ex.what());
     }

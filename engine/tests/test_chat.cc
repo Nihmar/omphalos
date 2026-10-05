@@ -6,6 +6,7 @@
 #include "text/chat.hh"
 #include "text/json.hh"
 
+#include <clocale>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -40,6 +41,18 @@ int main() {
     CHECK(roundtrip(" { } ") == "{}" && roundtrip("[]") == "[]", "empty containers");
     CHECK(throws("{\"a\":}") && throws("[1,]") && throws("\"x") && throws("1 2") && throws("tru"),
           "malformed input throws");
+
+    // Number parsing is the C locale by construction (std::from_chars, not
+    // strtod): a host program that called setlocale(LC_ALL, "") under a
+    // comma-decimal locale must still read "0.5" (#343). Skipped when no such
+    // locale is installed (CI images often have only C).
+    if (std::setlocale(LC_NUMERIC, "it_IT.UTF-8") != nullptr ||
+        std::setlocale(LC_NUMERIC, "de_DE.UTF-8") != nullptr) {
+        CHECK(roundtrip("[0.5, 1.25, 2e-3]") == "[0.5, 1.25, 0.002]", "a comma-decimal locale breaks parsing");
+        std::setlocale(LC_NUMERIC, "C");
+    } else {
+        std::printf("     (no comma-decimal locale installed: the locale case is skipped)\n");
+    }
 
     // the template's "thinking off" generation prompt (jinja2 reference)
     const Json req = Json::parse(

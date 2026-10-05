@@ -20,16 +20,12 @@ static int on_token(int32_t token, const char * piece, size_t len, void * user) 
 }
 
 static int run_turn(omph_engine * e, const char * request, const char * image, size_t image_size) {
-    char text[16384];
-    const int64_t nt = omph_chat_render(e, request, text, sizeof(text));
-    if (nt < 0) {
-        fprintf(stderr, "render: %s\n", omph_engine_last_error(e));
-        return 1;
-    }
+    /* the #292 safe path: render and tokenize in one call, so a message's own
+     * text cannot inject one of the template's special tokens (#343) */
     int32_t ids[8192];
-    const int64_t n = omph_tokenize(e, text, (size_t) nt, 1, ids, 8192);
+    const int64_t n = omph_chat_tokenize(e, request, ids, 8192, NULL);
     if (n < 0) {
-        fprintf(stderr, "tokenize: %s\n", omph_engine_last_error(e));
+        fprintf(stderr, "chat tokenize: %s\n", omph_engine_last_error(e));
         return 1;
     }
     omph_generate_params gp;
@@ -71,14 +67,15 @@ int main(int argc, char ** argv) {
     /* round trip */
     const char * s = "Ciao, mondo! \xe2\x98\x95";
     int32_t ids[64];
-    const int64_t n = omph_tokenize(e, s, strlen(s), 1, ids, 64);
+    const int64_t n = omph_tokenize(e, s, strlen(s), 1, ids, 64, NULL);
     char back[128];
-    const int64_t m = omph_detokenize(e, ids, (size_t) n, 1, back, sizeof(back));
+    const int64_t m = omph_detokenize(e, ids, (size_t) n, 1, back, sizeof(back), NULL);
     printf("round trip: %lld tokens, %s\n", (long long) n,
            m == (int64_t) strlen(s) && memcmp(back, s, (size_t) m) == 0 ? "identical" : "DIFFERENT");
-    /* a too small buffer reports the size it needs */
-    const int64_t need = omph_tokenize(e, s, strlen(s), 1, ids, 1);
-    printf("small buffer: %lld (needs %lld)\n", (long long) need, (long long) n);
+    /* a too small buffer reports the size it needs (OMPH_E_SPACE, #343) */
+    size_t need = 0;
+    const int64_t space = omph_tokenize(e, s, strlen(s), 1, ids, 1, &need);
+    printf("small buffer: %lld (needs %zu)\n", (long long) space, need);
     /* two turns: the second continues the cached sequence */
     int rc = run_turn(e, "{\"messages\":[{\"role\":\"user\",\"content\":\"Name three primary colors.\"}],"
                          "\"add_generation_prompt\":true,\"enable_thinking\":false}", NULL, 0);
@@ -110,7 +107,7 @@ int main(int argc, char ** argv) {
     }
     /* errors are codes, not exceptions */
     char out[16];
-    const int64_t bad = omph_chat_render(e, "{\"messages\":[]}", out, sizeof(out));
+    const int64_t bad = omph_chat_render(e, "{\"messages\":[]}", out, sizeof(out), NULL);
     printf("bad request: %lld (%s)\n", (long long) bad, omph_engine_last_error(e));
     omph_engine_free(e);
     return rc;
