@@ -184,6 +184,11 @@ OMPH_KV_F32=1 engine/build/omph-run <model> <tokens.txt> /tmp/p.f32 --last-logit
 engine/build/omph-run <model> <tokens.txt> /tmp/p.f32 --last-logits --gemv --generate 64 \
     --gen-out q.txt --gen-logits q.f32 --gen-force ref.txt   # then compare_logits.py ref.f32 q.f32
 
+# the largest context that actually runs on the 16 GB card (#237): VRAM/GTT after load and
+# peak over one long prompt + a decode, one row appended to bench/results/max-context-237.txt
+uv run python check_max_context.py --ctx 196608 --kv k4 --spec mtp \
+    [--dflash FILE] [--tokens N] [--generate N]
+
 # CPU-only tests (no GPU, no ROCm; what CI runs, .github/workflows/ci.yml)
 cmake -S engine/tests -B engine/build-tests && cmake --build engine/build-tests -j
 ctest --test-dir engine/build-tests --output-on-failure   # repack round trip, GGUF parser, tokenizer, JSON + chat
