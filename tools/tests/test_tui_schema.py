@@ -90,6 +90,13 @@ def test_bools_and_empty_strings() -> None:
     assert "OMPH_NGRAM" in env and env["OMPH_NGRAM"] == "0"
 
 
+def test_a_dflash_path_is_passed() -> None:
+    """The TUI pre-fills the DFlash2 drafter (#332); the field has to reach the
+    server as --dflash."""
+    _, argv = schema.build_command({**schema.defaults(), "model": "m.omph", "dflash": "/m/d.omph"})
+    assert argv[argv.index("--dflash") + 1] == "/m/d.omph"
+
+
 def test_profiles_round_trip(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(profiles, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(profiles, "PROFILES_PATH", tmp_path / "profiles.json")

@@ -259,9 +259,15 @@ table keeps the columns that answer "cache hit? how fast? did it stop?").
 
 ```sh
 cd tools
-uv run python omph_tui.py                     # the default model, the coding-agent profile
-uv run python omph_tui.py --model $M --profile long-context
+uv run python omph_tui.py                          # the repo's model + DFlash2 drafter, coding-agent
+uv run python omph_tui.py --model $M --dflash ""   # another model, on the MTP head
+uv run python omph_tui.py --profile long-context
 ```
+
+- **The model and the DFlash2 drafter** default to the repository's own
+  `models/` files, so the form starts on the same "everything on" setup as the
+  recipes above; `--dflash ""` clears the drafter and starts on the MTP head,
+  and the field can be edited or emptied in the `Drafting` tab.
 
 - **The form** is one tab per group of the tables above (`Model`, `Sampling`,
   `Drafting`, `Cache`, `Vision`, `Advanced`): the same options and defaults as
