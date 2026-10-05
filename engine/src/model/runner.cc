@@ -186,12 +186,11 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     if (kv_host_) {
         // Validation reference only: the exact f32 cache in pinned host RAM
         // (4.29 GB at 32k does not fit beside the weights), and one layer's
-        // worth of it staged into VRAM before each attention.
+        // worth of it staged into VRAM before each attention. The shared pair
+        // is allocated lazily, by a layer that gets no pair of its own (#342).
         const size_t bytes = (size_t) n_kv * kvcap * attn_kv * 4;
         kv_k_ = mem_.host(bytes, "cannot allocate the host KV cache");
         kv_v_ = mem_.host(bytes, "cannot allocate the host KV cache");
-        alloc(&kv_stage_k_, (size_t) kvcap * attn_kv * 4);
-        alloc(&kv_stage_v_, (size_t) kvcap * attn_kv * 4);
         kv_stage_.assign((size_t) h_.n_layer, HostStage{});
     } else if (!kv_q8q4_) {
         alloc(&kv_k_, (size_t) n_kv * kvcap * attn_kv * 4);
@@ -215,9 +214,9 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         alloc(&kv_vq_, (size_t) n_kv * kvcap * attn_kv / 2);
         alloc(&kv_vs_, (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2);
         // FP16 window: the last `kv_window_` tokens exactly, in the same
-        // rotated basis, in a ring (PLAN §13.4). 128 by default: it keeps the
-        // KL under llama.cpp's q8_0/q4_0 up to 32k for 8.4 MB (#61);
-        // OMPH_KV_WINDOW=0 turns it off.
+        // rotated basis, in a ring (PLAN §13.4). 512 since #318: at 16k it
+        // halves the mixed K4/K8 KL for ~25 MiB (the ring; the speculation
+        // backup is spec_max rows since #342); OMPH_KV_WINDOW=0 turns it off.
         kv_window_ = env_.kv_window;
         // kKvRingExtra slots more: every query of a short chunk (a
         // verification) reads its own last kv_window_ keys exactly (#161)
@@ -505,6 +504,18 @@ void Runner::watch_step_end() {
         slow_steps_ = 0;
         step_ref_ = 0.9 * step_ref_ + 0.1 * ms;
     }
+}
+
+// The shared staging pair of OMPH_KV_HOST (#316): a layer whose own pair did
+// not fit uploads its whole f32 cache through these, refilled from row 0 on
+// every call. Allocated at the first such layer (#342: 256 MiB at 32k was held
+// from load even when every layer had a pair of its own).
+void * Runner::kv_shared_stage(const size_t bytes) {
+    if (kv_stage_k_ == nullptr) {
+        kv_stage_k_ = mem_.device(bytes, "out of VRAM (host KV staging)");
+        kv_stage_v_ = mem_.device(bytes, "out of VRAM (host KV staging)");
+    }
+    return kv_stage_k_;
 }
 
 // OMPH_KV_HOST's staging decision for one layer (#316). Called at a layer's first
@@ -1037,9 +1048,13 @@ void Runner::enable_speculation(const int64_t max_tokens) {
     if (kv_q8q4_ && kv_window_ > 0) {
         const int64_t n_kv = (int64_t) std::count_if(kv_index_.begin(), kv_index_.end(),
                                                      [](int64_t k) { return k >= 0; });
-        const size_t ring = (size_t) n_kv * kv_ring_ * h_.n_head_kv * h_.head_dim * 2;
-        ring_backup_k_ = mem_.device(ring);
-        ring_backup_v_ = mem_.device(ring);
+        // A verification saves at most its own T <= spec_max_ rows per layer,
+        // in a compact buffer indexed by the verification's position (#342):
+        // the full-ring copy this used to be cost ~33 MiB at window 512, held
+        // for the whole run, for 16 rows of use.
+        const size_t backup = (size_t) n_kv * (size_t) spec_max_ * h_.n_head_kv * h_.head_dim * 2;
+        ring_backup_k_ = mem_.device(backup, "out of VRAM (FP16-ring backup)");
+        ring_backup_v_ = mem_.device(backup, "out of VRAM (FP16-ring backup)");
     }
     spec_keys_ = mem_.device((size_t) std::max<int64_t>(max_tokens, 1) * 8);
     // A verification brings every row back, also with --last-logits.
@@ -1059,7 +1074,7 @@ bool Runner::verify(const std::vector<int32_t> & toks, const int64_t pos0,
     const int64_t row_bytes = h_.n_head_kv * h_.head_dim * 2;
     if (ring_backup_k_ != nullptr &&
         !omph::kernels::kv_ring_copy(kv_k16_, kv_v16_, ring_backup_k_, ring_backup_v_, n_kv,
-                                     kv_ring_, row_bytes, pos0, T, nullptr)) {
+                                     kv_ring_, pos0, spec_max_, 0, row_bytes, T, nullptr)) {
         return fail("verify: ring backup failed");
     }
     if (env_.spec_check && ring_backup_k_ != nullptr) {
@@ -1160,9 +1175,11 @@ bool Runner::commit(const int64_t accepted) {
     if (ring_backup_k_ != nullptr) {
         const int64_t n_kv = (int64_t) std::count_if(kv_index_.begin(), kv_index_.end(),
                                                      [](int64_t k) { return k >= 0; });
+        // The compact backup holds the verification's rows 0..T-1; restore the
+        // rejected ones (accepted..T-1) to their ring slots (#342).
         if (!omph::kernels::kv_ring_copy(ring_backup_k_, ring_backup_v_, kv_k16_, kv_v16_, n_kv,
-                                         kv_ring_, h_.n_head_kv * h_.head_dim * 2,
-                                         verify_pos0_ + accepted, T - accepted, nullptr)) {
+                                         spec_max_, accepted, kv_ring_, verify_pos0_ + accepted,
+                                         h_.n_head_kv * h_.head_dim * 2, T - accepted, nullptr)) {
             return fail("commit: ring restore failed");
         }
         if (env_.spec_check) {

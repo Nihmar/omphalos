@@ -109,14 +109,15 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
 // (a decode step or a speculative batch), so the two agree bit for bit.
 int64_t attention_key_chunk(int64_t max_seq);
 
-// Copies the FP16-ring slots of positions pos_first .. pos_first + count - 1
-// (slot = position % ring) of every layer from (src_k, src_v) to
-// (dst_k, dst_v), all laid out as the ring: layers x ring x row_bytes. Saves
-// the slots a speculative verification overwrites, and restores those of the
-// rejected positions (#98, #122). row_bytes % 16 == 0.
+// Copies the FP16-ring rows of positions src_first .. src_first + count - 1
+// from (src_k, src_v), laid out as `layers` rings of src_ring rows (slot =
+// position % src_ring), to (dst_k, dst_v) laid out as `layers` rings of
+// dst_ring rows at positions dst_first .. — the same ring for an in-place
+// save/restore, or a compact buffer for the speculation backup (#98, #122,
+// #342). row_bytes % 16 == 0.
 bool kv_ring_copy(const void * src_k, const void * src_v, void * dst_k, void * dst_v,
-                  int64_t layers, int64_t ring, int64_t row_bytes, int64_t pos_first,
-                  int64_t count, hipStream_t stream);
+                  int64_t layers, int64_t src_ring, int64_t src_first, int64_t dst_ring,
+                  int64_t dst_first, int64_t row_bytes, int64_t count, hipStream_t stream);
 
 // Workspace for any call with up to `max_tokens` query tokens (and, with a
 // key chunk, sequences up to max_seq).

@@ -22,7 +22,7 @@ weights stay bit-exact with the GGUF (lossless re-layouts only).
 |---|---|
 | Decode | fused dequant + dot GEMVs on load-time repacked weights; every decode drafts 3 tokens per step with the model's own MTP head, 7 with the DFlash2 drafter (`--dflash`, #245) or up to 15 from an n-gram lookup when the context repeats (#199), and verifies them in one pass: greedy output bit-identical to plain greedy, sampled output with plain sampling's distribution (speculative sampling, #197) |
 | Prefill | fused dequant + WMMA GEMM, WMMA flash attention, token-parallel delta net |
-| KV cache | V in Q4; K in Q4 on the 8 least sensitive of the 16 attention layers and Q8 on the rest (#175); the last 128 tokens exact in an FP16 ring |
+| KV cache | V in Q4; K in Q4 on the 8 least sensitive of the 16 attention layers and Q8 on the rest (#175); the last 512 tokens exact in an FP16 ring |
 | Text | the GGUF's byte-level BPE tokenizer and its chat template (thinking, reasoning effort, tool calls), reimplemented in C++ and checked against llama.cpp and jinja2 |
 | Sampling | greedy, or temperature / top-k / top-p / min-p with a seed; both decode speculatively (code at temperature 0.6: 18.5 vs 44.4 ms/token) |
 | Cache reuse | a prompt that extends the cached sequence prefills only its new tokens; checkpoints in host RAM let a retried answer or an edited history resume from an earlier point; a prompt that leaves the cached sequence saves its whole conversation in host RAM (`--kv-ram`, default 8 GiB) and returns to it with an upload |
@@ -239,7 +239,7 @@ serving (the complete list, with the diagnostics and the ablations, is in
 | `OMPH_KV_K4_LAYERS=i,j,...\|none` | K in Q4 on those attention layers (0-15), Q8 on the rest; the default is the eight measured least sensitive ([#175](https://github.com/Nihmar/omphalos/issues/175)), `none` is K8 everywhere |
 | `OMPH_KV_K4` | K4 on every layer: the most aggressive cache, measured over llama.cpp's q8_0/q4_0 KL budget (#175): an experiment |
 | `OMPH_KV_F32`, `OMPH_KV_HOST` | exact f32 KV in VRAM / in pinned host RAM (references, much more memory) |
-| `OMPH_KV_WINDOW` | every query reads its last N keys exactly from an FP16 ring (default 128, `0` off) |
+| `OMPH_KV_WINDOW` | every query reads its last N keys exactly from an FP16 ring (default 512, `0` off) |
 | `OMPH_MTP_WINDOW` | the MTP block's KV window (default 16384: 16 sinks plus the last 16k-32k positions), -150 MiB of VRAM at 128k |
 | `OMPH_DRAFT_VOCAB` | drafts over the first N token ids (default 98304), a few percent faster |
 | `OMPH_NGRAM`, `OMPH_NGRAM_MIN` | n-gram (prompt lookup) drafts instead of the model's (default on; `OMPH_NGRAM=0` off) |

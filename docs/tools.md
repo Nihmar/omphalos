@@ -283,7 +283,7 @@ the layer's attention-norm input. Writes `<out-prefix>.out.f32` and, with
 | option | default | effect |
 |---|---|---|
 | `--kv` | `q8q4` | the cache: `f32` (as `OMPH_KV_F32`), `q8q4` (the default), `q4q4` (as `OMPH_KV_K4`) |
-| `--window N` | `128` | the exact FP16 window of the quantized cache (`0`: every key goes through the quantized blocks) |
+| `--window N` | `512` | the exact FP16 window of the quantized cache (`0`: every key goes through the quantized blocks) |
 | `--chunk N` | all | tokens per call: `1` is the decode path with the split-K attention, all of them is the prefill path |
 | `--trace` | off | also write the intermediate tensors |
 

@@ -346,6 +346,7 @@ bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T
             // Final fix when the pairs do not fit: a key offset in attention_gqa,
             // staging the keys in pieces and accumulating the splits (#316).
             const size_t bytes = (size_t) (pos0 + T) * kv_out * 4;
+            kv_shared_stage((size_t) max_seq_ * kv_out * 4);  // once, at the first such layer (#342)
             if (hipMemcpy(kv_stage_k_, k_cache, bytes, hipMemcpyHostToDevice) != hipSuccess ||
                 hipMemcpy(kv_stage_v_, v_cache, bytes, hipMemcpyHostToDevice) != hipSuccess) {
                 return false;
