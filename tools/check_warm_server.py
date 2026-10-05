@@ -19,8 +19,9 @@ back on it twice in shuffled orders, and requires:
     reasoning_content + content (thinking on spends the whole budget inside
     <think>), and the 2k family runs with enable_thinking false so the answer
     itself is compared too (#348);
-  * the seeded-sampling request identical too (its random stream restarts from
-    the request's seed);
+  * the seeded-sampling requests identical too (their random stream restarts
+    from the request's seed, and a sampled request follows its configuration's
+    speculative stream: the no-mtp variant gets its own fresh reference);
   * a canary sentence planted in one prompt that never appears in a later
     answer.
 
@@ -259,6 +260,20 @@ def main() -> None:
         print(f"ok   fresh {extra}: {n} tokens: {json.dumps(t[:70])}", flush=True)
     if "2k-other" in fresh:
         fresh["2k-retry"] = fresh["2k-other"]
+    # A sampled request follows its configuration's speculative RNG stream (#197:
+    # the distribution is the same, the stream is not), so the no-mtp variant
+    # cannot be compared against the default fresh reference. One more fresh
+    # server for each sampled prompt (#348's rerun found it: the text comparison
+    # used to compare two empty contents and never saw it).
+    fresh_nomtp: dict[str, tuple[str, int]] = {}
+    if not args.fresh_limit:
+        for tag in (i["tag"] for i in items if i.get("temperature")):
+            item = next(i for i in items if i["tag"] == tag)
+            with Server(args.omph, args.model, f"fresh-{tag}-nomtp", ctx, extra=("--no-mtp",),
+                        mmproj=args.mmproj or None) as url:
+                fresh_nomtp[tag] = ask(url, item)
+            t, n = fresh_nomtp[tag]
+            print(f"ok   fresh {tag} (no-mtp): {n} tokens: {json.dumps(t[:70])}", flush=True)
 
     for vi, (name, env, extra) in enumerate(VARIANTS):
         rng = random.Random(20261005)
@@ -276,6 +291,8 @@ def main() -> None:
                     t, n = ask(url, item)
                     answers[item["tag"]] = t
                     ref = fresh.get(item["tag"])
+                    if "--no-mtp" in extra:
+                        ref = fresh_nomtp.get(item["tag"], ref)
                     if ref is None:
                         continue
                     same = t == ref[0] and (n < 0 or ref[1] < 0 or n == ref[1])
