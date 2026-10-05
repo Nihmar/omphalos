@@ -40,3 +40,36 @@
 #   realistically half of it. Reaching it needs the next key tile's loads in flight during the
 #   current one's LDS/WMMA work -- a double-buffered `vt` and a hierarchical softmax reduction --
 #   not a different launch shape: both cheap hypotheses are measured and rejected above.
+
+# --- follow-up, same day: the double-buffered V, measured with a proper A/B, and
+# --- a method error worth recording.
+#
+# Method. The GPU throttles over a session (the same binary drifts by 3-4 % between
+# runs minutes apart) and, worse, the tools link libomphalos.so dynamically, so
+# swapping a prebuilt tool binary compares *the same library twice*. The first
+# 4-wave-versus-8-wave comparison in this file was therefore invalid; only an A/B
+# *inside one binary* (an environment switch picking a kernel instantiation) is
+# trustworthy. This is how the numbers below were taken.
+#
+# Double-buffered V (NVT=2: the next key tile's V transposed into a second LDS
+# buffer while the current tile computes; NVT=1: the plain loop). Template
+# parameter, OMPH_TEST_NO_VT_DBUF as the switch, four alternating rounds, medians:
+#   seq    T   NVT=2            NVT=1            delta
+#   32768  1   250.0 us         249.7 us         +0.1 %
+#   32768  8   463.8           465.1            -0.3 %
+#   100000 1   717.6           718.9            -0.2 %
+#   100000 8   1298.4          1297.3           +0.1 %
+# Neutral in all four, with the signs flipping run to run, and the row identity
+# (bit-for-bit against the single-token call) holds with both. So the exposed
+# V-fill latency is not what costs the verification its second pass over the
+# cache: the barrier chain per key tile is (three barriers for ~24 WMMAs a wave),
+# which the issue diagnosed and which a 32-key tile or a key-split softmax would
+# reduce -- both of them LDS-heavy, and three LDS/register experiments on this
+# kernel have now all lost (#270).
+#
+# The current baseline, for the record (note it differs from the issue's opening
+# numbers, which are stale: another driver/library state, and the FP16 window has
+# doubled since -- 512 in #318):
+#   seq      T=1    T=8      (issue: 241/474 at 32k, 539/1208 at 100k)
+#   32768    250    464
+#   100000   718    1296
