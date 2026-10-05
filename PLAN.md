@@ -806,6 +806,7 @@ Recurrently read and rewritten every token → errors accumulate. Small, fixed-s
 - Struct-of-arrays: quantized values contiguous per (layer, KV head, token block), scales in a separate stream, aligned for 128-bit loads.
 - Flash-decoding dequantizes on the fly; int8 K × int8 Q with `dot4`.
 - Validation at **long context** (16–32k; short prompts hide KV errors): KL divergence vs FP16 KV, needle-in-a-haystack style retrieval tests. Compare against llama.cpp's `-ctk/-ctv` options as a baseline. Our margin over llama.cpp: rotation, FP16 windows, per-layer choice.
+- The exact f32 reference itself is only cheap while it fits: `OMPH_KV_F32` (128 KB per token) fits the card to ~33k, and `OMPH_KV_HOST`'s per-layer staging pairs (8 KB per row per layer, ~4.4 GiB of budget) to ~35k. Above that the fallback layers re-upload their whole f32 prefix per call — ~4.6 µs per context row per step, 28 GB/s of PCIe — which no staging scheme can remove (a causal query reads every key once per call); the host cache is also 128 KB per token of pinned RAM, so the mode gets impractical from ~64k (#316, `bench/results/host-kv-pairs-316.txt`). The quantized cache is what makes long-context serving possible in the first place.
 
 ### 13.9 Conventions the kernels fix
 

@@ -1,0 +1,65 @@
+# #316: OMPH_KV_HOST's staging when the per-layer pairs do not all fit.
+# Follow-up of #319, which added the per-layer pairs (bench/results/host-kv-stage-316.txt).
+# This file closes the "key offset in attention_gqa, staging in pieces" item.
+# Engine 96c6757 (main, #319 for the pairs), RX 9060 XT 16 GB, 2026-10-05, screen on.
+#
+# Tool: engine/build/omph-run <model.omph> <tokens.txt> /tmp/o.f32 --gemv --generate 4
+#       --gen-out /tmp/g.txt --tokens N, OMPH_TIMING=1; the prompt is the first N ids of
+#       wikitext-2 train; step gpu = the median of the last two of the four decode steps
+#       (T = 1 each, KV capacity N + 12).
+#
+# Configurations:
+#   OMPH_KV_HOST=1                          the pairs as they fit (incremental when a layer has one)
+#   OMPH_KV_HOST=1 OMPH_HOST_STAGE_MIB=-1   the shared buffer only: every layer re-uploads its
+#                                           whole prefix [0, pos0 + T) on every call (the fallback)
+#   OMPH_KV_F32=1                           the exact f32 cache in VRAM (reference; bit-identical)
+#
+# Measured, 4-token greedy decode (step gpu, median of the last two):
+#   tokens   host, pairs   host, shared only   OMPH_KV_F32   prefill (pairs / shared / f32)
+#   2600     44.3 ms       55.0 ms             43.4 ms       4.6 / 4.4 / 4.1 s
+#   8192     46.5          84.4                45.5          14.1 / 13.7 / 12.4 s
+#   16384    49.3          126.7               48.3          -  (#319, host-kv-stage-316.txt)
+# (2600 and 8192 measured for this file; the 16k row is #319's table. The 2600 shared-only figure
+#  reproduces #319's 55.0 ms exactly, so the two sessions agree.)
+#
+# What the fallback costs, and why pieces cannot change it
+# - The shared buffer holds one layer's whole f32 cache (max_seq x 1024 x 4 B per K and V), and
+#   every attention layer overwrites it: per call the fallback copies [0, pos0 + T) for each of
+#   the 16 layers, i.e. 16 x N x 8 KB per decode step. The differences above fit one slope:
+#   (126.7 - 49.3) / 16384 = 4.72 us per context row, (84.4 - 46.5) / 8192 = 4.63, (55.0 - 44.3)
+#   / 2600 = 4.1 -> ~4.6 us per row per step for 16 layers x 8 KB = 130 KB per row, i.e. ~28 GB/s
+#   of host-to-device PCIe. A 64k decode with 8 fallback layers would pay ~200 ms/step on top.
+# - Splitting the upload into pieces via a key offset in attention_gqa (the item this issue kept
+#   open) does not reduce those bytes: a causal query reads every key once per call, and the
+#   current code already uploads exactly them, once per call. The pieces would only bound the
+#   staging buffer's VRAM (the shared pair is max_seq-sized: 1.07 GB at 128k), at the cost of
+#   more launches and a kernel API change. The traffic is irreducible without holding the rows
+#   in VRAM, which is what the per-layer pairs do.
+#
+# How many pairs fit (the boundary)
+# - The budget host_stage computes at the first attention is free VRAM minus a 512 MiB margin.
+#   Measured with the one-line-per-layer diagnostic added with this file: 4408 MiB at 16k,
+#   4396 MiB at 8192, ~4400 MiB at 2600 - the mode's VRAM after load is context-independent
+#   (11.38 GiB).
+# - A pair is 2 x max_seq x 1024 x 4 B = 8 KB per row. All 16 fit while 16 x 8 KB x N <= ~4.4 GiB,
+#   i.e. N <= ~35k rows (measured: 16 pairs at 16k with 2346 MiB left, at 8k with 3372 left).
+#   Above that, floor(4.4 GiB / (N x 8 KB)) pairs fit: ~14 at 40k, 8 at 64k, 5 at 96k, 4 at 128k;
+#   the rest fall back at ~0.29 us per row per layer (the 4.6 us above divided by 16).
+#
+# The reference mode's practical boundary
+# - OMPH_KV_F32 is the better reference wherever it fits: bit-identical, no PCIe, 43-45 ms/step.
+#   Its cache is 16 x 2 x 1024 x 4 B = 128 KB per token; with ~4.26 GiB free after load it fits
+#   to ~33k tokens, about the same as the pairs' all-16 boundary. Below ~32k use OMPH_KV_F32.
+# - OMPH_KV_HOST's host cache is 128 KB per token of pinned host RAM (2.1 GB at 16k, 8.4 GB at
+#   64k, 12.6 GB at 96k): on a 31 GB machine the pinned cache plus the model's page cache and the
+#   desktop starts swapping from ~64k, which makes the mode impractical there whatever the
+#   staging does. (The 96k attempt of this measurement failed in a lazy f16-path allocation with
+#   4.9 GiB of VRAM "free" while the machine swapped; that is the memory pressure above, not a
+#   staging bug - the error now names the size it could not allocate.)
+# - So the host mode is fast exactly where it is not needed (the pairs fit where the f32 cache in
+#   VRAM fits too) and PCIe-bound where it is needed. That is a property of the exact f32
+#   reference, not of the staging; #316's remaining item is closed with this finding.
+#
+# The diagnostics added with this measurement (runner.cc): OMPH_TIMING prints one
+# "host staging: layer N pair/shared, X MiB of the budget left" line per attention layer, and the
+# lazy f16-path allocation's error names the size it wanted.
