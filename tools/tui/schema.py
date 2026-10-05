@@ -9,7 +9,9 @@ the other way round, for the flags the TUI means to expose).
 An entry is either a command-line flag (``flag``) or one of the engine's
 environment switches (``env``); the second kind is only written into the
 environment when its value differs from the engine's default, so the command
-preview stays readable.
+preview stays readable. A switch the engine reads with ``flag()`` (set = on,
+value ignored) is a ``bool`` and is **only ever written as ``NAME=1``**: writing
+``NAME=0`` would turn it on (#328).
 """
 
 from __future__ import annotations
@@ -94,31 +96,31 @@ SCHEMA: tuple[Option, ...] = (
     _opt("kv_k4_layers", "cache", "env", "OMPH_KV_K4_LAYERS", "enum", "2,4,5,6,7,9,11,15",
          "K in Q4 on those attention layers (0-15), Q8 on the rest",
          choices=("2,4,5,6,7,9,11,15", "none", "2,5,7,15"), note="the default is the measured mix"),
-    _opt("kv_k4", "cache", "env", "OMPH_KV_K4", "int", 0,
+    _opt("kv_k4", "cache", "env", "OMPH_KV_K4", "bool", False,
          "K4 on every layer: an experiment, over the q8_0/q4_0 KL budget"),
     _opt("kv_window", "cache", "env", "OMPH_KV_WINDOW", "int", 128,
          "the exact FP16 window of the quantized cache; 0 is off"),
-    _opt("kv_f32", "cache", "env", "OMPH_KV_F32", "int", 0, "exact f32 KV in VRAM (reference)"),
-    _opt("kv_host", "cache", "env", "OMPH_KV_HOST", "int", 0, "exact f32 KV in pinned host RAM (reference)"),
+    _opt("kv_f32", "cache", "env", "OMPH_KV_F32", "bool", False, "exact f32 KV in VRAM (reference)"),
+    _opt("kv_host", "cache", "env", "OMPH_KV_HOST", "bool", False, "exact f32 KV in pinned host RAM (reference)"),
     # --- advanced
     _opt("api_key", "advanced", "flag", "--api-key", "str", "", "require Authorization: Bearer KEY"),
     _opt("cors", "advanced", "flag", "--cors", "str", "", "allow browser requests from ORIGIN (* for any)"),
     _opt("gemm_min", "advanced", "env", "OMPH_GEMM_MIN", "int", 16, "tokens from which a run takes the GEMM path"),
-    _opt("overlap", "advanced", "env", "OMPH_OVERLAP", "int", 0, "a side stream for sibling GEMVs"),
-    _opt("host_argmax", "advanced", "env", "OMPH_HOST_ARGMAX", "int", 0, "greedy argmax on the host"),
-    _opt("timing", "advanced", "env", "OMPH_TIMING", "int", 0, "VRAM and a per-step timing line on stderr"),
-    _opt("no_fused_gemm", "advanced", "env", "OMPH_NO_FUSED_GEMM", "int", 0, "dequant + GEMM instead of the fused one"),
-    _opt("no_swiglu_gemm", "advanced", "env", "OMPH_NO_SWIGLU_GEMM", "int", 0, "SwiGLU after the up GEMM"),
-    _opt("no_group", "advanced", "env", "OMPH_NO_GROUP", "int", 0, "sibling GEMVs as separate launches"),
-    _opt("no_b4", "advanced", "env", "OMPH_NO_B4", "int", 0, "no NT = 2..4 GEMVs"),
-    _opt("no_bf16_gemv", "advanced", "env", "OMPH_NO_BF16_GEMV", "int", 0, "BF16 weights through the f16 path"),
-    _opt("no_f16_cache", "advanced", "env", "OMPH_NO_F16_CACHE", "int", 0, "re-convert f16 weights on every call"),
-    _opt("attn_scalar", "advanced", "env", "OMPH_ATTN_SCALAR", "int", 0, "prefill attention on the scalar kernel"),
-    _opt("attn_dec_scalar", "advanced", "env", "OMPH_ATTN_DEC_SCALAR", "int", 0, "decode attention on the scalar kernel"),
-    _opt("gdn_exact", "advanced", "env", "OMPH_GDN_EXACT", "int", 0, "the delta rule per token"),
-    _opt("gdn_serial", "advanced", "env", "OMPH_GDN_SERIAL", "int", 0, "a multi-token delta rule in one launch"),
-    _opt("spec_check", "advanced", "env", "OMPH_SPEC_CHECK", "int", 0, "check every speculative rollback (slow)"),
-    _opt("phases", "advanced", "env", "OMPH_PHASES", "int", 0, "per-phase GPU totals (adds ~2.6 ms per step)"),
+    _opt("overlap", "advanced", "env", "OMPH_OVERLAP", "bool", False, "a side stream for sibling GEMVs"),
+    _opt("host_argmax", "advanced", "env", "OMPH_HOST_ARGMAX", "bool", False, "greedy argmax on the host"),
+    _opt("timing", "advanced", "env", "OMPH_TIMING", "bool", False, "VRAM and a per-step timing line on stderr"),
+    _opt("no_fused_gemm", "advanced", "env", "OMPH_NO_FUSED_GEMM", "bool", False, "dequant + GEMM instead of the fused one"),
+    _opt("no_swiglu_gemm", "advanced", "env", "OMPH_NO_SWIGLU_GEMM", "bool", False, "SwiGLU after the up GEMM"),
+    _opt("no_group", "advanced", "env", "OMPH_NO_GROUP", "bool", False, "sibling GEMVs as separate launches"),
+    _opt("no_b4", "advanced", "env", "OMPH_NO_B4", "bool", False, "no NT = 2..4 GEMVs"),
+    _opt("no_bf16_gemv", "advanced", "env", "OMPH_NO_BF16_GEMV", "bool", False, "BF16 weights through the f16 path"),
+    _opt("no_f16_cache", "advanced", "env", "OMPH_NO_F16_CACHE", "bool", False, "re-convert f16 weights on every call"),
+    _opt("attn_scalar", "advanced", "env", "OMPH_ATTN_SCALAR", "bool", False, "prefill attention on the scalar kernel"),
+    _opt("attn_dec_scalar", "advanced", "env", "OMPH_ATTN_DEC_SCALAR", "bool", False, "decode attention on the scalar kernel"),
+    _opt("gdn_exact", "advanced", "env", "OMPH_GDN_EXACT", "bool", False, "the delta rule per token"),
+    _opt("gdn_serial", "advanced", "env", "OMPH_GDN_SERIAL", "bool", False, "a multi-token delta rule in one launch"),
+    _opt("spec_check", "advanced", "env", "OMPH_SPEC_CHECK", "bool", False, "check every speculative rollback (slow)"),
+    _opt("phases", "advanced", "env", "OMPH_PHASES", "bool", False, "per-phase GPU totals (adds ~2.6 ms per step)"),
 )
 
 BY_KEY = {o.key: o for o in SCHEMA}
