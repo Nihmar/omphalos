@@ -27,7 +27,7 @@ weights stay bit-exact with the GGUF (lossless re-layouts only).
 | Sampling | greedy, or temperature / top-k / top-p / min-p with a seed; both decode speculatively (code at temperature 0.6: 18.5 vs 44.4 ms/token) |
 | Cache reuse | a prompt that extends the cached sequence prefills only its new tokens; checkpoints in host RAM let a retried answer or an edited history resume from an earlier point; a prompt that leaves the cached sequence saves its whole conversation in host RAM (`--kv-ram`, default 8 GiB) and returns to it with an upload |
 | Vision | images encoded on the CPU by llama.cpp's mtmd (no VRAM), fed as embeddings with M-RoPE positions |
-| Interfaces | `omph-generate` (CLI), `omph-server` (OpenAI-compatible HTTP), `libomphalos.so` with a C ABI (`engine/include/omphalos.h`) |
+| Interfaces | `omph-generate` (CLI), `omph-server` (OpenAI-compatible HTTP), `libomphalos.so` with a C ABI (`engine/include/omphalos.h`), `tools/omph_tui.py` (a terminal UI around the server) |
 
 Measured on the RX 9060 XT (details and conditions in `bench/results/`):
 
@@ -249,6 +249,48 @@ serving (the complete list, with the diagnostics and the ablations, is in
 | `OMPH_HOST_ARGMAX` | greedy argmax on the host instead of the device |
 | `OMPH_TIMING` | VRAM after load and a per-step timing line on stderr |
 
+### `omph-tui`: the server in a terminal
+
+`omph-server` has a terminal UI that composes the command, runs it and shows
+what it did: the server's options in a form, its log as it writes it, and one
+row per request. It wraps **one** server process, and it is the way to work
+over ssh -- a phone in portrait reflows (the form stacks above the log and the
+table keeps the columns that answer "cache hit? how fast? did it stop?").
+
+```sh
+cd tools
+uv run python omph_tui.py                     # the default model, the coding-agent profile
+uv run python omph_tui.py --model $M --profile long-context
+```
+
+- **The form** is one tab per group of the tables above (`Model`, `Sampling`,
+  `Drafting`, `Cache`, `Vision`, `Advanced`): the same options and defaults as
+  the flags, the `OMPH_*` switches included. `1`..`6` jump to a tab.
+- **`s` / `F2` starts** the server with the form's values; `x` / `F3` stops it
+  (its process group too: the TUI never leaves an orphan holding VRAM), `r` /
+  `F5` restarts. `F9` / `c` shows the exact `argv`, the environment line and
+  the pre-flight checks (model, port, other servers, VRAM estimate) before
+  anything runs; `F10` / `y` copies that command.
+- **The log** is the server's own stderr, so it also shows the requests another
+  client (pi, curl) sent; `e` filters it to errors, `ctrl+l` clears it. A
+  prompt in flight shows its prefill percentage, then its decode rate.
+- **The table** has one row per request: prompt and cached tokens, prefill and
+  decode rates, drafts accepted, stop reason. `enter` (or a double click on a
+  row) opens the detail, where `c` copies the request as JSON; `F8` writes the
+  whole table to a CSV.
+- **`p` / `F7`** loads, saves (`s`) or deletes (`d`) a profile: the
+  `coding-agent` recipe below, `long-context`, `fast`, `vision`, `default`, or
+  your own under `~/.config/omphalos/profiles.json`. `--profile` picks the one
+  the form starts from.
+- **`t`** sends a small test prompt through the running server, the quick way
+  to prove a configuration end to end before pointing an agent at it.
+
+Keyboard and mouse are both first class; every action has a letter because a
+phone's soft keyboard has no F-keys. `--exec CMD` runs any command instead of
+the server and `--demo FILE` replays a saved log, which is how the UI is
+developed and tested without a GPU. The full option, key and mouse tables are
+in [docs/tools.md](docs/tools.md#omph-tui).
+
 ### Serving a coding agent
 
 An agent whose model entry has no sampling parameters does not send
@@ -290,9 +332,9 @@ engine/build/omph-server $M --ctx 131072 \
 - `--temp`/`--top-p`/... only set what a request leaves out; a client that
   sends its own sampling wins. A sampling field the engine does not implement
   is refused, not ignored (#284).
-- the same options have a terminal UI, `uv run python omph_tui.py` in `tools/`
-  (form, live log, one row per request, `--profile` presets; it works over ssh
-  from a phone): [docs/tools.md](docs/tools.md#omph-tui).
+- the same options have a terminal UI: `uv run python omph_tui.py` in `tools/`
+  ([the section above](#omph-tui-the-server-in-a-terminal)); it starts the server from a
+  form, shows its log and one row per request, and works over ssh from a phone.
 
 pi (`~/.pi/agent/models.json`) does not know a custom provider is a reasoning
 model, so it sends no temperature and its thinking level does nothing.
