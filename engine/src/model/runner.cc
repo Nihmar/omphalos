@@ -573,6 +573,12 @@ Runner::HostStage * Runner::host_stage(const int64_t il) {
                 kv_stage_budget_ -= 2 * bytes;
             }
         }
+        // Which layers got a pair decides the fallback's PCIe cost (#316): one
+        // line per layer at its first attention, under the diagnostics switch.
+        if (env_.timing) {
+            std::fprintf(stderr, "host staging: layer %lld %s, %.0f MiB of the budget left\n",
+                         (long long) il, s.k != nullptr ? "pair" : "shared", kv_stage_budget_ / 1048576.0);
+        }
     }
     return s.k != nullptr ? &s : nullptr;
 }
@@ -773,7 +779,9 @@ bool Runner::kv_prefix_restore(const void * host, const int64_t n, const int64_t
 // Allocates *p on first use (the f16-path buffers, #86).
 void * Runner::lazy(void ** p, const size_t bytes) {
     if (*p == nullptr) {
-        *p = mem_.device(bytes, "out of VRAM (f16-path buffer)");
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "out of VRAM (f16-path buffer, %.0f MiB)", bytes / 1048576.0);
+        *p = mem_.device(bytes, msg);
     }
     return *p;
 }
