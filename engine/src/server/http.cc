@@ -136,6 +136,22 @@ bool Connection::client_gone() {
     return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
 }
 
+// #364: an early error's response is written while the client may still be
+// sending; reading (and dropping) that data keeps close() from turning into an
+// RST, which can make the client lose the response.
+void Connection::drain(const size_t limit) {
+    timeval tv{1, 0};
+    ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    size_t seen = 0;
+    char buf[16384];
+    while (seen < limit) {
+        const ssize_t n = ::recv(fd_, buf, sizeof(buf), 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        seen += (size_t) n;
+    }
+}
+
 bool Connection::read(Request & req) {
     // a client that stalls must not hold the server (one connection at a time)
     timeval tv{kRecvTimeoutMs / 1000, (kRecvTimeoutMs % 1000) * 1000};
@@ -150,6 +166,7 @@ bool Connection::read(Request & req) {
     while ((end = data.find("\r\n\r\n")) == std::string::npos) {
         if (data.size() > kMaxHead) {
             respond(431, "application/json", error_json("request headers too large"));
+            drain();  // the client may still be sending them (#364)
             return false;
         }
         if (now_ms() > deadline) {
@@ -201,6 +218,7 @@ bool Connection::read(Request & req) {
         }
         if (v > kMaxBody) {
             respond(413, "application/json", error_json("request body too large"));
+            drain();  // the body is still in flight: do not reset before the client reads (#364)
             return false;
         }
         length = (size_t) v;

@@ -238,7 +238,41 @@ def run_checks(url: str) -> None:
     code, body = raw_post(url, "/v1/completions", b'{"prompt":"\\ud800","max_tokens":1,"echo":true}')
     echoed = body.get("choices", [{}])[0].get("text", "")
     check(code == 200 and "\ufffd" in echoed, f"a lone surrogate in the echo: {echoed!r}")
+    run_early_error_checks(url)
     run_abandon_checks(url)
+
+
+def run_early_error_checks(url: str) -> None:
+    """#364: an early 413/431 must reach the client even with its request still
+    in flight; closing with unread data would reset the connection instead."""
+    import socket
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    host, port = parts.hostname or "127.0.0.1", parts.port or 80
+
+    def status_of(payload: bytes) -> bytes:
+        sock = socket.create_connection((host, port), timeout=10)
+        try:
+            sock.sendall(payload)
+            head = b""
+            while b"\r\n" not in head:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                head += chunk
+            return head[:24]
+        finally:
+            sock.close()
+
+    # > 64 KiB of headers with no terminator: the server answers 431 while the
+    # client is still sending (the terminator in the same read would end the
+    # loop and 411 instead)
+    check(status_of(b"POST /v1/completions HTTP/1.1\r\nHost: localhost\r\nX-Big: " + b"a" * (70 << 10))
+          .startswith(b"HTTP/1.1 431"), "a 70 KiB header block gets its 431")
+    check(status_of(b"POST /v1/completions HTTP/1.1\r\nHost: localhost\r\n"
+                    b"Content-Type: application/json\r\nContent-Length: 100000000\r\n\r\n"
+                    + b"x" * (1 << 20)).startswith(b"HTTP/1.1 413"),
+          "a 100 MB Content-Length gets its 413")
 
 
 def run_abandon_checks(url: str) -> None:
