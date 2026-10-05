@@ -7,6 +7,7 @@
 #include "format/gguf.hh"
 #include "text/tokenizer.hh"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -106,6 +107,16 @@ int main() {
     types.push_back(3);
     tokens.push_back("<think>");
     types.push_back(4);
+    // #345: a merge chain over '=' (the 10 levels of a 1 MB run) so the BPE's
+    // merge loop is exercised by one enormous pre-tokenizer word; after the
+    // specials, whose ids the checks below pin
+    std::vector<std::string> merges = {G + " t", "h e", G + "t he"};
+    const int32_t id_eq2 = (int32_t) tokens.size();
+    for (int k = 1; k <= 10; ++k) {
+        tokens.push_back(std::string(1u << k, '='));
+        types.push_back(1);
+        merges.push_back(std::string(1u << (k - 1), '=') + " " + std::string(1u << (k - 1), '='));
+    }
     const int32_t id_gt = 256, id_he = 257, id_gthe = 258, id_ims = 259, id_think = 260;
     Writer w;
     w.u32(0x46554747u);
@@ -116,7 +127,7 @@ int main() {
     w.kv_str("tokenizer.ggml.pre", "qwen35");
     w.kv_strs("tokenizer.ggml.tokens", tokens);
     w.kv_i32s("tokenizer.ggml.token_type", types);
-    w.kv_strs("tokenizer.ggml.merges", {G + " t", "h e", G + "t he"});
+    w.kv_strs("tokenizer.ggml.merges", merges);
     while (w.b.size() % 32 != 0) w.b.push_back(0);
     char path[] = "/tmp/omph_test_tokenizer_XXXXXX";
     const int fd = mkstemp(path);
@@ -144,6 +155,18 @@ int main() {
         CHECK(tok.decode(tok.encode(text), false).find("<|im_start|>") == std::string::npos,
               "control tokens dropped without `special`");
         CHECK(tok.find("<think>") == id_think && tok.find("nope") == -1, "find by text");
+        // #345: a 1 MB run of one character is one pre-tokenizer word; the old
+        // merge loop rescanned every pair after every merge (O(n^2), minutes)
+        {
+            const std::string run(1 << 20, '=');
+            const auto t0 = std::chrono::steady_clock::now();
+            const std::vector<int32_t> ids = tok.encode(run);
+            const double ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            CHECK(ids.size() == 1024 && ids.front() == id_eq2 + 9,
+                  "a 1 MB '=' run merges to 1024 symbols (%zu ids)", ids.size());
+            CHECK(ms < 1000.0, "1 MB of '=' took %.1f ms", ms);
+        }
     } catch (const std::exception & e) {
         CHECK(false, "exception: %s", e.what());
     }

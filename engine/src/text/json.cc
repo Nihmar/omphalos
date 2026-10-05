@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <system_error>
+#include <unordered_map>
 
 namespace omph::text {
 namespace {
@@ -129,11 +130,11 @@ struct Parser {
         const char c = s[i];
         if (c == '{') {
             ++i;
-            Json o = Json::object();
+            std::vector<std::pair<std::string, Json>> members;
             ws();
             if (i < s.size() && s[i] == '}') {
                 ++i;
-                return o;
+                return Json::object_of(std::move(members));
             }
             while (true) {
                 ws();
@@ -143,7 +144,7 @@ struct Parser {
                     fail("expected ':'", i);
                 }
                 ++i;
-                o.set(std::move(k), value(depth + 1));
+                members.emplace_back(std::move(k), value(depth + 1));
                 ws();
                 if (i < s.size() && s[i] == ',') {
                     ++i;
@@ -151,7 +152,7 @@ struct Parser {
                 }
                 if (i < s.size() && s[i] == '}') {
                     ++i;
-                    return o;
+                    return Json::object_of(std::move(members));
                 }
                 fail("expected ',' or '}'", i);
             }
@@ -206,6 +207,15 @@ struct Parser {
         if (r.ec != std::errc() || r.ptr != num.data() + num.size()) {
             fail("bad number", b);
         }
+        if (integer) {
+            // keep the literal exactly while it fits an int64 (#345): a dumped
+            // tool-call id of 19 digits must reach the client unrounded
+            int64_t iv = 0;
+            const auto ri = std::from_chars(num.data(), num.data() + num.size(), iv);
+            if (ri.ec == std::errc() && ri.ptr == num.data() + num.size()) {
+                return Json::integer(iv);
+            }
+        }
         return Json::number(v, integer);
     }
 };
@@ -237,7 +247,13 @@ void dump_string(std::string & out, const std::string & s) {
 
 // Python's repr of a float: the shortest round trip, with ".0" on integral
 // values and exponent form outside [1e-4, 1e16).
-void dump_number(std::string & out, double v, bool integer) {
+void dump_number(std::string & out, const Json & j) {
+    if (j.number_is_exact()) {
+        out += std::to_string(j.as_int64());  // no '.' ever, so the C locale
+        return;
+    }
+    const double v = j.as_number();
+    const bool integer = j.number_is_integer();
     if (integer && std::fabs(v) < 9.007199254740992e15) {
         out += std::to_string((long long) v);
         return;
@@ -275,7 +291,7 @@ void dump_value(std::string & out, const Json & j) {
     switch (j.type()) {
         case Json::Type::Null: out += "null"; break;
         case Json::Type::Bool: out += j.as_bool() ? "true" : "false"; break;
-        case Json::Type::Number: dump_number(out, j.as_number(), j.number_is_integer()); break;
+        case Json::Type::Number: dump_number(out, j); break;
         case Json::Type::String: dump_string(out, j.as_string()); break;
         case Json::Type::Array: {
             out += '[';
@@ -317,6 +333,30 @@ Json Json::number(const double v, const bool integer) {
     j.type_ = Type::Number;
     j.num_ = v;
     j.integer_ = integer;
+    return j;
+}
+Json Json::integer(const int64_t v) {
+    Json j;
+    j.type_ = Type::Number;
+    j.num_ = (double) v;
+    j.integer_ = true;
+    j.exact_ = true;
+    j.int_ = v;
+    return j;
+}
+Json Json::object_of(std::vector<std::pair<std::string, Json>> members) {
+    Json j = Json::object();
+    std::unordered_map<std::string, size_t> index;
+    index.reserve(members.size());
+    for (auto & m : members) {
+        const auto it = index.find(m.first);
+        if (it != index.end()) {
+            j.obj_[(size_t) it->second].second = std::move(m.second);  // last value, first position
+        } else {
+            index.emplace(m.first, j.obj_.size());
+            j.obj_.push_back(std::move(m));
+        }
+    }
     return j;
 }
 Json Json::string(std::string s) {

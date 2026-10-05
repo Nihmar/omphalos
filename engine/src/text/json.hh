@@ -20,9 +20,15 @@ public:
     Json() = default;
     static Json boolean(bool b);
     static Json number(double v, bool integer);
+    // An integer literal: dump() writes it exactly, 2^53 and beyond (#345).
+    static Json integer(int64_t v);
     static Json string(std::string s);
     static Json array();
     static Json object();
+    // An object from members in order: duplicate keys keep the first position
+    // and the last value, as set() and json.loads do. The parser builds
+    // objects this way, O(n), instead of one O(n) set() per member (#345).
+    static Json object_of(std::vector<std::pair<std::string, Json>> members);
 
     // Throws std::runtime_error with the byte offset on malformed input.
     static Json parse(std::string_view text);
@@ -38,7 +44,10 @@ public:
 
     bool as_bool() const { return b_; }
     double as_number() const { return num_; }
+    // The exact integer of an integer literal (or the double's value, rounded)
+    int64_t as_int64() const { return exact_ ? int_ : (int64_t) num_; }
     bool number_is_integer() const { return integer_; }
+    bool number_is_exact() const { return exact_; }
     const std::string & as_string() const { return str_; }
 
     // arrays
@@ -57,7 +66,9 @@ private:
     Type type_ = Type::Null;
     bool b_ = false;
     double num_ = 0.0;
-    bool integer_ = false;
+    bool integer_ = false;   // the literal had no '.' / 'e'
+    bool exact_ = false;     // int_ holds it exactly (an integer literal)
+    int64_t int_ = 0;
     std::string str_;
     std::vector<Json> arr_;
     std::vector<std::pair<std::string, Json>> obj_;

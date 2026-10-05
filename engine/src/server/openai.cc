@@ -133,7 +133,7 @@ void parse_sampling(const Json & body, const Defaults & d, Job & job) {
     if (seed != nullptr && !seed->is_null()) {
         if (!seed->is_number() || !seed->number_is_integer()) bad("seed must be an integer", "seed");
         job.seeded = true;
-        job.seed = (uint64_t) (int64_t) seed->as_number();
+        job.seed = (uint64_t) seed->as_int64();
     }
     job.max_tokens = d.max_tokens;
     for (const char * key : {"max_tokens", "max_completion_tokens"}) {
@@ -142,7 +142,7 @@ void parse_sampling(const Json & body, const Defaults & d, Job & job) {
         if (!v->is_number() || !v->number_is_integer() || v->as_number() < 1) {
             bad(std::string(key) + " must be a positive integer", key);
         }
-        job.max_tokens = (int64_t) v->as_number();
+        job.max_tokens = v->as_int64();
     }
     const Json & stop = body.get("stop");
     if (stop.is_string()) {
@@ -216,7 +216,7 @@ Job parse_request(const Json & body, const bool chat, const Defaults & defaults)
                 if (!t.is_number() || !t.number_is_integer()) {
                     bad("prompt must be a string, token ids, or a batch of one of them", "prompt");
                 }
-                job.prompt_ids.push_back((int32_t) t.as_number());
+                job.prompt_ids.push_back((int32_t) t.as_int64());
             }
         } else {
             bad("prompt must be a string, token ids, or a batch of one of them", "prompt");

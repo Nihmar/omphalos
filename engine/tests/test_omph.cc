@@ -61,8 +61,6 @@ int main() {
           "sha256(empty)");
     const std::string m56 = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
     CHECK(omph::format::sha256_hex(reinterpret_cast<const uint8_t *>(m56.data()), m56.size()) ==
-              "248d6a61d20638b8e5c0262693c3e60c4ab0d2b4a5c4e8f3e7d1e4b6c66b9cb4" ||
-              omph::format::sha256_hex(reinterpret_cast<const uint8_t *>(m56.data()), m56.size()) ==
               "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
           "sha256(56-byte message)");
 
