@@ -132,7 +132,7 @@ the conversation growing stays fast.
 | `--port P` | `8080` | port |
 | `--ctx N` | `8192` | KV capacity in tokens: the hard limit of one conversation. A longer prompt is a 400; VRAM grows with it (~26 KiB per token with the default K/Q8 + V/Q4 cache, 0.87 GB at 32k, [#58](https://github.com/Nihmar/omphalos/issues/58)) |
 | `--chunk N` | `512` | tokens per prefill chunk, i.e. the size of the activation buffers |
-| `--alias NAME` | the file name, minus a `.gguf` suffix | the model id in `/v1/models` and in every response |
+| `--alias NAME` | the file name, minus a `.omph` suffix | the model id in `/v1/models` and in every response |
 | `--no-mtp` | off | do not load the MTP block: no speculative drafts, -352 MiB of VRAM |
 | `--dflash FILE` | off | draft with a DFlash2 drafter `.omph` (7 drafts per step) instead of the MTP block |
 | `--cache-ram MIB` | `2048` | pinned host RAM for **sequence checkpoints** (`0`: none): an answer that is retried, or a history whose reasoning was dropped, resumes from a checkpoint instead of prefilling again |

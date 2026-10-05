@@ -46,6 +46,12 @@ public:
     // socket with nothing to read.
     bool client_gone();
 
+    // After an early error (413 / 431), the client may still be sending its
+    // request: read and discard what is in flight (bounded, 1 s per read), so
+    // closing cannot reset the connection before the client reads the answer
+    // (#364).
+    void drain(size_t limit = 4 << 20);
+
     // added to every response (CORS)
     std::vector<std::pair<std::string, std::string>> extra_headers;
 

@@ -14,7 +14,7 @@
 //                     retried answer or a history without the reasoning resumes from one
 //   --mmproj FILE     the vision encoder: images as base64 data: URLs in image_url
 //                     items, encoded on the CPU (builds with OMPH_LLAMA_DIR, #160)
-//   --alias NAME      the model id in the API (default: the file name without .gguf)
+//   --alias NAME      the model id in the API (default: the file name without .omph)
 //   --api-key KEY     require "Authorization: Bearer KEY"
 //   --cors ORIGIN     allow browser requests from ORIGIN (e.g. "*")
 //   --temp T, --top-k K, --top-p P, --min-p M, --max-tokens N
@@ -511,7 +511,15 @@ struct Server {
 
 std::string default_id(const std::string & path) {
     std::string name = path.substr(path.find_last_of('/') + 1);
-    if (name.size() > 5 && name.compare(name.size() - 5, 5, ".gguf") == 0) name.resize(name.size() - 5);
+    // the server loads the .omph omph-convert writes (#178): its id lost the
+    // conversion suffix only for .gguf and kept ".omph" (#364)
+    for (const char * suffix : {".omph", ".gguf"}) {
+        const size_t n = std::strlen(suffix);
+        if (name.size() > n && name.compare(name.size() - n, n, suffix) == 0) {
+            name.resize(name.size() - n);
+            break;
+        }
+    }
     return name;
 }
 
