@@ -4,65 +4,13 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
-#include <unordered_map>
 
+#include "model/ngram.hh"
 #include "runtime/timing.hh"
 
 #include <hip/hip_runtime.h>
 
 namespace omph::model {
-
-namespace {
-
-// Prompt lookup (#199): for n = kMin .. kMax, the latest position that follows
-// each n-gram of the sequence, so the n-gram ending the sequence proposes the
-// tokens that followed it last time (hash collisions excluded by comparing).
-class NgramIndex {
-public:
-    static constexpr int kMin = 4;
-    static constexpr int kMax = 8;
-
-    // Indexes the n-grams of c that end before its last token, then proposes up
-    // to k tokens after the longest earlier match of c's tail.
-    void propose(const std::vector<int32_t> & c, const int64_t k, std::vector<int32_t> & out) {
-        out.clear();
-        const int64_t len = (int64_t) c.size();
-        for (int64_t e = std::max<int64_t>(done_, kMin); e < len; ++e) {  // continuation c[e] known
-            for (int n = kMin; n <= kMax && n <= e; ++n) {
-                map_[n][hash(c, e - n, n)] = e;
-            }
-        }
-        done_ = std::max(done_, len);
-        for (int n = kMax; n >= kMin; --n) {
-            if (len <= n) {
-                continue;
-            }
-            const auto it = map_[n].find(hash(c, len - n, n));
-            if (it == map_[n].end()) {
-                continue;
-            }
-            const int64_t p = it->second;
-            if (!std::equal(c.begin() + (p - n), c.begin() + p, c.begin() + (len - n))) {
-                continue;
-            }
-            out.assign(c.begin() + p, c.begin() + std::min<int64_t>(p + k, len));
-            return;
-        }
-    }
-
-private:
-    static uint64_t hash(const std::vector<int32_t> & c, const int64_t at, const int n) {
-        uint64_t h = 0xcbf29ce484222325ull ^ (uint64_t) n;
-        for (int i = 0; i < n; ++i) {
-            h = (h ^ (uint32_t) c[(size_t) (at + i)]) * 0x100000001b3ull;
-        }
-        return h;
-    }
-    std::unordered_map<uint64_t, int64_t> map_[kMax + 1];
-    int64_t done_ = 0;  // n-grams ending (exclusive) before this index are in
-};
-
-} // namespace
 
 Generator::Generator(const Config & config, const omph::runtime::EnvOptions & env)
     : config_(config), env_(env) {

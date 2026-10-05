@@ -135,6 +135,19 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
     if (T <= 0 || T > max_tokens_ || start_pos < 0 || start_pos + T > max_seq_) {
         return fail("forward: tokens exceed the activation or KV capacity");
     }
+    // Every id must index the embedding table: a negative id is an image
+    // placeholder (those rows come from `in`), and the n-gram drafts copy ids
+    // out of the sequence (#334). The embedding lookup itself has no bounds
+    // check.
+    for (int64_t t = 0, next_row = 0; t < T; ++t) {
+        if (in != nullptr && next_row < (int64_t) in->rows.size() && in->rows[(size_t) next_row] == t) {
+            ++next_row;
+            continue;
+        }
+        if (toks[(size_t) t] < 0 || toks[(size_t) t] >= h_.n_vocab) {
+            return fail("forward: token id outside the vocabulary");
+        }
+    }
     watch_step_begin(T);
     hipEvent_t step_a{}, step_b{};
     const bool time_step = T == 1 && env_.timing;
