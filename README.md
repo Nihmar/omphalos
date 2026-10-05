@@ -140,6 +140,7 @@ the conversation growing stays fast.
 | `--mmproj FILE` | off | the vision encoder: images as base64 `data:` URLs, encoded on the CPU (needs a build with `OMPH_LLAMA_DIR`) |
 | `--api-key KEY` | off | require `Authorization: Bearer KEY` on everything but `/health` |
 | `--cors ORIGIN` | off | allow browser requests from `ORIGIN` (`*` for any), preflight included |
+| `--log-json` | off | one JSON object per line on stderr for the ready line, a request's start and progress and its summary, instead of the human lines ([#304](https://github.com/Nihmar/omphalos/issues/304): `tools/tui/log.py` reads both) |
 | `--temp T` | `0` | default temperature; `0` is greedy, the fastest path |
 | `--top-k K` | `0` | default top-k; `0` is off |
 | `--top-p P` | `1` | default top-p; `1` is off |
@@ -238,6 +239,13 @@ and decode times and rates, the drafts accepted and the stop reason
 model is loading or the prompt is prefilling, not that the server is hung --
 with `--cache-ram`/`--kv-ram` a continued conversation resumes instead of
 prefilling and says so (`restored`).
+
+With `--log-json` those events are one JSON object per line on stderr instead
+(`{"event": "ready", ...}`, `request_start`, `progress`, `request`), the shape
+`tools/tui/log.py` reads; the `progress` events carry `phase` (`prefill` with
+`total`, `decode` with `last_t_s` and the drafts), and the summary carries every
+timing the human line printed. Anything that is not one of those events (a
+startup error, the ablation banner, the images' line) stays human.
 
 #### Environment
 

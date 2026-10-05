@@ -100,7 +100,8 @@ engine/build/omph-capi-demo <model.omph> [<mmproj.gguf> <image>]
 # OpenAI-compatible server (#156): /v1/chat/completions, /v1/completions, /v1/models, /health;
 # streamed or not, reasoning_content / tool_calls; one request at a time on 127.0.0.1:8080.
 # Logs to stderr a progress line every 3 s of decoding (tokens, t/s, drafts accepted) and a summary
-# per request (#231). --dflash FILE: draft with the DFlash2 drafter (#245) instead of the MTP block
+# per request (#231); --log-json makes those events one JSON object per line (#304). --dflash FILE:
+# draft with the DFlash2 drafter (#245) instead of the MTP block
 # (convert z-lab/Qwen3.8-27B-DFlash2-GGUF's Q4_K_M with omph-convert; also for omph-generate, omph-run).
 # Options: --host --port --ctx --cache-ram MIB (sequence checkpoints in host RAM, #158; default
 # 2048) --kv-ram MIB (whole conversations in host RAM: a prompt that leaves the cached one saves

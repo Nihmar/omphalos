@@ -17,6 +17,9 @@
 //   --alias NAME      the model id in the API (default: the file name without .omph)
 //   --api-key KEY     require "Authorization: Bearer KEY"
 //   --cors ORIGIN     allow browser requests from ORIGIN (e.g. "*")
+//   --log-json        one JSON object per line on stderr for the ready line,
+//                     the requests' start and progress and the summary,
+//                     instead of the human lines (#304; the TUI reads both)
 //   --temp T, --top-k K, --top-p P, --min-p M, --max-tokens N
 //                     defaults for requests that leave them out (default: greedy,
 //                     until the context is full); greedy and sampled requests both
@@ -91,12 +94,30 @@ struct Server {
     std::string api_key;
     std::string cors;
     omph::server::Defaults defaults;
+    bool log_json = false;
+    int64_t request_seq = 0;  // --log-json: correlates a request's three events
 #ifdef OMPH_VISION
     omph::vision::Encoder * vision = nullptr;
 #endif
 
     static Json num(const double v) { return Json::number(v, true); }
     static Json str(const std::string & s) { return Json::string(s); }
+
+    // --log-json (#304): the events of tools/tui/log.py, one JSON object per
+    // line on stderr, replacing the human line of the same event. Everything
+    // else (a startup error, the ablation banner, the images' line) stays
+    // human, and the TUI passes it through.
+    static Json event_object(const char * name, const int64_t id) {
+        Json e = Json::object();
+        e.set("event", str(name));
+        e.set("id", Json::integer(id));
+        return e;
+    }
+    void log_event(const Json & e) const {
+        if (log_json) {
+            std::fprintf(stderr, "%s\n", e.dump().c_str());
+        }
+    }
 
     bool reply(omph::server::Connection & c, const int status, const Json & body) {
         // every string that reaches a response is valid UTF-8, whatever byte
@@ -186,6 +207,13 @@ struct Server {
     }
 
     void complete(omph::server::Connection & c, const omph::server::Request & req, const bool chat) {
+        const int64_t req_id = ++request_seq;
+        if (log_json) {
+            Json e = event_object("request_start", req_id);
+            e.set("method", str(req.method));
+            e.set("path", str(req.path));
+            log_event(e);
+        }
         omph::server::Job job;
         try {
             job = omph::server::parse_request(Json::parse(req.body), chat, defaults);
@@ -281,8 +309,8 @@ struct Server {
         {
             const double t0 = omph::runtime::now_ms();
             double t_last = t0;
-            greq.on_prefill = [&c, &client_gone, t0, t_last](const int64_t done,
-                                                             const int64_t total) mutable {
+            greq.on_prefill = [this, &c, &client_gone, req_id, t0, t_last](const int64_t done,
+                                                                      const int64_t total) mutable {
                 if (c.client_gone()) {  // the abandoned request stops here, not an hour later (#338)
                     client_gone = true;
                     return false;
@@ -292,8 +320,18 @@ struct Server {
                     return true;
                 }
                 t_last = now;
-                std::fprintf(stderr, "  prefill %lld / %lld tokens, %.1f t/s\n", (long long) done,
-                             (long long) total, done > 0 && now > t0 ? 1000.0 * (double) done / (now - t0) : 0.0);
+                const double t_s = done > 0 && now > t0 ? 1000.0 * (double) done / (now - t0) : 0.0;
+                if (log_json) {
+                    Json e = event_object("progress", req_id);
+                    e.set("phase", str("prefill"));
+                    e.set("tokens", Json::integer(done));
+                    e.set("total", Json::integer(total));
+                    e.set("t_s", num(t_s));
+                    log_event(e);
+                } else {
+                    std::fprintf(stderr, "  prefill %lld / %lld tokens, %.1f t/s\n", (long long) done,
+                                 (long long) total, t_s);
+                }
                 return true;
             };
         }
@@ -405,13 +443,28 @@ struct Server {
                 if (n++ == 0) t_first = t_last = now;
                 if (now - t_last >= 3000.0) {
                     const GenerateResult & r = gen.running();
-                    std::fprintf(stderr, "  %lld tokens, %.1f t/s (last 3 s: %.1f t/s)", (long long) n,
-                                 1000.0 * (double) (n - 1) / (now - t_first),
-                                 1000.0 * (double) (n - n_last) / (now - t_last));
-                    if (r.drafted > 0) {
-                        std::fprintf(stderr, ", drafts accepted %.0f %%", 100.0 * (double) r.accepted / (double) r.drafted);
+                    const double t_s = 1000.0 * (double) (n - 1) / (now - t_first);
+                    const double last_s = 1000.0 * (double) (n - n_last) / (now - t_last);
+                    if (log_json) {
+                        Json e = event_object("progress", req_id);
+                        e.set("phase", str("decode"));
+                        e.set("tokens", Json::integer(n));
+                        e.set("t_s", num(t_s));
+                        e.set("last_t_s", num(last_s));
+                        if (r.drafted > 0) {
+                            e.set("drafted", Json::integer(r.drafted));
+                            e.set("accepted", Json::integer(r.accepted));
+                        }
+                        log_event(e);
+                    } else {
+                        std::fprintf(stderr, "  %lld tokens, %.1f t/s (last 3 s: %.1f t/s)", (long long) n, t_s,
+                                     last_s);
+                        if (r.drafted > 0) {
+                            std::fprintf(stderr, ", drafts accepted %.0f %%",
+                                         100.0 * (double) r.accepted / (double) r.drafted);
+                        }
+                        std::fprintf(stderr, "\n");
                     }
-                    std::fprintf(stderr, "\n");
                     t_last = now;
                     n_last = n;
                 }
@@ -489,23 +542,44 @@ struct Server {
         }
         static const char * kStop[] = {"length", "end of generation", "stop token", "stopped", "context full",
                                        "error"};
-        std::fprintf(stderr,
-                     "%s %s: sampling %s; prompt %zu tokens (%lld cached%s%s) in %.0f ms "
-                     "(checkpoints %.0f ms, %.1f t/s); %zu "
-                     "tokens in %.0f ms "
-                     "(%.1f t/s, drafts accepted %lld / %lld); stop: %s%s\n",
-                     req.method.c_str(), req.path.c_str(), sampling_label(job).c_str(), (size_t) prompt_len,
-                     (long long) res.cached_tokens,
-                     res.restored ? ", restored" : "", res.saved ? ", previous conversation saved" : "",
-                     res.prefill_ms,
-                     res.checkpoint_ms,
-                     res.prefill_ms > 0 ? 1000.0 * (double) (res.prompt_tokens - res.cached_tokens) / res.prefill_ms
-                                        : 0.0,
-                     res.tokens.size(), res.decode_ms,
-                     res.decode_ms > 0 ? 1000.0 * completion_tokens / res.decode_ms : 0.0,
-                     (long long) res.accepted, (long long) res.drafted,
-                     parser.stopped() ? "stop string" : kStop[(int) res.stop],
-                     (gone || client_gone) ? " (client gone)" : "");
+        const char * stop = parser.stopped() ? "stop string" : kStop[(int) res.stop];
+        const bool client_left = gone || client_gone;
+        if (log_json) {
+            Json e = event_object("request", req_id);
+            e.set("method", str(req.method));
+            e.set("path", str(req.path));
+            e.set("sampling_line", str(sampling_label(job)));
+            e.set("prompt_tokens", Json::integer(prompt_len));
+            e.set("cached_tokens", Json::integer(res.cached_tokens));
+            e.set("restored", Json::boolean(res.restored));
+            e.set("saved", Json::boolean(res.saved));
+            e.set("prefill_ms", num(res.prefill_ms));
+            e.set("checkpoint_ms", num(res.checkpoint_ms));
+            e.set("completion_tokens", Json::integer((int64_t) res.tokens.size()));
+            e.set("decode_ms", num(res.decode_ms));
+            e.set("drafts", Json::integer(res.drafted));
+            e.set("accepted", Json::integer(res.accepted));
+            e.set("stop", str(stop));
+            e.set("client_gone", Json::boolean(client_left));
+            log_event(e);
+        } else {
+            std::fprintf(stderr,
+                         "%s %s: sampling %s; prompt %zu tokens (%lld cached%s%s) in %.0f ms "
+                         "(checkpoints %.0f ms, %.1f t/s); %zu "
+                         "tokens in %.0f ms "
+                         "(%.1f t/s, drafts accepted %lld / %lld); stop: %s%s\n",
+                         req.method.c_str(), req.path.c_str(), sampling_label(job).c_str(), (size_t) prompt_len,
+                         (long long) res.cached_tokens,
+                         res.restored ? ", restored" : "", res.saved ? ", previous conversation saved" : "",
+                         res.prefill_ms,
+                         res.checkpoint_ms,
+                         res.prefill_ms > 0
+                             ? 1000.0 * (double) (res.prompt_tokens - res.cached_tokens) / res.prefill_ms
+                             : 0.0,
+                         res.tokens.size(), res.decode_ms,
+                         res.decode_ms > 0 ? 1000.0 * completion_tokens / res.decode_ms : 0.0,
+                         (long long) res.accepted, (long long) res.drafted, stop, client_left ? " (client gone)" : "");
+        }
     }
 };
 
@@ -535,6 +609,7 @@ int main(int argc, char ** argv) {
     std::string host = "127.0.0.1";
     int port = 8080;
     std::string alias, api_key, cors, mmproj;
+    bool log_json = false;
     omph::server::Defaults defaults;
     for (int i = 2; i < argc; ++i) {
         const auto val = [&]() -> const char * {
@@ -556,6 +631,7 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--mmproj")) mmproj = val();
         else if (!std::strcmp(argv[i], "--api-key")) api_key = val();
         else if (!std::strcmp(argv[i], "--cors")) cors = val();
+        else if (!std::strcmp(argv[i], "--log-json")) log_json = true;
         else if (!std::strcmp(argv[i], "--temp")) defaults.temperature = (float) omph::cli::number(val(), "--temp");
         else if (!std::strcmp(argv[i], "--top-k")) defaults.top_k = (int) omph::cli::integer(val(), "--top-k");
         else if (!std::strcmp(argv[i], "--top-p")) defaults.top_p = (float) omph::cli::number(val(), "--top-p");
@@ -572,8 +648,10 @@ int main(int argc, char ** argv) {
     }
     try {
         omph::server::Listener listener(host, port);  // fail before the minute of loading
+        const double t_load = omph::runtime::now_ms();
         omph::model::Generator gen(cfg, omph::runtime::EnvOptions::from_env());
         Server server{gen, alias.empty() ? default_id(cfg.model) : alias, host, port, api_key, cors, defaults};
+        server.log_json = log_json;
 #ifdef OMPH_VISION
         std::unique_ptr<omph::vision::Encoder> vision;
         if (!mmproj.empty()) {
@@ -583,8 +661,19 @@ int main(int argc, char ** argv) {
 #else
         if (!mmproj.empty()) throw std::runtime_error("--mmproj: built without vision (OMPH_LLAMA_DIR)");
 #endif
-        std::fprintf(stderr, "omph-server: %s on http://%s:%d (context %lld)\n", server.model_id.c_str(),
-                     host.c_str(), port, (long long) gen.context());
+        if (log_json) {
+            Json e = Json::object();
+            e.set("event", Server::str("ready"));
+            e.set("model", Server::str(server.model_id));
+            e.set("host", Server::str(host));
+            e.set("port", Server::num(port));
+            e.set("context", Json::integer(gen.context()));
+            e.set("load_ms", Server::num(omph::runtime::now_ms() - t_load));
+            server.log_event(e);
+        } else {
+            std::fprintf(stderr, "omph-server: %s on http://%s:%d (context %lld)\n", server.model_id.c_str(),
+                         host.c_str(), port, (long long) gen.context());
+        }
         while (true) {
             const int fd = listener.accept_one();
             if (fd < 0) {
@@ -597,7 +686,17 @@ int main(int argc, char ** argv) {
             try {
                 server.handle(conn, req);
             } catch (const std::exception & e) {  // the next request still gets served
-                std::fprintf(stderr, "%s %s: %s\n", req.method.c_str(), req.path.c_str(), e.what());
+                if (log_json) {
+                    Json j = Json::object();
+                    j.set("event", Server::str("http"));
+                    j.set("status", Server::num(500));
+                    j.set("method", Server::str(req.method));
+                    j.set("path", Server::str(req.path));
+                    j.set("error", Server::str(e.what()));
+                    server.log_event(j);
+                } else {
+                    std::fprintf(stderr, "%s %s: %s\n", req.method.c_str(), req.path.c_str(), e.what());
+                }
                 if (conn.streaming()) {
                     // The event stream's headers are out: an error event and the
                     // end of the stream, never a second HTTP response in it (#337).

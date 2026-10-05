@@ -140,12 +140,18 @@ def _from_json(obj: dict) -> Event:
     if kind == "request_start":
         return Event("raw", f"start {obj.get('path', '')}", fields=dict(obj))
     if kind == "progress":
+        phase = obj.get("phase", "decode")
         tokens = obj.get("tokens")
         tps = obj.get("t_s")
-        f = {"tokens": tokens, "tps": tps, "last_tps": tps}
+        f = {"phase": phase, "tokens": tokens, "tps": tps, "last_tps": obj.get("last_t_s", tps)}
+        if phase == "prefill":
+            f["total"] = obj.get("total")
         if obj.get("drafted"):
             f["accepted_pct"] = 100.0 * (obj.get("accepted") or 0) / obj["drafted"]
-        text = f"  {tokens if tokens is not None else '?'} tokens"
+        if phase == "prefill":
+            text = f"  prefill {tokens if tokens is not None else '?'} / {f.get('total')} tokens"
+        else:
+            text = f"  {tokens if tokens is not None else '?'} tokens"
         if tps is not None:
             text += f", {tps:.1f} t/s"
         if f.get("accepted_pct") is not None:
@@ -153,6 +159,9 @@ def _from_json(obj: dict) -> Event:
         return Event("progress", text, fields=f)
     if kind == "request":
         f = dict(obj)
+        # the summary the table shows in its sampling cell; the human line has
+        # it as "sampling", the JSON event as "sampling_line" (#304)
+        f["sampling"] = f.get("sampling_line") or ""
         full = f.get("completion_tokens") or 0
         f["prompt_tokens"] = f.get("prompt_tokens") or 0
         f["cached_tokens"] = f.get("cached_tokens") or 0
