@@ -307,6 +307,13 @@ void Tokenizer::bpe(const std::string_view word, std::vector<int32_t> & out) con
 }
 
 std::vector<int32_t> Tokenizer::encode(const std::string_view text, const bool parse_special) const {
+    // bit 1: user-defined allowed (always, as before #344), bit 2: control
+    const std::vector<uint8_t> allow(text.size(), parse_special ? 3 : 1);
+    return encode_masked(text, allow);
+}
+
+std::vector<int32_t> Tokenizer::encode_masked(const std::string_view text,
+                                              const std::vector<uint8_t> & allow) const {
     // fragments: raw text ranges, or special token ids
     struct Frag {
         bool raw;
@@ -316,9 +323,8 @@ std::vector<int32_t> Tokenizer::encode(const std::string_view text, const bool p
     };
     std::vector<Frag> frags{{true, 0, text.size(), -1}};
     for (const int32_t sid : special_) {
-        if (!parse_special && types_[(size_t) sid] == 3) {
-            continue;
-        }
+        // a control token needs bit 2, a user-defined one bit 1 (#344)
+        const uint8_t need = types_[(size_t) sid] == 3 ? 2 : 1;
         const std::string & st = tokens_[(size_t) sid];
         if (st.empty()) {
             continue;
@@ -330,20 +336,25 @@ std::vector<int32_t> Tokenizer::encode(const std::string_view text, const bool p
                 next.push_back(f);
                 continue;
             }
-            size_t pos = f.b;
+            size_t pos = f.b;  // where the next search starts
+            size_t raw = f.b;  // the start of the raw run not emitted yet
             while (pos < f.e) {
                 const size_t m = text.substr(0, f.e).find(st, pos);
                 if (m == std::string_view::npos) {
                     break;
                 }
-                if (m > pos) {
-                    next.push_back({true, pos, m, -1});
+                if (m >= allow.size() || (allow[m] & need) != need) {
+                    pos = m + 1;  // not allowed to start here: keep looking
+                    continue;
+                }
+                if (m > raw) {
+                    next.push_back({true, raw, m, -1});
                 }
                 next.push_back({false, m, m + st.size(), sid});
-                pos = m + st.size();
+                pos = raw = m + st.size();
             }
-            if (pos < f.e) {
-                next.push_back({true, pos, f.e, -1});
+            if (raw < f.e) {
+                next.push_back({true, raw, f.e, -1});
             }
         }
         frags.swap(next);

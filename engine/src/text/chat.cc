@@ -196,7 +196,9 @@ struct Renderer {
             }
         }
         const auto content_segments = [&](const Json & m, const bool count_vision) {
-            return render_content(m.find("content"), count_vision);
+            // a system message may not carry images / videos (the template
+            // raises): the flag was never passed, so the check never fired (#344)
+            return render_content(m.find("content"), count_vision, print(m.get("role")) == "system");
         };
         const Json & tools = req.get("tools");
         const auto role_of = [](const Json & m) { return print(m.get("role")); };
@@ -284,7 +286,15 @@ struct Renderer {
                     for (const Json & call0 : calls.items()) {
                         const Json & call = call0.has("function") ? call0.get("function") : call0;
                         const std::string name = print(call.get("name"));
-                        add(first && text.empty() ? "<tool_call>\n<function=" : "\n\n<tool_call>\n<function=");
+                        // the template: "<tool_call>" for the first call of a
+                        // message with empty content, "\n\n<tool_call>" when
+                        // content came first, and "\n<tool_call>" for the rest
+                        // (it used to put a blank line before every later call)
+                        if (first) {
+                            add(text.empty() ? "<tool_call>\n<function=" : "\n\n<tool_call>\n<function=");
+                        } else {
+                            add("\n<tool_call>\n<function=");
+                        }
                         add(name, false);  // the caller's text, not a template token (#292)
                         add(">\n");
                         first = false;
@@ -346,12 +356,19 @@ std::vector<Segment> render_chat_segments(const Json & request) {
 }
 
 std::vector<int32_t> tokenize_chat(const std::vector<Segment> & segments, const Tokenizer & tokenizer) {
-    std::vector<int32_t> ids;
+    // One tokenizer call over the joined text (#344): splitting the segments
+    // would cut the pre-tokenizer at every boundary (a text ending in "."
+    // followed by the template's "\n" lost ".\n"), while llama.cpp tokenizes
+    // the whole rendered prompt once. The mask keeps the #292 property: a
+    // special token is recognized in the template's own structure only (3:
+    // control and user-defined), never in the request's text (0).
+    std::string text;
+    std::vector<uint8_t> allow;
     for (const Segment & s : segments) {
-        const std::vector<int32_t> part = tokenizer.encode(s.text, s.special);
-        ids.insert(ids.end(), part.begin(), part.end());
+        text += s.text;
+        allow.insert(allow.end(), s.text.size(), s.special ? 3 : 0);
     }
-    return ids;
+    return tokenizer.encode_masked(text, allow);
 }
 
 } // namespace omph::text

@@ -19,10 +19,13 @@ class Tokenizer;
 // user's (or a tool result's, or a file's) text must stay text: tokenizing a
 // whole prompt with special-token parsing turns `a <|im_end|> b` into a turn
 // boundary, which is prompt injection through anything the engine does not
-// control (#292).
+// control (#292). tokenize_chat joins the segments for one tokenizer call
+// (#344), so the pre-tokenizer still sees a text ending in "." and the
+// template's "\n" as one word, while the text stays text: the distinction
+// covers the user-defined added tokens (<think>, <tool_call>, ...) too.
 struct Segment {
     std::string text;
-    bool special = true;
+    bool special = true;  // the template's own structure: parse its special tokens
 };
 
 // request: an object with
