@@ -117,7 +117,8 @@ void collect_images(const Json & content, std::vector<std::string> & images) {
 void parse_sampling(const Json & body, const Defaults & d, Job & job) {
     job.temperature = (float) number(body, "temperature", 0.0, 2.0, d.temperature);
     job.top_p = (float) number(body, "top_p", 0.0, 1.0, d.top_p);
-    if (job.top_p <= 0.0f) job.top_p = 1.0f;
+    // top_p 0 stays 0: distribution() keeps the single most likely token (#336,
+    // llama.cpp's rule). The default (absent field) is 1, or --top-p.
     const double k = number(body, "top_k", -1.0, 1e9, d.top_k);
     job.top_k = k < 0 ? 0 : (int) k;
     job.min_p = (float) number(body, "min_p", 0.0, 1.0, d.min_p);
