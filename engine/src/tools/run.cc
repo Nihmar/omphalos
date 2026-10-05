@@ -23,6 +23,7 @@
 // variants, A/B switches, ablations, timing) are listed in runtime/options.hh
 // and AGENTS.md.
 #include "model/runner.hh"
+#include "model/sampler.hh"
 #include "runtime/options.hh"
 #include "runtime/timing.hh"
 
@@ -249,14 +250,10 @@ int main(int argc, char ** argv) {
                          omph::runtime::now_ms() - prefill_t0, (long long) n_toks);
         }
         write_f32(logits_path, logits);
+        // the same rule as the engine's (the largest finite value, the lowest
+        // id on a tie, #318)
         const auto argmax = [&](const float * row) {
-            int64_t best = 0;
-            for (int64_t i = 1; i < h.n_vocab; ++i) {
-                if (row[i] > row[best]) {
-                    best = i;
-                }
-            }
-            return (int32_t) best;
+            return omph::model::argmax_finite(row, h.n_vocab);
         };
         if (generate > 0) {
             // greedy decode: one token per step, reusing the KV cache, the conv

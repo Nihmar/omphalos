@@ -456,13 +456,15 @@ struct Server {
         static const char * kStop[] = {"length", "end of generation", "stop token", "stopped", "context full",
                                        "error"};
         std::fprintf(stderr,
-                     "%s %s: sampling %s; prompt %zu tokens (%lld cached%s%s) in %.0f ms (%.1f t/s); %zu "
+                     "%s %s: sampling %s; prompt %zu tokens (%lld cached%s%s) in %.0f ms "
+                     "(checkpoints %.0f ms, %.1f t/s); %zu "
                      "tokens in %.0f ms "
                      "(%.1f t/s, drafts accepted %lld / %lld); stop: %s%s\n",
                      req.method.c_str(), req.path.c_str(), sampling_label(job).c_str(), (size_t) prompt_len,
                      (long long) res.cached_tokens,
                      res.restored ? ", restored" : "", res.saved ? ", previous conversation saved" : "",
                      res.prefill_ms,
+                     res.checkpoint_ms,
                      res.prefill_ms > 0 ? 1000.0 * (double) (res.prompt_tokens - res.cached_tokens) / res.prefill_ms
                                         : 0.0,
                      res.tokens.size(), res.decode_ms,

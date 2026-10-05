@@ -94,6 +94,14 @@ void distribution(float * row, int64_t nv, const Sampling & s, const PenaltyWind
 // A draw from d without token `skip` (-1: none).
 int32_t draw(const Dist & d, int32_t skip, std::mt19937_64 & rng);
 
+// The greedy pick over one logits row: the largest finite value, the lowest id
+// on a tie, and id 0 when the row has no finite value at all. Non-finite
+// values are ignored the same way the device's packed argmax ignores them
+// (kernels/elementwise.hip's argmax_key), so a corrupted row gives the two
+// paths the same token instead of two different ones (#318; OMPH_CHECK_FINITE
+// is what reports the corruption).
+int32_t argmax_finite(const float * row, int64_t nv);
+
 // The decision over one logits row: the penalties, then the argmax
 // (temperature 0, llama.cpp applies them before the greedy pick too) or a
 // sampled draw.

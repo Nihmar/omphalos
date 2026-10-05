@@ -1,6 +1,7 @@
 // Runner: load (upload + repack), buffers, KV cache and states, weight
 // resolution, the f16 staging path, diagnostics.
 #include "model/runner.hh"
+#include "model/sampler.hh"
 
 #include "format/repack.hh"
 #include "kernels/attn.hh"
@@ -1045,14 +1046,8 @@ bool Runner::verify(const std::vector<int32_t> & toks, const int64_t pos0,
     }
     argmax.resize((size_t) T);
     for (int64_t t = 0; t < T; ++t) {
-        const float * row = logits.data() + t * h_.n_vocab;
-        int64_t best = 0;
-        for (int64_t i = 1; i < h_.n_vocab; ++i) {
-            if (row[i] > row[best]) {
-                best = i;
-            }
-        }
-        argmax[(size_t) t] = (int32_t) best;
+        // the same rule as the device's packed argmax and the sampler's (#318)
+        argmax[(size_t) t] = omph::model::argmax_finite(logits.data() + t * h_.n_vocab, h_.n_vocab);
     }
     return true;
 }
