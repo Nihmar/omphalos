@@ -397,6 +397,12 @@ int main(int argc, char ** argv) {
                                     true, host_argmax ? nullptr : &on_device)) {
                     return 1;
                 }
+                if (on_device < 0 && (int64_t) step_logits.size() < h.n_vocab) {
+                    // the forward returned without the device argmax and without
+                    // the row: nothing to take a token from (#335)
+                    std::fprintf(stderr, "run: no logits for the next token\n");
+                    return 1;
+                }
                 next = on_device >= 0 ? on_device : argmax(step_logits.data());
                 if (!force.empty()) {
                     next = force[(size_t) i + 1];

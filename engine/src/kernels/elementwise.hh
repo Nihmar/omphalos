@@ -3,6 +3,8 @@
 
 #include <cstdint>
 
+#include "kernels/argmax_key.hh"
+
 #include <hip/hip_runtime.h>
 
 namespace omph::kernels {
@@ -24,15 +26,12 @@ bool add_rms_norm_f16(const float * a, const float * b, float * sum_out, const f
                       void * y_f16, int64_t rows, int64_t n, float eps, hipStream_t stream);
 
 // Greedy argmax of x[0..n) on the device (#102): *key = max over i of
-// (orderable(x[i]) << 32) | (0xffffffff - i), so the token is
+// argmax_key_pack(x[i], i) (kernels/argmax_key.hh), so the token is
 // argmax_key_index(*key) — the lowest index among equal maxima, as the host
 // argmax_finite picks it (-0.0 counts as +0.0; a non-finite value never wins,
-// and a row with none gives index 0, #318). `key` (8 bytes, device) is cleared
-// and written on `stream`; n < 2^32.
+// and a row with none gives index 0, #318/#335). `key` (8 bytes, device) is
+// cleared and written on `stream`; n < 2^32.
 bool argmax_f32(const float * x, int64_t n, unsigned long long * key, hipStream_t stream);
-inline int32_t argmax_key_index(const unsigned long long key) {
-    return (int32_t) (0xffffffffu - (uint32_t) (key & 0xffffffffu));
-}
 
 // The wave size the kernels were compiled for, or 0 if the probe fails. Every
 // kernel assumes 32 (gfx1200's default): five-step shuffle reductions, `lane =
