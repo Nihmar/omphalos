@@ -127,6 +127,11 @@ const char * finish_reason(bool length, bool tool_calls);
 // completed by the next token).
 size_t utf8_complete(const std::string & text);
 
+// Invalid UTF-8 (a byte-level token sequence that never completes a character,
+// or a lone surrogate the JSON parser combined) to U+FFFD, so that every
+// string written into a response keeps it valid JSON text (#338).
+std::string sanitize_utf8(const std::string & s);
+
 // Base64 (RFC 4648, padding optional, whitespace ignored) to bytes; false
 // on any other character.
 bool base64_decode(const std::string & in, std::string & out);

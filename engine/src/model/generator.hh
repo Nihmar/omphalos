@@ -46,7 +46,11 @@ struct GenerateRequest {
     // A long prompt is minutes of work with nothing to show: the server turns
     // this into a progress line every few seconds (#310). Called after every
     // prefill chunk with the tokens fed so far and the total.
-    std::function<void(int64_t done, int64_t total)> on_prefill;
+    // Called after every prefill chunk with the tokens fed so far and the
+    // total, both counted from where this request's prefill started (a resumed
+    // prefix is not fed again, #338). False aborts the prefill: the caller's
+    // client is gone, or the run must stop.
+    std::function<bool(int64_t done, int64_t total)> on_prefill;
 };
 
 struct GenerateResult {

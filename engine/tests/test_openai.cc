@@ -182,6 +182,12 @@ int main() {
           "invalid UTF-8");
     CHECK(omph::server::utf8_complete("ab\xe2\x82") == 2 && omph::server::utf8_complete("ab\xe2\x82\xac") == 5,
           "utf8_complete");
+    // The public sanitizer (#338): the same rule, on strings the parser never saw
+    CHECK(omph::server::sanitize_utf8("ok") == "ok", "sanitize keeps valid text");
+    CHECK(omph::server::sanitize_utf8("a\xff" "b") == "a\xef\xbf\xbd" "b", "sanitize replaces a bad byte");
+    CHECK(omph::server::sanitize_utf8("\xed\xa0\x80") == "\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd",
+          "sanitize rejects a surrogate (one replacement per byte)");
+    CHECK(omph::server::sanitize_utf8("\xf0\x9f\x98\x80") == "\xf0\x9f\x98\x80", "a 4-byte character survives");
 
     if (omph_test::failures == 0) {
         std::printf("test_openai: all checks passed\n");
