@@ -20,6 +20,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -133,6 +134,8 @@ def main() -> None:
     ap.add_argument("--server", default="../engine/build/omph-server")
     ap.add_argument("--model", default="../models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf")
     ap.add_argument("--ctx", type=int, default=8192)
+    ap.add_argument("--tools", default="", help="start the server with --tools (e.g. all) and check the agent "
+                    "tools (#380); empty: check that /tools answers 403")
     ap.add_argument("--image", help="also check images (the server gets --mmproj): an image of the moon landing "
                     "front page, e.g. llama.cpp's tools/mtmd/test-1.jpeg")
     ap.add_argument("--mmproj", default="../models/mmproj-Qwen3.8-27B-BF16.gguf")
@@ -146,12 +149,14 @@ def main() -> None:
         url = f"http://127.0.0.1:{port}"
         vision = ["--mmproj", args.mmproj] if args.image else []
         proc = subprocess.Popen([args.server, omph_file(args.model), "--port", str(port), "--ctx", str(args.ctx),
-                                 "--log-json", *vision], stderr=subprocess.PIPE, text=True, bufsize=1)
+                                 "--log-json", *(["--tools", args.tools] if args.tools else []), *vision],
+                                stderr=subprocess.PIPE, text=True, bufsize=1)
         threading.Thread(target=drain_stderr, args=(proc, log_lines), daemon=True).start()
     try:
         wait_health(url, proc, 600)
         run_checks(url)
         run_webui_checks(url)
+        run_tools_checks(url, args.tools)
         if args.image:
             run_image_checks(url, Path(args.image))
         if proc is not None:
@@ -410,6 +415,58 @@ def run_webui_checks(url: str) -> None:
     check(status7 == 200 and len(slots) == 1 and slots[0].get("n_ctx", 0) > 0, f"GET /slots: {sbody[:120]!r}")
     status8, _, _ = raw_get(url, "/metrics")
     check(status8 == 501, f"llama.cpp's /metrics is a 501 here: {status8}")
+
+
+def run_tools_checks(url: str, enabled: str) -> None:
+    """The server-side agent tools (#380): the listing, an invocation of each
+    kind, and the 403 when the server was started without --tools."""
+    req = urllib.request.Request(url + "/tools")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            listed = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            check(not enabled, f"GET /tools without --tools: 403 ({e.code})")
+            return
+        check(False, f"GET /tools: {e.code}")
+        return
+    if not enabled:
+        check(False, "GET /tools answered without --tools")
+        return
+    names = [t["tool"] for t in listed]
+    check(names == ["read_file", "file_glob_search", "grep_search", "exec_shell_command", "write_file",
+                    "edit_file", "get_info"], f"GET /tools lists the seven: {names}")
+    check(all(t["type"] == "server" and t["uses_cwd"] and "definition" in t for t in listed),
+          "every entry has the UI's shape")
+    with tempfile.TemporaryDirectory() as d:
+        headers = {"x-tool-cwd": d}
+        status, body = raw_post(url, "/tools", json.dumps(
+            {"tool": "write_file", "params": {"path": "a.txt", "content": "one\ntwo\n"}}).encode(), headers)
+        check(status == 200 and body.get("result") == "file written successfully", f"write_file: {body}")
+        status, body = raw_post(url, "/tools", json.dumps(
+            {"tool": "read_file", "params": {"path": "a.txt", "append_loc": True}}).encode(), headers)
+        check(status == 200 and body.get("plain_text_response", "").startswith("1\u2192one"),
+              f"read_file: {body}")
+        status, body = raw_post(url, "/tools", json.dumps(
+            {"tool": "edit_file", "params": {"path": "a.txt", "edits": [{"old_text": "two", "new_text": "TWO"}]}})
+            .encode(), headers)
+        check(status == 200 and body.get("edits_applied") == 1, f"edit_file: {body}")
+        status, body = raw_post(url, "/tools", json.dumps(
+            {"tool": "grep_search", "params": {"path": ".", "pattern": "TWO", "return_line_numbers": True}})
+            .encode(), headers)
+        check(status == 200 and "a.txt:2:TWO" in body.get("plain_text_response", ""), f"grep_search: {body}")
+        status, body = raw_post(url, "/tools", json.dumps(
+            {"tool": "file_glob_search", "params": {"path": ".", "include": "*.txt"}}).encode(), headers)
+        check(status == 200 and body.get("entries") and body["entries"][0]["path"] == "a.txt",
+              f"file_glob_search: {body}")
+        status, body = raw_post(url, "/tools", json.dumps(
+            {"tool": "exec_shell_command", "params": {"command": "echo hi"}}).encode(), headers)
+        check(status == 200 and "hi" in body.get("plain_text_response", "") and
+              "[exit code: 0]" in body.get("plain_text_response", ""), f"exec_shell_command: {body}")
+        status, body = raw_post(url, "/tools", json.dumps({"tool": "get_info", "params": {}}).encode(), headers)
+        check(status == 200 and body.get("cwd") == d and "Linux" in body.get("os", ""), f"get_info: {body}")
+        status, body = raw_post(url, "/tools", json.dumps({"tool": "nope", "params": {}}).encode(), headers)
+        check(status == 500, f"an unknown tool: {status}")
 
 
 def run_image_checks(url: str, image: Path) -> None:

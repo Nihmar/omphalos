@@ -106,7 +106,8 @@ engine/build/omph-capi-demo <model.omph> [<mmproj.gguf> <image>]
 # streamed or not, reasoning_content / tool_calls; one request at a time on 127.0.0.1:8080.
 # Logs to stderr a progress line every 3 s of decoding (tokens, t/s, drafts accepted) and a summary
 # per request (#231); --log-json makes those events one JSON object per line (#304). Serves llama.cpp's
-# web UI at / when built with OMPH_WEBUI_DIR (#378): /props, /slots and the assets. --dflash FILE:
+# web UI at / when built with OMPH_WEBUI_DIR (#378): /props, /slots and the assets; --tools LIST|all
+# (—agent) enables llama.cpp's server-side agent tools the UI lists (#380); --dflash FILE:
 # draft with the DFlash2 drafter (#245) instead of the MTP block
 # (convert z-lab/Qwen3.8-27B-DFlash2-GGUF's Q4_K_M with omph-convert; also for omph-generate, omph-run).
 # Options: --host --port --ctx --cache-ram MIB (sequence checkpoints in host RAM, #158; default
