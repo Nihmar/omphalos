@@ -205,6 +205,27 @@ dropped in silence ([#284](https://github.com/Nihmar/omphalos/issues/284)).
 | `add_generation_prompt` | ignored for chat: the server always appends the assistant's turn (that is what a chat request means here) |
 | `echo` | `/v1/completions`: prepend the prompt to `choices[0].text` |
 
+#### Web UI
+
+With the build's `-DOMPH_WEBUI_DIR=<llama.cpp>/build-hip/tools/ui/ui-gzip/_gzip` (or a
+plain `tools/ui/dist`), opening `http://127.0.0.1:8080/` serves **the same web UI
+`llama-server` serves**: the identical files, one exact route per asset, the
+content's SHA-256 as the ETag (304 on `If-None-Match`), `Content-Encoding: gzip`
+when the tree is the gzip stage (a client that does not accept gzip gets 415,
+as in llama.cpp), `Cache-Control: immutable` for the hashed assets and
+`no-cache` for the index, service worker, manifest and version file, and
+COEP/COOP on the index. The UI talks to the OpenAI endpoints plus
+`GET /props` (defaults, context, the GGUF's chat template, modalities) and
+`GET /slots`; `endpoint_slots` is on while `endpoint_props` and
+`endpoint_metrics` are off, and llama.cpp's other routes (`/metrics`, `/tools`,
+`/models/load|unload|sse`, `/v1/stream` + lookup, the completion control
+endpoint) answer a 501 in the OpenAI error shape instead of a 404. A build
+without the assets answers 404 at `/` and is otherwise unchanged.
+
+The assets are never copied into the repository: the CMake script
+(`engine/cmake/embed_webui.cmake`) embeds the tree at build time, so the UI
+stays whatever llama.cpp version the path points at.
+
 #### Responses
 
 A chat answer splits at `</think>`: everything before it is

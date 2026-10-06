@@ -61,6 +61,15 @@ Generator::~Generator() {
     }
 }
 
+std::string Generator::chat_template() const {
+    const omph::gguf::Value * v = file_->find("tokenizer.chat_template");
+    std::string_view s;
+    if (v != nullptr && v->as_str(s)) {
+        return std::string(s);
+    }
+    return {};
+}
+
 bool Generator::is_eog(const int32_t id) const {
     return std::find(eog_.begin(), eog_.end(), id) != eog_.end();
 }

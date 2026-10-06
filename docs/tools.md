@@ -120,7 +120,9 @@ check that a next turn resumes from the cache instead of prefilling.
 
 The OpenAI-compatible server: see the
 [README](../README.md#omph-server-in-full) for its options, the request fields
-it reads, the response shape and the serving-relevant `OMPH_*` switches.
+it reads, the response shape and the serving-relevant `OMPH_*` switches. Built
+with `-DOMPH_WEBUI_DIR=<llama.cpp>/tools/ui/dist` (or its gzip stage) it also
+serves llama.cpp's own web UI at `/` (#378), with `/props` and `/slots` for it.
 
 ## omph-tui
 

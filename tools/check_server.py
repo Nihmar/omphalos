@@ -14,7 +14,9 @@ TUI reads (#304).
 
 import argparse
 import base64
+import gzip
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -149,6 +151,7 @@ def main() -> None:
     try:
         wait_health(url, proc, 600)
         run_checks(url)
+        run_webui_checks(url)
         if args.image:
             run_image_checks(url, Path(args.image))
         if proc is not None:
@@ -350,6 +353,63 @@ def run_abandon_checks(url: str) -> None:
         except (urllib.error.URLError, ConnectionError, TimeoutError):
             time.sleep(0.5)
     check(ok, f"an abandoned request stopped ({time.monotonic() - t0:.1f} s until the next one)")
+
+
+def raw_get(url: str, path: str, headers: dict | None = None) -> tuple[int, dict, bytes]:
+    req = urllib.request.Request(url + path, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, dict(r.headers), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read()
+
+
+def run_webui_checks(url: str) -> None:
+    """The llama.cpp web UI omph-server serves (#378): the assets, /props, /slots."""
+    status, headers, body = raw_get(url, "/", {"Accept-Encoding": "gzip"})
+    if status == 404:
+        print("skip the web UI checks: this build has no embedded assets (OMPH_WEBUI_DIR)")
+        return
+    check(status == 200 and headers.get("Content-Encoding") == "gzip",
+          f"GET /: {status} {headers.get('Content-Encoding')} {headers.get('Content-Type')}")
+    html = gzip.decompress(body).decode("utf-8", "replace")
+    check("<html" in html.lower(), f"GET / is HTML ({len(html)} chars)")
+    etag = headers.get("ETag", "")
+    check(etag.startswith('"') and len(etag) == 66 and
+          headers.get("Cross-Origin-Opener-Policy") == "same-origin" and
+          headers.get("Cache-Control") == "no-cache", f"the index's headers (ETag {etag[:14]}...)")
+    status2, _, _ = raw_get(url, "/", {"Accept-Encoding": "gzip", "If-None-Match": etag})
+    check(status2 == 304, f"a revalidated index: {status2}")
+    status3, _, _ = raw_get(url, "/")
+    check(status3 == 415, f"a client that cannot gunzip the assets: {status3}")
+    status4, _, _ = raw_get(url, "/no-such-asset.js", {"Accept-Encoding": "gzip"})
+    check(status4 == 404, f"an unknown asset is a 404, not the index: {status4}")
+    match = re.search(r'href="\./(_app/immutable/[^"]+\.js)"', html)
+    check(match is not None, "the index links its hashed bundle")
+    if match:
+        status5, h5, _ = raw_get(url, "/" + match.group(1), {"Accept-Encoding": "gzip"})
+        check(status5 == 200 and "immutable" in h5.get("Cache-Control", "") and
+              "javascript" in h5.get("Content-Type", ""),
+              f"the bundle: {status5} {h5.get('Cache-Control')}")
+    status6, _, pbody = raw_get(url, "/props")
+    try:
+        props = json.loads(pbody)
+    except json.JSONDecodeError:
+        props = {}
+    check(status6 == 200 and props.get("total_slots") == 1 and
+          props.get("default_generation_settings", {}).get("n_ctx", 0) > 0,
+          f"GET /props: {str(props)[:120]}")
+    check(props.get("endpoint_slots") is True and props.get("endpoint_metrics") is False and
+          props.get("model_alias") and len(props.get("chat_template") or "") > 0,
+          "props flags: slots on, metrics off, alias and chat template present")
+    status7, _, sbody = raw_get(url, "/slots")
+    try:
+        slots = json.loads(sbody)
+    except json.JSONDecodeError:
+        slots = []
+    check(status7 == 200 and len(slots) == 1 and slots[0].get("n_ctx", 0) > 0, f"GET /slots: {sbody[:120]!r}")
+    status8, _, _ = raw_get(url, "/metrics")
+    check(status8 == 501, f"llama.cpp's /metrics is a 501 here: {status8}")
 
 
 def run_image_checks(url: str, image: Path) -> None:

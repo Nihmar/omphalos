@@ -64,6 +64,11 @@ Model paths used below: `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (local, git-
 cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release
 cmake --build engine/build -j
 
+# build with the web UI (#378): llama.cpp's UI assets embedded at build time, so
+# omph-server serves the same page llama-server does at /
+cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release \
+    -DOMPH_WEBUI_DIR=<llama.cpp>/build-hip/tools/ui/ui-gzip/_gzip   # or tools/ui/dist
+
 # build with vision (#160): llama.cpp's mtmd from a CPU-only llama.cpp build (out of tree;
 # every GPU backend off: the encoder must never touch VRAM), then point the engine at it
 cmake -S <llama.cpp> -B /var/tmp/omphalos-llama-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -100,7 +105,8 @@ engine/build/omph-capi-demo <model.omph> [<mmproj.gguf> <image>]
 # OpenAI-compatible server (#156): /v1/chat/completions, /v1/completions, /v1/models, /health;
 # streamed or not, reasoning_content / tool_calls; one request at a time on 127.0.0.1:8080.
 # Logs to stderr a progress line every 3 s of decoding (tokens, t/s, drafts accepted) and a summary
-# per request (#231); --log-json makes those events one JSON object per line (#304). --dflash FILE:
+# per request (#231); --log-json makes those events one JSON object per line (#304). Serves llama.cpp's
+# web UI at / when built with OMPH_WEBUI_DIR (#378): /props, /slots and the assets. --dflash FILE:
 # draft with the DFlash2 drafter (#245) instead of the MTP block
 # (convert z-lab/Qwen3.8-27B-DFlash2-GGUF's Q4_K_M with omph-convert; also for omph-generate, omph-run).
 # Options: --host --port --ctx --cache-ram MIB (sequence checkpoints in host RAM, #158; default
