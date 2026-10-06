@@ -1,0 +1,5 @@
+commit,config,prompt,prompt_tokens,reasoning_chars,completion_tokens,paragraphs,paragraphs_skipped,repetitions,repetitions_anywhere,repeats_per_1k_tokens,worst_pair_similarity
+577e8f6,greedy,2026-10-04T09:10:35Z,65544,15636,4096,49,18,0,0,0.0,0.646
+577e8f6,greedy,2026-10-04T09:15:54Z,90145,15398,4096,1,74,0,0,0.0,0.0
+577e8f6,greedy,2026-10-04T10:24:24Z,104159,810,370,3,0,0,0,0.0,0.403
+577e8f6,greedy,2026-10-04T11:59:19Z,88760,331,142,3,0,0,0,0.0,0.765
