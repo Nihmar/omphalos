@@ -157,6 +157,7 @@ def main() -> None:
         run_checks(url)
         run_webui_checks(url)
         run_tools_checks(url, args.tools)
+        run_timings_checks(url)
         if args.image:
             run_image_checks(url, Path(args.image))
         if proc is not None:
@@ -367,6 +368,42 @@ def raw_get(url: str, path: str, headers: dict | None = None) -> tuple[int, dict
             return r.status, dict(r.headers), r.read()
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read()
+
+
+def stream_chunks(url: str, body: dict) -> list[dict]:
+    """The SSE data objects of a streamed chat request, as they arrive."""
+    req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    out: list[dict] = []
+    with urllib.request.urlopen(req, timeout=600) as r:
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if line.startswith("data: ") and line[6:] != "[DONE]":
+                out.append(json.loads(line[6:]))
+    return out
+
+
+def run_timings_checks(url: str) -> None:
+    """#382: the web UI's live statistics. Every streamed chunk carries the
+    running `timings` (with llama.cpp's fields) and the prefill sends
+    `prompt_progress`."""
+    notes = (Path(__file__).resolve().parent.parent / "PLAN.md").read_text()[20000:36000]
+    chunks = stream_chunks(url, {"messages": [{"role": "user", "content": "Summarize in one sentence.\n\n" + notes}],
+                                 "max_tokens": 48, "stream": True, "timings_per_token": True,
+                                 "return_progress": True})
+    timed = [c["timings"] for c in chunks if "timings" in c]
+    timeline = [int(t["predicted_n"]) for t in timed]
+    check(len(timeline) >= 2 and timeline == sorted(timeline),
+          f"per-chunk timings, predicted_n rising: {timeline[:8]}...")
+    check(all("prompt_n" in t and "prompt_ms" in t and "predicted_ms" in t for t in timed),
+          "every chunk's timings carries the running counters")
+    progress = [c["prompt_progress"] for c in chunks if "prompt_progress" in c]
+    check(bool(progress) and int(progress[-1]["total"]) > 0 and 0 <= int(progress[-1]["cache"]) <= int(progress[-1]["processed"]),
+          f"prompt_progress during the prefill: {progress[-1] if progress else None}")
+    final = timed[-1] if timed else {}
+    check("cache_n" in final and "predicted_per_second" in final and "prompt_per_second" in final,
+          f"the final timings carries llama.cpp's fields: {sorted(final)}")
+    check(int(final.get("predicted_n", -1)) == max(timeline or [0]), "the last chunk's predicted_n is the total")
 
 
 def run_webui_checks(url: str) -> None:

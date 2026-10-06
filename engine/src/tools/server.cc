@@ -164,6 +164,31 @@ struct Server {
                          std::string(reinterpret_cast<const char *>(a.data), a.size));
     }
 
+    // llama.cpp's timings object (server-common.cpp), the fields its web UI
+    // reads for the live statistics (#382): the running counters during the
+    // stream and the final numbers in the last chunk.
+    static Json timings_json(const GenerateResult & r) {
+        const double prompt_n = (double) (r.prompt_tokens - r.cached_tokens);
+        const double pred_n = (double) r.tokens.size();
+        Json t = Json::object();
+        t.set("cache_n", Json::integer(r.cached_tokens));
+        t.set("prompt_n", Json::integer((int64_t) prompt_n));
+        t.set("prompt_ms", Json::number(r.prefill_ms, false));
+        if (prompt_n > 0 && r.prefill_ms > 0) {
+            t.set("prompt_per_token_ms", Json::number(r.prefill_ms / prompt_n, false));
+            t.set("prompt_per_second", Json::number(1000.0 * prompt_n / r.prefill_ms, false));
+        }
+        t.set("predicted_n", Json::integer((int64_t) pred_n));
+        t.set("predicted_ms", Json::number(r.decode_ms, false));
+        if (pred_n > 0 && r.decode_ms > 0) {
+            t.set("predicted_per_token_ms", Json::number(r.decode_ms / pred_n, false));
+            t.set("predicted_per_second", Json::number(1000.0 * pred_n / r.decode_ms, false));
+        }
+        t.set("draft_n", Json::integer(r.drafted));
+        t.set("draft_n_accepted", Json::integer(r.accepted));
+        return t;
+    }
+
     // llama.cpp's /props shape (tools/server/server-context.cpp: get_res_props),
     // the fields its web UI reads (#378).
     Json props_json() const {
@@ -467,38 +492,6 @@ struct Server {
         greq.sampling.presence_penalty = job.presence_penalty;
         greq.sampling.penalty_last_n = job.penalty_last_n;
         bool client_gone = false;  // the socket says the client is gone (#338)
-        // A 20 s - 2.5 min prefill with no output looks like a hang (#310): one
-        // line every 3 s, the same shape as the decode progress below.
-        {
-            const double t0 = omph::runtime::now_ms();
-            double t_last = t0;
-            greq.on_prefill = [this, &c, &client_gone, req_id, t0, t_last](const int64_t done,
-                                                                      const int64_t total) mutable {
-                if (c.client_gone()) {  // the abandoned request stops here, not an hour later (#338)
-                    client_gone = true;
-                    return false;
-                }
-                const double now = omph::runtime::now_ms();
-                if (done < total && now - t_last < 3000.0) {
-                    return true;
-                }
-                t_last = now;
-                const double t_s = done > 0 && now > t0 ? 1000.0 * (double) done / (now - t0) : 0.0;
-                if (log_json) {
-                    Json e = event_object("progress", req_id);
-                    e.set("phase", str("prefill"));
-                    e.set("tokens", Json::integer(done));
-                    e.set("total", Json::integer(total));
-                    e.set("t_s", num(t_s));
-                    log_event(e);
-                } else {
-                    std::fprintf(stderr, "  prefill %lld / %lld tokens, %.1f t/s\n", (long long) done,
-                                 (long long) total, t_s);
-                }
-                return true;
-            };
-        }
-
         const std::string id = omph::server::random_id(chat ? "chatcmpl-" : "cmpl-", 24);
         const auto created = (double) std::time(nullptr);
         // a chunk of the stream (or the response's frame)
@@ -548,11 +541,32 @@ struct Server {
         }
         bool gone = false;         // the client closed the stream
         int n_streamed_calls = 0;
+        double last_write = omph::runtime::now_ms();
         // every SSE payload is a JSON body too: the same UTF-8 guarantee
-        const auto event = [&c](const Json & body) {
+        const auto event = [&c, &last_write](const Json & body) {
+            last_write = omph::runtime::now_ms();
             return c.event(omph::server::sanitize_utf8(body.dump()));
         };
+        bool in_generate = false;
+        // llama.cpp's per-chunk `timings` (#382): the web UI's live statistics
+        // read it from every chunk while a reply is being written.
+        const auto timed = [&](Json body) {
+            if (job.timings_per_token && in_generate) {
+                body.set("timings", timings_json(gen.running()));
+            }
+            return body;
+        };
+        // llama.cpp's `sse_ping_interval`: a comment keeps a silent stream
+        // (a long prefill) from being dropped by an impatient client.
+        const auto ping_if_due = [&]() {
+            if (job.sse_ping_interval > 0 && !gone &&
+                omph::runtime::now_ms() - last_write >= job.sse_ping_interval * 1000.0) {
+                gone = !c.ping();
+                last_write = omph::runtime::now_ms();
+            }
+        };
         const auto send = [&](const Delta & d) {
+            ping_if_due();
             if (!job.stream) {
                 reasoning += d.reasoning;
                 content += d.content;
@@ -561,25 +575,25 @@ struct Server {
             }
             if (gone || d.empty()) return;
             if (!chat) {
-                gone = !event(chunk(str(d.content), Json()));
+                gone = !event(timed(chunk(str(d.content), Json())));
                 return;
             }
             if (!d.reasoning.empty()) {
                 Json delta = Json::object();
                 delta.set("reasoning_content", str(d.reasoning));
-                gone = gone || !event(chunk(std::move(delta), Json()));
+                gone = gone || !event(timed(chunk(std::move(delta), Json())));
             }
             if (!d.content.empty()) {
                 Json delta = Json::object();
                 delta.set("content", str(d.content));
-                gone = gone || !event(chunk(std::move(delta), Json()));
+                gone = gone || !event(timed(chunk(std::move(delta), Json())));
             }
             for (const auto & call : d.calls) {
                 Json delta = Json::object();
                 Json arr = Json::array();
                 arr.push(call_json(call, n_streamed_calls++, true));
                 delta.set("tool_calls", std::move(arr));
-                gone = gone || !event(chunk(std::move(delta), Json()));
+                gone = gone || !event(timed(chunk(std::move(delta), Json())));
             }
         };
         if (job.stream) {
@@ -588,13 +602,59 @@ struct Server {
                 Json delta = Json::object();
                 delta.set("role", str("assistant"));
                 delta.set("content", str(""));
-                gone = !event(chunk(std::move(delta), Json()));
+                gone = !event(chunk(std::move(delta), Json()));  // no timings yet: the prefill starts now
             } else if (!gone && !echo.empty()) {
                 gone = !event(chunk(str(echo), Json()));
             }
         }
+        // The prefill's progress (#382): llama.cpp's `prompt_progress`, one
+        // chunk per prefill chunk, on top of the stderr line of #310.
+        {
+            const double t0 = omph::runtime::now_ms();
+            double t_last = t0;
+            greq.on_prefill = [this, &c, &client_gone, &gone, &chunk, &event, &timed, &ping_if_due, &job, chat,
+                               req_id, t0, t_last](const int64_t done, const int64_t total) mutable {
+                if (c.client_gone()) {  // the abandoned request stops here, not an hour later (#338)
+                    client_gone = true;
+                    return false;
+                }
+                const double now = omph::runtime::now_ms();
+                const bool report = done >= total || now - t_last >= 3000.0;
+                if (report) {
+                    t_last = now;
+                    const double t_s = done > 0 && now > t0 ? 1000.0 * (double) done / (now - t0) : 0.0;
+                    if (log_json) {
+                        Json e = event_object("progress", req_id);
+                        e.set("phase", str("prefill"));
+                        e.set("tokens", Json::integer(done));
+                        e.set("total", Json::integer(total));
+                        e.set("t_s", num(t_s));
+                        log_event(e);
+                    } else {
+                        std::fprintf(stderr, "  prefill %lld / %lld tokens, %.1f t/s\n", (long long) done,
+                                     (long long) total, t_s);
+                    }
+                }
+                if (job.stream && !gone && (job.return_progress || job.timings_per_token)) {
+                    Json body = timed(chunk(chat ? Json::object() : str(""), Json()));
+                    if (job.return_progress) {
+                        Json progress = Json::object();
+                        progress.set("total", Json::integer(total));
+                        progress.set("cache", Json::integer(gen.running().cached_tokens));
+                        progress.set("processed", Json::integer(done));
+                        progress.set("time_ms", Json::number(now - t0, false));
+                        body.set("prompt_progress", std::move(progress));
+                    }
+                    gone = gone || !event(body);
+                }
+                ping_if_due();
+                return true;
+            };
+        }
+
         GenerateResult res;
         if (!gone) {
+            in_generate = true;
             // a progress line every 3 s of decoding, as llama-server's (#231)
             double t_first = 0.0, t_last = 0.0;
             int64_t n = 0, n_last = 0;
@@ -634,6 +694,7 @@ struct Server {
                 send(parser.push(tok.piece(t, false)));
                 return !gone && !client_gone && !parser.stopped();
             });
+            in_generate = false;
             send(parser.finish());
         }
         const bool error = res.stop == GenerateResult::Stop::Error;
@@ -649,13 +710,7 @@ struct Server {
         details.set("cached_tokens", num((double) res.cached_tokens));
         usage.set("prompt_tokens_details", std::move(details));
         // llama.cpp's timings, for clients that show them
-        Json timings = Json::object();
-        timings.set("prompt_n", num((double) (res.prompt_tokens - res.cached_tokens)));
-        timings.set("prompt_ms", Json::number(res.prefill_ms, false));
-        timings.set("predicted_n", num(completion_tokens));
-        timings.set("predicted_ms", Json::number(res.decode_ms, false));
-        timings.set("draft_n", num((double) res.drafted));
-        timings.set("draft_n_accepted", num((double) res.accepted));
+        Json timings = timings_json(res);
 
         if (job.stream) {
             if (!gone) {

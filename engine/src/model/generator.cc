@@ -472,6 +472,12 @@ GenerateResult Generator::generate(const std::vector<int32_t> & prompt, const Ge
 GenerateResult Generator::generate_inner(const std::vector<int32_t> & prompt_ids, const GenerateRequest & req,
                                          const std::function<bool(int32_t)> & on_token) {
     GenerateResult res;
+    // running() is valid only while this call runs: reset it before the
+    // GenerateResult copy goes out of scope, so a late reader cannot dangle.
+    struct RunningGuard {
+        const GenerateResult ** slot;
+        ~RunningGuard() { *slot = nullptr; }
+    } running_guard{&running_};
     running_ = &res;
     Expanded ex;
     if (prompt_ids.empty() || !expand(prompt_ids, req, ex)) {

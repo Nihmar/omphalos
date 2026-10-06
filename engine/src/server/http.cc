@@ -124,6 +124,8 @@ bool Connection::begin_events() {
 
 bool Connection::event(const std::string & data) { return write_all("data: " + data + "\n\n"); }
 
+bool Connection::ping() { return write_all(":\n\n"); }
+
 bool Connection::client_gone() {
     char peek = 0;
     const ssize_t n = ::recv(fd_, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
