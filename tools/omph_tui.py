@@ -28,6 +28,7 @@ import shlex
 import signal
 import threading
 import time
+import webbrowser
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -311,9 +312,10 @@ class HelpScreen(ModalScreen):
             ("c / F9", "the command that will run, with the pre-flight checks"),
             ("y / F10", "copy that command"),
             ("t", "send a small test prompt to the running server"),
+            ("w", "open the server's web UI in the browser"),
             ("e", "the log: everything / errors only"),
             ("enter", "details for the selected request (or double click)"),
-            ("1..6", "the form's tabs"),
+            ("1..7", "the form's tabs"),
             ("ctrl+l", "clear the log"),
             ("q", "quit (asks first if the server is running)"))
 
@@ -498,6 +500,7 @@ class OmphTui(App):
         Binding("h", "help", "help", show=False),
         Binding("question_mark", "help", "help", show=False),
         Binding("t", "test_prompt", "test prompt"),
+        Binding("w", "open_webui", "web ui"),
         Binding("e", "toggle_errors", "errors"),
         Binding("ctrl+l", "clear_log", "clear log"),
         Binding("enter", "details", "details"),
@@ -507,6 +510,7 @@ class OmphTui(App):
         Binding("4", "tab('cache')", "", show=False),
         Binding("5", "tab('vision')", "", show=False),
         Binding("6", "tab('advanced')", "", show=False),
+        Binding("7", "tab('tools')", "", show=False),
         Binding("q", "quit", "quit"),
     ]
 
@@ -918,6 +922,18 @@ class OmphTui(App):
 
     def action_details(self) -> None:
         self.open_details(self.table.cursor_row)
+
+    def action_open_webui(self) -> None:
+        """`w`: the server's own web UI (#378) in the browser."""
+        if not self.server.running():
+            self.notify("start the server first", severity="warning")
+            return
+        host = str(self.values.get("host") or "127.0.0.1")
+        if host in ("0.0.0.0", "::", "[::]"):
+            host = "127.0.0.1"  # a wildcard bind is not a connectable address
+        url = f"http://{host}:{self.values.get('port')}/"
+        self.notify(f"opening {url}")
+        webbrowser.open(url)
 
     def action_test_prompt(self) -> None:
         values = self.collect()

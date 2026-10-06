@@ -163,9 +163,10 @@ button (the title bar, the modals):
 | `c` / `F9` | the command that will run, the `OMPH_*` line and the pre-flight checks (model, port, other servers, VRAM estimate) |
 | `y` / `F10` | copy that command to the clipboard |
 | `t` | send a small test prompt to the running server |
+| `w` | open the server's web UI (llama.cpp's, #378) in the browser |
 | `e` | the log: everything / errors only |
 | `enter` | details for the selected request (or double click a row) |
-| `1`..`6` | the form's tabs |
+| `1`..`7` | the form's tabs |
 | `?` / `h` | the key list |
 | `ctrl+l` | clear the log |
 | `q` | quit (asks first when the server is running) |

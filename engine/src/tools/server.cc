@@ -17,6 +17,12 @@
 //   --alias NAME      the model id in the API (default: the file name without .omph)
 //   --api-key KEY     require "Authorization: Bearer KEY"
 //   --cors ORIGIN     allow browser requests from ORIGIN (e.g. "*")
+//   --tools LIST      llama.cpp's server-side agent tools the web UI lists:
+//                     read_file, file_glob_search, grep_search,
+//                     exec_shell_command, write_file, edit_file, get_info, or
+//                     "all". They run with this process's permissions (files,
+//                     shell): enable only where that is trusted (#380)
+//   --agent           --tools all, llama.cpp's shortcut
 //   --log-json        one JSON object per line on stderr for the ready line,
 //                     the requests' start and progress and the summary,
 //                     instead of the human lines (#304; the TUI reads both)
@@ -39,6 +45,7 @@
 #include "server/access.hh"
 #include "server/http.hh"
 #include "server/openai.hh"
+#include "server/tools.hh"
 #include "server/webui.hh"
 #include "tools/cli.hh"
 #include "text/json.hh"
@@ -96,6 +103,9 @@ struct Server {
     std::string api_key;
     std::string cors;
     omph::server::Defaults defaults;
+    // llama.cpp's server-side agent tools the web UI lists (#380): the names
+    // from --tools/--agent, empty when off (the route then answers 403).
+    std::vector<std::string> tools;
     bool log_json = false;
     int64_t request_seq = 0;  // --log-json: correlates a request's three events
 #ifdef OMPH_VISION
@@ -276,11 +286,48 @@ struct Server {
             reply(c, 200, arr);
             return;
         }
+        // The web UI's tool page (#380): the list and the invocations, in
+        // llama.cpp's shapes. Off unless --tools/--agent enabled them.
+        if (path == "/tools") {
+            if (tools.empty()) {
+                fail(c, 403, "server tools are not enabled (start omph-server with --tools all)",
+                     "not_supported_error");
+                return;
+            }
+            if (req.method == "GET") {
+                reply(c, 200, omph::server::tools::list(tools));
+                return;
+            }
+            if (req.method != "POST") {
+                fail(c, 405, "use GET or POST");
+                return;
+            }
+            Json body;
+            try {
+                body = Json::parse(req.body);
+            } catch (const std::exception & e) {
+                fail(c, 400, std::string("invalid JSON body: ") + e.what());
+                return;
+            }
+            const Json & tool = body.get("tool");
+            if (!tool.is_string()) {
+                fail(c, 400, "tool is required and must be a string", "invalid_request_error", "tool");
+                return;
+            }
+            const std::string * tool_cwd = req.header("x-tool-cwd");
+            try {
+                reply(c, 200, omph::server::tools::invoke(tool.as_string(), body.get("params"),
+                                                          tool_cwd != nullptr ? *tool_cwd : ""));
+            } catch (const std::exception & e) {
+                fail(c, 500, e.what(), "server_error");
+            }
+            return;
+        }
         // llama-server routes omph-server does not implement: answer a 501 in
         // the OpenAI shape (the UI's optional features hide behind the
         // endpoint_* flags of /props and fail loudly if ever called).
-        for (const char * p : {"/metrics", "/tools", "/models/load", "/models/unload", "/models/sse",
-                               "/stream", "/streams/lookup", "/chat/completions/control"}) {
+        for (const char * p : {"/metrics", "/models/load", "/models/unload", "/models/sse", "/stream",
+                               "/streams/lookup", "/chat/completions/control"}) {
             if (path == p) {
                 fail(c, 501, std::string("omph-server does not implement ") + p + " (llama.cpp's route)",
                      "not_supported_error");
@@ -724,7 +771,7 @@ int main(int argc, char ** argv) {
     cfg.model = argv[1];
     std::string host = "127.0.0.1";
     int port = 8080;
-    std::string alias, api_key, cors, mmproj;
+    std::string alias, api_key, cors, mmproj, tools_spec;
     bool log_json = false;
     omph::server::Defaults defaults;
     for (int i = 2; i < argc; ++i) {
@@ -747,6 +794,8 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--mmproj")) mmproj = val();
         else if (!std::strcmp(argv[i], "--api-key")) api_key = val();
         else if (!std::strcmp(argv[i], "--cors")) cors = val();
+        else if (!std::strcmp(argv[i], "--tools")) tools_spec = val();
+        else if (!std::strcmp(argv[i], "--agent")) tools_spec = "all";  // llama.cpp's shortcut
         else if (!std::strcmp(argv[i], "--log-json")) log_json = true;
         else if (!std::strcmp(argv[i], "--temp")) defaults.temperature = (float) omph::cli::number(val(), "--temp");
         else if (!std::strcmp(argv[i], "--top-k")) defaults.top_k = (int) omph::cli::integer(val(), "--top-k");
@@ -762,12 +811,19 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
+    std::vector<std::string> enabled_tools;
+    try {
+        enabled_tools = omph::server::tools::parse(tools_spec);
+    } catch (const std::exception & e) {  // an unknown --tools name, before the model loads
+        std::fprintf(stderr, "%s\n", e.what());
+        return 2;
+    }
     try {
         omph::server::Listener listener(host, port);  // fail before the minute of loading
         const double t_load = omph::runtime::now_ms();
         omph::model::Generator gen(cfg, omph::runtime::EnvOptions::from_env());
         Server server{gen, alias.empty() ? default_id(cfg.model) : alias, cfg.model, host, port, api_key, cors,
-                      defaults};
+                      defaults, enabled_tools};
         server.log_json = log_json;
 #ifdef OMPH_VISION
         std::unique_ptr<omph::vision::Encoder> vision;

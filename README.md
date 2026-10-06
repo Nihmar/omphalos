@@ -141,6 +141,8 @@ the conversation growing stays fast.
 | `--api-key KEY` | off | require `Authorization: Bearer KEY` on everything but `/health` |
 | `--cors ORIGIN` | off | allow browser requests from `ORIGIN` (`*` for any), preflight included |
 | `--log-json` | off | one JSON object per line on stderr for the ready line, a request's start and progress and its summary, instead of the human lines ([#304](https://github.com/Nihmar/omphalos/issues/304): `tools/tui/log.py` reads both) |
+| `--tools LIST` | off | llama.cpp's server-side agent tools the web UI offers the model: `read_file`, `file_glob_search`, `grep_search`, `exec_shell_command`, `write_file`, `edit_file`, `get_info`, or `all`. They run with this process's permissions — files and shell — so enable them only where that is trusted ([#380](https://github.com/Nihmar/omphalos/issues/380)) |
+| `--agent` | off | `--tools all`, llama.cpp's shortcut |
 | `--temp T` | `0` | default temperature; `0` is greedy, the fastest path |
 | `--top-k K` | `0` | default top-k; `0` is off |
 | `--top-p P` | `1` | default top-p; `1` is off |
@@ -225,6 +227,12 @@ without the assets answers 404 at `/` and is otherwise unchanged.
 The assets are never copied into the repository: the CMake script
 (`engine/cmake/embed_webui.cmake`) embeds the tree at build time, so the UI
 stays whatever llama.cpp version the path points at.
+
+#### Tools
+
+With `--tools` (or `--agent`) `omph-server` serves the same tool API llama.cpp's web UI reads, so the UI's tool page works: `GET /tools` lists the enabled ones with their OpenAI function declarations, `POST /tools` runs one (`{tool, params}`, `{"error": ...}` on failure, `{"plain_text_response": ...}` or structured JSON on success, the `x-tool-cwd` header overriding the working directory). The seven tools are llama.cpp's, with its names, parameter schemas, output caps (16 KB reads and shell output, 100 hits, a 10 s default / 60 s max shell timeout) and path rules (relative to the server's working directory; listings respect `.gitignore` through `git ls-files` when the directory is a repository, with a junk-directory walk otherwise).
+
+They are **off by default and dangerous when on**: they read, write and execute with this process's permissions on this machine. There is no sandbox yet (llama.cpp's `--tools-runtime` container/ssh isolation is a follow-up), and the API key, when set, protects `/tools` like `/props`. Without the flag the route answers 403, so a client can tell "no tools" from "no server".
 
 #### Responses
 

@@ -105,6 +105,7 @@ add_custom_command(
     COMMENT "Embedding the web UI assets (${OMPH_WEBUI_DIR})" VERBATIM)
 
 add_executable(omph-server src/tools/server.cc src/server/http.cc src/server/openai.cc src/server/webui.cc
+               src/server/tools.cc
                ${OMPH_WEBUI_GEN}/webui_assets.cc)
 target_include_directories(omph-server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(omph-server PRIVATE omphalos hip::host omph_warnings)

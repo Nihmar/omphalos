@@ -19,7 +19,7 @@ from __future__ import annotations
 import shlex
 from dataclasses import dataclass
 
-GROUPS = ("model", "sampling", "drafting", "cache", "vision", "advanced")
+GROUPS = ("model", "sampling", "drafting", "cache", "vision", "advanced", "tools")
 
 
 @dataclass(frozen=True)
@@ -106,6 +106,13 @@ SCHEMA: tuple[Option, ...] = (
     # --- advanced
     _opt("api_key", "advanced", "flag", "--api-key", "str", "", "require Authorization: Bearer KEY"),
     _opt("cors", "advanced", "flag", "--cors", "str", "", "allow browser requests from ORIGIN (* for any)"),
+    # --- tools
+    _opt("tools", "tools", "flag", "--tools", "str", "",
+         "llama.cpp's server tools the web UI lists (read_file, file_glob_search, "
+         "grep_search, exec_shell_command, write_file, edit_file, get_info) or all",
+         note="experimental: files and shell with the server's own permissions (#380)"),
+    _opt("agent", "tools", "flag", "--agent", "bool", False, "enable every tool (--tools all)",
+         note="llama.cpp's shortcut"),
     _opt("log_json", "advanced", "flag", "--log-json", "bool", False,
          "one JSON object per line on stderr for the ready line, the requests and their progress",
          note="#304: the TUI reads both this and the human lines"),
