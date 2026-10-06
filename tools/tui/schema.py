@@ -106,6 +106,9 @@ SCHEMA: tuple[Option, ...] = (
     # --- advanced
     _opt("api_key", "advanced", "flag", "--api-key", "str", "", "require Authorization: Bearer KEY"),
     _opt("cors", "advanced", "flag", "--cors", "str", "", "allow browser requests from ORIGIN (* for any)"),
+    _opt("log_json", "advanced", "flag", "--log-json", "bool", False,
+         "one JSON object per line on stderr for the ready line, the requests and their progress",
+         note="#304: the TUI reads both this and the human lines"),
     _opt("gemm_min", "advanced", "env", "OMPH_GEMM_MIN", "int", 16, "tokens from which a run takes the GEMM path"),
     _opt("overlap", "advanced", "env", "OMPH_OVERLAP", "bool", False, "a side stream for sibling GEMVs"),
     _opt("host_argmax", "advanced", "env", "OMPH_HOST_ARGMAX", "bool", False, "greedy argmax on the host"),

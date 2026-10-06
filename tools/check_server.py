@@ -4,7 +4,8 @@ Starts the server (or uses one already running with --url), then checks:
 the model listing; chat completions whole and streamed (the same text, the
 same reasoning split, usage); a chat's next turn reusing the cached prompt;
 a tool call round trip; stop strings and length limits; raw completions;
-seeded sampling; the errors of invalid requests.
+seeded sampling; the errors of invalid requests; and the --log-json events the
+TUI reads (#304).
 
     uv run python check_server.py --server ../engine/build/omph-server \
         --model ../models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
@@ -17,6 +18,7 @@ import json
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -80,6 +82,49 @@ def stream_chat(client: openai.OpenAI, **kw) -> tuple[str, str, list, str | None
     return reasoning, content, calls, finish, usage
 
 
+def drain_stderr(proc: subprocess.Popen, lines: list[str]) -> None:
+    """Keep the server's log live on this terminal and its lines for the check."""
+    assert proc.stderr is not None
+    for line in proc.stderr:
+        lines.append(line)
+        sys.stderr.write(line)
+
+
+def check_json_log(lines: list[str]) -> None:
+    """--log-json (#304): one JSON object per line, the shape tools/tui/log.py
+    reads, instead of the ready line, the progress lines and the summary."""
+    events: list[dict] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue  # the ablation banner, the image line, a startup error: still human
+        try:
+            events.append(json.loads(stripped))
+        except json.JSONDecodeError:
+            check(False, f"a --log-json line is not JSON: {stripped[:100]!r}")
+            return
+    ready = [e for e in events if e.get("event") == "ready"]
+    check(len(ready) == 1 and ready[0].get("load_ms", 0) > 0 and ready[0].get("context", 0) > 0,
+          f"ready event with the load time: {ready[0] if ready else None}")
+    starts = [e for e in events if e.get("event") == "request_start"]
+    reqs = [e for e in events if e.get("event") == "request"]
+    check(bool(starts) and len({e["id"] for e in starts}) == len(starts),
+          f"{len(starts)} request_start events, unique ids")
+    start_ids = {e["id"] for e in starts}
+    check(bool(reqs) and all(e.get("id") in start_ids for e in reqs),
+          f"{len(reqs)} request summaries, each with its start")
+    progress = [e for e in events if e.get("event") == "progress"]
+    check(bool(progress) and all(e.get("phase") in ("prefill", "decode") for e in progress),
+          f"{len(progress)} progress events, each with a phase")
+    check(any(e.get("phase") == "decode" for e in progress), "at least one decode progress event")
+    need = ("method", "path", "sampling_line", "prompt_tokens", "cached_tokens", "restored", "prefill_ms",
+            "completion_tokens", "decode_ms", "drafts", "accepted", "stop", "client_gone")
+    missing = sorted({k for e in reqs for k in need if k not in e})
+    check(not missing, f"every summary carries the fields the TUI reads (missing {missing})")
+    check(not [line for line in lines if line.startswith(("POST ", "GET ")) and ": sampling " in line],
+          "--log-json replaced the human summary lines")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", help="a running server (else one is started)")
@@ -92,17 +137,24 @@ def main() -> None:
     args = ap.parse_args()
 
     proc = None
+    log_lines: list[str] = []
     url = args.url
     if url is None:
         port = free_port()
         url = f"http://127.0.0.1:{port}"
         vision = ["--mmproj", args.mmproj] if args.image else []
-        proc = subprocess.Popen([args.server, omph_file(args.model), "--port", str(port), "--ctx", str(args.ctx), *vision])
+        proc = subprocess.Popen([args.server, omph_file(args.model), "--port", str(port), "--ctx", str(args.ctx),
+                                 "--log-json", *vision], stderr=subprocess.PIPE, text=True, bufsize=1)
+        threading.Thread(target=drain_stderr, args=(proc, log_lines), daemon=True).start()
     try:
         wait_health(url, proc, 600)
         run_checks(url)
         if args.image:
             run_image_checks(url, Path(args.image))
+        if proc is not None:
+            check_json_log(log_lines)
+        else:
+            print("skip --log-json checks: --url points at a server this script did not start")
     finally:
         if proc is not None:
             proc.terminate()

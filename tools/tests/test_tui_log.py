@@ -114,20 +114,37 @@ def test_json_events() -> None:
     ready = log.parse_line(json.dumps({"event": "ready", "model": "m.omph", "host": "127.0.0.1",
                                        "port": 7070, "context": 131072, "load_ms": 1610}))
     assert ready.kind == "ready" and ready.fields["port"] == 7070
-    prog = log.parse_line(json.dumps({"event": "progress", "id": 1, "tokens": 1536, "t_s": 40.9,
-                                      "accepted": 980, "drafted": 2480}))
+    prog = log.parse_line(json.dumps({"event": "progress", "id": 1, "phase": "decode", "tokens": 1536,
+                                      "t_s": 40.9, "last_t_s": 42.1, "accepted": 980, "drafted": 2480}))
     assert prog.kind == "progress" and prog.fields["tokens"] == 1536
     assert abs(prog.fields["accepted_pct"] - 39.5) < 0.1
+    assert prog.fields["phase"] == "decode" and abs(prog.fields["last_tps"] - 42.1) < 0.05
     req = log.parse_line(json.dumps({
         "event": "request", "id": 4, "path": "/v1/chat/completions", "method": "POST",
+        "sampling_line": "temp 0.60 top-k 20 top-p 0.95 min-p 0.00",
         "prompt_tokens": 45206, "cached_tokens": 45193, "restored": True, "prefill_ms": 62,
         "completion_tokens": 889, "decode_ms": 21268, "drafts": 1611, "accepted": 612, "stop": "length"}))
     assert req.kind == "request"
     assert req.fields["drafted"] == 1611 and req.fields["restored"]
     assert abs(req.fields["decode_tps"] - 41.8) < 0.1
+    assert log.sampling_summary(req.fields["sampling"]) == "0.6/20/0.95"
+    start = log.parse_line(json.dumps({"event": "request_start", "id": 4, "method": "POST",
+                                       "path": "/v1/chat/completions"}))
+    assert start.kind == "raw" and "chat/completions" in start.text
     http = log.parse_line(json.dumps({"event": "http", "status": 400, "path": "/v1/completions",
                                       "error": "frequency_penalty is not implemented"}))
     assert http.kind == "error" and http.fields["status"] == 400
+
+
+def test_json_prefill_progress() -> None:
+    """The JSON prefill event fills the same live row as the human line (#310):
+    the phase and the total have to survive _from_json."""
+    ev = log.parse_line(json.dumps({"event": "progress", "id": 1, "phase": "prefill", "tokens": 12288,
+                                    "total": 98255, "t_s": 820.4}))
+    assert ev.kind == "progress"
+    assert ev.fields["phase"] == "prefill" and ev.fields["total"] == 98255
+    assert ev.fields["tokens"] == 12288 and abs(ev.fields["tps"] - 820.4) < 0.05
+    assert "prefill 12288 / 98255 tokens" in ev.text
 
 
 def test_sampling_summary() -> None:
