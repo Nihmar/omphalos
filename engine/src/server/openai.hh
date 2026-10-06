@@ -54,6 +54,14 @@ struct Job {
     int64_t max_tokens = -1;
     std::vector<std::string> stop;
     bool stream = false;
+    // The web UI's live statistics (#382): llama.cpp's fields. With
+    // timings_per_token every streamed chunk carries the running `timings`;
+    // return_progress adds a top-level `prompt_progress` per prefill chunk;
+    // sse_ping_interval (seconds, 0 = off) keeps a silent stream alive with
+    // `:` comments.
+    bool timings_per_token = false;
+    bool return_progress = false;
+    double sse_ping_interval = 0.0;
     bool include_usage = false;   // stream_options.include_usage
     bool echo = false;            // /v1/completions: the prompt before the completion
     std::vector<std::string> images;  // the image files' bytes, in prompt order (#160)

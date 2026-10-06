@@ -35,6 +35,9 @@ public:
     // A server-sent event stream: the headers, then one `data:` event per call.
     bool begin_events();
     bool event(const std::string & data);
+    // An SSE comment (":\n\n"): a keep-alive for a stream that has been
+    // silent for longer than the client asked (#382).
+    bool ping();
 
     // True once begin_events() wrote the stream's headers: an exception from
     // then on has to end the event stream, not start a second HTTP response

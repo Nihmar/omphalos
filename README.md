@@ -245,11 +245,18 @@ or a stop string), `length` (the cap, or the context filling up) or
 back text that may still become a tag or a stop string, so a delta boundary is
 not a token boundary.
 
-The full response also carries llama.cpp's `timings` object (`prompt_n`,
-`prompt_ms`, `predicted_n`, `predicted_ms`, `draft_n`, `draft_n_accepted`) and
-an OpenAI `usage` with `prompt_tokens_details.cached_tokens`: how much of the
-prompt the cache already held, which is what a client can use to tell a
-resumed conversation from a fresh prefill.
+The full response also carries llama.cpp's `timings` object (`cache_n`,
+`prompt_n`, `prompt_ms`, `prompt_per_token_ms`, `prompt_per_second`,
+`predicted_n`, `predicted_ms`, `predicted_per_token_ms`,
+`predicted_per_second`, `draft_n`, `draft_n_accepted`); a streamed request can
+ask for it on **every** chunk (`timings_per_token: true`, what llama.cpp's web
+UI sends) and for the prefill's `prompt_progress`
+(`{total, cache, processed, time_ms}`, `return_progress: true`), which is what
+makes the UI's live speeds and progress bar move; `sse_ping_interval: N` adds
+a `:` keep-alive comment when the stream has been silent that long (#382). It
+also carries an OpenAI `usage` with `prompt_tokens_details.cached_tokens`: how
+much of the prompt the cache already held, which is what a client can use to
+tell a resumed conversation from a fresh prefill.
 
 Errors are OpenAI-shaped (`{"error": {"message", "type", "param",
 "code"}}`): 400 for a malformed request, a prompt longer than `--ctx`, or

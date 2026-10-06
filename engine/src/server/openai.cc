@@ -161,6 +161,11 @@ void parse_sampling(const Json & body, const Defaults & d, Job & job) {
         bad("only n = 1 is supported", "n");
     }
     job.stream = flag(body, "stream", false);
+    // llama.cpp's live-timing fields the web UI sends (#382): the per-chunk
+    // `timings`, the prefill `prompt_progress` and the SSE keep-alive.
+    job.timings_per_token = flag(body, "timings_per_token", false);
+    job.return_progress = flag(body, "return_progress", false);
+    job.sse_ping_interval = number(body, "sse_ping_interval", 0.0, 3600.0, 0.0);
     const Json & so = body.get("stream_options");
     if (so.is_object()) job.include_usage = flag(so, "include_usage", false);
 }

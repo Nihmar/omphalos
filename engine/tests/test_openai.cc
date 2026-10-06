@@ -88,6 +88,13 @@ int main() {
               j.prompt.size() > tail.size() && j.prompt.compare(j.prompt.size() - tail.size(), tail.size(), tail) == 0,
           "the generation prompt (the template's default effort)");
     CHECK(j.thinking && !j.parse_tools && j.stream && j.include_usage, "flags");
+    CHECK(!j.timings_per_token && !j.return_progress && j.sse_ping_interval == 0.0,
+          "the live-timing fields default off (#382)");
+    const Job live = chat_job(
+        R"({"messages":[{"role":"user","content":"Hi"}],"stream":true,"timings_per_token":true,)"
+        R"("return_progress":true,"sse_ping_interval":1})");
+    CHECK(live.timings_per_token && live.return_progress && live.sse_ping_interval == 1.0,
+          "timings_per_token, return_progress and sse_ping_interval are parsed (#382)");
     CHECK(j.temperature == 0.6f && j.top_p == 0.95f && j.top_k == 20 && j.seeded && j.seed == 7 &&
               j.max_tokens == 64 && j.stop == std::vector<std::string>{"END"},
           "sampling");
