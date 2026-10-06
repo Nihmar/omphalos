@@ -89,8 +89,24 @@ add_executable(omph-generate src/tools/generate.cc)
 target_include_directories(omph-generate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(omph-generate PRIVATE omphalos hip::host omph_warnings)
 
-add_executable(omph-server src/tools/server.cc src/server/http.cc src/server/openai.cc)
-target_include_directories(omph-server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# The web UI (#378): llama.cpp's static bundle, embedded at build time from
+# the tree named here (its tools/ui/dist, or the gzip staging directory its
+# build makes: build.../tools/ui/ui-gzip/_gzip). Empty: no web UI, "/" 404s.
+set(OMPH_WEBUI_DIR "" CACHE PATH "llama.cpp web UI assets to embed (empty: none)")
+set(OMPH_WEBUI_GEN ${CMAKE_CURRENT_BINARY_DIR}/generated/server)
+add_custom_command(
+    OUTPUT ${OMPH_WEBUI_GEN}/webui_assets.cc ${OMPH_WEBUI_GEN}/webui_assets.hh
+    COMMAND ${CMAKE_COMMAND} -DWEBUI_DIR=${OMPH_WEBUI_DIR} -DOUT_CC=${OMPH_WEBUI_GEN}/webui_assets.cc
+            -DOUT_HH=${OMPH_WEBUI_GEN}/webui_assets.hh -DTEMPLATE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/cmake
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_webui.cmake
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_webui.cmake
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/webui_assets.cc.in
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/webui_assets.hh.in
+    COMMENT "Embedding the web UI assets (${OMPH_WEBUI_DIR})" VERBATIM)
+
+add_executable(omph-server src/tools/server.cc src/server/http.cc src/server/openai.cc src/server/webui.cc
+               ${OMPH_WEBUI_GEN}/webui_assets.cc)
+target_include_directories(omph-server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(omph-server PRIVATE omphalos hip::host omph_warnings)
 
 add_executable(omph-convert src/tools/convert.cc)

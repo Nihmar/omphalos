@@ -92,6 +92,11 @@ public:
     const omph::text::Tokenizer & tokenizer() const { return *tokenizer_; }
     int64_t context() const { return config_.context; }
 
+    // The source GGUF's `tokenizer.chat_template` metadata (the .omph copies
+    // the KV block): the server's /props reports it to the web UI (#378).
+    // Empty when the file carries none.
+    std::string chat_template() const;
+
     // Generates after `prompt`. on_token(id) gets every generated token as it
     // is decided; returning false stops (Stop::Callback). The prompt continues
     // the cached sequence when it starts with it, else the latest checkpoint

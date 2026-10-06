@@ -39,6 +39,7 @@
 #include "server/access.hh"
 #include "server/http.hh"
 #include "server/openai.hh"
+#include "server/webui.hh"
 #include "tools/cli.hh"
 #include "text/json.hh"
 #ifdef OMPH_VISION
@@ -89,6 +90,7 @@ std::string sampling_label(const omph::server::Job & job) {
 struct Server {
     omph::model::Generator & gen;
     std::string model_id;
+    std::string model_path;
     std::string host;
     int port = 0;
     std::string api_key;
@@ -124,6 +126,82 @@ struct Server {
         // sequence a tokenizer or a JSON escape put in it (#338)
         return c.respond(status, "application/json", omph::server::sanitize_utf8(body.dump()));
     }
+
+    // One web UI asset (#378): the resolution webui::resolve made, turned into
+    // the response llama.cpp sends (ETag, cache policy, gzip, COEP/COOP).
+    static bool serve_webui(omph::server::Connection & c,
+                            const omph::server::webui::Resolution & res) {
+        using S = omph::server::webui::Resolution::Status;
+        if (res.status == S::GzipRequired) {
+            c.extra_headers.emplace_back("Vary", "Accept-Encoding");
+            return c.respond(415, "text/plain", "Error: gzip is not supported by this browser\n");
+        }
+        const omph::server::webui::Asset & a = *res.asset;
+        c.extra_headers.emplace_back("ETag", "\"" + std::string(a.etag) + "\"");
+        if (res.status == S::NotModified) {
+            return c.respond(304, "", "");
+        }
+        c.extra_headers.emplace_back("Cache-Control", res.cache_control);
+        if (a.gzip) {
+            c.extra_headers.emplace_back("Vary", "Accept-Encoding");
+            c.extra_headers.emplace_back("Content-Encoding", "gzip");
+        }
+        if (res.isolate) {
+            c.extra_headers.emplace_back("Cross-Origin-Embedder-Policy", "require-corp");
+            c.extra_headers.emplace_back("Cross-Origin-Opener-Policy", "same-origin");
+        }
+        return c.respond(200, std::string(a.type),
+                         std::string(reinterpret_cast<const char *>(a.data), a.size));
+    }
+
+    // llama.cpp's /props shape (tools/server/server-context.cpp: get_res_props),
+    // the fields its web UI reads (#378).
+    Json props_json() const {
+        const omph::text::Tokenizer & tok = gen.tokenizer();
+        Json params = Json::object();
+        params.set("temperature", Json::number((double) defaults.temperature, false));
+        params.set("top_k", Json::integer(defaults.top_k));
+        params.set("top_p", Json::number((double) defaults.top_p, false));
+        params.set("min_p", Json::number((double) defaults.min_p, false));
+        params.set("seed", Json::integer(-1));  // -1: drawn per request
+        params.set("n_predict", Json::integer(defaults.max_tokens));
+        params.set("max_tokens", Json::integer(defaults.max_tokens));
+        params.set("stream", Json::boolean(false));
+        params.set("repeat_last_n", Json::integer(defaults.penalty_last_n));
+        params.set("repeat_penalty", Json::number((double) defaults.repeat_penalty, false));
+        params.set("presence_penalty", Json::number((double) defaults.presence_penalty, false));
+        params.set("frequency_penalty", Json::number((double) defaults.frequency_penalty, false));
+        Json dgs = Json::object();
+        dgs.set("params", std::move(params));
+        dgs.set("n_ctx", Json::integer(gen.context()));
+        Json props = Json::object();
+        props.set("default_generation_settings", std::move(dgs));
+        props.set("total_slots", Json::integer(1));
+        props.set("model_alias", str(model_id));
+        props.set("model_path", str(model_path));
+        Json modalities = Json::object();
+#ifdef OMPH_VISION
+        modalities.set("vision", Json::boolean(vision != nullptr));
+#else
+        modalities.set("vision", Json::boolean(false));
+#endif
+        modalities.set("video", Json::boolean(false));
+        modalities.set("audio", Json::boolean(false));
+        props.set("modalities", std::move(modalities));
+        props.set("media_marker", str("<__media__>"));
+        props.set("endpoint_slots", Json::boolean(true));
+        props.set("endpoint_props", Json::boolean(false));   // no POST /props
+        props.set("endpoint_metrics", Json::boolean(false));  // no /metrics
+        props.set("ui", Json::boolean(!omph::server::webui::assets().empty()));
+        props.set("ui_settings", Json::object());
+        props.set("chat_template", str(gen.chat_template()));
+        props.set("bos_token", str(tok.piece(tok.bos(), true)));
+        props.set("eos_token", str(tok.piece(tok.eos(), true)));
+        props.set("build_info", str("omphalos"));
+        props.set("is_sleeping", Json::boolean(false));
+        props.set("cors_proxy_enabled", Json::boolean(false));
+        return props;
+    }
     bool fail(omph::server::Connection & c, const int status, const std::string & message,
               const std::string & type = "invalid_request_error", const std::string & param = "") {
         return reply(c, status, omph::server::error_body(message, type, param));
@@ -158,6 +236,18 @@ struct Server {
         }
         std::string path = req.path;
         if (path.rfind("/v1/", 0) == 0) path.erase(0, 3);
+        // The web UI (#378): llama.cpp's static bundle, one exact route per
+        // embedded file, served before the API key so the page itself is what
+        // asks the client for the key (llama-server does the same).
+        if (req.method == "GET") {
+            const auto web = omph::server::webui::resolve(
+                path, req.header("if-none-match") != nullptr ? *req.header("if-none-match") : "",
+                req.header("accept-encoding") != nullptr ? *req.header("accept-encoding") : "");
+            if (web.status != omph::server::webui::Resolution::Status::NotFound) {
+                serve_webui(c, web);
+                return;
+            }
+        }
         if (path == "/health") {
             Json ok = Json::object();
             ok.set("status", str("ok"));
@@ -168,6 +258,32 @@ struct Server {
             const std::string * auth = req.header("authorization");
             if (auth == nullptr || !omph::server::bearer_key_ok(*auth, api_key)) {
                 fail(c, 401, "invalid API key", "authentication_error");
+                return;
+            }
+        }
+        if (path == "/props" && req.method == "GET") {  // the web UI (#378)
+            reply(c, 200, props_json());
+            return;
+        }
+        if (path == "/slots" && req.method == "GET") {
+            Json arr = Json::array();
+            Json slot = Json::object();
+            slot.set("id", Json::integer(0));
+            slot.set("n_ctx", Json::integer(gen.context()));
+            slot.set("speculative", Json::boolean(true));
+            slot.set("is_processing", Json::boolean(false));
+            arr.push(std::move(slot));
+            reply(c, 200, arr);
+            return;
+        }
+        // llama-server routes omph-server does not implement: answer a 501 in
+        // the OpenAI shape (the UI's optional features hide behind the
+        // endpoint_* flags of /props and fail loudly if ever called).
+        for (const char * p : {"/metrics", "/tools", "/models/load", "/models/unload", "/models/sse",
+                               "/stream", "/streams/lookup", "/chat/completions/control"}) {
+            if (path == p) {
+                fail(c, 501, std::string("omph-server does not implement ") + p + " (llama.cpp's route)",
+                     "not_supported_error");
                 return;
             }
         }
@@ -650,7 +766,8 @@ int main(int argc, char ** argv) {
         omph::server::Listener listener(host, port);  // fail before the minute of loading
         const double t_load = omph::runtime::now_ms();
         omph::model::Generator gen(cfg, omph::runtime::EnvOptions::from_env());
-        Server server{gen, alias.empty() ? default_id(cfg.model) : alias, host, port, api_key, cors, defaults};
+        Server server{gen, alias.empty() ? default_id(cfg.model) : alias, cfg.model, host, port, api_key, cors,
+                      defaults};
         server.log_json = log_json;
 #ifdef OMPH_VISION
         std::unique_ptr<omph::vision::Encoder> vision;
