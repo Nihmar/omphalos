@@ -134,6 +134,16 @@ def test_bools_and_empty_strings() -> None:
     assert "OMPH_NGRAM" in env and env["OMPH_NGRAM"] == "0"
 
 
+def test_the_tools_entries_build_the_command() -> None:
+    """#380: the tools tab reaches the server as --tools/--agent."""
+    _, argv = schema.build_command({**schema.defaults(), "model": "m.omph", "tools": "read_file,grep_search"})
+    assert argv[argv.index("--tools") + 1] == "read_file,grep_search"
+    _, argv = schema.build_command({**schema.defaults(), "model": "m.omph", "agent": True})
+    assert "--agent" in argv and "--tools" not in argv
+    _, argv = schema.build_command({**schema.defaults(), "model": "m.omph"})
+    assert "--tools" not in argv and "--agent" not in argv
+
+
 def test_a_dflash_path_is_passed() -> None:
     """The TUI pre-fills the DFlash2 drafter (#332); the field has to reach the
     server as --dflash."""

@@ -460,3 +460,28 @@ def test_errors_only_keeps_an_error_without_the_prefix(tmp_path) -> None:
             assert len(seen) == 1 and "wants an integer" in str(seen[0][0])
 
     asyncio.run(run())
+
+
+def test_the_tools_tab_and_the_web_ui_key(tmp_path, monkeypatch) -> None:
+    """#380: the tools tab holds the agent-tool flags and `w` opens the web UI
+    in the browser (and opens nothing when the server is not running)."""
+    fixture(tmp_path)
+    opened: list[str] = []
+    monkeypatch.setattr(omph_tui.webbrowser, "open", lambda url: opened.append(url))
+
+    async def run() -> None:
+        app = make_app(tmp_path)
+        async with app.run_test(size=(140, 46)) as pilot:
+            await pilot.press("7")
+            assert app.query_one(TabbedContent).active == "tab-tools", "7 is the tools tab"
+            app.server.running = lambda: True  # type: ignore[method-assign]
+            await pilot.press("w")
+            await pilot.pause(0.1)
+            assert opened == ["http://127.0.0.1:7070/"], f"w opened {opened!r}"
+        stopped = make_app(tmp_path)
+        async with stopped.run_test(size=(140, 46)) as pilot:
+            await pilot.press("w")
+            await pilot.pause(0.1)
+            assert opened == ["http://127.0.0.1:7070/"], "no running server: nothing opened"
+
+    asyncio.run(run())
