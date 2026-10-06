@@ -1,0 +1,39 @@
+# HumanEval with sampling: DFlash2 + n-gram at temperature 0, 0.6 and 1 (#261)
+
+Engine a010be4 (`feat/261-humaneval-sampling` on top of main), RX 9060 XT 16 GB,
+CachyOS, desktop session active. omphalos only, K4/V4 (`--kv k4q4`), DFlash2
+drafter (`--spec dflash`, `models/Qwen3.8-27B-DFlash2-Q4_K_M.omph`) with the
+n-gram drafts that are on by default; thinking on, `--think-budget 8192`,
+`--answer-tokens 4096`, `--ctx 16384`, the same 164 rendered prompts and the
+same bubblewrap sandbox as #195.
+
+    uv run python humaneval.py --engine omphalos --spec dflash --kv k4q4 \
+        --out ../bench/results/he-dflash-omph-k4q4.jsonl
+    uv run python humaneval.py --engine omphalos --spec dflash --kv k4q4 --temp 1 \
+        --out ../bench/results/he-dflash-omph-k4q4-t1.jsonl
+    uv run python humaneval.py --engine omphalos --spec dflash --kv k4q4 --temp 0.6 \
+        --out ../bench/results/he-dflash-omph-k4q4-t06.jsonl
+
+The sampled runs use Qwen's recommended sampling (top_k 20, top_p 0.95, min_p 0)
+and the fixed seed 261; the greedy run is the same binary with no sampling.
+
+| temperature | pass@1 | failed | tokens | decode t/s | drafts accepted |
+|---|---|---|---|---|---|
+| 0 (greedy) | 161 / 164 = 98.2 % | 74, 145, 158 | 279748 | 82.6 | 214493 / 475731 = 45 % |
+| 0.6 | 161 / 164 = 98.2 % | 47, 67, 145 | 269378 | 66.4 | 196337 / 494919 = 40 % |
+| 1 | 163 / 164 = 99.4 % | 145 | 236180 | 52.2 | 160905 / 454207 = 35 % |
+
+Reading:
+
+- pass@1 is flat within the noise of 164 problems (161 vs 163 is one problem;
+  HumanEval/145 fails at every temperature, and 13-14 runs hit the 8192-token
+  thinking cap).
+- Sampling costs decode speed: 82.6 → 66.4 → 52.2 t/s, and the draft acceptance
+  falls 45 → 40 → 35 %, because a sampled trajectory is harder to predict than
+  the greedy one (the drafts are still verified exactly, so the speculative
+  path never changes the output; it only accepts fewer drafts).
+- No sampled run produced a broken or empty answer (`0 answers cut`, 0 sandbox
+  timeouts): sampling does not put the parser or the sandbox at risk.
+
+Raw rows: one JSON line per problem in the three `.jsonl` files next to this
+note (task, passed, error, thinking/answer text, predicted_n/ms, drafts).
