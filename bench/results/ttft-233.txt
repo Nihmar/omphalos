@@ -1,0 +1,48 @@
+# Time to first token through the servers (#233) — partial, see "state"
+
+Engine a010be4 (the campaign tree), RX 9060 XT 16 GB, CachyOS, desktop session
+active. A wikitext prompt of the target size in a chat template (rendered once
+with omph-tokenize, the same text to both engines), streamed, one token to
+generate, prompt caching off (`--cache-ram 0 --kv-ram 0` on omphalos,
+`cache_prompt: false` on llama.cpp), median of 5 runs after one warm-up
+(tools/ttft.py, PLAN.md §17). TTFT is the first streamed delta: template +
+tokenization + HTTP + prefill; the "overhead" column is TTFT minus the server's
+own `timings.prompt_ms`.
+
+| kv | size | prompt tokens | omphalos TTFT | omphalos t/s | llama TTFT | llama t/s |
+|---|---|---|---|---|---|---|
+| k4q4 | 500 | 499 | 0.48 s | 1042 | 0.90 s | 553 |
+| k4q4 | 2000 | 1995 | 1.94 | 1031 | 3.37 | 594 |
+| k4q4 | 8000 | 8005 | 7.99 | 1003 | 13.31 | 602 |
+| k4q4 | 16000 | 16038 | 16.66 | 964 | 27.45 | 585 |
+| k4q4 | 32000 | 32038 | 35.69 | 898 | 58.66 | 547 |
+| k4q4 | 64000 | 64273 | 82.23 | 782 | 134.70 | 478 |
+| k4q4 | 100000 | 100020 | 146.64 | 682 | 239.12 * | 419 * |
+| k8q4 | 500..100000 | 499..100020 | 0.49..144.75 | 1024..691 | — | — |
+| k8 | 500..100000 | 499..100020 | 0.49..142.79 | 1022..701 | (llama has no mixed row) | |
+
+* llama k4q4 100k has 2 of the 5 runs; the parse is recomputed from the JSONLs.
+The omphalos rows are complete for all three cache settings (k4q4 = `OMPH_KV_K4=1`,
+k8q4 = the default mix, k8 = `OMPH_KV_K4_LAYERS=none`); k4q4 and k8 are within
+1 % of each other at every size (the prefill reads the FP16 window regardless
+of the quantization), so the cache precision is not a TTFT knob.
+
+Reading so far: omphalos' prefill is 1.6-2.0x llama.cpp's at every size
+(1042 vs 553 t/s at 500, 682 vs 419 t/s at 100k), and the server overhead
+(tokenization + template + HTTP) is 1-2 ms at 500 and ≤ 132 ms at 100k on both.
+The 100k TTFT at ~147 s is the number a user actually waits for; at 32k it is
+36 s.
+
+## State / how to resume
+
+Done: omphalos k4q4, k8q4, k8 (7 sizes x 6 requests each), llama k4q4 through
+64k. Missing: llama k4q4 100k (2/5 runs), the whole llama k8q4 row.
+
+    uv run python ttft.py --engine llama --llama-server <llama>/bin/llama-server --kv k4q4 \
+        --out ../bench/results/ttft-233-llama-k4q4.jsonl --csv ../bench/results/ttft-233-llama.csv
+    uv run python ttft.py --engine llama --llama-server <llama>/bin/llama-server --kv k8q4 \
+        --out ../bench/results/ttft-233-llama-k8q4.jsonl --csv ../bench/results/ttft-233-llama.csv
+
+The JSONLs accumulate and are the source of truth; `bench/results/ttft-233.csv`
+is regenerated from all `ttft-233-*.jsonl` (median per cell; for the llama k4q4
+100k cell keep the last 5 rows once the rerun is there).
