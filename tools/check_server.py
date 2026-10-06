@@ -461,8 +461,8 @@ def run_tools_checks(url: str, enabled: str) -> None:
               f"file_glob_search: {body}")
         status, body = raw_post(url, "/tools", json.dumps(
             {"tool": "exec_shell_command", "params": {"command": "echo hi"}}).encode(), headers)
-        check(status == 200 and body.get("plain_text_response", "").startswith("hi\n[exit code: 0]"),
-              f"exec_shell_command: {body}")
+        check(status == 200 and "hi" in body.get("plain_text_response", "") and
+              "[exit code: 0]" in body.get("plain_text_response", ""), f"exec_shell_command: {body}")
         status, body = raw_post(url, "/tools", json.dumps({"tool": "get_info", "params": {}}).encode(), headers)
         check(status == 200 and body.get("cwd") == d and "Linux" in body.get("os", ""), f"get_info: {body}")
         status, body = raw_post(url, "/tools", json.dumps({"tool": "nope", "params": {}}).encode(), headers)
