@@ -1,0 +1,7 @@
+engine,kv,turn,kind,prompt_tokens,cached_tokens,prompt_n,prompt_ms,ttft_ms,wall_s,predicted_n,decode_tps,vram_peak_mib,rss_peak_mib
+llama,k8q4,1,append,19890,0,19890,34611.4,34641.7,35.82,22,18.7,15080,1388
+llama,k8q4,2,append,21600,19911,1689,3498.5,3532.1,4.72,22,18.5,15074,1812
+llama,k8q4,3,append,23310,21621,1689,3511.6,3547.0,4.75,22,18.3,15074,2264
+llama,k8q4,4,edit,23332,18203,5129,10064.7,10099.5,10.1,1,1000000.0,15082,1516
+llama,k8q4,5,regen,23332,23328,4,149.9,184.7,0.19,1,1000000.0,15082,1520
+llama,k8q4,6,append,25021,23332,1689,3623.5,3660.2,4.89,22,17.9,15080,1970
