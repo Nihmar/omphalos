@@ -1,0 +1,7 @@
+engine,kv,turn,kind,prompt_tokens,cached_tokens,prompt_n,prompt_ms,ttft_ms,wall_s,predicted_n,decode_tps,vram_peak_mib,rss_peak_mib
+omphalos,k4q4,1,append,19890,0,19890,21582.1,21601.9,22.7,22,20.0,14149,12376
+omphalos,k4q4,2,append,21600,19911,1689,2366.6,2385.9,2.51,22,173.1,14149,12470
+omphalos,k4q4,3,append,23310,21621,1689,2407.5,2427.8,2.56,22,171.2,14149,12577
+omphalos,k4q4,4,edit,23341,18203,5138,11286.3,11307.1,11.43,22,172.3,14149,13775
+omphalos,k4q4,5,regen,23341,23334,7,478.0,499.8,0.63,22,172.4,14141,14652
+omphalos,k4q4,6,append,25021,23334,1687,2203.0,2224.8,2.35,22,174.1,14141,14652

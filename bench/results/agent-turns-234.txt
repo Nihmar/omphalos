@@ -1,0 +1,55 @@
+# Multi-turn agent prefill: omphalos vs llama.cpp (#234)
+
+Engine a010be4 (the campaign tree; main + the harness branches), RX 9060 XT
+16 GB, CachyOS, desktop session active. One conversation of 6 turns: a system
+message with ~20k tokens of wikitext, then turns that append a ~2k-token tool
+output and ask for a one-sentence answer (greedy, thinking off where the
+engine honours it), the whole growing messages list sent to the server each
+turn (tools/agent_turns.py). Turn 4 edits the first tool output (the cache
+cannot be reused past the edit); turn 5 resends turn 4's conversation (a
+regenerated answer); turn 6 appends again. omphalos runs with its defaults
+(`--cache-ram 2048`, `--kv-ram 8192`, MTP loaded), llama.cpp with its prompt
+cache (`cache_prompt`), `-fa on` and the matching KV types (k8q4: `-ctk q8_0
+-ctv q4_0`; k4q4: both q4_0; llama has no mixed-K8 row).
+
+    for kv in k4q4 k8q4 k8; do uv run python agent_turns.py --engine omphalos --kv $kv \
+        --turns 6 --initial 20000 --fill 2000 --edit-turn 4 --regen-turn 5 \
+        --out ../bench/results/agent-turns-234-$kv.jsonl --csv ../bench/results/agent-turns-234-$kv.csv; done
+    for kv in k4q4 k8q4; do uv run python agent_turns.py --engine llama --llama-server <llama>/bin/llama-server \
+        --kv $kv --turns 6 --initial 20000 --fill 2000 --edit-turn 4 --regen-turn 5 \
+        --out ../bench/results/agent-turns-234-llama-$kv.jsonl --csv ../bench/results/agent-turns-234-llama-$kv.csv; done
+
+Median of one run per cell (single stream, PLAN.md §17 style would need repeats;
+these are the shapes, and every row is in the .jsonl).
+
+| turn (kind) | omphalos k4q4 | omphalos k8q4 | omphalos k8 | llama k4q4 | llama k8q4 |
+|---|---|---|---|---|---|
+| 1 append: 19890 new | 21.60 s | 21.04 s | 21.01 s | 34.49 s | 34.64 s |
+| 2 append: 1689 new (19911 cached) | 2.39 s | 2.15 s | 2.14 s | 3.53 s | 3.53 s |
+| 3 append: 1689 new (21621 cached) | 2.43 s | 2.18 s | 2.17 s | 3.56 s | 3.55 s |
+| 4 edit: 5138 new (18203 cached) | 11.31 s | 6.27 s | 6.29 s | 10.06 s | 10.10 s |
+| 5 regen: 7 new (23334 cached) | 0.50 s | 0.50 s | 0.51 s | 0.19 s | 0.18 s |
+| 6 append: 1687 new (23334 cached) | 2.22 s | 2.36 s | 2.22 s | 3.69 s | 3.66 s |
+
+TTFT (the first streamed delta), seconds; the prefill time is 20-30 ms less.
+VRAM peaks 14.1-15.1 GiB for both engines; the server's RSS grows to ~15 GiB on
+omphalos (the pinned conversation cache) and stays ~1-2 GiB on llama.cpp.
+
+Reading:
+
+- The growing conversation is what both engines are good at: each appended turn
+  prefills only its 1.7k new tokens on both engines, and the regenerated turn
+  hits the cache on both (omphalos 7 tokens, llama 4).
+- The same delta costs omphalos ~2.2 s (715-770 t/s) and llama.cpp ~3.5 s
+  (482 t/s), and the cold 20k prefill 21 s vs 34.5 s: omphalos' prefill is
+  1.45-1.62x faster through the same HTTP chat path, matching #232's curve.
+- The edit turn is the interesting one: llama.cpp stalls 10.1 s on both KV
+  settings, omphalos k8q4/k8 6.3 s but k4q4 **11.3 s**. That k4q4-only cost
+  (5.1k tokens prefilled at 455 t/s against k8's 817 t/s) is worth chasing: it
+  looks like the K4 cache's restore path, not the prefill itself (the appended
+  turns are identical across the three settings).
+- llama.cpp's decode is the plain one (15-19 t/s here): its MTP/DFlash2 flags
+  were left off, so the wall times are not a decoding comparison.
+- `tools/agent_turns.py` reports `decode_tps` as ~1e6 for llama's regenerated
+  turns: llama-server returns `predicted_ms` ~0 for a 1-2 token answer; the
+  `predicted_n` / `wall_s` columns are the usable ones there.
