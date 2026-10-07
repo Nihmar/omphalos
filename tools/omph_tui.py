@@ -9,10 +9,12 @@ binding, every visible target is clickable (tabs, rows, selectors, checkboxes,
 the modal buttons, the scrollbars).
 
     uv run python omph_tui.py [--exec CMD | --demo FILE] [--model FILE] [--dflash FILE]
-                              [--profile NAME] [--poll SECONDS] [--screenshot FILE.svg]
+                              [--mmproj FILE] [--profile NAME] [--poll SECONDS]
+                              [--screenshot FILE.svg]
 
-The model and the DFlash2 drafter default to the repository's own `models/`
-files (`--dflash ""` starts on the MTP head instead).
+The model, the DFlash2 drafter and the vision encoder default to the
+repository's own `models/` files (`--dflash ""` starts on the MTP head instead,
+`--mmproj ""` without vision).
 
 `--exec` runs any command instead of omph-server and `--demo` replays a saved
 log: both are how the UI is developed and tested without a GPU (the pytest in
@@ -61,23 +63,26 @@ import tui.server as srv
 from tui import profiles, schema
 
 HERE = Path(__file__).resolve().parent
-# The repo's own files, for the form's defaults: the .omph omph-convert writes
-# and the DFlash2 drafter next to it (README's "everything on" / coding-agent
-# recipes). The drafter is optional, so a checkout without it leaves the field
-# empty rather than failing the preflight.
+# The repo's own files, for the form's defaults: the .omph omph-convert writes,
+# the DFlash2 drafter and the vision encoder next to it (README's "everything
+# on" / coding-agent recipes; the encoder runs on the CPU, no VRAM, #385). Both
+# are optional, so a checkout without one leaves its field empty rather than
+# failing the preflight.
 DEFAULT_MODEL = HERE.parent / "models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph"
 DEFAULT_DFLASH = HERE.parent / "models/Qwen3.8-27B-DFlash2-Q4_K_M.omph"
+DEFAULT_MMPROJ = HERE.parent / "models/mmproj-Qwen3.8-27B-BF16.gguf"
 
 
-def default_dflash(path: Path = DEFAULT_DFLASH) -> str:
-    """The DFlash2 drafter to pre-fill the form with, or "" when it is not
-    there (the model field is always filled; this one only when it can run)."""
+def default_file(path: Path) -> str:
+    """An optional file (drafter, encoder) to pre-fill the form with, or ""
+    when it is not there (the model field is always filled; these only when
+    they can run)."""
     return str(path) if path.is_file() else ""
 
 
-def resolve_dflash(cli: str | None, profile_value: object, repo_default: str) -> str:
-    """`--dflash` wins, then the profile's own drafter, then the repo's
-    (the profile's empty field means "the default", `--dflash ""` means off)."""
+def resolve_file(cli: str | None, profile_value: object, repo_default: str) -> str:
+    """`--dflash` / `--mmproj` wins, then the profile's own file, then the
+    repo's (the profile's empty field means "the default", `--dflash ""` off)."""
     if cli is not None:
         return cli
     return str(profile_value or repo_default)
@@ -1013,6 +1018,9 @@ def main() -> None:
     ap.add_argument("--dflash", default=None,
                     help="the DFlash2 drafter .omph to fill in (default: the repo's when the file exists; "
                          "empty starts on the MTP head)")
+    ap.add_argument("--mmproj", default=None,
+                    help="the vision encoder to fill in, run on the CPU (default: the repo's when the file "
+                         "exists; empty for no vision)")
     ap.add_argument("--profile", default="coding-agent", help="the profile to start from")
     ap.add_argument("--binary", default=str(HERE.parent / "engine/build/omph-server"))
     ap.add_argument("--exec", dest="exec_command", default=None,
@@ -1024,9 +1032,10 @@ def main() -> None:
     args = ap.parse_args()
 
     values = profiles.load().get(args.profile, schema.defaults())
-    # --dflash wins, then the profile's own drafter, then the repo's when present
-    dflash = resolve_dflash(args.dflash, values.get("dflash"), default_dflash())
-    values = {**values, "model": args.model, "dflash": dflash}
+    # --dflash / --mmproj win, then the profile's own file, then the repo's when present
+    dflash = resolve_file(args.dflash, values.get("dflash"), default_file(DEFAULT_DFLASH))
+    mmproj = resolve_file(args.mmproj, values.get("mmproj"), default_file(DEFAULT_MMPROJ))
+    values = {**values, "model": args.model, "dflash": dflash, "mmproj": mmproj}
     app = OmphTui(values, binary=args.binary, exec_command=args.exec_command, demo_file=args.demo,
                   poll=args.poll, demo_delay=args.demo_delay)
 

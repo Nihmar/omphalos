@@ -298,19 +298,20 @@ def test_preflight_catches_the_wrong_model_file(tmp_path) -> None:
     assert 14.0 < est < 15.6, f"11.3 GiB of weights + 3.3 GiB of KV at 128k, got {est:.2f}"
 
 
-def test_the_dflash_default_is_the_repos_when_it_exists(tmp_path) -> None:
+def test_the_dflash_and_mmproj_defaults_are_the_repos_when_they_exist(tmp_path) -> None:
     """The form pre-fills the model path; it should pre-fill the DFlash2 drafter
-    the same way, but only when the file is there (it is optional)."""
+    and the vision encoder the same way, but only when the file is there (they
+    are optional)."""
     missing = tmp_path / "nope.omph"
-    assert omph_tui.default_dflash(missing) == ""
+    assert omph_tui.default_file(missing) == ""
     present = tmp_path / "d.omph"
     present.write_text("x")
-    assert omph_tui.default_dflash(present) == str(present)
+    assert omph_tui.default_file(present) == str(present)
     # precedence: --dflash, then the profile's drafter, then the repo's
-    assert omph_tui.resolve_dflash("/cli.omph", "/profile.omph", "/repo.omph") == "/cli.omph"
-    assert omph_tui.resolve_dflash(None, "/profile.omph", "/repo.omph") == "/profile.omph"
-    assert omph_tui.resolve_dflash(None, "", "/repo.omph") == "/repo.omph"
-    assert omph_tui.resolve_dflash("", "/profile.omph", "/repo.omph") == "", "--dflash '' turns it off"
+    assert omph_tui.resolve_file("/cli.omph", "/profile.omph", "/repo.omph") == "/cli.omph"
+    assert omph_tui.resolve_file(None, "/profile.omph", "/repo.omph") == "/profile.omph"
+    assert omph_tui.resolve_file(None, "", "/repo.omph") == "/repo.omph"
+    assert omph_tui.resolve_file("", "/profile.omph", "/repo.omph") == "", "--dflash '' turns it off"
 
 
 def test_preflight_does_not_call_our_own_child_another_server(tmp_path, monkeypatch) -> None:
