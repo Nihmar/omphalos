@@ -143,6 +143,7 @@ server's own log, so it also shows the requests another client (pi, curl) sent.
 |---|---|---|
 | `--model FILE` | `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph` | the `.omph` to serve |
 | `--dflash FILE` | `models/Qwen3.8-27B-DFlash2-Q4_K_M.omph` when it exists | the DFlash2 drafter `.omph` the form starts on (`--dflash ""` for the MTP head) |
+| `--mmproj FILE` | `models/mmproj-Qwen3.8-27B-BF16.gguf` when it exists | the vision encoder the form starts on, run on the CPU (`--mmproj ""` for no vision; #385) |
 | `--profile NAME` | `coding-agent` | the profile to start the form from (see `tools/tui/profiles.py`: `default`, `coding-agent`, `long-context`, `fast`, `vision`) |
 | `--binary PATH` | `engine/build/omph-server` | the server to run |
 | `--exec CMD` | off | run this command instead of the server: a fake server for development |
