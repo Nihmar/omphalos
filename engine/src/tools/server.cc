@@ -28,6 +28,12 @@
 //   --log-json        one JSON object per line on stderr for the ready line,
 //                     the requests' start and progress and the summary,
 //                     instead of the human lines (#304; the TUI reads both)
+//   --chat-template NAME  the chat template the server renders: "original"
+//                     (the GGUF's own, the default) or "sharp" (the vendored
+//                     Qwen Sharp template, #392; its extra kwargs -- terse,
+//                     reasoning_effort aliases, tool_call_format,
+//                     max_tool_*_chars, ... -- go through
+//                     chat_template_kwargs)
 //   --temp T, --top-k K, --top-p P, --min-p M, --max-tokens N
 //                     defaults for requests that leave them out (default: greedy,
 //                     until the context is full); greedy and sampled requests both
@@ -235,6 +241,7 @@ struct Server {
         // commit, not omphalos' (empty when the assets came from nowhere)
         props.set("webui_llama_commit", str(std::string(omph::server::webui::commit())));
         props.set("chat_template", str(gen.chat_template()));
+        props.set("chat_template_name", str(omph::text::chat_template_name(defaults.chat_template)));
         props.set("bos_token", str(tok.piece(tok.bos(), true)));
         props.set("eos_token", str(tok.piece(tok.eos(), true)));
         props.set("build_info", str("omphalos"));
@@ -883,6 +890,14 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--api-key")) api_key = val();
         else if (!std::strcmp(argv[i], "--cors")) cors = val();
         else if (!std::strcmp(argv[i], "--tools")) tools_spec = val();
+        else if (!std::strcmp(argv[i], "--chat-template")) {
+            try {
+                defaults.chat_template = omph::text::chat_template_from_string(val());
+            } catch (const std::exception & e) {
+                std::fprintf(stderr, "%s\n", e.what());
+                return 2;
+            }
+        }
         else if (!std::strcmp(argv[i], "--agent")) tools_spec = "all";  // llama.cpp's shortcut
         else if (!std::strcmp(argv[i], "--log-json")) log_json = true;
         else if (!std::strcmp(argv[i], "--temp")) defaults.temperature = (float) omph::cli::number(val(), "--temp");

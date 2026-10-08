@@ -15,7 +15,7 @@ endif()
 set(OMPH_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 add_library(omph_format STATIC ${OMPH_SRC}/format/gguf.cc ${OMPH_SRC}/format/repack.cc
             ${OMPH_SRC}/format/omph.cc ${OMPH_SRC}/format/sha256.cc
-            ${OMPH_SRC}/text/tokenizer.cc ${OMPH_SRC}/text/json.cc ${OMPH_SRC}/text/chat.cc
+            ${OMPH_SRC}/text/tokenizer.cc ${OMPH_SRC}/text/json.cc ${OMPH_SRC}/text/chat.cc ${OMPH_SRC}/text/chat_sharp.cc
             ${OMPH_SRC}/server/openai.cc ${OMPH_SRC}/server/tools.cc ${OMPH_SRC}/model/sampler.cc ${OMPH_SRC}/model/hparams.cc)
 target_include_directories(omph_format PUBLIC ${OMPH_SRC})
 target_compile_options(omph_format PRIVATE -Wall -Wextra)

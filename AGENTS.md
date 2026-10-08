@@ -90,7 +90,7 @@ cmake -S engine -B engine/build -DOMPH_LLAMA_DIR=<llama.cpp> -DOMPH_LLAMA_LIB=/v
 engine/build/omph-convert <model.gguf> [<model.omph>]
 
 # tokenizer (#148): text on stdin -> ids, or --decode ids -> text (reads a .gguf or an .omph)
-engine/build/omph-tokenize <model.gguf> [--no-parse-special] < prompt.txt > tokens.txt
+engine/build/omph-tokenize <model.gguf> [--no-parse-special] [--chat-template original|sharp] < prompt.txt > tokens.txt
 # chat template (#150): a JSON request {messages, tools?, add_generation_prompt?,
 # enable_thinking?, ...} on stdin -> the prompt (--chat) or its ids (--chat-ids)
 engine/build/omph-tokenize <model.gguf> --chat-ids < request.json > tokens.txt
@@ -99,6 +99,7 @@ engine/build/omph-tokenize <model.gguf> --chat-ids < request.json > tokens.txt
 # greedy uses MTP speculation, --temp/--top-k/--top-p/--min-p/--seed sample, --then FILE a next turn,
 # --repeat N the same request again (resumes from a checkpoint), --cache-mib N (0: no checkpoints),
 # --mmproj FILE --image FILE (one per image item, i.e. one per image-pad token), --force IDS
+# --chat-template original|sharp (the GGUF's template or the vendored Qwen Sharp, #392)
 # --logits-out FILE
 # (teacher-forced logits, validation)
 engine/build/omph-generate <model.omph> --chat --max 256 < request.json
@@ -119,6 +120,9 @@ engine/build/omph-capi-demo <model.omph> [<mmproj.gguf> <image>]
 # 2048) --kv-ram MIB (whole conversations in host RAM: a prompt that leaves the cached one saves
 # it, one that continues a saved one restores it, #179; default 8192) --mmproj FILE (images as base64 data: URLs, #160) --alias --api-key --cors ORIGIN, request defaults --temp
 # --top-k --top-p --min-p --max-tokens (default greedy: speculative MTP decoding), and
+# --chat-template original|sharp (#392: the GGUF's own template or the vendored Qwen Sharp,
+# whose `terse` / effort aliases / tool_call_format / max_tool_*_chars kwargs go through
+# chat_template_kwargs; /props reports it as chat_template_name), and
 # llama.cpp's penalties sampler (#298) --repeat-penalty P --repeat-last-n N --frequency-penalty P
 # --presence-penalty P (defaults 1.0 / 64 / 0 / 0, off; a penalized greedy step gives up the
 # speculative drafts, the device argmax cannot see them)
@@ -155,7 +159,10 @@ uv run python check_gpu_decode.py [--gemv]        # greedy decode vs the NumPy r
 uv run python check_tokenizer.py <model> <llama.cpp>/bin/llama-tokenize [--fuzz N]
                                                   # tokenizer vs llama.cpp, token for token
 uv run python check_chat_template.py <model>      # chat template vs jinja2, byte for byte; with a
-    # second argument (llama-tokenize) the chat ids of the same renderings too (#344)
+    # second argument (llama-tokenize) the chat ids of the same renderings too (#344);
+    # --template sharp runs the vendored Qwen Sharp template instead (#392)
+uv run python check_chat_template_ab.py [--dflash FILE] --temp 0.6  # #392: the two templates A/B
+    # end to end (markers answered, drafts accepted, ms/token); CSV with --out
 uv run python check_conversations.py [--spec mtp,dflash] [--image FILE]  # #179: back to a saved
                                                   # conversation: restored, not prefilled, same answer;
                                                   # #339 with --image: the text prefill while the CPU

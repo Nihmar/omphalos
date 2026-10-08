@@ -60,6 +60,7 @@ int main(int argc, char ** argv) {
     bool out_ids = false;
     int repeat = 1;
     std::string then_path, mmproj, logits_out, force_path;
+    omph::text::ChatTemplate tpl = omph::text::ChatTemplate::Original;
     std::vector<std::string> image_paths;
     for (int i = 2; i < argc; ++i) {
         const auto val = [&]() -> const char * {
@@ -73,6 +74,14 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--prompt-ids")) prompt_ids = true;
         else if (!std::strcmp(argv[i], "--ids")) out_ids = true;
         else if (!std::strcmp(argv[i], "--no-spec")) req.speculative = false;
+        else if (!std::strcmp(argv[i], "--chat-template")) {
+            try {
+                tpl = omph::text::chat_template_from_string(val());
+            } catch (const std::exception & e) {
+                std::fprintf(stderr, "%s\n", e.what());
+                return 2;
+            }
+        }
         else if (!std::strcmp(argv[i], "--no-mtp")) cfg.mtp = false;
         else if (!std::strcmp(argv[i], "--dflash")) cfg.dflash = val();
         else if (!std::strcmp(argv[i], "--max")) req.max_tokens = (int64_t) omph::cli::integer(val(), "--max");
@@ -144,8 +153,8 @@ int main(int argc, char ** argv) {
             long long v = 0;
             while (ss >> v) prompt.push_back((int32_t) v);
         } else {
-            prompt = chat ? omph::text::tokenize_chat(omph::text::render_chat_segments(omph::text::Json::parse(in)),
-                                                      tok)
+            prompt = chat ? omph::text::tokenize_chat(
+                                omph::text::render_chat_segments(omph::text::Json::parse(in), tpl), tok)
                           : tok.encode(in);
         }
 #ifdef OMPH_VISION
@@ -181,8 +190,8 @@ int main(int argc, char ** argv) {
                 size_t n = 0;
                 while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) body.append(buf, n);
                 std::fclose(f);
-                prompt = omph::text::tokenize_chat(omph::text::render_chat_segments(omph::text::Json::parse(body)),
-                                                   tok);
+                prompt = omph::text::tokenize_chat(
+                    omph::text::render_chat_segments(omph::text::Json::parse(body), tpl), tok);
             }
             bool first = true;
             // the same prefill progress the server prints (#310): a long

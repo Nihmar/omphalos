@@ -30,6 +30,7 @@ add_library(omphalos SHARED
     src/text/tokenizer.cc
     src/text/json.cc
     src/text/chat.cc
+    src/text/chat_sharp.cc
     src/runtime/context.cc
     src/runtime/engine_api.cc
     src/runtime/matmul.cc
