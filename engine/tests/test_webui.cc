@@ -23,11 +23,14 @@ Resolution::Status st(const std::string & path, const std::string & inm = "",
 std::string quoted(const std::string_view etag) { return "\"" + std::string(etag) + "\""; }
 
 void test_table() {
-    CHECK(assets().size() == 6, "the fixture tree's five files, sorted (%zu)", assets().size());
+    CHECK(assets().size() == 7, "the fixture tree's seven files, sorted (%zu)", assets().size());
     const Asset * index = omph::server::webui::find("index.html");
     CHECK(index != nullptr, "the index is in the table");
     CHECK(index != nullptr && index->type == "text/html; charset=utf-8", "the index's type");
     CHECK(index != nullptr && !index->gzip, "the plain fixture is not gzip");
+    const Asset * empty = omph::server::webui::find("empty.txt");
+    CHECK(empty != nullptr && empty->size == 0 && empty->type == "text/plain; charset=utf-8",
+          "a zero-byte asset embeds as an empty entry (#391)");
     const Asset * ico = omph::server::webui::find("favicon.ico");
     CHECK(ico != nullptr && ico->type == "image/x-icon", "the icon's type");
     const Asset * gz = omph::server::webui::find("_app/gz.js");

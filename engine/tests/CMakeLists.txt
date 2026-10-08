@@ -26,13 +26,21 @@ enable_testing()
 # run on a fixture tree, so the asset lookup, the cache policy and the gzip /
 # ETag rules are covered without a socket.
 set(OMPH_WEBUI_GEN ${CMAKE_CURRENT_BINARY_DIR}/generated/server)
+# The fixture tree as a glob: an asset change re-runs the embed step. The
+# manifest file makes an added or removed asset re-run the custom command too
+# (#391).
+file(GLOB_RECURSE OMPH_WEBUI_FIXTURE CONFIGURE_DEPENDS LIST_DIRECTORIES false
+     "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/webui/*")
+set(OMPH_WEBUI_FIXTURE_MANIFEST ${OMPH_WEBUI_GEN}/webui_fixture_manifest.txt)
+file(CONFIGURE OUTPUT "${OMPH_WEBUI_FIXTURE_MANIFEST}" CONTENT
+     "web UI fixture:\n${OMPH_WEBUI_FIXTURE}\n" @ONLY)
 add_custom_command(
     OUTPUT ${OMPH_WEBUI_GEN}/webui_assets.cc ${OMPH_WEBUI_GEN}/webui_assets.hh
     COMMAND ${CMAKE_COMMAND} -DWEBUI_DIR=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/webui
             -DOUT_CC=${OMPH_WEBUI_GEN}/webui_assets.cc -DOUT_HH=${OMPH_WEBUI_GEN}/webui_assets.hh
             -DTEMPLATE_DIR=${OMPH_SRC}/../cmake -P ${OMPH_SRC}/../cmake/embed_webui.cmake
     DEPENDS ${OMPH_SRC}/../cmake/embed_webui.cmake ${OMPH_SRC}/../cmake/webui_assets.cc.in
-            ${OMPH_SRC}/../cmake/webui_assets.hh.in
+            ${OMPH_SRC}/../cmake/webui_assets.hh.in ${OMPH_WEBUI_FIXTURE_MANIFEST} ${OMPH_WEBUI_FIXTURE}
     COMMENT "Embedding the test web UI fixture" VERBATIM)
 add_library(omph_webui STATIC ${OMPH_SRC}/server/webui.cc ${OMPH_WEBUI_GEN}/webui_assets.cc)
 target_include_directories(omph_webui PUBLIC ${OMPH_SRC} ${CMAKE_CURRENT_BINARY_DIR}/generated)
