@@ -1,0 +1,347 @@
+The user wants SVG code for a 2D animation of a pelican riding a bicycle. Let me think about what this needs:
+
+1. A pelican body (white/cream colored, with a distinctive beak)
+2. A bicycle (two wheels, frame, pedals, handlebars)
+3. Animation - the pelican should appear to be riding, so:
+   - Wheels should rotate
+   - The pelican could bob up and down slightly
+   - Pedals should turn
+   - Maybe the pelican's legs move in a pedaling motion
+
+Let me design this:
+
+- Bicycle: two circles for wheels with spokes, a frame (lines), handlebars, seat, pedals
+- Pelican: oval body, neck, head with big beak (pelicans have a distinctive large beak with a throat pouch), legs on pedals
+- Animation: 
+  - Wheels rotate (animateTransform rotate)
+  - Pedals rotate around the crank
+  - Pelican bobs slightly
+  - Legs move in pedaling motion
+
+Let me write this out:
+
+For the bicycle:
+- Rear wheel at x=100, front wheel at x=250, both at y=200 (center), radius 40
+- Frame connecting them
+- Crank at about x=175, y=200
+- Pedals rotating around crank
+
+For the pelican:
+- Body: ellipse centered around x=175, y=140
+- Neck: curved path going up
+- Head: circle at top
+- Beak: large triangular/pouch shape
+- Legs: lines from body to pedals
+
+Let me code this up properly with SMIL animations.
+
+Let me think about coordinates:
+- Canvas: 400x300
+- Wheels: centers at (100, 220) and (260, 220), radius 45
+- Frame: lines connecting wheel centers to seat and handlebars
+- Crank center: (180, 220)
+- Seat: around (150, 160)
+- Handlebars: around (250, 150)
+
+Pelican:
+- Body: ellipse at (160, 130), rx=45, ry=30
+- Neck: path curving up from body to head
+- Head: circle at (210, 80), r=15
+- Beak: large shape extending right from head
+- Legs: from body down to pedals
+
+For animation:
+- Wheels: rotate 360deg over 1s, repeat indefinite
+- Crank/pedals: rotate 360deg over 1s
+- Pelican body: slight vertical bob (translate y by a few pixels)
+- Legs: animate to follow pedals (this is complex - maybe just animate the leg endpoints)
+
+Actually, for the legs to properly follow the pedals, I'd need to animate the path or line endpoints. Let me use animate on the y2 attribute of lines, or use a path with animate.
+
+Let me simplify: I'll make the legs as lines from the body to the pedal positions, and animate them. The pedals rotate around the crank, so the pedal positions change. I can animate the leg endpoints.
+
+Actually, let me use a simpler approach:
+- The crank rotates, pedals are attached to it
+- The legs can be represented as paths that animate their endpoints
+
+Let me structure this:
+
+```svg
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300">
+  <!-- Background -->
+  <rect width="400" height="300" fill="#87CEEB"/>
+  
+  <!-- Ground -->
+  <rect y="265" width="400" height="35" fill="#8B4513"/>
+  
+  <!-- Bicycle group -->
+  <g>
+    <!-- Rear wheel -->
+    <g transform="translate(100,220)">
+      <circle r="45" fill="none" stroke="#333" stroke-width="4"/>
+      <!-- Spokes -->
+      <g>
+        <line x1="0" y1="-45" x2="0" y2="45" stroke="#555" stroke-width="1.5"/>
+        <line x1="-45" y1="0" x2="45" y2="0" stroke="#555" stroke-width="1.5"/>
+        <line x1="-32" y1="-32" x2="32" y2="32" stroke="#555" stroke-width="1.5"/>
+        <line x1="-32" y1="32" x2="32" y2="-32" stroke="#555" stroke-width="1.5"/>
+        <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="1s" repeatCount="indefinite"/>
+      </g>
+      <circle r="5" fill="#333"/>
+    </g>
+    
+    <!-- Front wheel -->
+    <g transform="translate(260,220)">
+      <circle r="45" fill="none" stroke="#333" stroke-width="4"/>
+      <g>
+        <line x1="0" y1="-45" x2="0" y2="45" stroke="#555" stroke-width="1.5"/>
+        <line x1="-45" y1="0" x2="45" y2="0" stroke="#555" stroke-width="1.5"/>
+        <line x1="-32" y1="-32" x2="32" y2="32" stroke="#555" stroke-width="1.5"/>
+        <line x1="-32" y1="32" x2="32" y2="-32" stroke="#555" stroke-width="1.5"/>
+        <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="1s" repeatCount="indefinite"/>
+      </g>
+      <circle r="5" fill="#333"/>
+    </g>
+    
+    <!-- Frame -->
+    <!-- Chain stay: rear wheel to crank -->
+    <line x1="100" y1="220" x2="180" y2="220" stroke="#C0392B" stroke-width="3"/>
+    <!-- Seat stay: rear wheel to seat -->
+    <line x1="100" y1="220" x2="150" y2="155" stroke="#C0392B" stroke-width="3"/>
+    <!-- Seat tube: seat to crank -->
+    <line x1="150" y1="155" x2="180" y2="220" stroke="#C0392B" stroke-width="3"/>
+    <!-- Down tube: crank to front wheel -->
+    <line x1="180" y1="220" x2="260" y2="220" stroke="#C0392B" stroke-width="3"/>
+    <!-- Top tube: seat to handlebars -->
+    <line x1="150" y1="155" x2="245" y2="145" stroke="#C0392B" stroke-width="3"/>
+    <!-- Fork: handlebars to front wheel -->
+    <line x1="245" y1="145" x2="260" y2="220" stroke="#C0392B" stroke-width="3"/>
+    
+    <!-- Seat -->
+    <ellipse cx="150" cy="152" rx="12" ry="5" fill="#222"/>
+    
+    <!-- Handlebars -->
+    <path d="M245,145 Q255,135 265,140" fill="none" stroke="#222" stroke-width="3" stroke-linecap="round"/>
+    
+    <!-- Crank and pedals -->
+    <g transform="translate(180,220)">
+      <circle r="8" fill="none" stroke="#333" stroke-width="2"/>
+      <!-- Crank arms and pedals -->
+      <g>
+        <line x1="0" y1="0" x2="20" y2="0" stroke="#333" stroke-width="3"/>
+        <rect x="15" y="-4" width="12" height="8" rx="2" fill="#222"/>
+        <line x1="0" y1="0" x2="-20" y2="0" stroke="#333" stroke-width="3"/>
+        <rect x="-27" y="-4" width="12" height="8" rx="2" fill="#222"/>
+        <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="1s" repeatCount="indefinite"/>
+      </g>
+    </g>
+  </g>
+  
+  <!-- Pelican -->
+  <g>
+    <!-- Body bob animation -->
+    <animateTransform attributeName="transform" type="translate" values="0,0; 0,-3; 0,0" dur="1s" repeatCount="indefinite"/>
+    
+    <!-- Legs (pedaling) - these need to connect to pedals -->
+    <!-- Left leg -->
+    <path d="M155,145 Q150,185 160,215" fill="none" stroke="#F5D76E" stroke-width="4" stroke-linecap="round">
+      <animate attributeName="d" dur="1s" repeatCount="indefinite"
+        values="M155,145 Q150,185 160,215;
+               M155,145 Q155,190 180,200;
+               M155,145 Q160,185 200,220;
+               M155,145 Q155,190 180,240;
+               M155,145 Q150,185 160,215"/>
+    </path>
+    <!-- Right leg -->
+    <path d="M165,145 Q170,185 180,225" fill="none" stroke="#F5D76E" stroke-width="4" stroke-linecap="round">
+      <animate attributeName="d" dur="1s" repeatCount="indefinite"
+        values="M165,145 Q170,185 180,225;
+               M165,145 Q170,190 200,220;
+               M165,145 Q175,185 180,200;
+               M165,145 Q170,190 160,215;
+               M165,145 Q170,185 180,225"/>
+    </path>
+    
+    <!-- Body -->
+    <ellipse cx="160" cy="130" rx="45" ry="28" fill="white" stroke="#ddd" stroke-width="1"/>
+    
+    <!-- Wing -->
+    <path d="M140,125 Q120,135 135,150 Q150,145 155,135" fill="#E8E8E8" stroke="#ccc" stroke-width="1"/>
+    
+    <!-- Neck -->
+    <path d="M195,120 Q210,100 215,85" fill="none" stroke="white" stroke-width="12" stroke-linecap="round"/>
+    
+    <!-- Head -->
+    <circle cx="218" cy="78" r="14" fill="white" stroke="#ddd" stroke-width="1"/>
+    
+    <!-- Eye -->
+    <circle cx="222" cy="74" r="3" fill="#333"/>
+    <circle cx="223" cy="73" r="1" fill="white"/>
+    
+    <!-- Beak (large pelican beak) -->
+    <path d="M228,75 L275,82 Q278,85 275,88 L228,85 Z" fill="#F39C12" stroke="#E67E22" stroke-width="1"/>
+    <!-- Throat pouch -->
+    <path d="M228,85 Q250,105 270,88" fill="#F5B041" stroke="#E67E22" stroke-width="1"/>
+    
+    <!-- Tail -->
+    <path d="M115,125 Q100,120 95,125 Q100,130 115,132" fill="#E8E8E8" stroke="#ccc" stroke-width="1"/>
+  </g>
+</svg>
+```
+
+Hmm, let me reconsider the leg animation. The pedals rotate around the crank at (180, 220) with radius 20. So the pedal positions are:
+- At 0°: (200, 220)
+- At 90°: (180, 200)
+- At 180°: (160, 220)
+- At 270°: (180, 240)
+
+The legs should connect from the pelican's body (around y=145-150) to the pedal positions. Let me make the leg animation match the crank rotation.
+
+Actually, let me reconsider the whole layout. Let me make it cleaner:
+
+- Canvas: 400x300
+- Ground line at y=265
+- Wheels: radius 40, centers at (100, 225) and (260, 225)
+- Crank at (175, 225)
+- Seat at (145, 160)
+- Handlebars at (245, 150)
+
+Pelican sits on the seat, body above, neck and head up and forward.
+
+Let me refine this. I'll make it look good and animate properly.
+
+Let me reconsider the leg animation to be simpler but effective. I'll use two legs that animate their endpoints to roughly follow the pedal circle.
+
+Actually, for a cleaner look, let me just have the legs as simple lines/paths that animate, and the crank rotates. The visual effect will be good enough for a 2D animation.
+
+Let me write the final version:
+</think>
+
+```svg
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300">
+  <!-- Sky -->
+  <rect width="400" height="300" fill="#87CEEB"/>
+  <!-- Ground -->
+  <rect y="265" width="400" height="35" fill="#6B8E23"/>
+  <line x1="0" y1="265" x2="400" y2="265" stroke="#556B2F" stroke-width="2"/>
+
+  <!-- === BICYCLE === -->
+  <g>
+    <!-- Rear wheel -->
+    <g transform="translate(100,225)">
+      <circle r="40" fill="none" stroke="#333" stroke-width="4"/>
+      <g>
+        <line x1="0" y1="-40" x2="0" y2="40" stroke="#666" stroke-width="1.5"/>
+        <line x1="-40" y1="0" x2="40" y2="0" stroke="#666" stroke-width="1.5"/>
+        <line x1="-28" y1="-28" x2="28" y2="28" stroke="#666" stroke-width="1.5"/>
+        <line x1="-28" y1="28" x2="28" y2="-28" stroke="#666" stroke-width="1.5"/>
+        <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="1s" repeatCount="indefinite"/>
+      </g>
+      <circle r="4" fill="#333"/>
+    </g>
+
+    <!-- Front wheel -->
+    <g transform="translate(260,225)">
+      <circle r="40" fill="none" stroke="#333" stroke-width="4"/>
+      <g>
+        <line x1="0" y1="-40" x2="0" y2="40" stroke="#666" stroke-width="1.5"/>
+        <line x1="-40" y1="0" x2="40" y2="0" stroke="#666" stroke-width="1.5"/>
+        <line x1="-28" y1="-28" x2="28" y2="28" stroke="#666" stroke-width="1.5"/>
+        <line x1="-28" y1="28" x2="28" y2="-28" stroke="#666" stroke-width="1.5"/>
+        <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="1s" repeatCount="indefinite"/>
+      </g>
+      <circle r="4" fill="#333"/>
+    </g>
+
+    <!-- Frame -->
+    <line x1="100" y1="225" x2="175" y2="225" stroke="#C0392B" stroke-width="3.5"/>
+    <line x1="100" y1="225" x2="145" y2="158" stroke="#C0392B" stroke-width="3.5"/>
+    <line x1="145" y1="158" x2="175" y2="225" stroke="#C0392B" stroke-width="3.5"/>
+    <line x1="175" y1="225" x2="260" y2="225" stroke="#C0392B" stroke-width="3.5"/>
+    <line x1="145" y1="158" x2="245" y2="148" stroke="#C0392B" stroke-width="3.5"/>
+    <line x1="245" y1="148" x2="260" y2="225" stroke="#C0392B" stroke-width="3.5"/>
+
+    <!-- Seat -->
+    <ellipse cx="145" cy="155" rx="13" ry="5" fill="#222"/>
+
+    <!-- Handlebars -->
+    <path d="M245,148 Q255,138 262,142" fill="none" stroke="#222" stroke-width="3.5" stroke-linecap="round"/>
+
+    <!-- Crank + pedals -->
+    <g transform="translate(175,225)">
+      <circle r="7" fill="none" stroke="#444" stroke-width="2"/>
+      <g>
+        <line x1="0" y1="0" x2="18" y2="0" stroke="#444" stroke-width="3"/>
+        <rect x="14" y="-4" width="10" height="8" rx="2" fill="#222"/>
+        <line x1="0" y1="0" x2="-18" y2="0" stroke="#444" stroke-width="3"/>
+        <rect x="-24" y="-4" width="10" height="8" rx="2" fill="#222"/>
+        <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="1s" repeatCount="indefinite"/>
+      </g>
+    </g>
+  </g>
+
+  <!-- === PELICAN === -->
+  <g>
+    <!-- Bob animation -->
+    <animateTransform attributeName="transform" type="translate"
+      values="0,0; 0,-3; 0,0" dur="1s" repeatCount="indefinite"/>
+
+    <!-- Legs (pedaling motion) -->
+    <path fill="none" stroke="#F5D76E" stroke-width="4" stroke-linecap="round">
+      <animate attributeName="d" dur="1s" repeatCount="indefinite"
+        values="M150,148 Q145,190 157,218;
+               M150,148 Q150,192 175,207;
+               M150,148 Q158,190 193,225;
+               M150,148 Q150,192 175,243;
+               M150,148 Q145,190 157,218"/>
+    </path>
+    <path fill="none" stroke="#E8C84A" stroke-width="4" stroke-linecap="round">
+      <animate attributeName="d" dur="1s" repeatCount="indefinite"
+        values="M160,148 Q168,190 193,225;
+               M160,148 Q168,192 175,243;
+               M160,148 Q162,190 157,218;
+               M160,148 Q168,192 175,207;
+               M160,148 Q168,190 193,225"/>
+    </path>
+
+    <!-- Body -->
+    <ellipse cx="155" cy="130" rx="42" ry="26" fill="white" stroke="#e0e0e0" stroke-width="1"/>
+
+    <!-- Wing -->
+    <path d="M135,125 Q115,138 130,152 Q145,148 152,136" fill="#EAEAEA" stroke="#ccc" stroke-width="1"/>
+
+    <!-- Tail feathers -->
+    <path d="M113,124 Q98,118 92,124 Q98,130 113,132" fill="#EAEAEA" stroke="#ccc" stroke-width="1"/>
+
+    <!-- Neck -->
+    <path d="M190,118 Q205,98 212,82" fill="none" stroke="white" stroke-width="12" stroke-linecap="round"/>
+    <path d="M190,118 Q205,98 212,82" fill="none" stroke="#e0e0e0" stroke-width="12" stroke-linecap="round" opacity="0.3"/>
+
+    <!-- Head -->
+    <circle cx="215" cy="76" r="14" fill="white" stroke="#e0e0e0" stroke-width="1"/>
+
+    <!-- Eye -->
+    <circle cx="220" cy="72" r="3.5" fill="#333"/>
+    <circle cx="221.5" cy="70.5" r="1.2" fill="white"/>
+
+    <!-- Beak -->
+    <path d="M226,72 L278,79 Q282,82 278,85 L226,82 Z" fill="#F39C12" stroke="#E67E22" stroke-width="1"/>
+    <!-- Throat pouch -->
+    <path d="M226,82 Q248,104 272,85" fill="#F5B041" stroke="#E67E22" stroke-width="1"/>
+
+    <!-- Crest -->
+    <path d="M208,64 Q212,58 216,62" fill="none" stroke="#e0e0e0" stroke-width="2" stroke-linecap="round"/>
+  </g>
+</svg>
+```
+
+**What's animated:**
+
+| Element | Animation |
+|---|---|
+| Both wheels (spokes) | 360° rotation, 1 s loop |
+| Crank + pedals | 360° rotation, 1 s loop (synced with wheels) |
+| Pelican body | 3 px vertical bob, 1 s loop |
+| Both legs | Path morph through 4 keyframes tracing the pedal circle |
+
+Open the file in any browser to see it run — no JavaScript or external dependencies needed.

@@ -1,0 +1,606 @@
+We need answer user's request: "Write SVG code that displays a 2D animation of a pelican riding a bicycle. No additional testing is required." Need produce SVG code. Need think in English? User English, so English. Need final with SVG code only? They ask write SVG code. We can provide code block. Need ensure animation works. Need create 2D animation of pelican riding bicycle. SVG with animateTransform maybe. Need be self-contained. Could use simple shapes: wheels circles, frame lines, pedals, crank, chain? Pelican body, head, beak, wings, legs? Need animate wheels rotation, maybe bobbing, pedals. Need maybe moving background? Could just animate in place. Need valid SVG. Let's design.
+
+Need likely include xmlns. Use viewBox. Animation: wheels rotate around centers. Bicycle frame static relative to wheels. Pelican seated. Pedals rotate with crank. Legs maybe simple lines from pelican to pedals? Could animate leg rotation? Hard. Simpler: pelican body bobbing, wings flap, head bob, wheels spin, pedals spin. Maybe chain? No.
+
+Need produce code. Let's craft robust SVG.
+
+Coordinate system: viewBox="0 0 600 400". Ground line y=320. Wheels: rear center (160, 280), front center (420, 280), radius 40. Frame: rear axle to seat (220,180), bottom bracket (300,280), top tube to head (380,180), down tube, fork to front axle. Handlebar (400,160). Saddle (220,170). Pelican body ellipse center (230,130) rx 60 ry 35. Tail? Head circle (290,90) r 20. Beak polygon from head to right: (305,85) to (370,105) to (305,100) maybe. Eye. Wing path. Legs: from body (250,150) to pedals? Pedals rotate around bottom bracket (300,280). Crank radius 25. Pedal positions: two opposite. Animate crank group rotate 360 around 300,280. Pedals as small rects at (325,280) and (275,280) inside group. But if group rotates, pedal rects rotate too (fine). Legs could be lines from pelican to pedal points but if pedal moves, line endpoints need animate. Could omit legs or make static legs to pedals? Maybe pelican feet not visible. But riding bicycle: legs should move. We can animate two leg paths? Use animate on line x2/y2? We can create lines from hip (255,145) to pedal positions, and animate pedal endpoint values synchronized with crank. Need calculate pedal coordinates over time. For crank radius 25, center (300,280). Pedal 1 angle 0 at start: (325,280). Pedal 2 angle 180: (275,280). Over 1s rotate 360. Coordinates: x=300+25 cos(t), y=280+25 sin(t) if angle increases clockwise? SVG y down. Use values for animate x2/y2 with keyTimes. Could use discrete? Better use animateTransform for crank and separate legs with animateMotion? Hmm.
+
+Simpler: Use legs as part of crank group? Attach feet to pedals? But hip fixed, can't. Could have legs as rotating lines from hip to pedals? Not physically.
+
+Alternative: Make pelican's legs just two short lines from body to crank area, not individual pedals. Or animate leg length? Maybe enough.
+
+Could use SMIL animate on path d for legs? We can define leg path M hip L pedal, animate d values. Need generate values. Let's do 1s cycle, 12 steps maybe. For pedal1 and pedal2 opposite. Use keyTimes 0;0.083;...;1. Need values.
+
+Let's compute coordinates for radius 25, center (300,280). Angle maybe start at -90? If pedal top? For riding, crank rotates. Let's choose angle 0 at right. Use t from 0 to 2π. y = 280 + 25*sin(angle) if angle positive downward. For 12 steps: angle = 0,30,...330. cos/sin:
+0: cos1 sin0 => (325,280)
+30: cos.866=21.65, sin.5=12.5 => (321.65,292.5)
+60: cos.5=12.5, sin.866=21.65 => (312.5,301.65)
+90: (300,305)
+120: (-12.5,21.65) => (287.5,301.65)
+150: (-21.65,12.5) => (278.35,292.5)
+180: (275,280)
+210: (-21.65,-12.5) => (278.35,267.5)
+240: (-12.5,-21.65) => (287.5,258.35)
+270: (300,255)
+300: (12.5,-21.65) => (312.5,258.35)
+330: (21.65,-12.5) => (321.65,267.5)
+360: (325,280)
+Pedal2 opposite: add 180: start (275,280), then (278.35,267.5), (287.5,258.35), (300,255), (312.5,258.35), (321.65,267.5), (325,280), (321.65,292.5), (312.5,301.65), (300,305), (287.5,301.65), (278.35,292.5), (275,280).
+
+Legs: hip maybe (250,150). But if line from hip to pedal, when pedal is top (300,255), leg short; bottom long. Could be okay. But both legs from same hip? Need two hips: left/right? In 2D side view, one leg visible maybe. Could have one leg line to pedal1 and another to pedal2, both from body. They may cross. Use hip1 (245,150), hip2 (265,150). Lines. Animate x2/y2. Need path or line? Use <line> with x2/y2 animate. For line x1 fixed. Use stroke width.
+
+But if leg line to pedal rotates, it may look like leg. Need pedal foot? Could have small circle at pedal endpoint with animate cx/cy? But line endpoint enough.
+
+Need synchronize with crank group. Use same dur 1s repeat indefinite. Crank group: contains two pedal lines? Actually crank arms from center to pedals and pedals. Use <g> with animateTransform rotate from 0 to 360 around 300,280. Inside: line from 300,280 to 325,280; line to 275,280; rects at pedal positions. That rotates. But legs animate coordinates using same angle. Need ensure line endpoints match rotated pedal positions. If rotate transform uses angle 0 to 360, at t=0 pedal1 right. At t=0.25 (90 deg) in SVG rotate positive is clockwise? In SVG, rotate(angle) rotates coordinate system clockwise? Yes positive angle clockwise in screen coords. Point (325,280) relative (25,0) after rotate 90 -> (300,305). Good matches sin positive. So values above match.
+
+Need maybe wheel spokes rotate. Wheels: group for each wheel with animateTransform rotate. Need draw spokes. Use circle outline and lines. For rear wheel center 160,280 radius 40. Front 420,280. Spokes: lines from center to radius. Use group with animateTransform rotate from 0 to 360 dur 1s? Wheel radius 40, bicycle speed? If crank 25 radius, wheel circumference 251, crank circumference 157, ratio 1.6, wheel should rotate faster: dur ~0.625s if same linear speed. But no need. Use 0.8s maybe. Could use 1s for simplicity. But if pedals 1s and wheels 0.6s looks plausible. Let's set wheels dur="0.7s". Need if background moves? Maybe not.
+
+Pelican bobbing: animateTransform translate values "0 0; 0 4; 0 0" dur 0.7s? Sync with pedal? Maybe 1s. Use group pelican. Head bob. Wing flap: animateTransform rotate around shoulder. Beak? Eye.
+
+Need maybe motion: background stripes moving left to simulate riding. Could add ground lines animate translate. But if bicycle in place, moving ground suggests motion. Add horizontal dashed line or ground pattern with animateTransform translate from 0 to -80 dur 0.5s repeat. But if wheels rotate and ground moves, nice. Need ensure not too much.
+
+Potential issue: SMIL animate on line x2/y2 with values list. Need values separated by semicolons. For x2: "325;321.65;312.5;300;287.5;278.35;275;278.35;287.5;300;312.5;321.65;325". keyTimes maybe "0;0.0833;0.1667;0.25;0.3333;0.4167;0.5;0.5833;0.6667;0.75;0.8333;0.9167;1". Need values count 13. For y2 similarly. For leg2 x2: "275;278.35;287.5;300;312.5;321.65;325;321.65;312.5;300;287.5;278.35;275". y2: "280;267.5;258.35;255;258.35;267.5;280;292.5;301.65;305;301.65;292.5;280".
+
+Need maybe use calcMode="linear". Good.
+
+Need draw order: background, ground, wheels, frame, crank, legs, pelican, handlebar? Pelican in front of frame? The legs behind pelican? Maybe draw legs before pelican body so body covers hips. Crank before legs? Pedals under legs? Draw wheels, frame, crank, legs, pelican.
+
+Need define pelican. Let's design coordinates.
+
+Bicycle:
+- rear wheel: circle cx=160 cy=280 r=40, fill none stroke #333 stroke-width 6. Hub circle r=8.
+- front wheel: cx=420 cy=280 r=40.
+- frame: path M160 280 L230 170 L300 280 L380 170 L420 280 M230 170 L380 170? Need seat tube from rear axle to seat (230,170). Down tube from bottom bracket (300,280) to head top (380,170). Top tube from seat to head (230,170 to 380,170). Seat stay from rear axle to seat. Chain stay from rear axle to bottom bracket (160,280 to 300,280). Fork from head top to front axle (380,170 to 420,280). Maybe head tube. Use stroke #e33 stroke-width 8 fill none. Saddle: line/rect at (210,165) to (250,165) stroke #222 width 8. Handlebar: path M380 170 L400 150 L420 155? Or simple line M380 170 L400 150, handlebar grip circle.
+
+Pelican:
+- Body ellipse cx=235 cy=125 rx=65 ry=38 fill #fff stroke #333. Tail maybe path to left.
+- Neck/head: circle cx=300 cy=85 r=22 fill #fff stroke #333. Maybe neck path from body to head: path M270 110 Q290 80 300 85? But circle enough.
+- Beak: polygon points "318,78 390,98 318,98" fill orange stroke #333. Pelican large beak with pouch? Could add lower pouch path: M318 98 Q350 118 390 98? Maybe. Use polygon for upper beak and path for pouch. Eye circle cx=305 cy=80 r=3 fill #000.
+- Wing: path M220 115 Q260 90 280 120 Q250 150 220 115 fill #eee stroke #333. Animate rotate around (240,125) values 0; -15; 0 dur 1s? Or translate. Use animateTransform type rotate values "0 240 125; -18 240 125; 0 240 125" dur="1s".
+- Legs: lines from (245,145) and (265,145) to pedal points. Stroke #333 width 8 linecap round. But if line from hip to pedal, at bottom it passes through frame? okay.
+- Feet? small circles at pedal endpoints? Could add circles with animate cx/cy same as leg endpoints. But line endpoint enough. Maybe add foot as circle radius 5 fill #333 at x2/y2 with animate. Need two circles. But line endpoint already. Could skip.
+
+Bobbing pelican: group pelican (body, head, wing, maybe not legs) animateTransform translate values "0 0; 0 3; 0 0" dur="0.7s"? But legs endpoints fixed relative to crank; if pelican body bobs, hip moves but legs x1 fixed? If legs inside bobbing group, x1 moves but x2 animate values absolute? If line inside group with translate, x2 values also shifted? Actually animate values are in local coordinates; group translate applies to whole line, so x2 values should be pedal coordinates minus bob? If group bobs, pedal endpoints won't match crank. Better keep legs outside bobbing group, or bob only upper body not legs. But hip would detach. Could not bob, or bob entire bicycle? Simpler no pelican bob. Or bob entire bicycle group including wheels? But wheels need rotate around centers; if group translate, okay. But ground? Could animate entire bicycle vertical bob while wheels rotate. But if wheels bob, they leave ground. Not ideal. Could bob pelican only and not legs; legs static from body? But body moves, legs detach. Maybe omit legs? But riding bicycle needs legs. Could keep pelican static and animate wing/head only. That's fine.
+
+Could animate whole pelican+legs? If group translate, crank endpoints need also translate? If whole bicycle bobs, wheels leave ground. Not necessary.
+
+Maybe animate pelican head/wing only. Good.
+
+Need maybe tail feather. Add path.
+
+Need ensure no additional testing required. We just output code.
+
+Potential validity: SMIL animate elements inside SVG. Need no external. Use <svg xmlns="http://www.w3.org/2000/svg" width="600" height="400" viewBox="0 0 600 400">.
+
+Let's craft final code.
+
+Detailed SVG:
+
+<svg ...>
+  <rect width="600" height="400" fill="#eaf6ff"/>
+  <g stroke="#999" stroke-width="4">
+    <line x1="0" y1="320" x2="600" y2="320"/>
+    <g>
+      <line x1="0" y1="320" x2="600" y2="320" stroke="#666" stroke-width="2" stroke-dasharray="20 20"/>
+      <animateTransform attributeName="transform" type="translate" from="0 0" to="-40 0" dur="0.5s" repeatCount="indefinite"/>
+    </g>
+  </g>
+
+But if animateTransform on group with line, from 0 to -40, dash pattern repeats every 40? dasharray 20 20 total 40, good. But line extends only 0-600; when translated left, gap at right. Need line longer: x1="-100" x2="700". Good.
+
+Wheels:
+<g>
+  <g>
+    <circle cx="160" cy="280" r="40" fill="none" stroke="#333" stroke-width="6"/>
+    <circle cx="160" cy="280" r="8" fill="#333"/>
+    <g stroke="#555" stroke-width="3">
+      <line x1="160" y1="280" x2="200" y2="280"/>
+      <line x1="160" y1="280" x2="160" y2="240"/>
+      <line x1="160" y1="280" x2="120" y2="280"/>
+      <line x1="160" y1="280" x2="160" y2="320"/>
+      <line x1="160" y1="280" x2="188" y2="252"/>
+      <line x1="160" y1="280" x2="132" y2="252"/>
+      <line x1="160" y1="280" x2="132" y2="308"/>
+      <line x1="160" y1="280" x2="188" y2="308"/>
+      <animateTransform attributeName="transform" type="rotate" from="0 160 280" to="360 160 280" dur="0.7s" repeatCount="indefinite"/>
+    </g>
+  </g>
+  ... front wheel similar.
+</g>
+
+But animateTransform inside g with lines: It will rotate the group. Good.
+
+Frame:
+<path d="M160 280 L230 170 L300 280 L380 170 L420 280 M230 170 L380 170 M160 280 L300 280" fill="none" stroke="#e33" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+Saddle: <line x1="205" y1="165" x2="255" y2="165" stroke="#222" stroke-width="10" stroke-linecap="round"/>
+Handlebar: <path d="M380 170 L400 145 L425 150" fill="none" stroke="#222" stroke-width="8" stroke-linecap="round"/>
+
+Crank group:
+<g stroke="#444" stroke-width="8" stroke-linecap="round">
+  <line x1="300" y1="280" x2="325" y2="280"/>
+  <line x1="300" y1="280" x2="275" y2="280"/>
+  <rect x="318" y="275" width="14" height="10" fill="#222" stroke="none"/>
+  <rect x="268" y="275" width="14" height="10" fill="#222" stroke="none"/>
+  <animateTransform attributeName="transform" type="rotate" from="0 300 280" to="360 300 280" dur="1s" repeatCount="indefinite"/>
+</g>
+<circle cx="300" cy="280" r="8" fill="#222"/> maybe after crank.
+
+Legs:
+<g stroke="#333" stroke-width="9" stroke-linecap="round">
+ <line x1="245" y1="145" x2="325" y2="280">
+   <animate attributeName="x2" dur="1s" repeatCount="indefinite" values="325;321.65;312.5;300;287.5;278.35;275;278.35;287.5;300;312.5;321.65;325" keyTimes="0;0.0833;0.1667;0.25;0.3333;0.4167;0.5;0.5833;0.6667;0.75;0.8333;0.9167;1"/>
+   <animate attributeName="y2" ... values="280;292.5;301.65;305;301.65;292.5;280;267.5;258.35;255;258.35;267.5;280" .../>
+ </line>
+ <line x1="265" y1="145" x2="275" y2="280">
+   <animate attributeName="x2" values="275;278.35;287.5;300;312.5;321.65;325;321.65;312.5;300;287.5;278.35;275" .../>
+   <animate attributeName="y2" values="280;267.5;258.35;255;258.35;267.5;280;292.5;301.65;305;301.65;292.5;280" .../>
+ </line>
+</g>
+
+But note: leg1 start x2 325 y2 280, leg2 start 275 280. Crank group start pedal1 right, pedal2 left. Good.
+
+Potential issue: line x2/y2 animate with keyTimes but no calcMode? default linear. Good.
+
+Pelican:
+<g>
+  <path d="M180 135 Q150 150 170 170 Q200 160 220 145 Z" fill="#fff" stroke="#333"/> tail? Maybe.
+  <ellipse cx="235" cy="125" rx="65" ry="38" fill="#fff" stroke="#333" stroke-width="3"/>
+  <path d="M220 115 Q260 85 285 115 Q255 150 220 115 Z" fill="#eee" stroke="#333">
+    <animateTransform attributeName="transform" type="rotate" values="0 240 125; -18 240 125; 0 240 125" dur="1s" repeatCount="indefinite"/>
+  </path>
+  <circle cx="300" cy="85" r="22" fill="#fff" stroke="#333" stroke-width="3"/>
+  <path d="M318 78 L390 98 L318 98 Z" fill="#ff9933" stroke="#333" stroke-width="3"/>
+  <path d="M318 98 Q350 120 390 98" fill="#ff7700" stroke="#333" stroke-width="3"/>
+  <circle cx="305" cy="80" r="3" fill="#000"/>
+</g>
+
+Need neck connection: body ellipse to head circle maybe gap. Body center 235,125 rx65 extends to x=300, y=125. Head at 300,85 r22 extends down to y=107, body top at y=87? Actually ellipse top y=87, so overlap. Good.
+
+Wing animation: The wing path is inside pelican group. animateTransform on path will rotate around 240 125. Good.
+
+Maybe head bob: add animateTransform to head group? Could group head/beak/eye and translate values "0 0; 0 2; 0 0" dur 1s. But not necessary. Could add.
+
+Need maybe pelican legs? The legs lines from (245,145) and (265,145) to pedals. Body ellipse covers start. Good.
+
+Potential issue: The legs are drawn before pelican, so pelican body covers upper legs. Good.
+
+Potential issue: Crank group rotates, but pedal rects rotate (orientation changes). Pedals should remain horizontal? Real pedals stay roughly horizontal due to crank? Actually pedals rotate with crank, orientation changes. Fine.
+
+Potential issue: The crank group includes lines from center to pedals and rects. It rotates. The leg endpoint values are absolute coordinates. Good.
+
+Potential issue: If wheel rotation dur 0.7s and pedal 1s, ground dash 0.5s. Fine.
+
+Could include <title>. Not necessary.
+
+Need final answer likely just code block. Ensure no XML errors. Let's validate mentally.
+
+Full code:
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="400" viewBox="0 0 600 400">
+  <rect width="600" height="400" fill="#eaf6ff"/>
+  <g>
+    <line x1="-100" y1="320" x2="700" y2="320" stroke="#666" stroke-width="3" stroke-dasharray="20 20"/>
+    <animateTransform attributeName="transform" type="translate" from="0 0" to="-40 0" dur="0.5s" repeatCount="indefinite"/>
+  </g>
+
+  <g>
+    <circle cx="160" cy="280" r="40" fill="none" stroke="#333" stroke-width="6"/>
+    <circle cx="160" cy="280" r="8" fill="#333"/>
+    <g stroke="#555" stroke-width="3">
+      <line x1="160" y1="280" x2="200" y2="280"/>
+...
+      <animateTransform .../>
+    </g>
+  </g>
+... front wheel.
+
+Frame path. Need maybe draw frame before crank? Crank at bottom bracket. Frame includes bottom bracket? We can draw frame, then crank. Good.
+
+Saddle and handlebar.
+
+Crank group. Need if group has stroke, rects fill none? Set fill="#222" stroke="none".
+
+Legs. Need line elements with animate. In SVG, <line> can contain animate. Good.
+
+Pelican. Need maybe wing animateTransform values with semicolons. Good.
+
+Let's consider if animateTransform on wing path with values "0 240 125; -18 240 125; 0 240 125" is valid? Yes for rotate, values can be "angle cx cy". Need no from/to. Good.
+
+Potential issue: The wing path may be covered by body? It is after body, so visible. Good.
+
+Potential issue: The pelican beak extends to x=390, near handlebar x=400. Good.
+
+Potential issue: The leg lines from hip to pedal may intersect body and frame. Fine.
+
+Need maybe add chain? Not necessary.
+
+Could make pelican more pelican-like: large beak, pouch, white body, black wing? But simple.
+
+Need ensure no additional testing required. Final can be code only. But maybe include brief "Here is SVG code:"? User asked write code. Desired oververbosity 9 but for code maybe just code. The instruction: lead with answer. Could output only code block. Good.
+
+Let's think if any hidden requirement: "Write SVG code that displays a 2D animation of a pelican riding a bicycle. No additional testing is required." They likely expect a single SVG snippet. Need not explain.
+
+Potential improvements: Use CSS animations instead of SMIL? SVG with CSS keyframes can animate transform, but line endpoints not easily. SMIL is fine. Some browsers support SMIL (Chrome, Firefox, Safari). Good.
+
+Potential issue: In SVG, animateTransform on a <g> with existing transform? We don't have existing. Good.
+
+Potential issue: The ground dash group animateTransform from 0 to -40. The line is in group. Good.
+
+Potential issue: The wheel spoke group has animateTransform; but the circle hub is outside? We put hub outside? In code above, hub outside spoke group? I wrote circle hub before spoke group. It won't rotate, okay. Spokes rotate. Tire circle static. Good.
+
+Potential issue: The front wheel group: Need duplicate with cx=420. Spokes coordinates: x2=460, 420, 380, y 240,320, diagonals 448/392 etc. Good.
+
+Potential issue: The frame path: M160 280 L230 170 L300 280 L380 170 L420 280 M230 170 L380 170 M160 280 L300 280. This draws seat tube, down tube, fork? Actually from 300,280 to 380,170 (down tube), then to 420,280 (fork), top tube separate, chain stay separate. Good.
+
+Potential issue: Saddle line at y=165 from 205 to 255, seat at 230,170. Good.
+
+Potential issue: Handlebar path from 380,170 to 400,145 to 425,150. Good.
+
+Potential issue: Pelican body center 235,125, rx65, ry38. Bottom y=163, near saddle y=165. Good.
+
+Potential issue: Legs start at y=145 inside body. Good.
+
+Potential issue: The leg animation values: At t=0.5, leg1 x2=275 y2=280 (left pedal), leg2 x2=325 y2=280 (right pedal). Crank group at 180 deg: original right pedal (325) rotates to left (275), original left to right. Good.
+
+Potential issue: The leg lines are not attached to pedal rects exactly? Endpoint at pedal center. Good.
+
+Potential issue: The pedal rects in crank group: At start, right pedal rect x=318 width14 centered 325, y=275 height10 centered 280. Left rect x=268 centered 275. When rotated, rect orientation rotates. Fine.
+
+Potential issue: The crank group stroke width 8 for lines, but rects stroke none. Good.
+
+Potential issue: The bottom bracket circle after crank covers center. Good.
+
+Potential issue: The chain stay line from rear axle to bottom bracket at y=280 overlaps crank. Fine.
+
+Potential issue: The front fork line from 380,170 to 420,280. Good.
+
+Potential issue: The background rect and ground line. Good.
+
+Could add <desc>. Not necessary.
+
+Need maybe make it scalable: width/height optional. Good.
+
+Let's consider if there is a more elegant way: Use <animateMotion> for pedals? No.
+
+Potential problem: SMIL animate on x2/y2 of line with many values may be okay. Need keyTimes count equals values count. We have 13 values. keyTimes 13. Good.
+
+Let's count keyTimes string: "0;0.0833;0.1667;0.25;0.3333;0.4167;0.5;0.5833;0.6667;0.75;0.8333;0.9167;1" 13. Good.
+
+Leg1 y values: 280;292.5;301.65;305;301.65;292.5;280;267.5;258.35;255;258.35;267.5;280. 13.
+Leg2 x: 275;278.35;287.5;300;312.5;321.65;325;321.65;312.5;300;287.5;278.35;275. 13.
+Leg2 y: 280;267.5;258.35;255;258.35;267.5;280;292.5;301.65;305;301.65;292.5;280. 13.
+
+Potential issue: The leg1 x values: 325;321.65;312.5;300;287.5;278.35;275;278.35;287.5;300;312.5;321.65;325. Good.
+
+Could round to 2 decimals. Fine.
+
+Potential issue: If browser doesn't support SMIL, no animation. But request SVG animation; SMIL acceptable. Could also use CSS for transforms but not endpoints. Fine.
+
+Potential issue: The wing animation rotate values with negative angle. In SVG, negative rotate counterclockwise. Good.
+
+Potential issue: The pelican head/beak maybe should be in front of wing. Good.
+
+Potential issue: The tail path: M180 135 Q150 150 170 170 Q200 160 220 145 Z. It may look odd. Could omit tail to avoid weird. But pelican has tail. It's okay. Maybe draw tail before body so body covers joint. Good.
+
+Potential issue: The body stroke width 3, tail stroke 3. Good.
+
+Potential issue: The wing path fill #eee, stroke #333. Good.
+
+Potential issue: The beak pouch path: M318 98 Q350 120 390 98. It is open path, fill #ff7700? If fill on open path, it will fill area between curve and straight line from 390 to 318? It may create pouch. Good. But upper beak polygon covers 318,78 to 390,98 to 318,98. Pouch below. Good.
+
+Potential issue: The eye at 305,80 inside head. Good.
+
+Potential issue: The neck: head circle overlaps body. Good.
+
+Potential issue: The pelican is facing right, bicycle facing right. Good.
+
+Potential issue: The ground line at y=320, wheel bottom at y=320 (cy280+r40). Good.
+
+Potential issue: The moving ground dash: line at y=320, same as ground. Good.
+
+Potential issue: The background rect covers all. Good.
+
+Let's think if the code is too long? Fine.
+
+Need final answer with code block. Ensure no commentary outside? Could just code. The final answer should be direct. Use ```svg. Good.
+
+Double-check XML:
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="400" viewBox="0 0 600 400">
+...
+</svg>
+
+All tags closed. Animate elements self-closed. Good.
+
+Let's write final code carefully.
+
+One nuance: animateTransform on ground group: The group contains line. The line's x1=-100 x2=700. When translate -40, line extends -140 to 660, still covers 0-600. At start covers -100 to 700. Good.
+
+One nuance: Wheel spoke group: It contains lines and animateTransform. The animateTransform will apply to the group. Good. But the group has no initial transform; at end 360 same as 0. Good.
+
+One nuance: The crank group contains rects and animateTransform. The group has stroke="#444" stroke-width="8" stroke-linecap="round". The rects have stroke="none". Good.
+
+One nuance: The bottom bracket circle after crank: <circle cx="300" cy="280" r="8" fill="#222"/>. Good.
+
+One nuance: The legs are after crank, so they appear over pedals. Good.
+
+One nuance: The pelican is after legs, so body covers leg starts. Good.
+
+Potential issue: The leg lines start at (245,145) and (265,145). The body ellipse covers them? Body center 235,125 rx65 ry38. At x=245, y range? Ellipse equation ((x-235)^2/65^2)+(y-125)^2/38^2 <=1. At x=245, dx=10, y half =38*sqrt(1-100/4225)=38*sqrt(0.9763)=37.5, y range 87.5 to 162.5. y=145 inside. At x=265, dx=30, half=38*sqrt(1-900/4225)=38*0.888=33.7, y range 91.3 to158.7. y=145 inside. Good.
+
+Potential issue: The leg endpoint at top pedal y=255, x=300. The line from hip (245,145) to (300,255) length ~125. Good.
+
+Potential issue: The leg may pass through saddle/frame. Fine.
+
+Could add feet circles to make pedals visible. But line endpoint with round cap looks like foot. Good.
+
+Potential issue: The crank pedal rects may be hidden by leg lines? Legs drawn after, so line covers center. Fine.
+
+Potential issue: The wheel spokes: We have 8 spokes. Good.
+
+Potential issue: The front wheel spokes coordinates:
+<line x1="420" y1="280" x2="460" y2="280"/>
+<line x1="420" y1="280" x2="420" y2="240"/>
+<line x1="420" y1="280" x2="380" y2="280"/>
+<line x1="420" y1="280" x2="420" y2="320"/>
+<line x1="420" y1="280" x2="448" y2="252"/>
+<line x1="420" y1="280" x2="392" y2="252"/>
+<line x1="420" y1="280" x2="392" y2="308"/>
+<line x1="420" y1="280" x2="448" y2="308"/>
+Good.
+
+Potential issue: The frame stroke red may be too thick. Fine.
+
+Potential issue: The saddle line at y=165, pelican body bottom at 163, so sitting. Good.
+
+Potential issue: The handlebar at x=400-425, beak to 390, no overlap. Good.
+
+Potential issue: The head circle at 300,85, beak from 318,78 to 390,98. The beak starts at head right edge? Head radius 22, center 300, right edge 322. Beak start 318 inside. Good.
+
+Potential issue: The pouch path from 318,98 to 390,98, lower than upper beak bottom. Good.
+
+Potential issue: The wing path from 220,115 to 285,115, maybe overlaps head? No.
+
+Potential issue: The tail path: M180 135 Q150 150 170 170 Q200 160 220 145 Z. It starts at left body, goes down-left, then to body. Good.
+
+Could add a black eye pupil. Good.
+
+Need maybe use <animate> for head bob? Could add to make more lively. But not necessary. If add, ensure not break. Maybe add head group with animateTransform translate. But head/beak/eye currently separate. Could group them:
+<g>
+  <circle .../>
+  <path beak/>
+  <path pouch/>
+  <circle eye/>
+  <animateTransform attributeName="transform" type="translate" values="0 0; 0 2; 0 0" dur="1s" repeatCount="indefinite"/>
+</g>
+This is fine. But if head bobs, beak moves. Good. Let's include? It adds life. Need ensure group transform doesn't affect wing? No.
+
+Pelican group:
+<g>
+  <path tail/>
+  <ellipse body/>
+  <path wing with animate/>
+  <g>
+    <circle head/>
+    <path beak/>
+    <path pouch/>
+    <circle eye/>
+    <animateTransform .../>
+  </g>
+</g>
+
+Good.
+
+Potential issue: The wing animateTransform on path: If path has no transform, okay. But if we put wing inside pelican group and also head group, no conflict.
+
+Potential issue: The wing rotation center 240,125. Good.
+
+Potential issue: The wing values: "0 240 125; -18 240 125; 0 240 125". At -18, wing rotates counterclockwise, maybe up. Good.
+
+Potential issue: The head bob values: "0 0; 0 2; 0 0" dur 1s. Good.
+
+Potential issue: The entire pelican not bobbing, but head and wing animate. Good.
+
+Could animate pelican body slight scale? Not needed.
+
+Potential issue: The leg animation dur 1s matches crank. Good.
+
+Potential issue: The wheel rotation dur 0.7s, ground 0.5s. The visual speed mismatch? Wheel circumference 251px, 0.7s => 359px/s. Ground dash 40px/0.5s => 80px/s. Mismatch. If want consistent, ground speed should match wheel surface speed. Wheel radius 40, circumference 251.3, rotation 1/0.7=1.428 rev/s, linear speed 358.8 px/s. Ground dash period 40px, dur = 40/358.8=0.1115s. That's very fast. Could set ground dur 0.11s. But moving dash too fast maybe. Or set wheel dur 2s to slower. Let's choose more coherent: Crank dur 1s, wheel radius 40, crank radius 25, gear ratio 1.6, wheel dur = 1/1.6 = 0.625s. Linear speed = 2π*40/0.625=402px/s. Ground dash period 40 => 0.0995s. Very fast. Could make dash period 160px (dasharray 80 80) dur 0.4s. But line pattern? If dasharray 80 80, period 160, translate -160 dur 0.4 => 400px/s. Good. Let's set ground dasharray="80 80", animate to -160 dur="0.4s". That is coherent enough. But a fast moving dashed line may be okay. Or omit moving ground to avoid mismatch. But motion suggests riding. Could set wheel dur 1s too, then linear speed 251px/s, ground dasharray 40 40, dur 0.159s. Still fast. Maybe not important.
+
+Simpler: No moving ground, just static ground. But animation of wheels and pedals enough. The request 2D animation of pelican riding bicycle; in place is okay. Moving background optional. If include, mismatch not critical. But for polish, set ground speed roughly match. Let's compute with wheel dur 0.7s: linear speed 358.8. Use dasharray 40 40 period 80? Wait dasharray 20 20 period 40. To move 40px in 0.1115s. Too fast. Use dasharray 80 80 period 160, translate -160 dur 0.446s. That is 358.7. Good. Let's set ground line stroke-dasharray="80 80", animate to -160 dur="0.45s". It will move fast but less extremely. Or set wheel dur 1.5s, crank 1s? Gear mismatch but visual okay. If wheel dur 1.5s, linear speed 167px/s, ground dash 40 period dur 0.24s. More reasonable. But pedal 1s, wheel slower than gear ratio but acceptable. Maybe choose wheel dur 1s for simplicity, ground dash 40 period dur 0.16s. Fast. Hmm.
+
+Maybe no ground movement to avoid weird. But a static scene with spinning wheels may look like stationary. However "riding" can be implied by pedaling. Could add slight horizontal translation of entire scene? If bicycle moves right, need background. But then wheels rotate and bicycle moves; could animate whole bicycle group translate x from 0 to 600 and repeat, but then need wrap. Too complex. In place with moving ground is common.
+
+Let's include moving ground with dasharray 80 80, dur 0.45s. It may be fast but okay. Or set wheel dur 1s and ground dur 0.45s? Linear speed 251, ground 160/0.45=355, mismatch. Not important.
+
+Maybe set wheel dur 1s, ground dasharray 40 40, dur 0.16s. It will be a fast dash. Could be okay.
+
+Alternatively animate a few background clouds moving left slowly, not tied to speed. But no need.
+
+Let's keep ground static? The user didn't require background. Simpler and less risk. But "riding" maybe needs motion. Spinning wheels and pedals enough. I can include a subtle moving dashed ground. It won't harm.
+
+Potential issue: If ground dash moves, the line is under wheels. Good.
+
+Let's decide final: include moving ground with dasharray="60 60" and translate -120 dur="0.5s" (240px/s). Wheel dur 0.8s? Let's set wheel dur 0.8s, linear speed 314px/s. Ground 120/0.5=240. Close. Crank 1s. Good. Use wheel dur 0.8s. Fine.
+
+But if wheel dur 0.8 and crank 1, gear ratio 0.8? Actually wheel faster than crank by 1.25, plausible. Good.
+
+Let's set wheel dur="0.8s", ground dasharray="60 60", animate to -120 dur="0.5s". Good.
+
+Potential issue: The ground line with dasharray 60 60, translate -120 (two periods) over 0.5s, seamless. Good.
+
+Now final code. Need ensure all animate elements have attributeName. For animateTransform, attributeName="transform". Good.
+
+Let's write final.
+
+Double-check no missing semicolons in values. For animateTransform values with rotate: "0 240 125; -18 240 125; 0 240 125". Good.
+
+Potential issue: The wing path animateTransform may need additive? No.
+
+Potential issue: The head group animateTransform translate values "0 0; 0 2; 0 0". Good.
+
+Potential issue: The ground group animateTransform from/to. Good.
+
+Potential issue: The wheel spoke group animateTransform from/to. Good.
+
+Potential issue: The crank group animateTransform from/to. Good.
+
+Potential issue: The line animate x2/y2: Need attributeName="x2" and "y2". Good.
+
+Potential issue: The line element with animate children: The line's x2/y2 initial values should match first values. Good.
+
+Potential issue: The line x1/y1 fixed. Good.
+
+Potential issue: The leg stroke width 9, linecap round. Good.
+
+Potential issue: The pelican tail path fill white stroke #333. Good.
+
+Potential issue: The body ellipse stroke #333. Good.
+
+Potential issue: The wing path fill #eee. Good.
+
+Potential issue: The beak polygon points. Use <polygon points="318,78 390,98 318,98" .../> or path. Polygon okay. Use path for consistency.
+
+Potential issue: The pouch path fill #ff7700. It may have a straight closing line from 390,98 to 318,98, which is also upper beak bottom. Good.
+
+Potential issue: The eye circle after pouch. Good.
+
+Potential issue: The head group includes head circle, beak, pouch, eye. The head circle stroke may be over beak? Draw beak after head, so beak over head. Good.
+
+Potential issue: The beak starts at 318,78, head circle edge at 322, so beak overlaps. Good.
+
+Potential issue: The pouch lower curve may extend below head. Good.
+
+Potential issue: The pelican body may cover part of beak? Body drawn before head, head after, so head/beak over body. Good.
+
+Potential issue: The wing drawn after body, before head. Good.
+
+Potential issue: The legs drawn before pelican, so pelican body covers leg starts. Good.
+
+Potential issue: The crank drawn before legs, so legs over crank. Good.
+
+Potential issue: The frame drawn before crank? Yes. The crank over frame. Good.
+
+Potential issue: The saddle drawn before pelican. Good.
+
+Potential issue: The handlebar drawn before pelican? Beak may overlap handlebar? Beak to 390, handlebar starts 380,170 to 400,145. Beak y 78-98, no overlap. Good.
+
+Potential issue: The front wheel hub circle static, spokes rotate. Good.
+
+Potential issue: The rear wheel hub static. Good.
+
+Potential issue: The tires static. Good.
+
+Potential issue: The viewBox and width/height. Good.
+
+Let's consider if there is any need for CDATA? No.
+
+Final answer: code block only.
+
+Need ensure final not too verbose. Good.
+</think>
+
+```svg
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="400" viewBox="0 0 600 400">
+  <rect width="600" height="400" fill="#eaf6ff"/>
+
+  <!-- moving ground -->
+  <g>
+    <line x1="-100" y1="320" x2="700" y2="320" stroke="#666" stroke-width="3" stroke-dasharray="60 60"/>
+    <animateTransform attributeName="transform" type="translate" from="0 0" to="-120 0" dur="0.5s" repeatCount="indefinite"/>
+  </g>
+
+  <!-- rear wheel -->
+  <g>
+    <circle cx="160" cy="280" r="40" fill="none" stroke="#333" stroke-width="6"/>
+    <circle cx="160" cy="280" r="8" fill="#333"/>
+    <g stroke="#555" stroke-width="3">
+      <line x1="160" y1="280" x2="200" y2="280"/>
+      <line x1="160" y1="280" x2="160" y2="240"/>
+      <line x1="160" y1="280" x2="120" y2="280"/>
+      <line x1="160" y1="280" x2="160" y2="320"/>
+      <line x1="160" y1="280" x2="188" y2="252"/>
+      <line x1="160" y1="280" x2="132" y2="252"/>
+      <line x1="160" y1="280" x2="132" y2="308"/>
+      <line x1="160" y1="280" x2="188" y2="308"/>
+      <animateTransform attributeName="transform" type="rotate" from="0 160 280" to="360 160 280" dur="0.8s" repeatCount="indefinite"/>
+    </g>
+  </g>
+
+  <!-- front wheel -->
+  <g>
+    <circle cx="420" cy="280" r="40" fill="none" stroke="#333" stroke-width="6"/>
+    <circle cx="420" cy="280" r="8" fill="#333"/>
+    <g stroke="#555" stroke-width="3">
+      <line x1="420" y1="280" x2="460" y2="280"/>
+      <line x1="420" y1="280" x2="420" y2="240"/>
+      <line x1="420" y1="280" x2="380" y2="280"/>
+      <line x1="420" y1="280" x2="420" y2="320"/>
+      <line x1="420" y1="280" x2="448" y2="252"/>
+      <line x1="420" y1="280" x2="392" y2="252"/>
+      <line x1="420" y1="280" x2="392" y2="308"/>
+      <line x1="420" y1="280" x2="448" y2="308"/>
+      <animateTransform attributeName="transform" type="rotate" from="0 420 280" to="360 420 280" dur="0.8s" repeatCount="indefinite"/>
+    </g>
+  </g>
+
+  <!-- bicycle frame -->
+  <path d="M160 280 L230 170 L300 280 L380 170 L420 280 M230 170 L380 170 M160 280 L300 280"
+        fill="none" stroke="#e33" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- saddle and handlebar -->
+  <line x1="205" y1="165" x2="255" y2="165" stroke="#222" stroke-width="10" stroke-linecap="round"/>
+  <path d="M380 170 L400 145 L425 150" fill="none" stroke="#222" stroke-width="8" stroke-linecap="round"/>
+
+  <!-- crank and pedals -->
+  <g stroke="#444" stroke-width="8" stroke-linecap="round">
+    <line x1="300" y1="280" x2="325" y2="280"/>
+    <line x1="300" y1="280" x2="275" y2="280"/>
+    <rect x="318" y="275" width="14" height="10" fill="#222" stroke="none"/>
+    <rect x="268" y="275" width="14" height="10" fill="#222" stroke="none"/>
+    <animateTransform attributeName="transform" type="rotate" from="0 300 280" to="360 300 280" dur="1s" repeatCount="indefinite"/>
+  </g>
+  <circle cx="300" cy="280" r="8" fill="#222"/>
+
+  <!-- pelican legs -->
+  <g stroke="#333" stroke-width="9" stroke-linecap="round">
+    <line x1="245" y1="145" x2="325" y2="280">
+      <animate attributeName="x2" dur="1s" repeatCount="indefinite"
+               values="325;321.65;312.5;300;287.5;278.35;275;278.35;287.5;300;312.5;321.65;325"
+               keyTimes="0;0.0833;0.1667;0.25;0.3333;0.4167;0.5;0.5833;0.6667;0.75;0.8333;0.9167;1"/>
+      <animate attributeName="y2" dur="1s" repeatCount="indefinite"
+               values="280;292.5;301.65;305;301.65;292.5;280;267.5;258.35;255;258.35;267.5;280"
+               keyTimes="0;0.0833;0.1667;0.25;0.3333;0.4167;0.5;0.5833;0.6667;0.75;0.8333;0.9167;1"/>
+    </line>
+    <line x1="265" y1="145" x2="275" y2="280">
+      <animate attributeName="x2" dur="1s" repeatCount="indefinite"
+               values="275;278.35;287.5;300;312.5;321.65;325;321.65;312.5;300;287.5;278.35;275"
+               keyTimes="0;0.0833;0.1667;0.25;0.3333;0.4167;0.5;0.5833;0.6667;0.75;0.8333;0.9167;1"/>
+      <animate attributeName="y2" dur="1s" repeatCount="indefinite"
+               values="280;267.5;258.35;255;258.35;267.5;280;292.5;301.65;305;301.65;292.5;280"
+               keyTimes="0;0.0833;0.1667;0.25;0.3333;0.4167;0.5;0.5833;0.6667;0.75;0.8333;0.9167;1"/>
+    </line>
+  </g>
+
+  <!-- pelican -->
+  <g>
+    <path d="M180 135 Q150 150 170 170 Q200 160 220 145 Z" fill="#fff" stroke="#333" stroke-width="3"/>
+    <ellipse cx="235" cy="125" rx="65" ry="38" fill="#fff" stroke="#333" stroke-width="3"/>
+
+    <path d="M220 115 Q260 85 285 115 Q255 150 220 115 Z" fill="#eee" stroke="#333" stroke-width="3">
+      <animateTransform attributeName="transform" type="rotate"
+                        values="0 240 125; -18 240 125; 0 240 125"
+                        dur="1s" repeatCount="indefinite"/>
+    </path>
+
+    <g>
+      <circle cx="300" cy="85" r="22" fill="#fff" stroke="#333" stroke-width="3"/>
+      <path d="M318 78 L390 98 L318 98 Z" fill="#ff9933" stroke="#333" stroke-width="3"/>
+      <path d="M318 98 Q350 120 390 98" fill="#ff7700" stroke="#333" stroke-width="3"/>
+      <circle cx="305" cy="80" r="3" fill="#000"/>
+      <animateTransform attributeName="transform" type="translate"
+                        values="0 0; 0 2; 0 0"
+                        dur="1s" repeatCount="indefinite"/>
+    </g>
+  </g>
+</svg>
+```
