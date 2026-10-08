@@ -93,7 +93,19 @@ target_link_libraries(omph-generate PRIVATE omphalos hip::host omph_warnings)
 # the tree named here (its tools/ui/dist, or the gzip staging directory its
 # build makes: build.../tools/ui/ui-gzip/_gzip). Empty: no web UI, "/" 404s.
 set(OMPH_WEBUI_DIR "" CACHE PATH "llama.cpp web UI assets to embed (empty: none)")
+# The asset tree as a glob: an asset change must re-run the embed step. The
+# DEPENDS list below watches the files' contents; CONFIGURE_DEPENDS re-globs
+# when the set of files changes (a new hashed bundle name or a removed one,
+# #391), and the manifest file it regenerates makes the custom command re-run
+# on that change too (a shrinking dependency list alone would not).
+set(OMPH_WEBUI_ASSETS "")
+if(OMPH_WEBUI_DIR AND EXISTS "${OMPH_WEBUI_DIR}/index.html")
+    file(GLOB_RECURSE OMPH_WEBUI_ASSETS CONFIGURE_DEPENDS LIST_DIRECTORIES false "${OMPH_WEBUI_DIR}/*")
+endif()
 set(OMPH_WEBUI_GEN ${CMAKE_CURRENT_BINARY_DIR}/generated/server)
+set(OMPH_WEBUI_MANIFEST ${OMPH_WEBUI_GEN}/webui_manifest.txt)
+file(CONFIGURE OUTPUT "${OMPH_WEBUI_MANIFEST}" CONTENT
+     "web UI assets (${OMPH_WEBUI_DIR}):\n${OMPH_WEBUI_ASSETS}\n" @ONLY)
 add_custom_command(
     OUTPUT ${OMPH_WEBUI_GEN}/webui_assets.cc ${OMPH_WEBUI_GEN}/webui_assets.hh
     COMMAND ${CMAKE_COMMAND} -DWEBUI_DIR=${OMPH_WEBUI_DIR} -DOUT_CC=${OMPH_WEBUI_GEN}/webui_assets.cc
@@ -102,6 +114,8 @@ add_custom_command(
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_webui.cmake
             ${CMAKE_CURRENT_SOURCE_DIR}/cmake/webui_assets.cc.in
             ${CMAKE_CURRENT_SOURCE_DIR}/cmake/webui_assets.hh.in
+            ${OMPH_WEBUI_MANIFEST}
+            ${OMPH_WEBUI_ASSETS}
     COMMENT "Embedding the web UI assets (${OMPH_WEBUI_DIR})" VERBATIM)
 
 add_executable(omph-server src/tools/server.cc src/server/http.cc src/server/openai.cc src/server/webui.cc
