@@ -762,8 +762,27 @@ struct Server {
                                        "error"};
         const char * stop = parser.stopped() ? "stop string" : kStop[(int) res.stop];
         const bool client_left = gone || client_gone;
+        // An answer with no content, no reasoning and no tool call looks like a
+        // finished turn to a harness and shows the user nothing (#384): say so,
+        // and say when a <tool_call> block never parsed (the markup went to
+        // content, the finish_reason is stop).
+        const bool empty_reply =
+            chat && !error && !client_left && content.empty() && reasoning.empty() && calls.empty();
+        const int unparsed_calls = parser.unparsed_calls();
+        if ((empty_reply || unparsed_calls > 0) && !log_json) {
+            if (unparsed_calls > 0) {
+                std::fprintf(stderr, "  %d <tool_call> block(s) did not parse: the markup is in content\n",
+                             unparsed_calls);
+            }
+            if (empty_reply) {
+                std::fprintf(stderr, "  the answer is empty: no content, no reasoning, no tool call (stop: %s)\n",
+                             stop);
+            }
+        }
         if (log_json) {
             Json e = event_object("request", req_id);
+            e.set("empty_reply", Json::boolean(empty_reply));
+            e.set("unparsed_tool_calls", Json::integer(unparsed_calls));
             e.set("method", str(req.method));
             e.set("path", str(req.path));
             e.set("sampling_line", str(sampling_label(job)));
