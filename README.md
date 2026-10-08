@@ -215,14 +215,20 @@ plain `tools/ui/dist`), opening `http://127.0.0.1:8080/` serves **the same web U
 content's SHA-256 as the ETag (304 on `If-None-Match`), `Content-Encoding: gzip`
 when the tree is the gzip stage (a client that does not accept gzip gets 415,
 as in llama.cpp), `Cache-Control: immutable` for the hashed assets and
-`no-cache` for the index, service worker, manifest and version file, and
-COEP/COOP on the index. The UI talks to the OpenAI endpoints plus
-`GET /props` (defaults, context, the GGUF's chat template, modalities) and
-`GET /slots`; `endpoint_slots` is on while `endpoint_props` and
-`endpoint_metrics` are off, and llama.cpp's other routes (`/metrics`, `/tools`,
-`/models/load|unload|sse`, `/v1/stream` + lookup, the completion control
-endpoint) answer a 501 in the OpenAI error shape instead of a 404. A build
-without the assets answers 404 at `/` and is otherwise unchanged.
+`no-cache` for the index, service worker, manifest, version and build files, and
+COEP/COOP on the index. The current bundle is llama.cpp **v0.6.0**'s
+([#395](https://github.com/Nihmar/omphalos/issues/395)): the UI talks to the
+OpenAI endpoints plus `GET /props` (defaults, context, the GGUF's chat template,
+modalities) and `GET /slots`, and reads `GET /v1/models`' `architecture`
+(`input_modalities` with `image` when a vision encoder is loaded,
+`output_modalities` `["text"]`). `endpoint_slots` is on while `endpoint_props`
+and `endpoint_metrics` are off; llama.cpp's model management (`POST /models`,
+`/models/load|unload|sse`) and its other routes (`/metrics`, `/v1/stream` +
+lookup, the completion control endpoint) answer a 501 in the OpenAI error shape
+instead of a 404, so the UI's Hub/download pages fail loudly and cleanly. A
+build without the assets answers 404 at `/` and serves a self-destroying
+service worker at `/sw.js` (llama.cpp's, #29565), so a browser that kept an
+older UI's worker drops it.
 
 The assets are never copied into the repository: the CMake script
 (`engine/cmake/embed_webui.cmake`) embeds the tree at build time, so the UI

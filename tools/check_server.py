@@ -408,9 +408,27 @@ def run_timings_checks(url: str) -> None:
 
 def run_webui_checks(url: str) -> None:
     """The llama.cpp web UI omph-server serves (#378): the assets, /props, /slots."""
+    # #395: /sw.js is always answered -- the embedded app's worker, or the
+    # self-destroying one when no UI is embedded (a stale worker would keep
+    # serving the old UI)
+    status, headers, body = raw_get(url, "/sw.js", {"Accept-Encoding": "gzip"})
+    if headers.get("Content-Encoding") == "gzip":
+        body = gzip.decompress(body)
+    check(status == 200 and "javascript" in headers.get("Content-Type", "") and b"self." in body,
+          f"GET /sw.js: {status} {headers.get('Content-Type')} ({len(body)} bytes)")
+    # #395: the model's modalities, as llama.cpp v0.6.0 reports them
+    status, _, mbody = raw_get(url, "/v1/models")
+    try:
+        model0 = json.loads(mbody)["data"][0]
+    except (json.JSONDecodeError, KeyError, IndexError):
+        model0 = {}
+    arch = model0.get("architecture", {})
+    check(status == 200 and arch.get("output_modalities") == ["text"] and
+              "text" in arch.get("input_modalities", []),
+          f"GET /v1/models modalities: {arch}")
     status, headers, body = raw_get(url, "/", {"Accept-Encoding": "gzip"})
     if status == 404:
-        print("skip the web UI checks: this build has no embedded assets (OMPH_WEBUI_DIR)")
+        print("skip the rest of the web UI checks: this build has no embedded assets (OMPH_WEBUI_DIR)")
         return
     check(status == 200 and headers.get("Content-Encoding") == "gzip",
           f"GET /: {status} {headers.get('Content-Encoding')} {headers.get('Content-Type')}")
@@ -452,6 +470,9 @@ def run_webui_checks(url: str) -> None:
     check(status7 == 200 and len(slots) == 1 and slots[0].get("n_ctx", 0) > 0, f"GET /slots: {sbody[:120]!r}")
     status8, _, _ = raw_get(url, "/metrics")
     check(status8 == 501, f"llama.cpp's /metrics is a 501 here: {status8}")
+    vision = props.get("modalities", {}).get("vision", False)
+    check(("image" in arch.get("input_modalities", [])) == bool(vision),
+          f"the image modality follows --mmproj: vision={vision} {arch}")
 
 
 def run_tools_checks(url: str, enabled: str) -> None:
