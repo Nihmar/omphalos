@@ -1,0 +1,43 @@
+# The llama.cpp pin got a new release upstream (#393): open or bump the refresh
+# issue. The pin itself and the checklist live in bench/llama.cpp.pin and
+# docs/llama-refresh.md.
+name: llama-pin
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"  # Mondays 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the pin with upstream's latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag=$(sed -n 's/^tag *= *//p' bench/llama.cpp.pin | head -1)
+          url=$(sed -n 's/^url *= *//p' bench/llama.cpp.pin | head -1)
+          repo=${url#https://github.com/}
+          latest=$(gh api "repos/$repo/releases/latest" --jq .tag_name)
+          echo "pin: $tag; upstream latest: $latest"
+          if [ "$tag" = "$latest" ]; then
+            echo "the pin is the latest release"
+            exit 0
+          fi
+          title="llama.cpp refresh: $latest"
+          body="A newer llama.cpp release exists upstream: the pin is $tag and the latest release is $latest. Follow docs/llama-refresh.md (the checklist this issue tracks) and record the findings here."
+          number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" \
+                     --json number --jq '.[0].number')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$GITHUB_REPOSITORY" \
+              --body "Still at $tag; upstream's latest is now $latest."
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

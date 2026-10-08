@@ -15,6 +15,9 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODEL=$root/models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
 TEXT=$root/models/datasets/wikitext-2-raw/wiki.test.raw
 mkdir -p "$WORK"
+# the llama.cpp reference (#393): warns when the checkout is not the pin
+ref="$(uv run python "$root/tools/llama_pin.py" --check "$BIN")"
+echo "$ref" | tee "$WORK/reference-$CTX.txt"
 # the base file is ~8 GB at 32k: never leave it behind, even on a failed run
 trap 'rm -f "$WORK/base-$CTX.kld"' EXIT
 common=(-m "$MODEL" -f "$TEXT" -c "$CTX" -b 512 -ub 512 --chunks 1 -ngl 99 -fa on)
@@ -26,6 +29,6 @@ for kv in "q8_0 q4_0" "q8_0 q8_0" "q4_0 q4_0"; do
     "$BIN/llama-perplexity" "${common[@]}" -ctk "$1" -ctv "$2" \
         --kl-divergence-base "$WORK/base-$CTX.kld" --kl-divergence \
         > "$WORK/kl-$CTX-$1-$2.log" 2>&1
-    echo "== ctx $CTX  K $1  V $2"
+    echo "== ctx $CTX  K $1  V $2  [$ref]"
     grep -E "Mean    KLD|Median  KLD|99.0%   KLD|Same top p" "$WORK/kl-$CTX-$1-$2.log" || true
 done

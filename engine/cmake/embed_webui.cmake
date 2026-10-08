@@ -72,6 +72,20 @@ if(EXISTS "${WEBUI_DIR}/index.html")
 endif()
 list(LENGTH assets N_ASSETS)
 
+# The llama.cpp commit the assets were taken from (#393): the tree's own
+# checkout, empty when it is not one (the tests' fixture tree resolves to the
+# omphalos checkout, which /props of a test build would report: the tests do
+# not check it, the server's build does).
+set(WEBUI_COMMIT "")
+if(EXISTS "${WEBUI_DIR}")
+    execute_process(COMMAND git -C "${WEBUI_DIR}" rev-parse HEAD
+                    OUTPUT_VARIABLE WEBUI_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE
+                    RESULT_VARIABLE WEBUI_COMMIT_RC ERROR_QUIET)
+    if(NOT WEBUI_COMMIT_RC EQUAL 0)
+        set(WEBUI_COMMIT "")
+    endif()
+endif()
+
 set(ASSET_ARRAYS "")
 set(ASSET_TABLE "")
 set(idx 0)

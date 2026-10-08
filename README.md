@@ -226,7 +226,11 @@ without the assets answers 404 at `/` and is otherwise unchanged.
 
 The assets are never copied into the repository: the CMake script
 (`engine/cmake/embed_webui.cmake`) embeds the tree at build time, so the UI
-stays whatever llama.cpp version the path points at.
+stays whatever llama.cpp version the path points at; the commit of that tree
+is recorded at build time and `/props` reports it as `webui_llama_commit`
+([#393](https://github.com/Nihmar/omphalos/issues/393); the reference itself
+is pinned in `bench/llama.cpp.pin`, `docs/llama-refresh.md` is the refresh
+checklist).
 
 #### Tools
 

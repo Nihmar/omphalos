@@ -16,6 +16,8 @@ import subprocess
 import sys
 import tempfile
 
+import llama_pin
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 ENGINE = REPO / "engine" / "build" / "omph-tokenize"
 
@@ -89,6 +91,7 @@ def main() -> int:
     ap.add_argument("--fuzz", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()
+    print(llama_pin.check(args.llama_tokenize), flush=True)  # the reference this check is against (#393)
 
     cases: list[tuple[str, bytes]] = [(f"edge {i}", s.encode()) for i, s in enumerate(EDGE)]
     wiki = REPO / "models" / "datasets" / "wikitext-2-raw" / "wiki.test.raw"

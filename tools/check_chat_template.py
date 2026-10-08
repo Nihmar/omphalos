@@ -21,6 +21,8 @@ import jinja2.ext
 from gguf import GGUFReader
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
+import llama_pin
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 ENGINE = REPO / "engine" / "build" / "omph-tokenize"
 
@@ -144,6 +146,8 @@ def llama_ids(llama: str, model: str, text: str) -> list[int]:
 def main() -> int:
     model = sys.argv[1]
     llama = sys.argv[2] if len(sys.argv) > 2 else None
+    if llama:
+        print(llama_pin.check(llama), flush=True)  # the reference this check is against (#393)
     tpl = template(model)
     bad = 0
     ids_checked = 0

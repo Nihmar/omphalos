@@ -35,6 +35,7 @@ import sys
 import urllib.error
 from pathlib import Path
 
+import llama_pin
 import pi_session
 from niah import free_port, post, wait_health
 from omph_model import omph_file
@@ -209,7 +210,7 @@ def score(text: str, para_min: int, fp_len: int, threshold: int,
     return repeats, worst, len(paras), skipped
 
 
-def write_csv(out: Path, rows: list[dict], commit: str) -> None:
+def write_csv(out: Path, rows: list[dict], commit: str, llama_ref: str = "") -> None:
     """The CSV accumulates: one file per experiment, the commit in every row,
     rewritten after every run so a killed matrix keeps what it measured."""
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -219,15 +220,15 @@ def write_csv(out: Path, rows: list[dict], commit: str) -> None:
             fresh = {(row["config"], row["prompt"]) for row in rows}
             previous = [r for r in csv.DictReader(f) if r and (r.get("config"), r.get("prompt")) not in fresh]
     with out.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["commit", "config", "prompt", "prompt_tokens", "reasoning_chars",
-                                          "completion_tokens", "paragraphs", "paragraphs_skipped",
-                                          "repetitions", "repetitions_anywhere",
+        w = csv.DictWriter(f, fieldnames=["commit", "llama_commit", "config", "prompt", "prompt_tokens",
+                                          "reasoning_chars", "completion_tokens", "paragraphs",
+                                          "paragraphs_skipped", "repetitions", "repetitions_anywhere",
                                           "repeats_per_1k_tokens", "worst_pair_similarity"])
         w.writeheader()
         for row in previous:
             w.writerow(row)
         for row in rows:
-            w.writerow({"commit": commit, **row})
+            w.writerow({"commit": commit, "llama_commit": llama_ref, **row})
 
 
 def main() -> None:
@@ -268,6 +269,7 @@ def main() -> None:
         prompts = json.loads(Path(args.prompts).read_text()) if args.prompts else PROMPTS
     commit = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], capture_output=True,
                             text=True, check=False).stdout.strip()
+    llama_ref = llama_pin.ref_commit(llama_pin.describe(llama_pin.load()["commit"]))  # #393
     rows = []
     for name in args.configs.split(","):
         cfg = CONFIGS[name]
@@ -315,7 +317,7 @@ def main() -> None:
                              "repetitions": repeats, "repetitions_anywhere": repeats_any,
                              "repeats_per_1k_tokens": round(per_k, 3), "worst_pair_similarity": round(worst, 3)})
                 if args.out:
-                    write_csv(Path(args.out), rows, commit)
+                    write_csv(Path(args.out), rows, commit, llama_ref)
                 if args.dump:
                     d = Path(args.dump)
                     d.mkdir(parents=True, exist_ok=True)
@@ -326,7 +328,7 @@ def main() -> None:
             proc.terminate()
             proc.wait()
     if args.out:
-        write_csv(Path(args.out), rows, commit)
+        write_csv(Path(args.out), rows, commit, llama_ref)
     fail = [r for r in rows if r["repetitions"] > 0]
     print(f"{len(rows)} runs, {len(fail)} with a repetition" +
           (f" ({', '.join(sorted({r['config'] for r in fail}))})" if fail else ""))

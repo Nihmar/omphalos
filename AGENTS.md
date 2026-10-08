@@ -53,6 +53,7 @@ Priorities, in order: **1) VRAM savings — 2) decode speed — 3) prefill speed
 - Engine: **C++20 + HIP**, CMake ≥ 3.21 (`CMAKE_HIP_ARCHITECTURES=gfx1200`).
 - Tooling, reference implementation, validation: **Python via `uv`** + NumPy.
 - Profiling and reference builds: `rocprofv3`, `hipblaslt-bench`, `rocminfo` / `amd-smi`, llama.cpp (HIP/Vulkan/CPU), `gguf-dump` (PLAN.md §6–§7).
+  The llama.cpp reference is pinned in `bench/llama.cpp.pin` (upstream tag + the RX 9060 XT overlay; #393): every comparison runs at it, every result records it (`llama_commit`), and `tools/llama_pin.py --check <checkout>` says whether a checkout is the pin (`OMPH_LLAMA_STRICT=1` refuses another one). The refresh procedure is `docs/llama-refresh.md`, reminded by `.github/workflows/llama-pin.yml`.
 - Once build/test/bench entry points exist, their exact commands are documented here.
 
 ## Entry points
@@ -63,6 +64,10 @@ Model paths used below: `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (local, git-
 # build
 cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release
 cmake --build engine/build -j
+
+# the llama.cpp reference (#393): which checkout a build/measurement came from
+# (bench/llama.cpp.pin; OMPH_LLAMA_STRICT=1 refuses another checkout)
+uv run python tools/llama_pin.py --check <llama.cpp>/build-hip/bin
 
 # build with the web UI (#378): llama.cpp's UI assets embedded at build time, so
 # omph-server serves the same page llama-server does at /

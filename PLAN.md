@@ -967,7 +967,7 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 - Report efficiency, not just speed: decode as % of *measured* achievable bandwidth; prefill as % of the *measured* FP16 WMMA throughput (~100 TFLOPS raw, #132).
 - MTP: acceptance rate per workload type (code / chat / prose), tokens per step, effective t/s.
 - Quality: KL divergence vs llama.cpp reference (and vs FP16 KV for KV experiments), top-1 agreement, perplexity on a fixed slice; greedy-output identity with/without MTP.
-- Keep results as CSV in `bench/` with git commit hash of the engine.
+- Keep results as CSV in `bench/` with git commit hash of the engine and the llama.cpp reference every comparison ran against (`llama_commit`, from `bench/llama.cpp.pin`, #393): the pinned tag and commit, or the checkout's own commit when the pin was not respected. Results written before the pin carry no `llama_commit` and are "pre-pin, unknown commit" (usually the RX 9060 XT fork's `build-hip`): not comparable with post-pin numbers (`docs/llama-refresh.md`).
 
 ---
 

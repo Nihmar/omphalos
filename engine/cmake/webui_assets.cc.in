@@ -13,6 +13,8 @@ const Asset k_assets[@ARRAY_SIZE@] = {
 
 std::span<const Asset> assets() { return {k_assets, @N_ASSETS@}; }
 
+std::string_view commit() { return "@WEBUI_COMMIT@"; }
+
 const Asset * find(const std::string_view name) {
     for (const Asset & a : assets()) {
         if (a.name == name) {

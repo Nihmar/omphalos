@@ -35,6 +35,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import llama_pin
 from niah import count_tokens, free_port, wait_health
 from omph_model import omph_file
 
@@ -106,7 +107,7 @@ def request(engine: str, url: str, prompt: str, timeout: float) -> tuple[float, 
 def write_csv(path: str, rows: list[dict]) -> None:
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["engine", "kv", "size", "prompt_tokens", "runs", "ttft_ms", "prompt_ms",
-                                          "overhead_ms", "prefill_tps"])
+                                          "overhead_ms", "prefill_tps", "llama_commit"])
         w.writeheader()
         for r in rows:
             w.writerow({k: r[k] for k in w.fieldnames})
@@ -128,6 +129,13 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--csv", default="")
     args = ap.parse_args()
+
+    # the llama.cpp reference this result is tagged with (#393)
+    if args.engine == "llama" and args.llama_server:
+        ref = llama_pin.check(args.llama_server)
+    else:
+        ref = llama_pin.describe(llama_pin.load()["commit"])
+    print(ref, flush=True)
 
     tokenize = f"{args.omph}/omph-tokenize"
     paragraphs = [p.strip() for p in Path(args.text).read_text().split("\n") if len(p.strip()) > 40]
@@ -162,7 +170,8 @@ def main() -> None:
                 row = {"engine": args.engine, "kv": args.kv, "size": size, "run": run - args.warmup,
                        "prompt_tokens": int(tm.get("prompt_n", 0)), "ttft_ms": round(ttft * 1000, 1),
                        "prompt_ms": round(prompt_ms, 1), "overhead_ms": round(ttft * 1000 - prompt_ms, 1),
-                       "prefill_tps": round(1000.0 * tm["prompt_n"] / prompt_ms, 1) if prompt_ms > 0 else 0.0}
+                       "prefill_tps": round(1000.0 * tm["prompt_n"] / prompt_ms, 1) if prompt_ms > 0 else 0.0,
+                       "llama_commit": llama_pin.ref_commit(ref)}
                 rows.append(row)
                 with open(args.out, "a") as f:
                     f.write(json.dumps(row) + "\n")
@@ -175,7 +184,8 @@ def main() -> None:
                             "runs": len(got), "ttft_ms": statistics.median(r["ttft_ms"] for r in got),
                             "prompt_ms": statistics.median(r["prompt_ms"] for r in got),
                             "overhead_ms": statistics.median(r["overhead_ms"] for r in got),
-                            "prefill_tps": statistics.median(r["prefill_tps"] for r in got)})
+                            "prefill_tps": statistics.median(r["prefill_tps"] for r in got),
+                            "llama_commit": got[0]["llama_commit"]})
             if args.csv:
                 write_csv(args.csv, summary)
     finally:
