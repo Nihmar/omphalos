@@ -34,6 +34,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+import llama_pin
 from niah import free_port, wait_health
 from omph_model import omph_file
 
@@ -86,6 +87,7 @@ def main() -> None:
     ap.add_argument("--out", default=str(DEFAULT_OUT))
     ap.add_argument("--note", default="")
     args = ap.parse_args()
+    llama_ref = llama_pin.describe(llama_pin.load()["commit"])  # the reference (#393)
 
     prompt_tokens = args.tokens or (args.ctx - 1024)
     if prompt_tokens + args.generate >= args.ctx:
@@ -151,14 +153,15 @@ def main() -> None:
                f"prefill {prefill_ms / 1000:.1f} s ({1000.0 * tm.get('prompt_n', 0) / prefill_ms:.0f} t/s), "
                f"decode {decode_ms / max(1, tm.get('predicted_n', 0)):.1f} ms/token, "
                f"prompt+generated {used.get('prompt_tokens')}+{used.get('completion_tokens')}, stop {stop}, "
-               f"wall {wall:.0f} s")
+               f"wall {wall:.0f} s; {llama_ref}")
         print(row, flush=True)
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
         if not out.exists():
             out.write_text("# #237: the largest usable context, one line per configuration (01_desktop included).\n"
                            "# check_max_context.py: VRAM/GTT after load and peak over one prompt + decode;\n"
-                           "# --cache-ram 0 (no host checkpoints), greedy.\n")
+                           "# --cache-ram 0 (no host checkpoints), greedy.\n"
+                           "# The llama.cpp reference of each row is its trailing label (bench/llama.cpp.pin, #393).\n")
         with out.open("a") as f:
             f.write(row + "\n")
     finally:

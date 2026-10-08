@@ -23,6 +23,9 @@ mkdir -p "$outdir"
 bench="$build/bin/llama-bench"
 [[ -x "$bench" ]] || { echo "missing $bench" >&2; exit 1; }
 
+# the llama.cpp reference (#393): warns when the checkout is not the pin
+ref="$(uv run python "$root/tools/llama_pin.py" --check "$build")"
+
 ts="$(date +%Y%m%d-%H%M%S)"
 csv="$outdir/m0-llama-bench-$label-$ts.csv"
 log="$outdir/m0-llama-bench-$label-$ts.log"
@@ -33,6 +36,7 @@ trap 'rm -f "$tmp"' EXIT
   echo "# omphalos M0 llama.cpp baselines"
   echo "# label: $label"
   echo "# build: $build"
+  echo "# reference: $ref"
   echo "# model: $model"
   echo "# date:  $(date -Is)"
   echo "# note:  desktop session active during run"
@@ -63,3 +67,4 @@ run -p 512 -n 128 -ctk q8_0 -ctv q4_0 -d 16384,32768
 
 rm -f "$tmp"
 echo "results: $csv" | tee -a "$log"
+echo "$ref"

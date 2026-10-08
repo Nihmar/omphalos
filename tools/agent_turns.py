@@ -39,6 +39,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import llama_pin
 from niah import VramPeak, free_port, wait_health
 from omph_model import omph_file
 
@@ -139,6 +140,13 @@ def main() -> None:
     ap.add_argument("--csv", default="")
     args = ap.parse_args()
 
+    # the llama.cpp reference this result is tagged with (#393)
+    if args.engine == "llama" and args.llama_server:
+        ref = llama_pin.check(args.llama_server)
+    else:
+        ref = llama_pin.describe(llama_pin.load()["commit"])
+    print(ref, flush=True)
+
     paragraphs = [p.strip() for p in Path(args.text).read_text().split("\n") if len(p.strip()) > 40]
     doc = sliced(paragraphs, args.initial * 4)
     port = free_port()
@@ -196,7 +204,8 @@ def main() -> None:
                    "prompt_ms": round(prompt_ms, 1), "ttft_ms": round(ttft * 1000, 1),
                    "wall_s": round(wall, 2), "predicted_n": predicted,
                    "decode_tps": round(1000.0 * predicted / decode_ms, 1) if decode_ms > 0 else 0.0,
-                   "vram_peak_mib": vram.reset(), "rss_peak_mib": rss.reset()}
+                   "vram_peak_mib": vram.reset(), "rss_peak_mib": rss.reset(),
+                   "llama_commit": llama_pin.ref_commit(ref)}
             rows.append(row)
             with open(args.out, "a") as f:
                 f.write(json.dumps(row) + "\n")

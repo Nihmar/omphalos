@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+import llama_pin
 from compare_logits import N_VOCAB, log_softmax
 from omph_model import omph_file
 
@@ -71,6 +72,13 @@ def main() -> None:
     ap.add_argument("--dumper", default=str(HERE / "native/dump_mtmd_logits"))
     ap.add_argument("--omph", default=str(ROOT / "engine/build"))
     args = ap.parse_args()
+
+    # the llama.cpp reference this check is against (#393): the dumper links
+    # libllama from the checkout it was built with (tools/native/build.sh)
+    if Path(args.dumper).exists():
+        print(llama_pin.check(args.dumper), flush=True)
+    else:
+        print(llama_pin.describe(llama_pin.load()["commit"]), flush=True)
 
     gen, tokenize = f"{args.omph}/omph-generate", f"{args.omph}/omph-tokenize"
     with tempfile.TemporaryDirectory() as tmp:

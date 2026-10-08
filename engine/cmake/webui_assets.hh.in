@@ -23,4 +23,8 @@ struct Asset {
 std::span<const Asset> assets();
 const Asset * find(std::string_view name);
 
+// The llama.cpp commit the assets were taken from (#393), or empty when the
+// tree is not a git checkout.
+std::string_view commit();
+
 }  // namespace omph::server::webui

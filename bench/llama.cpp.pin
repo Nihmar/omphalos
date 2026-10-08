@@ -1,0 +1,36 @@
+# bench/llama.cpp.pin -- the llama.cpp reference omphalos measures against (#393).
+#
+# Every comparison with llama.cpp (baselines, KL references, the golden dump,
+# the tokenizer / chat-template / vision checks, the TTFT / agent-turn /
+# loop-rate runs, the web UI assets) must name this checkout, and every result
+# carries it. tools/llama_pin.py reads this file; OMPH_LLAMA_STRICT=1 turns the
+# warning about another checkout into a refusal.
+#
+# The reference is upstream ggml-org/llama.cpp at a release tag: it is what the
+# refresh procedure (docs/llama-refresh.md) reviews, and what the issues that
+# follow announcements (the web UI, the server API, the engine-side kernels)
+# can be pinned to. The RX 9060 XT fork stays in use for HIP numbers -- its
+# RDNA4 patches are what makes llama.cpp's tg on gfx1200 what it is -- so it is
+# recorded here too and its base (an upstream commit) must move with the pin.
+#
+# Refresh cadence: every 4-6 weeks, or sooner when upstream ships something
+# relevant; the scheduled workflow .github/workflows/llama-pin.yml reminds us.
+# The procedure is an issue (docs/llama-refresh.md has the checklist).
+
+url = https://github.com/ggml-org/llama.cpp
+tag = v0.6.0
+release = b11429
+commit = d81235049384534c167caea52b85a694f6103d14
+date = 2026-10-05
+
+# The HIP reference on this machine: the fork's integration branch (the RDNA4
+# patches), whose master base is a plain upstream commit. Rebase it onto the
+# new pin at every refresh and record the new commits.
+overlay_url = https://github.com/Nihmar/llama.cpp-RX9060XT-16GB
+overlay_branch = rx9060xt/integration
+overlay_commit = f19c20f9d67ed7d46567fc05eb56a29a80be79b6
+overlay_base = 6c7a87f7e5e5cd75b8a641c3471f2dee84a6ed17
+overlay_date = 2026-09-29
+
+# Build configurations the reference is built in (PLAN.md 6-7).
+builds = HIP gfx1200 (fork overlay), Vulkan, CPU-only (mtmd)

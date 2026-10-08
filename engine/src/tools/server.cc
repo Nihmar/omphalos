@@ -229,6 +229,9 @@ struct Server {
         props.set("endpoint_metrics", Json::boolean(false));  // no /metrics
         props.set("ui", Json::boolean(!omph::server::webui::assets().empty()));
         props.set("ui_settings", Json::object());
+        // the llama.cpp the embedded UI was taken from (#393): the UI's own
+        // commit, not omphalos' (empty when the assets came from nowhere)
+        props.set("webui_llama_commit", str(std::string(omph::server::webui::commit())));
         props.set("chat_template", str(gen.chat_template()));
         props.set("bos_token", str(tok.piece(tok.bos(), true)));
         props.set("eos_token", str(tok.piece(tok.eos(), true)));
