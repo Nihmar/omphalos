@@ -397,6 +397,11 @@ def run_timings_checks(url: str) -> None:
           f"per-chunk timings, predicted_n rising: {timeline[:8]}...")
     check(all("prompt_n" in t and "prompt_ms" in t and "predicted_ms" in t for t in timed),
           "every chunk's timings carries the running counters")
+    # #388: the decode speed must move while the reply is written, not only in
+    # the last chunk
+    live = [t for t in timed if int(t["predicted_n"]) > 0]
+    check(bool(live) and float(live[0].get("predicted_per_second", 0)) > 0,
+          f"a mid-stream chunk carries the live decode speed: {live[0] if live else None}")
     progress = [c["prompt_progress"] for c in chunks if "prompt_progress" in c]
     check(bool(progress) and int(progress[-1]["total"]) > 0 and 0 <= int(progress[-1]["cache"]) <= int(progress[-1]["processed"]),
           f"prompt_progress during the prefill: {progress[-1] if progress else None}")

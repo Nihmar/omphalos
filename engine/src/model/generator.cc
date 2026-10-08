@@ -538,6 +538,10 @@ GenerateResult Generator::generate_inner(const std::vector<int32_t> & prompt_ids
     // committed, so seq_.size() is not it (#340).
     const auto emit = [&](const int32_t t, const int64_t at) {
         res.tokens.push_back(t);
+        // The elapsed decode so far, before the callback: a live `timings`
+        // chunk (#388) needs predicted_ms / predicted_per_second, and both
+        // were zero until the end of the run (they are set below too).
+        res.decode_ms = omph::runtime::now_ms() - t1;
         const bool cont = on_token ? on_token(t) : true;
         if (is_eog(t)) {
             res.stop = GenerateResult::Stop::EndOfGeneration;
