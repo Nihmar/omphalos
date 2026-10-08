@@ -251,6 +251,22 @@ struct Server {
         m.set("object", str("model"));
         m.set("created", num(0));
         m.set("owned_by", str("omphalos"));
+        // llama.cpp v0.6.0's shape, what its UI reads (#395): aliases and tags
+        // (none here -- the id is the only name), and the architecture's
+        // input/output modalities
+        m.set("aliases", Json::array());
+        m.set("tags", Json::array());
+        Json input = Json::array();
+        input.push(str("text"));
+#ifdef OMPH_VISION
+        if (vision != nullptr) input.push(str("image"));
+#endif
+        Json output = Json::array();
+        output.push(str("text"));
+        Json arch = Json::object();
+        arch.set("input_modalities", std::move(input));
+        arch.set("output_modalities", std::move(output));
+        m.set("architecture", std::move(arch));
         return m;
     }
 
@@ -283,6 +299,24 @@ struct Server {
                 req.header("accept-encoding") != nullptr ? *req.header("accept-encoding") : "");
             if (web.status != omph::server::webui::Resolution::Status::NotFound) {
                 serve_webui(c, web);
+                return;
+            }
+            // A browser that used llama.cpp's (or an older embedded) UI keeps
+            // its service worker, and a plain 404 does not remove one: answer
+            // the worker's update check with upstream's self-destroying worker
+            // when no UI is embedded (#29565, #395). An embedded sw.js was
+            // served by resolve() above.
+            if (path == "/sw.js") {
+                static constexpr const char * kRemoveWorker = R"(
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil((async () => {
+    await self.registration.unregister();
+    for (const key of await caches.keys()) await caches.delete(key);
+    for (const c of await self.clients.matchAll({ type: 'window' })) c.navigate(c.url);
+})()));
+)";
+                c.extra_headers.emplace_back("Cache-Control", "no-cache");
+                c.respond(200, "application/javascript", kRemoveWorker);
                 return;
             }
         }
@@ -364,7 +398,11 @@ struct Server {
         }
         if (path == "/models" || path == "/models/" + model_id) {
             if (req.method != "GET") {
-                fail(c, 405, "use GET");
+                // the UI's model management (load/unload/download/delete) is
+                // not something this server does: the 501 of the other
+                // llama.cpp routes (#395)
+                fail(c, 501, std::string("omph-server does not implement ") + req.method + " " + path +
+                                 " (llama.cpp's model management)", "not_supported_error");
                 return;
             }
             if (path != "/models") {
