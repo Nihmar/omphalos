@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 
 #include "model/ngram.hh"
@@ -529,6 +530,12 @@ GenerateResult Generator::generate_inner(const std::vector<int32_t> & prompt_ids
     // far, and the acceptance test still keeps plain sampling's distribution.
     const bool dev_argmax = greedy && !req.sampling.penalizes();
     const bool speculate = !(greedy && req.sampling.penalizes());
+    // Sampled MTP drafts (#394): the drafter samples its token from its own
+    // distribution q (the request's sampling settings over the draft
+    // vocabulary prefix) and the target verifies with min(1, p/q), the
+    // residual from norm(max(0, p - q)). OMPH_SPEC_POINTMASS=1 keeps the
+    // pre-#394 point-mass rule for the A/B.
+    const bool sampled_mtp = !greedy && !env_.spec_pointmass;
     int32_t next = forcing ? (*req.force)[0] : sample_row(logits, req.sampling, seq_, rng_);
     if (forcing && req.forced_logits != nullptr) {
         req.forced_logits->insert(req.forced_logits->end(), logits.begin(), logits.end());
@@ -599,6 +606,7 @@ GenerateResult Generator::generate_inner(const std::vector<int32_t> & prompt_ids
                                                 std::min(budget, config_.context - pos - 1));
             std::vector<int32_t> batch{next};
             std::vector<int32_t> drafts;
+            std::vector<Dist> draft_q;  // sampled MTP proposals' q, per draft (#394)
             const int64_t kn = std::min<int64_t>(std::min(runner_->spec_max() - 1, budget),
                                                  config_.context - pos - 1);
             if (env_.ngram && kn > 0) {
@@ -612,11 +620,34 @@ GenerateResult Generator::generate_inner(const std::vector<int32_t> & prompt_ids
                     ++res.ngram_steps;
                 }
             }
-            if (drafts.empty() && k > 0 &&
-                !(runner_->dflash_on() ? runner_->dflash_draft(next, pos, k, drafts)
-                                       : runner_->mtp_draft(next, pos, k, drafts))) {
-                res.stop = GenerateResult::Stop::Error;
-                break;
+            if (drafts.empty() && k > 0) {
+                bool ok = false;
+                if (runner_->dflash_on()) {
+                    // DFlash2 drafts are a greedy path (measured: rejection
+                    // sampling does not help it, upstream and here, #245/#394)
+                    ok = runner_->dflash_draft(next, pos, k, drafts);
+                } else if (sampled_mtp) {
+                    // The MTP head's distribution over the draft vocabulary's
+                    // prefix is q; the chain continues on the drawn token, so
+                    // each row is the proposal distribution of its draft, and
+                    // q is kept for the verification's acceptance ratio.
+                    std::vector<float> dlogits;
+                    std::function<int32_t(float *, int64_t)> pick = [&](float * row, const int64_t nq) {
+                        PenaltyWindow no_pen;  // q is the head's own distribution
+                        Dist q;
+                        distribution(row, nq, req.sampling, no_pen, q);
+                        const int32_t x = draw(q, -1, rng_);
+                        draft_q.push_back(std::move(q));
+                        return x;
+                    };
+                    ok = runner_->mtp_draft(next, pos, k, drafts, &dlogits, &pick, /*prefix_logits=*/true);
+                } else {
+                    ok = runner_->mtp_draft(next, pos, k, drafts);
+                }
+                if (!ok) {
+                    res.stop = GenerateResult::Stop::Error;
+                    break;
+                }
             }
             res.drafted += (int64_t) drafts.size();
             batch.insert(batch.end(), drafts.begin(), drafts.end());
@@ -649,15 +680,20 @@ GenerateResult Generator::generate_inner(const std::vector<int32_t> & prompt_ids
                         break;
                     }
                     const int32_t x = batch[(size_t) a + 1];
-                    double px = 0.0;
-                    for (size_t i = 0; i < dist.ids.size(); ++i) {
-                        if (dist.ids[i] == x) {
-                            px = dist.w[i] / dist.total;
-                            break;
+                    const double px = prob_of(dist, x);
+                    if (!draft_q.empty()) {
+                        // speculative sampling (#394): keep with min(1, p/q),
+                        // reject into norm(max(0, p - q))
+                        const Dist & q = draft_q[(size_t) a];
+                        const double qx = prob_of(q, x);
+                        const double keep = qx > 0.0 ? std::min(1.0, px / qx) : 1.0;
+                        if (unit(rng_) < keep) {
+                            ++a;
+                        } else {
+                            after = draw_residual(dist, q, x, rng_);
                         }
-                    }
-                    if (unit(rng_) < px) {
-                        ++a;
+                    } else if (unit(rng_) < px) {
+                        ++a;  // point mass: the draft is an argmax, so q(x) = 1
                     } else {
                         after = draw(dist, x, rng_);
                     }

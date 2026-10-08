@@ -94,6 +94,17 @@ void distribution(float * row, int64_t nv, const Sampling & s, const PenaltyWind
 // A draw from d without token `skip` (-1: none).
 int32_t draw(const Dist & d, int32_t skip, std::mt19937_64 & rng);
 
+// The probability of one token in d: w(id) / total, or 0 when the
+// truncations dropped it (#394's acceptance ratio).
+double prob_of(const Dist & d, int32_t id);
+
+// norm(max(0, p - q)) for speculative sampling (#394): the residual draw
+// after a draft drawn from q was rejected by p. `p` and `q` are normalized
+// over their kept sets (prob_of) and the residual is over p's ids (a token
+// only q kept contributes max(0, 0 - q) = 0). Falls back to p without `skip`
+// when floating point leaves no residual mass, where the sampler is exact.
+int32_t draw_residual(const Dist & p, const Dist & q, int32_t skip, std::mt19937_64 & rng);
+
 // The greedy pick over one logits row: the largest finite value, the lowest id
 // on a tie, and id 0 when the row has no finite value at all. Non-finite
 // values are ignored the same way the device's packed argmax ignores them

@@ -76,7 +76,7 @@ void Runner::mtp_rewind(const int64_t pos) {
 
 bool Runner::mtp_block(const int32_t * toks, const float * h_in, const int64_t pos0,
                        const int64_t T, const bool kv_only, int32_t * argmax,
-                       std::vector<float> * logits, const ForwardInputs * in) {
+                       std::vector<float> * logits, const ForwardInputs * in, const bool prefix_logits) {
     const int64_t ne = h_.n_embd;
     if (!mtp_ || T <= 0 || T > max_tokens_ || pos0 + T > max_seq_) {
         return fail("mtp: not enabled, or tokens out of range");
@@ -151,14 +151,14 @@ bool Runner::mtp_block(const int32_t * toks, const float * h_in, const int64_t p
         !omph::kernels::cast_f32_to_f16(static_cast<const float *>(mtp_g_), h16_, ne, nullptr)) {
         return fail("mtp: head failed");
     }
-    // A draft needs its argmax only (sampled speculation keeps it as a point
-    // mass, #197): over the first draft_vocab token ids, the frequent ones,
-    // reading a fraction of the 682 MiB head (#217), while the recent text
-    // stays inside them (draft_oov_). Validation (logits) and the other head
-    // types read it whole.
+    // A draft needs its argmax only, or -- sampled since #394 -- the rows the
+    // proposal q is built from: over the first draft_vocab token ids, the
+    // frequent ones, reading a fraction of the 682 MiB head (#217), while the
+    // recent text stays inside them (draft_oov_). Validation (logits without
+    // prefix_logits) and the other head types read it whole.
     const GemvEntry * hg = head_.gemv;
     const int64_t dv = draft_vocab_rows();  // OMPH_DRAFT_VOCAB in head tiles (#340)
-    const int64_t nv = logits == nullptr && dv > 0 && dv < h_.n_vocab && use_gemv_ &&
+    const int64_t nv = (logits == nullptr || prefix_logits) && dv > 0 && dv < h_.n_vocab && use_gemv_ &&
                                draft_oov_ < kDraftOovMax &&
                                hg != nullptr && hg->type == 12 && hg->rows == h_.n_vocab
                            ? dv
@@ -171,8 +171,8 @@ bool Runner::mtp_block(const int32_t * toks, const float * h_in, const int64_t p
     }
     if (logits != nullptr) {
         const size_t at = logits->size();
-        logits->resize(at + (size_t) h_.n_vocab);
-        if (hipMemcpy(logits->data() + at, logits_, (size_t) h_.n_vocab * 4,
+        logits->resize(at + (size_t) nv);
+        if (hipMemcpy(logits->data() + at, logits_, (size_t) nv * 4,
                       hipMemcpyDeviceToHost) != hipSuccess) {
             return fail("mtp: logits copy failed");
         }
@@ -218,14 +218,22 @@ bool Runner::mtp_fill(const int64_t keep) {
 }
 
 bool Runner::mtp_draft(const int32_t token, const int64_t pos, const int64_t k,
-                       std::vector<int32_t> & drafts, std::vector<float> * logits) {
+                       std::vector<int32_t> & drafts, std::vector<float> * logits,
+                       const std::function<int32_t(float *, int64_t)> * pick, const bool prefix_logits) {
     drafts.clear();
     int32_t tok = token;
     const float * h = static_cast<const float *>(mtp_pending_);
     for (int64_t i = 0; i < k; ++i) {
         int32_t d = -1;
-        if (!mtp_block(&tok, h, pos + i, 1, false, &d, logits)) {
+        const size_t at = logits != nullptr ? logits->size() : 0;
+        if (!mtp_block(&tok, h, pos + i, 1, false, pick != nullptr ? nullptr : &d, logits, nullptr,
+                       prefix_logits)) {
             return false;
+        }
+        if (pick != nullptr) {
+            // the sampled draft (#394): the row is the proposal q, the chain
+            // continues on the chosen token, not on the argmax
+            d = (*pick)(logits->data() + at, (int64_t) logits->size() - (int64_t) at);
         }
         drafts.push_back(d);
         tok = d;
