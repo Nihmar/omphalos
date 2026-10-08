@@ -1,0 +1,68 @@
+# #394: sampled MTP drafts drawn from q, accepted with min(1, p/q). Engine c989c35 (branch
+# feat/394-sampled-spec, built in engine/build), RX 9060 XT, 2026-10-08. Omphalos-only A/B: no llama.cpp
+# run, so no llama_commit; the rule is upstream's (ggml-org/llama.cpp#27694, b11368).
+#
+# 1. Speed and acceptance: OMPH_NGRAM=0 omph-generate <model> --chat --max 256 --top-p 0.95 --temp T
+#    --seed S (thinking off, add_generation_prompt), seeds 1..5, median ms/token; "new" = the MTP head
+#    samples each draft from its own distribution q (the request's sampling settings over the draft
+#    vocabulary prefix, 98304 ids) and the target accepts with min(1, p(x)/q(x)), rejecting into
+#    norm(max(0, p - q)); "point" = OMPH_SPEC_POINTMASS=1, the pre-#394 rule (the argmax draft, kept with
+#    probability p(x)). CSV: bench/results/spec-sampling-394.csv.
+#
+#    workload  T     rule    ms/token   accepted / drafted   accept %
+#    code      0.6   new     14.94      919 / 1060           86.7
+#    code      0.6   point   14.87      911 / 1080           84.4
+#    code      0.8   new     16.17      904 / 1108           81.6
+#    code      0.8   point   15.67      887 / 1152           77.0
+#    code      1.0   new     18.31      860 / 1237           69.5
+#    code      1.0   point   16.21      896 / 1135           78.9
+#    prose     0.6   new     24.13      692 / 1738           39.8
+#    prose     0.6   point   24.65      656 / 1846           35.5
+#    prose     0.8   new     25.57      672 / 1796           37.4
+#    prose     0.8   point   25.23      664 / 1820           36.5
+#    prose     1.0   new     25.11      703 / 1708           41.2
+#    prose     1.0   point   26.76      640 / 1890           33.9
+#    chat      0.6   new     19.97      785 / 1455           54.0
+#    chat      0.6   point   20.36      774 / 1490           51.9
+#    chat      0.8   new     20.31      787 / 1456           54.1
+#    chat      0.8   point   20.75      758 / 1534           49.4
+#    chat      1.0   new     22.38      763 / 1524           50.1
+#    chat      1.0   point   23.30      731 / 1621           45.1
+#
+#    Acceptance rises on every workload and temperature except code T 1.0 -- the noisiest cell: the two
+#    rules diverge on the same seed and its five runs span 14.5-20.9 ms/token (new) against 14.5-17.4
+#    (point), so the medians there (18.31 vs 16.21) are not separated. Where the target is already peaked
+#    there is little to win (code T 0.6: 84-87 % accepted both ways); the gain is the largest where the
+#    target is least certain (prose T 1.0 33.9 -> 41.2 %, chat T 1.0 45.1 -> 50.1 %, chat T 0.8 49.4 ->
+#    54.1 %). Time is within a few percent of the point mass -- the extra host work is k distributions
+#    over the prefix rows plus the residual draw on a rejection -- and the medians move with the
+#    acceptance (prose T 1.0 26.76 -> 25.11 ms/token, chat T 1.0 23.30 -> 22.38).
+#
+# 2. The distribution is still the target's: tools/check_spec_sampling.py (omph-server --no-mtp vs the
+#    default, 120 continuations of 4 tokens each, seeds 0..119 in both modes, TVD per position and a
+#    permutation test of 2000 rounds):
+#
+#    120 samples per mode, temperature 1.0, top_p 1.0
+#    position 0: 59 distinct tokens, TVD plain vs spec 0.000 (plain half vs half 0.600), permutation p = 1.000
+#    position 1: 29 distinct tokens, TVD plain vs spec 0.067 (plain half vs half 0.217), permutation p = 1.000
+#    position 2: 89 distinct tokens, TVD plain vs spec 0.383 (plain half vs half 0.533), permutation p = 0.988
+#    position 3: 75 distinct tokens, TVD plain vs spec 0.342 (plain half vs half 0.433), permutation p = 0.686
+#    whole continuations: 219 distinct, permutation p = 0.932
+#    PASS
+#    120 samples per mode, temperature 0.6, top_p 0.95
+#    position 0: 24 distinct tokens, TVD plain vs spec 0.000 (plain half vs half 0.217), permutation p = 1.000
+#    position 1:  9 distinct tokens, TVD plain vs spec 0.000 (plain half vs half 0.183), permutation p = 1.000
+#    position 2: 34 distinct tokens, TVD plain vs spec 0.200 (plain half vs half 0.367), permutation p = 0.942
+#    position 3: 37 distinct tokens, TVD plain vs spec 0.217 (plain half vs half 0.350), permutation p = 0.668
+#    whole continuations: 113 distinct, permutation p = 0.977
+#    PASS
+#
+#    Every TVD is below the plain-half-vs-half noise of the same run and no permutation p is small.
+#
+# 3. Greedy unchanged: OMPH_NGRAM=0 omph-generate --chat --max 64 --temp 0 (speculative, the MTP block)
+#    and the same with --no-spec: byte-identical output ("List the first ten prime numbers").
+#
+# 4. Validation: tools/check_gpu_mtp.py PASS (the GPU's draft logits vs the NumPy MTP block: draft 1
+#    rel 4.5e-2, draft 2 rel 5.1e-2, top-5 overlap 5/5 both; --mtp-out still writes whole vocabulary
+#    rows, 2 x 248320 floats); tools/check_gpu_decode.py --gemv PASS (greedy sequence identical to the
+#    NumPy reference); ctest 13/13 (test_sampler covers prob_of and draw_residual).
