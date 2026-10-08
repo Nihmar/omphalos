@@ -180,6 +180,26 @@ int main() {
     CHECK(consistent(tool, "</think><tool_call>garbage</tool_call>", o) && o.calls.empty() &&
               o.content == "<tool_call>garbage</tool_call>",
           "a malformed call stays content");
+    // #384: a call written inside the reasoning is parsed and closes it; a
+    // value quoting the closing tags does not end the call early
+    const std::string call1 = "<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n"
+                              "<parameter=days>\n3\n</parameter>\n<parameter=units>\n\"c\"\n</parameter>\n"
+                              "</function>\n</tool_call>";
+    CHECK(consistent(tool, "plan\n" + call1 + "\n</think>\n\nDone.", o) && o.reasoning == "plan" &&
+              o.content == "Done." && o.calls.size() == 1 && o.calls[0].name == "get_weather",
+          "a tool call inside the reasoning closes it");
+    CHECK(consistent(tool, "searching\n" + call1, o) && o.reasoning == "searching" && o.content.empty() &&
+              o.calls.size() == 1,
+          "an unterminated reasoning with a call at its end");
+    CHECK(consistent(tool, "</think><tool_call>garbage</tool_call>" + call1, o) && o.calls.size() == 1 &&
+              o.content == "<tool_call>garbage</tool_call>",
+          "a malformed call stays content, the next one parses");
+    const std::string quoted =
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nA </parameter> B </tool_call> C\n</parameter>\n"
+        "<parameter=days>\n2\n</parameter>\n</function>\n</tool_call>";
+    CHECK(consistent(tool, "</think>" + quoted, o) && o.calls.size() == 1 &&
+              o.calls[0].arguments == R"({"city": "A </parameter> B </tool_call> C", "days": 2})",
+          "closing tags inside a parameter value: %s", o.calls.empty() ? "" : o.calls[0].arguments.c_str());
     CHECK(consistent(think, "</think><tool_call>x</tool_call>", o) && o.content == "<tool_call>x</tool_call>",
           "no tools: no parsing");
     // raw completions: as generated; invalid UTF-8 replaced

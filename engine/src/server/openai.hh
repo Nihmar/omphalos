@@ -108,6 +108,9 @@ public:
 
     bool stopped() const { return stopped_; }
     bool any_tool_call() const { return n_calls_ > 0; }
+    // <tool_call> blocks that never parsed (the markup went to content): the
+    // server logs an empty answer against them (#384).
+    int unparsed_calls() const { return n_unparsed_calls_; }
 
 private:
     enum class State { Reasoning, Content, ToolCall };
@@ -122,10 +125,12 @@ private:
     size_t fed_ = 0;        // raw_[0, fed_) went through feed()
     std::string buf_;       // fed text waiting for its state's tag
     State state_;
+    bool after_reasoning_call_ = false;  // swallow a </think> after a call from the reasoning (#384)
     bool stopped_ = false;
     bool started_[2] = {false, false};  // reasoning / content: something emitted
     std::string space_[2];              // their trailing whitespace, held back
     int n_calls_ = 0;
+    int n_unparsed_calls_ = 0;
 };
 
 // OpenAI's finish_reason from how the generation ended.

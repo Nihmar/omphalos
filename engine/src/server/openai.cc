@@ -329,60 +329,119 @@ Delta OutputParser::finish() {
     switch (state_) {
         case State::Reasoning: emit(State::Reasoning, buf_, d); break;
         case State::Content: emit(State::Content, buf_, d); break;
-        case State::ToolCall: emit(State::Content, "<tool_call>" + buf_, d); break;  // unterminated
+        case State::ToolCall:  // no parseable call: the markup stays content
+            ++n_unparsed_calls_;
+            emit(State::Content, "<tool_call>" + buf_, d);
+            break;
     }
     buf_.clear();
     state_ = State::Content;
+    after_reasoning_call_ = false;
     return d;
+}
+
+// The text before `pos` ends with </function> (whitespace aside): the only way
+// a tool call block can end, so a value quoting </tool_call> is not one (#384).
+static bool ends_function(const std::string & s, const size_t pos) {
+    static const std::string kFunctionEnd = "</function>";
+    size_t e = pos;
+    while (e > 0 && is_space(s[e - 1])) --e;
+    return e >= kFunctionEnd.size() && s.compare(e - kFunctionEnd.size(), kFunctionEnd.size(), kFunctionEnd) == 0;
 }
 
 void OutputParser::feed(const std::string & text, Delta & d) {
     static const std::string kThinkEnd = "</think>", kCall = "<tool_call>", kCallEnd = "</tool_call>";
     buf_ += text;
     while (true) {
-        const std::string * tag = state_ == State::Reasoning ? &kThinkEnd
-                                  : state_ == State::ToolCall ? &kCallEnd
-                                  : job_.parse_tools          ? &kCall
-                                                              : nullptr;
-        if (tag == nullptr) {
-            emit(state_, buf_, d);
+        if (state_ == State::ToolCall) {
+            // A call is parsed whole: the first </tool_call> whose block parses
+            // is its end. A parameter value quoting </tool_call> leaves the
+            // prefix before it unparseable, so the scan goes on; with no
+            // candidate the text waits for more (finish() gives up, #384).
+            size_t at = std::string::npos;
+            ToolCall call;
+            for (size_t pos = buf_.find(kCallEnd); pos != std::string::npos; pos = buf_.find(kCallEnd, pos + 1)) {
+                if (!ends_function(buf_, pos)) continue;
+                ToolCall candidate;
+                if (parse_call(buf_.substr(0, pos), candidate)) {
+                    at = pos;
+                    call = std::move(candidate);
+                    break;
+                }
+            }
+            if (at == std::string::npos) {
+                // A new <tool_call> before any parseable end means the current
+                // block is malformed: it stays content, the new one is parsed.
+                const size_t restart = buf_.find(kCall, 1);
+                if (restart == std::string::npos) return;
+                ++n_unparsed_calls_;
+                emit(State::Content, "<tool_call>" + buf_.substr(0, restart), d);
+                buf_.erase(0, restart + kCall.size());
+                space_[1].clear();
+                continue;
+            }
+            buf_.erase(0, at + kCallEnd.size());
+            d.calls.push_back(std::move(call));
+            ++n_calls_;
+            state_ = State::Content;
+            continue;
+        }
+        if (state_ == State::Reasoning) {
+            // A tool call seen inside the reasoning closes it and is parsed as
+            // a call (#384): thinking models write the call before </think>.
+            const size_t think = buf_.find(kThinkEnd);
+            const size_t call = job_.parse_tools ? buf_.find(kCall) : std::string::npos;
+            if (call != std::string::npos && (think == std::string::npos || call < think)) {
+                emit(State::Reasoning, buf_.substr(0, call), d);
+                buf_.erase(0, call + kCall.size());
+                space_[0].clear();
+                space_[1].clear();
+                state_ = State::ToolCall;
+                after_reasoning_call_ = true;
+                continue;
+            }
+            if (think != std::string::npos) {
+                emit(State::Reasoning, buf_.substr(0, think), d);
+                buf_.erase(0, think + kThinkEnd.size());
+                space_[0].clear();
+                state_ = State::Content;
+                continue;
+            }
+            size_t hold = partial_suffix(buf_, kThinkEnd);
+            if (job_.parse_tools) hold = std::max(hold, partial_suffix(buf_, kCall));
+            emit(State::Reasoning, buf_.substr(0, buf_.size() - hold), d);
+            buf_.erase(0, buf_.size() - hold);
+            return;
+        }
+        // Content
+        if (after_reasoning_call_) {
+            // The call closed the reasoning: a </think> the model wrote after
+            // it (whitespace aside) is swallowed rather than served as content (#384).
+            size_t b = 0;
+            while (b < buf_.size() && is_space(buf_[b])) ++b;
+            const size_t n = std::min(buf_.size() - b, kThinkEnd.size());
+            if (buf_.compare(b, n, kThinkEnd, 0, n) == 0) {
+                if (buf_.size() - b < kThinkEnd.size()) return;  // may still complete
+                buf_.erase(0, b + kThinkEnd.size());
+            }
+            after_reasoning_call_ = false;
+        }
+        if (!job_.parse_tools) {
+            emit(State::Content, buf_, d);
             buf_.clear();
             return;
         }
-        const size_t pos = buf_.find(*tag);
+        const size_t pos = buf_.find(kCall);
         if (pos == std::string::npos) {
-            if (state_ != State::ToolCall) {  // a call is parsed whole
-                const size_t hold = partial_suffix(buf_, *tag);
-                emit(state_, buf_.substr(0, buf_.size() - hold), d);
-                buf_.erase(0, buf_.size() - hold);
-            }
+            const size_t hold = partial_suffix(buf_, kCall);
+            emit(State::Content, buf_.substr(0, buf_.size() - hold), d);
+            buf_.erase(0, buf_.size() - hold);
             return;
         }
-        const std::string before = buf_.substr(0, pos);
-        buf_.erase(0, pos + tag->size());
-        switch (state_) {
-            case State::Reasoning:
-                emit(State::Reasoning, before, d);
-                space_[0].clear();
-                state_ = State::Content;
-                break;
-            case State::Content:
-                emit(State::Content, before, d);
-                space_[1].clear();
-                state_ = State::ToolCall;
-                break;
-            case State::ToolCall: {
-                ToolCall call;
-                if (parse_call(before, call)) {
-                    d.calls.push_back(std::move(call));
-                    ++n_calls_;
-                } else {
-                    emit(State::Content, "<tool_call>" + before + "</tool_call>", d);
-                }
-                state_ = State::Content;
-                break;
-            }
-        }
+        emit(State::Content, buf_.substr(0, pos), d);
+        buf_.erase(0, pos + kCall.size());
+        space_[1].clear();
+        state_ = State::ToolCall;
     }
 }
 
@@ -420,6 +479,20 @@ bool OutputParser::parse_call(const std::string & block, ToolCall & call) {
         i += lit.size();
         return true;
     };
+    // A parameter's value ends at the first </parameter> that closes the
+    // parameter: one followed (whitespace aside) by <parameter= or
+    // </function>. A value quoting the tag does not end the value early (#384).
+    const auto parameter_end = [&](size_t from) {
+        static const std::string kEnd = "</parameter>";
+        for (size_t at = block.find(kEnd, from); at != std::string::npos; at = block.find(kEnd, at + 1)) {
+            size_t j = at + kEnd.size();
+            while (j < block.size() && is_space(block[j])) ++j;
+            if (block.compare(j, 11, "<parameter=") == 0 || block.compare(j, 11, "</function>") == 0) {
+                return at;
+            }
+        }
+        return std::string::npos;
+    };
     skip();
     if (!take("<function=")) return false;
     size_t e = block.find('>', i);
@@ -435,7 +508,7 @@ bool OutputParser::parse_call(const std::string & block, ToolCall & call) {
         if (e == std::string::npos) return false;
         const std::string key = sanitize_utf8(block.substr(i, e - i));
         i = e + 1;
-        e = block.find("</parameter>", i);
+        e = parameter_end(i);
         if (e == std::string::npos) return false;
         std::string value = block.substr(i, e - i);
         i = e + std::string("</parameter>").size();
