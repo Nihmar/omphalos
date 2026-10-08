@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -21,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include "server/openai.hh"
+
 namespace omph::server::tools {
 namespace {
 
@@ -31,6 +34,11 @@ using Json = omph::text::Json;
 constexpr size_t kReadMax = 16 * 1024;          // read_file's text budget
 constexpr size_t kReadMaxBase64 = 32 * 1024 * 1024;
 constexpr size_t kExecMaxOutput = 16 * 1024;
+constexpr size_t kEditMax = 16 * 1024 * 1024;   // edit_file reads the whole file (#389)
+constexpr size_t kSearchFileMax = 16 * 1024 * 1024;  // grep_search's bytes per file (#389)
+constexpr size_t kSearchLineMax = 1 << 20;          // ... and per line
+constexpr size_t kSearchPatternMax = 1024;          // ... and pattern characters
+constexpr int kSearchTimeout = 15;                  // ... and seconds for the whole search
 constexpr int kExecDefaultTimeout = 10;
 constexpr int kExecMaxTimeout = 60;
 constexpr size_t kSearchMaxResults = 100;
@@ -39,7 +47,10 @@ constexpr size_t kListMaxLimit = 100;
 constexpr size_t kWalkCap = 200000;  // a walk that finds nothing must end
 constexpr int kListTimeout = 15;
 
-Json str(const std::string & s) { return Json::string(s); }
+// Every string that leaves for the JSON response goes through here: a
+// process's bytes, a file's contents or a path can be invalid UTF-8 (or
+// binary), and the response must stay valid JSON text (#389).
+Json str(const std::string & s) { return Json::string(omph::server::sanitize_utf8(s)); }
 Json boolean(const bool b) { return Json::boolean(b); }
 
 Json error(const std::string & message) {
@@ -69,7 +80,12 @@ std::string string_param(const Json & params, const char * key, const std::strin
 
 int64_t int_param(const Json & params, const char * key, const int64_t fallback) {
     const Json * v = param(params, key);
-    return v != nullptr && v->is_number() ? (int64_t) v->as_number() : fallback;
+    if (v == nullptr || !v->is_number()) return fallback;
+    const double d = v->as_number();
+    // A cast of NaN, an infinity or an out-of-range double to int64_t is
+    // undefined behavior; an absurd value is not a parameter (#389).
+    if (!std::isfinite(d) || d < -9.2233720368547758e18 || d >= 9.2233720368547758e18) return fallback;
+    return (int64_t) d;
 }
 
 bool bool_param(const Json & params, const char * key, const bool fallback = false) {
@@ -136,6 +152,71 @@ bool read_file_bytes(const fs::path & p, std::string & out, const size_t max = (
     return true;
 }
 
+// A line stream over a file of any size (#389): each line is cut at `cap`
+// bytes (the rest is discarded, `dropped` says so), so neither a multi-GB
+// file nor a single endless line can be read into memory.
+class LineStream {
+public:
+    explicit LineStream(const fs::path & p) : in_(p, std::ios::binary) {}
+    bool ok() const { return (bool) in_; }
+    // The next line (without '\n', the last one may lack it); false at EOF.
+    bool next(std::string & line, const size_t cap, bool & dropped) {
+        line.clear();
+        dropped = false;
+        bool any = false;
+        while (true) {
+            if (pos_ == fill_) {
+                in_.read(buf_, sizeof buf_);
+                fill_ = (size_t) in_.gcount();
+                pos_ = 0;
+                if (fill_ == 0) return any;
+            }
+            while (pos_ < fill_) {
+                const char c = buf_[pos_++];
+                any = true;
+                if (c == '\n') return true;
+                if (line.size() < cap) {
+                    line += c;
+                } else {
+                    dropped = true;
+                }
+            }
+        }
+    }
+
+private:
+    std::ifstream in_;
+    char buf_[64 * 1024];
+    size_t pos_ = 0, fill_ = 0;
+};
+
+// Writes `content` to `p` through a temporary file renamed in place: a failed
+// or short write must not destroy the file it replaces (the old path
+// truncated first, #389).
+bool write_file_atomic(const fs::path & p, const std::string & content) {
+    std::error_code ec;
+    const fs::path tmp = p.string() + ".omph-tmp-" + std::to_string((long) ::getpid());
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+        out.write(content.data(), (std::streamsize) content.size());
+        out.close();
+        if (!out) {
+            fs::remove(tmp, ec);
+            return false;
+        }
+    }
+    if (fs::exists(p, ec)) {  // keep the replaced file's mode
+        fs::permissions(tmp, fs::status(p, ec).permissions(), ec);
+    }
+    fs::rename(tmp, p, ec);
+    if (ec) {
+        fs::remove(tmp, ec);
+        return false;
+    }
+    return true;
+}
+
 //
 // subprocesses (shell commands and git listings)
 //
@@ -145,13 +226,37 @@ struct ProcResult {
     int exit_code = -1;
     bool timed_out = false;
     bool spawn_error = false;
+    bool truncated = false;  // more output than max_output
 };
 
 ProcResult run_process(const std::vector<std::string> & argv, const std::string & cwd, const int timeout_s,
                        const size_t max_output, const bool append_all = true) {
     ProcResult res;
+    // The argv and the error messages are built before fork(): a multithreaded
+    // process may not allocate (or printf) between fork() and exec() (#389).
+    std::vector<char *> args;
+    args.reserve(argv.size() + 1);
+    for (const std::string & a : argv) {
+        args.push_back(const_cast<char *>(a.c_str()));
+    }
+    args.push_back(nullptr);
+    std::string chdir_err;
+    if (!cwd.empty()) {
+        chdir_err = "omphalos: cannot enter the tool's working directory ";
+        chdir_err += cwd;
+        chdir_err += "\n";
+    }
+    std::string exec_err = "omphalos: cannot run ";
+    exec_err += argv.empty() ? "the command" : argv[0];
+    exec_err += "\n";
+    const auto fail = [&](const std::string & what) {
+        if (!what.empty()) (void) write(STDERR_FILENO, what.data(), what.size());
+        _exit(127);
+    };
     int fds[2];
-    if (pipe(fds) != 0) {
+    // O_CLOEXEC: a tool's daemon must not inherit the server's descriptors
+    // (the listening socket and the accepted connection, #389).
+    if (pipe2(fds, O_CLOEXEC) != 0) {
         res.spawn_error = true;
         return res;
     }
@@ -173,57 +278,58 @@ ProcResult run_process(const std::vector<std::string> & argv, const std::string 
         (void) dup2(fds[1], STDERR_FILENO);
         close(fds[0]);
         close(fds[1]);
-        if (!cwd.empty() && chdir(cwd.c_str()) != 0) {
-            _exit(127);
-        }
-        std::vector<char *> args;
-        args.reserve(argv.size() + 1);
-        for (const std::string & a : argv) {
-            args.push_back(const_cast<char *>(a.c_str()));
-        }
-        args.push_back(nullptr);
+        if (!cwd.empty() && chdir(cwd.c_str()) != 0) fail(chdir_err);
         execvp(args[0], args.data());
-        _exit(127);
+        fail(exec_err);
     }
     close(fds[1]);
     (void) fcntl(fds[0], F_SETFL, O_NONBLOCK);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
     bool eof = false;
-    bool truncated = false;
+    bool child_exited = false;
+    int status = 0;
+    // The direct child's exit ends the read: a background grandchild holding
+    // the pipe must not keep the tool waiting ("sleep 100 & echo hi" reported
+    // a timeout although the shell had exited, #389). Whatever the direct
+    // child wrote is in the pipe already when it exits.
+    const auto reap = [&] {
+        if (child_exited) return;
+        const pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid || (r < 0 && errno == ECHILD)) child_exited = true;
+    };
     while (!eof) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            res.timed_out = true;  // checked every pass: a never-ending writer cannot run forever
+            break;
+        }
         char buf[8192];
         const ssize_t n = read(fds[0], buf, sizeof buf);
         if (n > 0) {
             if (res.output.size() < max_output) {
                 const size_t room = max_output - res.output.size();
                 res.output.append(buf, std::min((size_t) n, room));
-                truncated = truncated || (size_t) n > room;
+                res.truncated = res.truncated || (size_t) n > room;
             } else {
-                truncated = true;
+                res.truncated = true;
             }
-        } else if (n == 0) {
-            eof = true;
-        } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-            eof = true;
+            continue;
         }
-        if (eof) {
+        if (n == 0) {
+            eof = true;  // every writer closed
             break;
         }
-        if (std::chrono::steady_clock::now() >= deadline) {
-            res.timed_out = true;
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            eof = true;
             break;
         }
-        if (n <= 0) {
-            pollfd pfd{fds[0], POLLIN, 0};
-            (void) poll(&pfd, 1, 20);
-        }
+        reap();
+        if (child_exited) break;  // no more output can arrive: drain and finish
+        pollfd pfd{fds[0], POLLIN, 0};
+        (void) poll(&pfd, 1, 20);
     }
     if (res.timed_out) {
         (void) kill(-pid, SIGKILL);
         (void) kill(pid, SIGKILL);
-    }
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
     }
     // whatever is still buffered in the closed pipe
     while (true) {
@@ -235,12 +341,17 @@ ProcResult run_process(const std::vector<std::string> & argv, const std::string 
         if (res.output.size() < max_output) {
             const size_t room = max_output - res.output.size();
             res.output.append(buf, std::min((size_t) n, room));
-            truncated = truncated || (size_t) n > room;
+            res.truncated = res.truncated || (size_t) n > room;
         } else {
-            truncated = true;
+            res.truncated = true;
         }
     }
     close(fds[0]);
+    if (!child_exited) {
+        // a killed group: collect it; a live one: wait for the direct child
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        }
+    }
     if (res.timed_out) {
         res.exit_code = -1;
     } else if (WIFEXITED(status)) {
@@ -248,7 +359,7 @@ ProcResult run_process(const std::vector<std::string> & argv, const std::string 
     } else if (WIFSIGNALED(status)) {
         res.exit_code = 128 + WTERMSIG(status);
     }
-    if (truncated && append_all) {
+    if (res.truncated && append_all) {
         res.output += "\n[output truncated]";
     }
     return res;
@@ -280,7 +391,10 @@ bool git_files(const fs::path & base, std::vector<std::string> & out) {
     const ProcResult r = run_process({"git", "-C", path_str(base), "ls-files", "-z", "--cached", "--others",
                                       "--exclude-standard"},
                                      "", kListTimeout, 8 * 1024 * 1024, /*append_all=*/false);
-    if (r.spawn_error || r.timed_out || r.exit_code != 0 || r.output.empty()) {
+    // A truncated listing would silently miss files: fall back to the walker
+    // rather than serve a partial tree (#389).
+    if (r.spawn_error || r.timed_out || r.truncated || r.exit_code != 0 || r.output.empty()) {
+        out.clear();
         return false;
     }
     size_t pos = 0;
@@ -406,16 +520,6 @@ std::string base64_encode(const std::string & in) {
     return out;
 }
 
-std::vector<std::string> split_lines(const std::string & text) {
-    std::vector<std::string> lines;
-    std::istringstream in(text);
-    std::string line;
-    while (std::getline(in, line)) {
-        lines.push_back(line);
-    }
-    return lines;
-}
-
 //
 // the tools
 //
@@ -451,27 +555,34 @@ Json tool_read_file(const Json & params, const std::string & cwd) {
         j.set("size_bytes", Json::integer((int64_t) bytes.size()));
         return j;
     }
-    if (size > kReadMax && end_line == -1) {
+    if (size > kReadMax && start_line == 1 && end_line == -1) {
         return error("file too large (" + std::to_string((size_t) size) + " bytes, max " +
                      std::to_string(kReadMax) + "). Use start_line/end_line to read a portion.");
     }
-    std::string content;
-    if (!read_file_bytes(p, content)) {
+    // Streamed: a range into a multi-GB file is read line by line with a
+    // bounded line length, and the output stops at kReadMax (#389).
+    LineStream in(p);
+    if (!in.ok()) {
         return error("failed to open file: " + path);
     }
-    const std::vector<std::string> lines = split_lines(content);
     std::string out;
-    for (int64_t i = start_line - 1; i < (int64_t) lines.size(); i++) {
-        if (end_line != -1 && i >= end_line) {
-            break;
-        }
-        const std::string & line = lines[i];
-        const std::string out_line = append_loc ? std::to_string(i + 1) + "\u2192" + line + "\n" : line + "\n";
+    std::string line;
+    int64_t no = 0;
+    bool dropped = false;
+    while (end_line == -1 || no < end_line) {
+        if (!in.next(line, kReadMax, dropped)) break;
+        ++no;
+        if (no < start_line) continue;
+        const std::string out_line = append_loc ? std::to_string(no) + "\u2192" + line + "\n" : line + "\n";
         if (out.size() + out_line.size() > kReadMax) {
             out += "[output truncated]";
             break;
         }
         out += out_line;
+        if (dropped) {
+            out += "[output truncated]";
+            break;
+        }
     }
     return plain(out);
 }
@@ -491,13 +602,7 @@ Json tool_write_file(const Json & params, const std::string & cwd) {
     if (p.has_parent_path()) {
         fs::create_directories(p.parent_path(), ec);
     }
-    std::ofstream out(p, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        return error("failed to write file: " + path);
-    }
-    out.write(content.data(), (std::streamsize) content.size());
-    out.close();
-    if (!out) {
+    if (!write_file_atomic(p, content)) {
         return error("failed to write file: " + path);
     }
     Json j = Json::object();
@@ -518,6 +623,14 @@ Json tool_edit_file(const Json & params, const std::string & cwd) {
         return error("\"edits\" must be a non-empty array");
     }
     const fs::path p = resolve(cwd, path);
+    // An edit needs the whole file in memory to match old_text: cap it rather
+    // than let a multi-GB file take the server down (#389).
+    std::error_code sec;
+    const uintmax_t psize = fs::file_size(p, sec);
+    if (!sec && psize > kEditMax) {
+        return error("file too large to edit (" + std::to_string((size_t) psize) + " bytes, max " +
+                     std::to_string(kEditMax) + ")");
+    }
     std::string content;
     if (!read_file_bytes(p, content)) {
         return error("failed to open file: " + path);
@@ -567,13 +680,7 @@ Json tool_edit_file(const Json & params, const std::string & cwd) {
     if (out == content) {
         return error("no changes made: the replacement(s) produced identical content");
     }
-    std::ofstream file(p, std::ios::binary | std::ios::trunc);
-    if (!file) {
-        return error("failed to write file: " + path);
-    }
-    file.write(out.data(), (std::streamsize) out.size());
-    file.close();
-    if (!file) {
+    if (!write_file_atomic(p, out)) {
         return error("failed to write file: " + path);
     }
     Json j = Json::object();
@@ -640,6 +747,53 @@ Json tool_file_glob_search(const Json & params, const std::string & cwd) {
     return j;
 }
 
+// A cheap guard against the classic catastrophic-backtracking shape: a
+// quantifier applied to a group that itself contains one ((a+)+, (a*)*,
+// (\d+\.)+). std::regex backtracks and cannot be interrupted or given a
+// deadline, so the pattern is refused rather than run on a line that can hang
+// the single-threaded server (#389).
+bool nested_quantifier(const std::string & pattern) {
+    struct Group {
+        bool quantified = false;  // the group's body holds a quantifier
+    };
+    std::vector<Group> groups{Group{}};  // the implicit top level
+    bool in_class = false;
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        const char c = pattern[i];
+        if (c == '\\') {
+            ++i;  // an escape: the next byte is a literal
+            continue;
+        }
+        if (in_class) {
+            if (c == ']') in_class = false;
+            continue;
+        }
+        if (c == '[') {
+            in_class = true;
+            continue;
+        }
+        if (c == '(') {
+            groups.push_back(Group{});
+            continue;
+        }
+        if (c == ')') {
+            const bool quantified = groups.size() > 1 && groups.back().quantified;
+            if (groups.size() > 1) groups.pop_back();
+            const size_t j = i + 1;
+            if (quantified && j < pattern.size() &&
+                (pattern[j] == '*' || pattern[j] == '+' || pattern[j] == '?' || pattern[j] == '{')) {
+                return true;
+            }
+            if (quantified) groups.back().quantified = true;
+            continue;
+        }
+        if (c == '*' || c == '+' || c == '?' || c == '{') {
+            groups.back().quantified = true;
+        }
+    }
+    return false;
+}
+
 Json tool_grep_search(const Json & params, const std::string & cwd) {
     std::string path;
     std::string missing;
@@ -668,6 +822,14 @@ Json tool_grep_search(const Json & params, const std::string & cwd) {
             escaped += c;
         }
         pattern_src = escaped;
+    }
+    if (pattern_src.size() > kSearchPatternMax) {
+        return error("pattern too long (" + std::to_string(pattern_src.size()) + " characters, max " +
+                     std::to_string(kSearchPatternMax) + ")");
+    }
+    if (!literal && nested_quantifier(pattern_src)) {
+        return error("the pattern nests quantifiers (e.g. (a+)+): std::regex backtracks, and one line can take "
+                     "exponential time on this single-threaded server");
     }
     std::regex pattern;
     try {
@@ -702,19 +864,54 @@ Json tool_grep_search(const Json & params, const std::string & cwd) {
     std::ostringstream text;
     size_t total = 0;
     bool limit_reached = false;
+    bool budget_hit = false;
+    bool file_cut = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kSearchTimeout);
     for (const std::string & f : files) {
         if (total >= kSearchMaxResults) {
             limit_reached = true;
             break;
         }
-        std::string content;
-        if (!read_file_bytes(f, content) || content.find('\0') != std::string::npos) {
-            continue;  // unreadable or binary
+        if (std::chrono::steady_clock::now() >= deadline) {
+            budget_hit = true;  // a tree of huge files must not hold the server for minutes
+            break;
         }
-        const std::vector<std::string> lines = split_lines(content);
+        // Streamed with a per-line and a per-file cap, so a multi-GB file (or
+        // one endless line) is scanned only up to the cap (#389).
+        LineStream in(f);
+        if (!in.ok()) continue;
+        std::vector<std::string> lines;
+        std::string line;
+        size_t bytes = 0;
+        bool dropped = false;
+        bool binary = false;
+        while (true) {
+            if (bytes >= kSearchFileMax) {
+                file_cut = true;
+                break;
+            }
+            if (!in.next(line, kSearchLineMax, dropped)) break;
+            bytes += line.size() + 1;
+            if (line.find('\0') != std::string::npos) {
+                binary = true;  // as before: a binary file is skipped whole
+                break;
+            }
+            if (dropped) file_cut = true;
+            lines.push_back(std::move(line));
+        }
+        if (binary) continue;
         const std::string display = single_file ? path : rel_to(base, fs::path(f));
         for (size_t i = 0; i < lines.size() && total < kSearchMaxResults; i++) {
-            if (!std::regex_search(lines[i], pattern)) {
+            bool match = false;
+            try {
+                match = std::regex_search(lines[i], pattern);
+            } catch (const std::regex_error & e) {
+                // error_complexity / error_stack: match-time limits, not a
+                // malformed pattern (the compile above caught those)
+                return error(std::string("the pattern is too expensive at line ") +
+                             std::to_string((long long) i + 1) + " of " + display + ": " + e.what());
+            }
+            if (!match) {
                 continue;
             }
             const int64_t from = ctx_lines > 0 ? std::max<int64_t>(0, (int64_t) i - ctx_lines) : (int64_t) i;
@@ -737,6 +934,12 @@ Json tool_grep_search(const Json & params, const std::string & cwd) {
     text << "\n---\nTotal matches: " << total << "\n";
     if (limit_reached) {
         text << "[" << kSearchMaxResults << " matches limit reached. Narrow the path/pattern/include to see more.]\n";
+    }
+    if (budget_hit) {
+        text << "[" << kSearchTimeout << " seconds budget reached: the search stopped early. Narrow the path.\n";
+    }
+    if (file_cut) {
+        text << "[some files were longer than " << kSearchFileMax << " bytes and were not searched in full]\n";
     }
     return plain(text.str());
 }

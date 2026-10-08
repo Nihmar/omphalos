@@ -5,6 +5,7 @@
 
 #include <unistd.h>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -125,6 +126,29 @@ void test_read_write(const Sandbox & s) {
                       s.dir.generic_string()))
               .size() > 0,
           "and a range reads it");
+    // #389: a range deep in a large file is streamed, and invalid UTF-8 comes
+    // back as replacement characters so the JSON stays valid
+    std::string many;
+    for (int i = 0; i < 2'000'000; i++) many += "line\n";
+    s.write("deep.txt", many);
+    const Json deep =
+        run("read_file", params_of(R"({"path":"deep.txt","start_line":1999999,"end_line":2000000})"),
+            s.dir.generic_string());
+    CHECK(!has_error(deep) && text_of(deep) == "line\nline\n", "a line range deep in a large file: %s",
+          has_error(deep) ? deep.get("error").as_string().c_str() : text_of(deep).c_str());
+    s.write("utf8.txt", "a\xff" "b\xe2\x82\xac" "c\n");
+    const std::string utf8 = text_of(run("read_file", params_of(R"({"path":"utf8.txt"})"), s.dir.generic_string()));
+    CHECK(utf8 == "a\xef\xbf\xbd" "b\xe2\x82\xac" "c\n", "invalid bytes are replaced, valid UTF-8 kept: [%s]",
+          utf8.c_str());
+    s.write("bigline.txt", std::string(2 * 1024 * 1024, 'x') + "\nmatch\n");
+    const Json bigline =
+        run("read_file", params_of(R"({"path":"bigline.txt","start_line":2})"), s.dir.generic_string());
+    CHECK(!has_error(bigline) && text_of(bigline) == "match\n", "a 2 MB line neither hangs nor fills the answer");
+    // #389: an out-of-range number is not a parameter (the old cast was UB)
+    CHECK(text_of(run("read_file", params_of(R"({"path":"d/a.txt","start_line":1e308})"),
+                      s.dir.generic_string()))
+              .find("one") == 0,
+          "an infinite start_line falls back");
 }
 
 void test_edit(const Sandbox & s) {
@@ -187,6 +211,21 @@ void test_grep(const Sandbox & s) {
     CHECK(has_error(r), "an invalid regex is an error");
     r = run("grep_search", params_of(R"({"path":"nope","pattern":"x"})"), cwd);
     CHECK(has_error(r), "a missing path is an error");
+    // #389: a nested-quantifier pattern is refused before std::regex can hang
+    r = run("grep_search", params_of(R"({"path":"g","pattern":"(a+)+$"})"), cwd);
+    CHECK(has_error(r) && r.get("error").as_string().find("nests quantifiers") != std::string::npos,
+          "a nested-quantifier pattern is refused: %s", has_error(r) ? r.get("error").as_string().c_str() : "?");
+    r = run("grep_search", params_of(R"({"path":"g","pattern":"(ab)+"})"), cwd);
+    CHECK(!has_error(r), "a harmless group quantifier still works");
+    r = run("grep_search", params_of(R"({"path":"g","pattern":"(a+)+$","literal":true})"), cwd);
+    CHECK(!has_error(r), "literal searches do not run the guard");
+    // #389: the per-line cap bounds the work; the match after the long line
+    // is still found, and the note says the file was not searched in full
+    r = run("grep_search", params_of(R"({"path":"bigline.txt","pattern":"match","return_line_numbers":true})"),
+            cwd);
+    CHECK(text_of(r).find(":2:match") != std::string::npos &&
+              text_of(r).find("not searched in full") != std::string::npos,
+          "a 2 MB line is capped, the match after it is found: %s", text_of(r).c_str());
 }
 
 void test_glob(const Sandbox & s) {
@@ -222,8 +261,29 @@ void test_exec(const Sandbox & s) {
     CHECK(text_of(r).find("[exit code: 3]") != std::string::npos, "a failing command keeps its code");
     r = run("exec_shell_command", params_of(R"({"command":"sleep 5","timeout":1})"), cwd);
     CHECK(text_of(r).find("[exit due to timed out]") != std::string::npos, "a timeout is reported");
+    r = run("exec_shell_command", params_of(R"({"command":"yes spam","timeout":1,"max_output_size":1024})"), cwd);
+    CHECK(text_of(r).find("[exit due to timed out]") != std::string::npos,
+          "a never-ending writer stops at the timeout");
     r = run("exec_shell_command", params_of(R"({})"), cwd);
     CHECK(has_error(r), "a missing command is an error");
+    // #389: a background grandchild holding the pipe must not turn a finished
+    // command into a timeout
+    const auto t0 = std::chrono::steady_clock::now();
+    r = run("exec_shell_command", params_of(R"({"command":"sleep 3 & echo hi"})"), cwd);
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(text_of(r).find("hi\n") == 0 && text_of(r).find("[exit code: 0]") != std::string::npos &&
+              text_of(r).find("timed out") == std::string::npos && elapsed < 2.0,
+          "a background child does not hold the pipe: %.2f s, %s", elapsed, text_of(r).c_str());
+    // a cwd that cannot be entered says so, not a bare exit 127
+    r = run("exec_shell_command", params_of(R"({"command":"echo hi"})"),
+            (s.dir / "nope").generic_string());
+    CHECK(text_of(r).find("cannot enter the tool's working directory") != std::string::npos &&
+              text_of(r).find("[exit code: 127]") != std::string::npos,
+          "an unusable cwd names itself: %s", text_of(r).c_str());
+    // invalid UTF-8 from a process is replaced, like a file's
+    r = run("exec_shell_command", params_of(R"({"command":"printf 'a\\377b'"})"), cwd);
+    CHECK(text_of(r).find("a\xef\xbf\xbd" "b") != std::string::npos, "invalid output bytes are replaced: [%s]",
+          text_of(r).c_str());
 }
 
 void test_get_info(const Sandbox & s) {
@@ -232,6 +292,17 @@ void test_get_info(const Sandbox & s) {
     CHECK(r.get("cwd").as_string() == s.dir.generic_string(), "the cwd override");
     const Json by_param = run("get_info", params_of(R"({"cwd":"/tmp"})"), s.dir.generic_string());
     CHECK(by_param.get("cwd").as_string() == "/tmp", "params.cwd wins");
+}
+
+// #389: write_file and edit_file go through a temporary file renamed in place;
+// one left behind means a failed or interrupted write
+void test_no_temps(const Sandbox & s) {
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(s.dir, fs::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        CHECK(name.find(".omph-tmp-") == std::string::npos, "a temporary file was left behind: %s", name.c_str());
+    }
 }
 
 }  // namespace
@@ -246,6 +317,7 @@ int main() {
     test_glob(s);
     test_exec(s);
     test_get_info(s);
+    test_no_temps(s);
     if (omph_test::failures == 0) {
         std::printf("test_tools: ok\n");
     }

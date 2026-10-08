@@ -261,7 +261,8 @@ Listener::Listener(const std::string & host, const int port) {
     }
     std::string err = "no address";
     for (addrinfo * a = res; a != nullptr; a = a->ai_next) {
-        const int fd = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        // SOCK_CLOEXEC: a tool's daemon must not inherit and hold the port (#389)
+        const int fd = ::socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
         if (fd < 0) {
             err = std::strerror(errno);
             continue;
@@ -287,7 +288,8 @@ Listener::~Listener() {
 
 int Listener::accept_one() {
     while (true) {
-        const int fd = ::accept(fd_, nullptr, nullptr);
+        // the accepted fd must not survive into a tool's child either (#389)
+        const int fd = ::accept4(fd_, nullptr, nullptr, SOCK_CLOEXEC);
         if (fd >= 0 || errno != EINTR) return fd;
     }
 }
