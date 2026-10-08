@@ -1,0 +1,6 @@
+{"template": "original", "total_tokens": 41719, "thinking_tokens": 37774, "answer_tokens": 3944, "wall_s": 463.5, "ms_per_token": 10.03, "total_ms": 418607.4, "accepted": 35079, "drafted": 62324, "stop": "end of generation", "svg_bytes": 8295, "paths": 61, "animate": 15}
+{"template": "sharp-effortxhigh", "total_tokens": 15292, "thinking_tokens": 12546, "answer_tokens": 2745, "wall_s": 237.3, "ms_per_token": 15.38, "total_ms": 235178.4, "accepted": 11194, "drafted": 30498, "stop": "end of generation", "svg_bytes": 5218, "paths": 39, "animate": 10}
+{"template": "sharp", "total_tokens": 6007, "thinking_tokens": 3502, "answer_tokens": 2504, "wall_s": 72.9, "ms_per_token": 11.9, "total_ms": 71507.5, "accepted": 4783, "drafted": 11469, "stop": "end of generation", "svg_bytes": 5147, "paths": 41, "animate": 6}
+images: ['/tmp/pelican392/original.png', '/tmp/pelican392/sharp-effortxhigh.png', '/tmp/pelican392/sharp.png']
+{"template": "original-effortmedium", "total_tokens": 4016, "thinking_tokens": 907, "answer_tokens": 3108, "wall_s": 55.4, "ms_per_token": 13.47, "total_ms": 54094.7, "accepted": 3056, "drafted": 7290, "stop": "end of generation", "svg_bytes": 6309, "paths": 51, "animate": 9}
+images: ['/tmp/pelican392/original-effortmedium.png']

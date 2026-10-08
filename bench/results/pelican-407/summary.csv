@@ -1,0 +1,5 @@
+run,effort,total_tokens,thinking_tokens,answer_tokens,wall_s,ms_per_token,total_ms,accepted,drafted,accept_pct,stop,svg_bytes,svg_shapes,svg_animations
+original-xhigh,xhigh,41719,37774,3944,463.5,10.03,418607.4,35079,62324,56.3,end_of_generation,8295,61,15
+sharp-xhigh,xhigh,15292,12546,2745,237.3,15.38,235178.4,11194,30498,36.7,end_of_generation,5218,39,10
+sharp-medium,medium,6007,3502,2504,72.9,11.9,71507.5,4783,11469,41.7,end_of_generation,5147,41,6
+original-medium,medium,4016,907,3108,55.4,13.47,54094.7,3056,7290,41.9,end_of_generation,6309,51,9
