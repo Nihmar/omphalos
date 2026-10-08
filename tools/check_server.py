@@ -404,6 +404,11 @@ def run_timings_checks(url: str) -> None:
     check("cache_n" in final and "predicted_per_second" in final and "prompt_per_second" in final,
           f"the final timings carries llama.cpp's fields: {sorted(final)}")
     check(int(final.get("predicted_n", -1)) == max(timeline or [0]), "the last chunk's predicted_n is the total")
+    # #390: sse_ping_interval on a non-streamed request must not put a `:` ping
+    # before the status line (a malformed response)
+    code, body = raw_post(url, "/v1/completions", json.dumps(
+        {"prompt": "Write one sentence about the sea.", "max_tokens": 64, "sse_ping_interval": 1}).encode())
+    check(code == 200 and "choices" in body, f"a non-streamed request with sse_ping_interval: {code}")
 
 
 def run_webui_checks(url: str) -> None:

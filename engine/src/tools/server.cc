@@ -557,9 +557,11 @@ struct Server {
             return body;
         };
         // llama.cpp's `sse_ping_interval`: a comment keeps a silent stream
-        // (a long prefill) from being dropped by an impatient client.
+        // (a long prefill) from being dropped by an impatient client. Only a
+        // streamed response: on a non-streamed one the ping would be written
+        // before the HTTP status line (#390).
         const auto ping_if_due = [&]() {
-            if (job.sse_ping_interval > 0 && !gone &&
+            if (job.stream && job.sse_ping_interval > 0 && !gone &&
                 omph::runtime::now_ms() - last_write >= job.sse_ping_interval * 1000.0) {
                 gone = !c.ping();
                 last_write = omph::runtime::now_ms();
