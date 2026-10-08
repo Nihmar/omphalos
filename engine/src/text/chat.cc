@@ -345,14 +345,26 @@ struct Renderer {
 
 std::string join_segments(const std::vector<Segment> & segments) { return join(segments); }
 
-std::string render_chat(const Json & request) {
+std::string render_chat(const Json & request, const ChatTemplate tpl) {
+    if (tpl == ChatTemplate::Sharp) return join(render_chat_segments_sharp(request));
     Renderer r{request};
     return join(r.run());
 }
 
-std::vector<Segment> render_chat_segments(const Json & request) {
+std::vector<Segment> render_chat_segments(const Json & request, const ChatTemplate tpl) {
+    if (tpl == ChatTemplate::Sharp) return render_chat_segments_sharp(request);
     Renderer r{request};
     return r.run();
+}
+
+ChatTemplate chat_template_from_string(const std::string & name) {
+    if (name == "original") return ChatTemplate::Original;
+    if (name == "sharp") return ChatTemplate::Sharp;
+    throw std::runtime_error("unknown chat template \"" + name + "\" (expected original or sharp)");
+}
+
+const char * chat_template_name(const ChatTemplate tpl) {
+    return tpl == ChatTemplate::Sharp ? "sharp" : "original";
 }
 
 std::vector<int32_t> tokenize_chat(const std::vector<Segment> & segments, const Tokenizer & tokenizer) {

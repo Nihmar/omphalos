@@ -27,6 +27,9 @@ struct Defaults {
     float presence_penalty = 0.0f;
     int penalty_last_n = 64;
     int64_t max_tokens = -1;   // -1: until the context is full
+    // The active chat template (#392): the GGUF's own (original) or the
+    // vendored Qwen Sharp one. omph-server --chat-template sets it.
+    text::ChatTemplate chat_template = text::ChatTemplate::Original;
 };
 
 // A request, validated: what to generate and how to answer.

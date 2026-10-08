@@ -60,6 +60,9 @@ SCHEMA: tuple[Option, ...] = (
     _opt("ctx", "model", "flag", "--ctx", "int", 8192, "KV capacity in tokens",
          note="a longer prompt is a 400; ~26 KiB/token"),
     _opt("chunk", "model", "flag", "--chunk", "int", 512, "tokens per prefill chunk (activation buffers)"),
+    _opt("chat_template", "model", "flag", "--chat-template", "enum", "original",
+         "the chat template the server renders", choices=("original", "sharp"),
+         note="sharp: the vendored Qwen Sharp template (#392)"),
     # --- sampling
     _opt("temperature", "sampling", "flag", "--temp", "float", 0.0, "temperature; 0 is greedy",
          note="the fastest path"),

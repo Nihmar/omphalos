@@ -1,0 +1,43 @@
+template,prompt,seed,tokens,ms_per_token,accepted,drafted,stop,ok
+original,math,1,4,14.66,3,7,end of generation,True
+original,math,2,4,14.7,3,7,end of generation,True
+original,math,3,4,14.71,3,7,end of generation,True
+original,exact,1,5,11.81,4,7,end of generation,True
+original,exact,2,5,11.88,4,7,end of generation,True
+original,exact,3,5,11.84,4,7,end of generation,True
+original,code,1,21,8.32,18,21,end of generation,True
+original,code,2,21,8.34,18,21,end of generation,True
+original,code,3,21,8.33,18,21,end of generation,True
+original,prose,1,21,18.96,14,49,end of generation,True
+original,prose,2,22,28.18,11,77,end of generation,True
+original,prose,3,22,20.66,14,56,end of generation,True
+original,long-code,1,192,9.59,158,237,length,True
+original,long-code,2,192,9.84,157,235,length,True
+original,long-code,3,192,9.31,159,242,length,True
+original,long-prose,1,192,20.87,117,422,length,True
+original,long-prose,2,192,20.68,117,409,length,True
+original,long-prose,3,192,19.31,123,417,length,True
+original,tool,1,27,8.69,22,36,end of generation,True
+original,tool,2,27,8.68,22,36,end of generation,True
+original,tool,3,27,8.7,22,36,end of generation,True
+sharp,math,1,4,14.81,3,7,end of generation,True
+sharp,math,2,4,14.83,3,7,end of generation,True
+sharp,math,3,4,14.85,3,7,end of generation,True
+sharp,exact,1,5,11.9,4,7,end of generation,True
+sharp,exact,2,5,11.88,4,7,end of generation,True
+sharp,exact,3,5,11.92,4,7,end of generation,True
+sharp,code,1,21,8.36,18,21,end of generation,True
+sharp,code,2,16,7.44,14,14,end of generation,True
+sharp,code,3,21,8.39,18,21,end of generation,True
+sharp,prose,1,21,21.65,13,56,end of generation,True
+sharp,prose,2,22,25.73,12,70,end of generation,True
+sharp,prose,3,20,22.73,12,56,end of generation,True
+sharp,long-code,1,162,9.04,135,190,end of generation,True
+sharp,long-code,2,145,10.47,117,197,end of generation,True
+sharp,long-code,3,167,10.73,134,250,end of generation,True
+sharp,long-prose,1,192,22.69,110,430,length,True
+sharp,long-prose,2,192,21.51,114,414,length,True
+sharp,long-prose,3,192,21.3,115,415,length,True
+sharp,tool,1,27,8.71,22,36,end of generation,True
+sharp,tool,2,27,8.7,22,36,end of generation,True
+sharp,tool,3,27,8.7,22,36,end of generation,True

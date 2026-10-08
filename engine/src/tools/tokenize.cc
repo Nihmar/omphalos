@@ -6,6 +6,8 @@
 //   --chat: a JSON chat request on stdin (text/chat.hh) -> the rendered prompt (#150)
 //   --chat-ids: the same, tokenized
 //   --no-parse-special: control tokens written in the text stay text
+//   --chat-template original|sharp: the GGUF's template (default) or the
+//   vendored Qwen Sharp one (#392)
 #include "format/gguf.hh"
 #include "text/chat.hh"
 #include "text/json.hh"
@@ -28,6 +30,7 @@ int main(int argc, char ** argv) {
     bool parse_special = true;
     bool decode = false;
     int chat = 0;  // 1: render, 2: render + tokenize
+    omph::text::ChatTemplate tpl = omph::text::ChatTemplate::Original;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--no-parse-special") == 0) {
             parse_special = false;
@@ -37,6 +40,13 @@ int main(int argc, char ** argv) {
             chat = 1;
         } else if (std::strcmp(argv[i], "--chat-ids") == 0) {
             chat = 2;
+        } else if (std::strcmp(argv[i], "--chat-template") == 0 && i + 1 < argc) {
+            try {
+                tpl = omph::text::chat_template_from_string(argv[++i]);
+            } catch (const std::exception & e) {
+                std::fprintf(stderr, "%s\n", e.what());
+                return 2;
+            }
         } else {
             std::fprintf(stderr, "unknown option %s\n", argv[i]);
             return 2;
@@ -45,7 +55,7 @@ int main(int argc, char ** argv) {
     try {
         const std::string in((std::istreambuf_iterator<char>(std::cin)), std::istreambuf_iterator<char>());
         if (chat == 1) {
-            const std::string prompt = omph::text::render_chat(omph::text::Json::parse(in));
+            const std::string prompt = omph::text::render_chat(omph::text::Json::parse(in), tpl);
             std::fwrite(prompt.data(), 1, prompt.size(), stdout);
             return 0;
         }
@@ -54,8 +64,9 @@ int main(int argc, char ** argv) {
         // a chat prompt is rendered as segments: its structure parsed for
         // special tokens, the request's own text not (#292)
         const std::optional<std::vector<omph::text::Segment>> segments =
-            chat == 2 ? std::optional(omph::text::render_chat_segments(omph::text::Json::parse(in))) : std::nullopt;
-        const std::string text = chat == 1 ? omph::text::render_chat(omph::text::Json::parse(in)) : in;
+            chat == 2 ? std::optional(omph::text::render_chat_segments(omph::text::Json::parse(in), tpl))
+                      : std::nullopt;
+        const std::string text = chat == 1 ? omph::text::render_chat(omph::text::Json::parse(in), tpl) : in;
         if (decode) {
             std::istringstream ss(in);
             std::vector<int32_t> ids;

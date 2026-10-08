@@ -1,6 +1,9 @@
 // The model's chat template as code (#150): the GGUF's Jinja template (Qwen
 // ChatML with <think> blocks, tools and tool calls, vision placeholders),
-// rendered byte for byte as jinja2 renders it in HF transformers.
+// rendered byte for byte as jinja2 renders it in HF transformers. The second
+// built-in template is Qwen Sharp (#392), the vendored
+// engine/templates/qwen-sharp-v22.5.0.jinja reimplemented the same way
+// (engine/src/text/chat_sharp.cc).
 #pragma once
 
 #include <string>
@@ -11,6 +14,13 @@
 namespace omph::text {
 
 class Tokenizer;
+
+// The built-in chat templates: the GGUF's own, or the vendored Qwen Sharp.
+enum class ChatTemplate { Original, Sharp };
+
+// A --chat-template value: "original" or "sharp" (anything else throws).
+ChatTemplate chat_template_from_string(const std::string & name);
+const char * chat_template_name(ChatTemplate tpl);
 
 // A piece of a rendered prompt: the template's own text and special tokens
 // (`special`), or a string the request supplied -- a message's text, its
@@ -38,13 +48,18 @@ struct Segment {
 //   reasoning_effort       "xhigh" (default) | "medium" | "low"
 //   preserve_thinking      bool (missing: true)
 //   add_vision_id          bool ("Picture N: " before each image)
+// `tpl` selects the built-in template (Sharp takes the extra kwargs of
+// engine/templates/README.md; unknown ones are ignored).
 // Throws std::runtime_error with the template's own message where it raises.
-std::string render_chat(const Json & request);
+std::string render_chat(const Json & request, ChatTemplate tpl = ChatTemplate::Original);
 
 // The same rendering, split into structure and content (#292): the callers
 // that tokenize a prompt tokenize each segment with its own flag (see
 // tokenize_chat), so that the text of a message cannot inject a special token.
-std::vector<Segment> render_chat_segments(const Json & request);
+std::vector<Segment> render_chat_segments(const Json & request, ChatTemplate tpl = ChatTemplate::Original);
+
+// The Sharp renderer (#392), behind render_chat_segments.
+std::vector<Segment> render_chat_segments_sharp(const Json & request);
 
 // The segments' text, joined (what render_chat returns).
 std::string join_segments(const std::vector<Segment> & segments);

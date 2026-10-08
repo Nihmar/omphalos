@@ -132,6 +132,7 @@ the conversation growing stays fast.
 | `--port P` | `8080` | port |
 | `--ctx N` | `8192` | KV capacity in tokens: the hard limit of one conversation. A longer prompt is a 400; VRAM grows with it (~26 KiB per token with the default K/Q8 + V/Q4 cache, 0.87 GB at 32k, [#58](https://github.com/Nihmar/omphalos/issues/58)) |
 | `--chunk N` | `512` | tokens per prefill chunk, i.e. the size of the activation buffers |
+| `--chat-template NAME` | `original` | the chat template the server renders: `original` is the GGUF's own, `sharp` the vendored **Qwen Sharp** template ([#392](https://github.com/Nihmar/omphalos/issues/392)); both are C++ renderings, byte-identical to their Jinja source. Sharp accepts extra `chat_template_kwargs`: `terse` (bool, default true: the terseness block after the system prompt), `reasoning_effort` with its own levels and aliases (`none`/`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultracode`/`extreme`), `preserve_reasoning`, `suppress_tool_instructions`, `auto_disable_thinking_with_tools`, `tool_call_format` (`xml`/`json`), `max_tool_arg_chars`, `max_tool_response_chars`, `add_vision_id`. `/props` reports the active one as `chat_template_name` |
 | `--alias NAME` | the file name, minus a `.omph` suffix | the model id in `/v1/models` and in every response |
 | `--no-mtp` | off | do not load the MTP block: no speculative drafts, -352 MiB of VRAM |
 | `--dflash FILE` | off | draft with a DFlash2 drafter `.omph` (7 drafts per step) instead of the MTP block |
@@ -188,8 +189,8 @@ dropped in silence ([#284](https://github.com/Nihmar/omphalos/issues/284)).
 | `model` | ignored: the server serves the one model it was started with |
 | `tools` | declarations in the OpenAI shape; the template renders them into the prompt, and `<tool_call>` blocks in the answer come back as `tool_calls` |
 | `tool_choice` | only `"none"` (drop the tools from the prompt) |
-| `chat_template_kwargs` | `enable_thinking` (bool: the engine's `<think>` block, on unless turned off), `reasoning_effort` (`xhigh`/`medium`/`low`, the template's own switch, default `xhigh`), `preserve_thinking` (bool, default true: keep the history's reasoning blocks in the prompt) |
-| `reasoning_effort` | top level: `off`/`none`/`minimal` turn thinking off, `low`/`medium`/`xhigh` set it, `high` reads as `xhigh` |
+| `chat_template_kwargs` | `enable_thinking` (bool: the engine's `<think>` block, on unless turned off), `reasoning_effort` (`xhigh`/`medium`/`low`, the template's own switch, default `xhigh`), `preserve_thinking` (bool, default true: keep the history's reasoning blocks in the prompt). With `--chat-template sharp`, also `terse`, `preserve_reasoning`, `suppress_tool_instructions`, `auto_disable_thinking_with_tools`, `tool_call_format`, `max_tool_arg_chars`, `max_tool_response_chars`, `add_vision_id` ([#392](https://github.com/Nihmar/omphalos/issues/392)) |
+| `reasoning_effort` | top level: `off`/`none`/`minimal` turn thinking off, `low`/`medium`/`xhigh` set it, `high` reads as `xhigh`; with `--chat-template sharp` its own levels and aliases are accepted too (`off`/`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultracode`/`extreme`) |
 | `temperature` | `0` (or absent, with no default set) is greedy. Range `[0, 2]` |
 | `top_p`, `top_k`, `min_p` | applied in that order after the penalties; `top_p 1`, `top_k 0`, `min_p 0` are off |
 | `seed` | integer; makes the sampled draw reproducible |

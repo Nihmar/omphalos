@@ -61,7 +61,7 @@ No options besides the output path.
 ## omph-tokenize
 
 ```
-omph-tokenize <model.gguf> [--no-parse-special] [--decode | --chat | --chat-ids] < input
+omph-tokenize <model.gguf> [--no-parse-special] [--chat-template original|sharp] [--decode | --chat | --chat-ids] < input
 ```
 
 | option | effect |
@@ -71,11 +71,12 @@ omph-tokenize <model.gguf> [--no-parse-special] [--decode | --chat | --chat-ids]
 | `--chat` | a JSON chat request on stdin (`text/chat.hh`, the same object `omph-generate --chat` takes) -> the rendered prompt |
 | `--chat-ids` | the same, tokenized: the template's structure is parsed for special tokens, the request's own text is not (#292) |
 | `--no-parse-special` | control tokens written in the *text* stay text (only meaningful outside the chat modes) |
+| `--chat-template NAME` | `original` (the GGUF's own template, the default) or `sharp` (the vendored Qwen Sharp template, #392) |
 
-The `--chat` rendering is byte-identical to the GGUF's Jinja template as
-jinja2 renders it (`tools/check_chat_template.py`), and `--chat-ids` is what the
-server would tokenize, so it is the tool to use to see what the model is
-actually asked.
+The `--chat` rendering is byte-identical to its Jinja source as jinja2
+renders it (`tools/check_chat_template.py`, `--template sharp` for the vendored
+one), and `--chat-ids` is what the server would tokenize, so it is the tool to
+use to see what the model is actually asked.
 
 ## omph-generate
 

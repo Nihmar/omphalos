@@ -262,16 +262,33 @@ Job parse_request(const Json & body, const bool chat, const Defaults & defaults)
     // top-level reasoning_effort
     const Json & kwargs = body.get("chat_template_kwargs");
     if (kwargs.is_object()) {
-        for (const char * key : {"enable_thinking", "reasoning_effort", "preserve_thinking"}) {
+        // the GGUF template's switches, then Qwen Sharp's (#392): unknown
+        // keys in the request are not copied, the renderers ignore the rest
+        for (const char * key : {"enable_thinking", "reasoning_effort", "preserve_thinking",
+                                 "preserve_reasoning", "terse", "suppress_tool_instructions",
+                                 "auto_disable_thinking_with_tools", "tool_call_format",
+                                 "max_tool_arg_chars", "max_tool_response_chars", "add_vision_id"}) {
             if (const Json * v = kwargs.find(key)) req.set(key, *v);
         }
     }
     if (const Json * v = body.find("reasoning_effort"); v != nullptr && !v->is_null()) {
-        const std::string e = effort(*v);
-        if (e == "off") {
-            req.set("enable_thinking", Json::boolean(false));
-        } else {
+        if (defaults.chat_template == text::ChatTemplate::Sharp) {
+            // Sharp's own levels and aliases (#392, its README): the template
+            // resolves them, the server only validates the spelling
+            if (!v->is_string()) bad("reasoning_effort must be a string", "reasoning_effort");
+            const std::string & e = v->as_string();
+            if (e != "none" && e != "off" && e != "minimal" && e != "low" && e != "medium" && e != "high" &&
+                e != "xhigh" && e != "max" && e != "ultracode" && e != "extreme") {
+                bad("unsupported reasoning_effort " + e, "reasoning_effort");
+            }
             req.set("reasoning_effort", Json::string(e));
+        } else {
+            const std::string e = effort(*v);
+            if (e == "off") {
+                req.set("enable_thinking", Json::boolean(false));
+            } else {
+                req.set("reasoning_effort", Json::string(e));
+            }
         }
     }
     if (const Json * v = req.find("enable_thinking"); v != nullptr && !v->is_bool()) {
@@ -280,7 +297,7 @@ Job parse_request(const Json & body, const bool chat, const Defaults & defaults)
     const Json * et = req.find("enable_thinking");
     job.thinking = et == nullptr || et->as_bool();
     try {
-        job.prompt_segments = text::render_chat_segments(req);
+        job.prompt_segments = text::render_chat_segments(req, defaults.chat_template);
         job.prompt = text::join_segments(job.prompt_segments);
     } catch (const std::runtime_error & e) {
         bad(e.what(), "messages");

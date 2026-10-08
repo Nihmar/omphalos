@@ -143,6 +143,23 @@ int main() {
               !omph::server::base64_decode("SGk=SGk", bytes) && !omph::server::base64_decode("S*Gk", bytes),
           "base64 (URL-safe alphabet, padding)");
     CHECK(rejects(R"({"messages":[{"role":"assistant","content":"Hi"}]})"), "the template's own errors");
+    // #392: the Sharp template through the server's parsing: its own effort
+    // aliases and chat_template_kwargs, and the terse block on/off
+    omph::server::Defaults sharp_defaults;
+    sharp_defaults.chat_template = omph::text::ChatTemplate::Sharp;
+    const Job sharp = omph::server::parse_request(
+        Json::parse(R"({"messages":[{"role":"user","content":"Hi"}],"reasoning_effort":"max"})"), true,
+        sharp_defaults);
+    CHECK(sharp.prompt.rfind("<|im_start|>system\nReasoning effort is set to xhigh.", 0) == 0 &&
+              sharp.prompt.find("Answer directly, after thinking.") != std::string::npos,
+          "the sharp template renders: %s", sharp.prompt.substr(0, 80).c_str());
+    const Job sharp_off = omph::server::parse_request(
+        Json::parse(R"({"messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"terse":false}})"),
+        true, sharp_defaults);
+    CHECK(sharp_off.prompt.rfind("<|im_start|>user\nHi", 0) == 0,
+          "sharp terse off drops the terse system block: %s", sharp_off.prompt.substr(0, 40).c_str());
+    CHECK(rejects(R"({"messages":[{"role":"user","content":"Hi"}],"reasoning_effort":"max"})"),
+          "the original template still refuses Sharp's aliases");
     j = omph::server::parse_request(Json::parse(R"({"prompt":[[1,2,3]],"echo":true})"), false, {});
     CHECK(!j.chat && j.prompt_ids == std::vector<int32_t>({1, 2, 3}) && j.echo, "completions: token ids");
     CHECK(rejects(R"({"prompt":["a","b"]})", false), "completions: a batch of two");
