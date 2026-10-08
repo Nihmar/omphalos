@@ -44,6 +44,7 @@ struct EnvOptions {
     bool gdn_serial = false;    // OMPH_GDN_SERIAL: a chunk's delta rule in one launch (#96)
     bool gdn_exact = false;     // OMPH_GDN_EXACT: prefill delta rule per token, not the chunked WY form (#240)
     bool no_b4 = false;         // OMPH_NO_B4: no NT-token GEMVs (verification, --gemv prefill)
+    bool spec_pointmass = false;  // OMPH_SPEC_POINTMASS: sampled MTP drafts keep the point-mass rule (#394, A/B)
     bool no_group = false;      // OMPH_NO_GROUP: sibling GEMVs as separate launches (#214)
     bool no_swiglu_gemm = false;  // OMPH_NO_SWIGLU_GEMM: the FFN's up GEMM writes f32, then swiglu_f16 (#221)
     int64_t mtp_window = 16384;  // OMPH_MTP_WINDOW=N: the MTP block attends 16 sinks + the last N..2N positions (0: all; #171)

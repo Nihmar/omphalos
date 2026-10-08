@@ -364,6 +364,41 @@ void test_top_p_zero() {
     CHECK(d2.ids.size() == 1 && d2.ids[0] == 1, "top_p 0 must keep the argmax");
 }
 
+// #394: the residual draw norm(max(0, p - q)); q's mass above p's on a token
+// contributes nothing, and p == q (floating point) falls back to p without
+// the rejected token.
+void test_residual() {
+    Sampling s;
+    s.temperature = 1.0f;
+    Dist p, q;
+    std::vector<float> prow = row_of({3.0, 2.0}, 4);
+    omph::model::distribution(prow.data(), 4, s, {}, p);
+    std::vector<float> qrow = row_of({1.0, 1.0}, 4);
+    omph::model::distribution(qrow.data(), 4, s, {}, q);
+    CHECK(std::fabs(omph::model::prob_of(p, 0) - 0.6) < 1e-6, "prob_of p(0): %f",
+          omph::model::prob_of(p, 0));
+    CHECK(std::fabs(omph::model::prob_of(q, 0) - 0.5) < 1e-6, "prob_of q(0): %f",
+          omph::model::prob_of(q, 0));
+    CHECK(omph::model::prob_of(p, 3) == 0.0, "a dropped token has probability 0");
+    std::mt19937_64 rng(7);
+    for (int i = 0; i < 100; ++i) {
+        CHECK(omph::model::draw_residual(p, q, -1, rng) == 0, "p - q is (0.1, 0): only id 0");
+    }
+    Dist p2, q2;
+    std::vector<float> r2 = row_of({1.0, 1.0}, 4);
+    omph::model::distribution(r2.data(), 4, s, {}, p2);
+    std::vector<float> r3 = row_of({3.0, 1.0}, 4);
+    omph::model::distribution(r3.data(), 4, s, {}, q2);
+    for (int i = 0; i < 100; ++i) {
+        CHECK(omph::model::draw_residual(p2, q2, -1, rng) == 1, "q's mass above p's leaves only id 1");
+    }
+    // p == q: no residual mass at all, the exact fallback is p without the
+    // rejected token
+    for (int i = 0; i < 100; ++i) {
+        CHECK(omph::model::draw_residual(p2, p2, 0, rng) == 1, "p == q falls back to p without skip");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -379,6 +414,7 @@ int main() {
     test_draw();
     test_empty_candidates();
     test_top_p_zero();
+    test_residual();
     if (omph_test::failures == 0) {
         std::printf("test_sampler: ok\n");
     }

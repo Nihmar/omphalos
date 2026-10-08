@@ -216,6 +216,48 @@ int32_t draw(const Dist & d, const int32_t skip, std::mt19937_64 & rng) {
     return last;
 }
 
+double prob_of(const Dist & d, const int32_t id) {
+    if (!(d.total > 0.0)) {
+        return 0.0;
+    }
+    for (size_t i = 0; i < d.ids.size(); ++i) {
+        if (d.ids[i] == id) {
+            return d.w[i] / d.total;
+        }
+    }
+    return 0.0;
+}
+
+int32_t draw_residual(const Dist & p, const Dist & q, const int32_t skip, std::mt19937_64 & rng) {
+    // q's probabilities by id, for the lookup below; a token q dropped has 0
+    // (w/total directly: prob_of() is a linear search, and this is O(n^2) over
+    // a vocabulary-sized Dist)
+    std::vector<std::pair<int32_t, double>> qs;
+    qs.reserve(q.ids.size());
+    for (size_t i = 0; i < q.ids.size(); ++i) {
+        qs.emplace_back(q.ids[i], q.total > 0.0 ? q.w[i] / q.total : 0.0);
+    }
+    std::sort(qs.begin(), qs.end());
+    Dist r;
+    r.ids.reserve(p.ids.size());
+    r.w.reserve(p.ids.size());
+    for (size_t i = 0; i < p.ids.size(); ++i) {
+        const double pw = p.w[i] / p.total;
+        const auto it = std::lower_bound(qs.begin(), qs.end(), std::make_pair(p.ids[i], -1.0));
+        const double qw = it != qs.end() && it->first == p.ids[i] ? it->second : 0.0;
+        const double w = pw - qw;
+        if (w > 0.0) {
+            r.ids.push_back(p.ids[i]);
+            r.w.push_back(w);
+            r.total += w;
+        }
+    }
+    if (r.ids.empty() || !(r.total > 0.0)) {
+        return draw(p, skip, rng);  // only floating point can get here
+    }
+    return draw(r, -1, rng);
+}
+
 int32_t argmax_finite(const float * row, const int64_t nv) {
     int32_t best = 0;
     float best_v = -std::numeric_limits<float>::infinity();

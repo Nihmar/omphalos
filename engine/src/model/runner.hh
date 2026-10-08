@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <algorithm>
+#include <functional>
 #include <initializer_list>
 #include <map>
 #include <memory>
@@ -184,9 +185,17 @@ public:
     // Drafts `k` tokens after `token` at position `pos` (the next position to
     // fill, i.e. the length of the kept sequence): the MTP block on
     // (h_{pos-1}, token), then chained on its own output. With `logits`, every
-    // draft's logits row is appended to it (validation).
+    // draft's logits row is appended to it (validation). `pick`, when given,
+    // chooses each draft from its row instead of the argmax (sampled
+    // speculation, #394): the chain continues on the chosen token, so the row
+    // is the proposal distribution q of the token actually proposed.
+    // `prefix_logits` keeps the rows to the draft vocabulary's prefix
+    // (draft_vocab_rows) instead of the whole head; validation wants the whole
+    // head.
     bool mtp_draft(int32_t token, int64_t pos, int64_t k, std::vector<int32_t> & drafts,
-                   std::vector<float> * logits = nullptr);
+                   std::vector<float> * logits = nullptr,
+                   const std::function<int32_t(float *, int64_t)> * pick = nullptr,
+                   bool prefix_logits = false);
 
     // --- DFlash2 drafting (#245), with a drafter .omph given at construction ---
     // Its KV ring gets the kept tokens' target features like the MTP KV (after
@@ -450,7 +459,7 @@ private:
     // shared_head_norm + lm_head and returns the greedy token.
     bool mtp_block(const int32_t * toks, const float * h_in, int64_t pos0, int64_t T,
                    bool kv_only, int32_t * argmax = nullptr, std::vector<float> * logits = nullptr,
-                   const ForwardInputs * in = nullptr);
+                   const ForwardInputs * in = nullptr, bool prefix_logits = false);
     // the inputs of the forward being run (#160); its M-RoPE positions on the device
     const ForwardInputs * inputs_ = nullptr;
     void * mpos_dev_ = nullptr;
