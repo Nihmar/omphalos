@@ -21,7 +21,9 @@
 //                     read_file, file_glob_search, grep_search,
 //                     exec_shell_command, write_file, edit_file, get_info, or
 //                     "all". They run with this process's permissions (files,
-//                     shell): enable only where that is trusted (#380)
+//                     shell): enable only where that is trusted, and on a
+//                     non-loopback --host only together with --api-key (#380,
+//                     #387)
 //   --agent           --tools all, llama.cpp's shortcut
 //   --log-json        one JSON object per line on stderr for the ready line,
 //                     the requests' start and progress and the summary,
@@ -325,6 +327,13 @@ struct Server {
             }
             if (req.method != "POST") {
                 fail(c, 405, "use GET or POST");
+                return;
+            }
+            // A text/plain POST from a web page is a CORS-simple request: it
+            // would run a shell command with no preflight (#387).
+            const std::string * ct = req.header("content-type");
+            if (ct == nullptr || !omph::server::json_content_type(*ct)) {
+                fail(c, 415, "Content-Type: application/json is required");
                 return;
             }
             Json body;
@@ -890,6 +899,14 @@ int main(int argc, char ** argv) {
         enabled_tools = omph::server::tools::parse(tools_spec);
     } catch (const std::exception & e) {  // an unknown --tools name, before the model loads
         std::fprintf(stderr, "%s\n", e.what());
+        return 2;
+    }
+    if (!enabled_tools.empty() && api_key.empty() && !omph::server::is_loopback_host(host)) {
+        std::fprintf(stderr,
+                     "--tools on %s: the tools run shell commands and write files with this process's "
+                     "permissions, and a non-loopback bind is reachable from the network: set --api-key, "
+                     "or bind 127.0.0.1\n",
+                     host.c_str());
         return 2;
     }
     try {

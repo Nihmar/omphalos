@@ -69,4 +69,26 @@ inline bool json_content_type(const std::string & value) {
            (v.size() == n || v[n] == ';' || v[n] == ' ' || v[n] == '\t');
 }
 
+// Whether a --host names only the loopback interface: localhost and the
+// 127.0.0.0/8 / ::1 literals. Anything else (a LAN address, a wildcard bind)
+// is reachable from the network, so the server-side agent tools may not be
+// enabled there without an API key (#387).
+inline bool is_loopback_host(const std::string & host) {
+    const std::string h = lower_ascii(host);
+    if (h == "localhost" || h == "::1" || h == "[::1]") return true;
+    unsigned parts[4] = {0, 0, 0, 0};
+    int part = 0;
+    for (const char c : h) {
+        if (std::isdigit((unsigned char) c)) {
+            parts[part] = parts[part] * 10 + (unsigned) (c - '0');
+            if (parts[part] > 255) return false;
+        } else if (c == '.' && part < 3) {
+            ++part;
+        } else {
+            return false;
+        }
+    }
+    return part == 3 && parts[0] == 127;
+}
+
 } // namespace omph::server

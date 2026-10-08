@@ -475,6 +475,11 @@ def run_tools_checks(url: str, enabled: str) -> None:
                     "edit_file", "get_info"], f"GET /tools lists the seven: {names}")
     check(all(t["type"] == "server" and t["uses_cwd"] and "definition" in t for t in listed),
           "every entry has the UI's shape")
+    # #387: the tools run shell commands, so a text/plain POST (a CORS-simple
+    # request any web page could send) must not reach them
+    status, body = raw_post(url, "/tools", json.dumps({"tool": "get_info", "params": {}}).encode(),
+                            {"Content-Type": "text/plain"})
+    check(status == 415 and "error" in body, f"a text/plain POST /tools: {status}")
     with tempfile.TemporaryDirectory() as d:
         headers = {"x-tool-cwd": d}
         status, body = raw_post(url, "/tools", json.dumps(

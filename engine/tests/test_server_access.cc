@@ -9,6 +9,7 @@ namespace {
 
 using omph::server::bearer_key_ok;
 using omph::server::host_allowed;
+using omph::server::is_loopback_host;
 using omph::server::json_content_type;
 
 void test_bearer() {
@@ -53,12 +54,27 @@ void test_content_type() {
     CHECK(!json_content_type("application/xml"), "another type");
 }
 
+void test_loopback() {
+    CHECK(is_loopback_host("127.0.0.1"), "the default bind");
+    CHECK(is_loopback_host("127.0.0.2"), "any 127.0.0.0/8 address");
+    CHECK(is_loopback_host("localhost"), "localhost");
+    CHECK(is_loopback_host("LOCALHOST"), "localhost, any case");
+    CHECK(is_loopback_host("::1") && is_loopback_host("[::1]"), "the IPv6 loopback");
+    CHECK(!is_loopback_host("0.0.0.0"), "a wildcard bind");
+    CHECK(!is_loopback_host(""), "an empty host is the wildcard");
+    CHECK(!is_loopback_host("192.168.1.5"), "a LAN address");
+    CHECK(!is_loopback_host("127.evil.com"), "a name that starts like loopback");
+    CHECK(!is_loopback_host("128.0.0.1"), "the next block");
+    CHECK(!is_loopback_host("127.0.0.256"), "an out-of-range octet");
+}
+
 } // namespace
 
 int main() {
     test_bearer();
     test_host();
     test_content_type();
+    test_loopback();
     if (omph_test::failures == 0) {
         std::printf("test_server_access: ok\n");
     }
