@@ -10,11 +10,14 @@ windows on every text (`cmp`).
 
 | text (prompt tokens) | 1024 | 1536 | 1792 | 2048 (the model's) |
 |---|---:|---:|---:|---:|
-| prose (283, ring not full) | 5.300 | | | **5.290** |
-| code2k (2000) | **5.720** | 5.900 | 6.070 | 6.080 |
-| repetitive (2477, ring full) | **5.520** | | | 5.870 |
+| prose (283, ring not full) | 5.300 | | 5.290 | **5.290** |
+| code2k (2000) | **5.720** | 5.900 | 6.060 | 6.080 |
+| repetitive (2477, ring full) | **5.520** | | 5.710 | 5.870 |
 | edit, file + task (2311, ring full) | 8.040 | 7.760 | **4.810** | 5.140 |
-| wiki16k (16384, ring full) | 6.640 | | | **6.540** |
+| wiki16k (16384, ring full) | 6.640 | | **6.520** | 6.540 |
+
+(1792: medians of 5 on code2k and edit, two runs on repetitive, three on
+wiki16k; every cell's tokens equal plain greedy.)
 
 ms/token; the prose row is the control (the ring never fills, so no effect), and
 it shows the run-to-run spread is 0.01 ms.
@@ -31,9 +34,12 @@ it shows the run-to-run spread is 0.01 ms.
   The task's *relevant* context sits at a specific distance; a window that
   excludes it destroys the drafts, one that includes more of it than needed
   merely dilutes them.
-- **The default stays the model's 2048.** `OMPH_DFLASH_WINDOW` is the knob for a
-  workload whose context needs are known (a completion-only server at 1024:
-  +6.3 % on code), with the numbers above as the warning.
+- **1792 is >= the trained 2048 on all five texts** (edit +6.9 %, repetitive
+  +2.7 %, code2k +0.3 %, wiki16k +0.3 %, prose unchanged), so the engine's
+  default is 1792 (`OMPH_DFLASH_WINDOW=0` restores the model's own value).
+  Shorter than that is a workload-specific trade: 1024 wins more on local text
+  (code2k +5.9 % over 1792) and loses badly where the context is far back (the
+  file-edit prompt -40 %), with the numbers above as the warning.
 
 The measurement closes #417's "smaller LDS footprint" idea from the other side:
 the ring's *reads* can be cut, and the cost is the drafts' quality, not the

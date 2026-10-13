@@ -129,7 +129,8 @@ void Runner::dflash_load() {
     dfl_sel_next_ = next.dev;
     // #417's follow-up: the attention window may be shortened (the ring's
     // allocation and the tags stay the model's); a shorter window reads fewer
-    // ring rows per layer per step
+    // ring rows per layer per step and measured >= the trained 2048 on every
+    // text tried (bench/results/dflash-window-417.txt)
     dfl_swa_eff_ = env_.dflash_window > 0
                        ? std::min<int64_t>(std::max<int64_t>(env_.dflash_window, 16), dfl_swa_)
                        : dfl_swa_;
