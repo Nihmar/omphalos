@@ -56,11 +56,34 @@ timing matches main's within the run-to-run spread.
 - Everything together is -11.2 % at 16k and -30.5 % at 74.6k, so at 16k the K
   staging plus the softmax account for the whole attention.
 
-## What the next round should try
+## What was tried and what it rules out
 
-1. **The K staging's store pattern**: a conflict-free layout (the V staging's
-   `vt_at` pattern costs nothing; K's `ks_at` costs 7-14 %) or one 32-byte store
-   per job instead of two 16-byte ones, with the consumer's operand read adapted
-   to match (`&ks[ks_at(jt * 16 + (lane & 15), 2 * s + (lane >> 4))]`).
-2. Nothing else: the WMMAs and the rescale are hidden, the softmax is at its
-   rates (#422), and the V staging is neutral.
+1. **A 8-dim staging job** (one 16-byte slot per lane, so a quarter-wavefront of
+   8 lanes covers an LDS phase's 128 bytes exactly, with `gqa_load_k8`): the job
+   count, the scale loads and the load instructions all double and the wall
+   **loses 4 %** at 16k. The conflicts it removes are not the cost.
+2. **Packed conversions** in the 16-dim job (`__float22half2_rn`): no measurable
+   change - the compiler was already emitting the packed form.
+3. **K double-buffered with V single-buffered** (66.6 KB of LDS with both
+   doubled, over the 64 KB static limit; K double + V single is 50.2 KB): the
+   whole staging moves into the consumers' first phase (where the QK^T leaves
+   the issue slots free) and the second phase is the softmax and P V alone.
+   **Bit-identical** (KL 0.000000, top-1 100 % against the single-buffered
+   build) and **+2 % slower** (16845 / 16942 / 17115 ms against 16528-16773 at
+   16k). The phases are not serialized by the staging: the producers' and the
+   consumers' instructions contend for the same issue slots, so moving work
+   between the phases changes nothing, and the extra barriers/setup cost 2 %.
+4. The **K store pattern's conflicts** are therefore not a lever either: what
+   the K staging costs is its instruction count (the Q8 load, the int8 -> f32
+   -> f16 dequant, the two stores, the index arithmetic) and it is already at
+   what this decomposition can measure. **Nothing in the ablation points at a
+   cheaper way to feed the WMMAs.**
+
+## What the numbers say about the attention as a whole
+
+At 16k the attention is ~12 % of the prefill (K staging 6.2 points, softmax 4.6,
+everything else ~1) and at 74.6k ~27 % (K staging 14, softmax 5.8). Both of its
+halves are instruction-bound and at their measured rates: the softmax at the
+ISA's (#422), the dequant at what a Q8 cache costs. The remaining lever is a
+*cheaper operand* - an f16 K cache (memory, PLAN 13) or a dequant that produces
+its f16 values with fewer instructions - not the kernel's phase structure.
