@@ -148,8 +148,16 @@ __global__ __launch_bounds__(kPrepHd) void attn_prep_kernel(const AttnPrep a) {
     if (a.k_q8 == nullptr) {
         return;  // f32 cache: the caller copies the rows
     }
-    const long long dst = (pos * a.nkv + h) * kPrepHd;               // element offset
-    const long long sdst = (pos * a.nkv + h) * (kPrepHd / kKvBlock);  // scale offset
+    // #409 step 3: a row at or beyond kv_split goes to the staged buffer, at
+    // this call's token index, instead of the cache's position.
+    const bool staged = a.kv_split > 0 && pos >= a.kv_split;
+    uint8_t * kq8 = staged ? a.kst_q8 : a.k_q8;
+    __half * ksc = staged ? a.kst_scales : a.k_scales;
+    uint8_t * vq4 = staged ? a.vst_q4 : a.v_q4;
+    __half * vsc = staged ? a.vst_scales : a.v_scales;
+    const long long rpos = staged ? t : pos;
+    const long long dst = (rpos * a.nkv + h) * kPrepHd;               // element offset
+    const long long sdst = (rpos * a.nkv + h) * (kPrepHd / kKvBlock);  // scale offset
     const int b = d / (int) kKvBlock;
     const int lane = d & 31;
     if (a.k16 != nullptr && pos + a.ring >= a.pos0 + a.tokens) {  // FP16 ring (#48, #161)
@@ -165,15 +173,15 @@ __global__ __launch_bounds__(kPrepHd) void attn_prep_kernel(const AttnPrep a) {
         const float sc = amax / 127.0f;
         const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
         if (lane == 0) {
-            a.k_scales[sdst + b] = __float2half(sc);
+            ksc[sdst + b] = __float2half(sc);
         }
         const int q = (int) rintf(x * inv);
-        a.k_q8[dst + d] = (uint8_t) (int8_t) (q > 127 ? 127 : (q < -127 ? -127 : q));
+        kq8[dst + d] = (uint8_t) (int8_t) (q > 127 ? 127 : (q < -127 ? -127 : q));
     } else {
-        const float vsc = amax / 7.0f;
+        const float vsc_v = amax / 7.0f;
         const float vinv = amax > 0.0f ? 7.0f / amax : 0.0f;
         if (lane == 0) {
-            (is_k ? a.k_scales : a.v_scales)[sdst + b] = __float2half(vsc);
+            (is_k ? ksc : vsc)[sdst + b] = __float2half(vsc_v);
         }
         const float x_hi = __shfl(x, (lane + 16) & 31);  // value lane + 16 of the block
         if (lane < (int) kKvBlock / 2) {
@@ -181,7 +189,7 @@ __global__ __launch_bounds__(kPrepHd) void attn_prep_kernel(const AttnPrep a) {
             const int q1 = (int) rintf(x_hi * vinv);
             const int c0 = q0 > 7 ? 7 : (q0 < -8 ? -8 : q0);
             const int c1 = q1 > 7 ? 7 : (q1 < -8 ? -8 : q1);
-            (is_k ? a.k_q8 : a.v_q4)[dst / 2 + b * (kKvBlock / 2) + lane] =
+            (is_k ? kq8 : vq4)[dst / 2 + b * (kKvBlock / 2) + lane] =
                 (uint8_t) (((c0 + 8) & 0xF) | (((c1 + 8) & 0xF) << 4));
         }
     }

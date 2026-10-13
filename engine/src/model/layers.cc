@@ -103,6 +103,16 @@ bool Runner::attn_layer(const int64_t il, const LayerWeights & L, const int64_t 
         prep.v16 = kv.window > 0 ? reinterpret_cast<__half *>(kv.q.v16) : nullptr;
         prep.ring = kv.ring;
         prep.k_q4 = kv.k_q4;
+        // #409 step 3: with the streaming working set, the rows at or beyond
+        // the resident prefix go to the write staging (by token index) instead
+        // of the cache, and the MTP block keeps its whole window in its cache.
+        if (kv_split_ > 0 && il < h_.n_layer) {
+            prep.kv_split = kv_split_;
+            prep.kst_q8 = static_cast<uint8_t *>(kv_wstg_k_);
+            prep.kst_scales = static_cast<__half *>(kv_wstg_ks_);
+            prep.vst_q4 = static_cast<uint8_t *>(kv_wstg_vq_);
+            prep.vst_scales = static_cast<__half *>(kv_wstg_vs_);
+        }
     }
     if (!proj_ok || !omph::kernels::attn_prep(prep, nullptr)) {
         return fail("attention prep failed");
@@ -110,6 +120,16 @@ bool Runner::attn_layer(const int64_t il, const LayerWeights & L, const int64_t 
     // #409 step 1: the KV the kernel just wrote goes to the host store too.
     if (kv.quant && !kv_stream_mirror(kv.layer, kv.q, pos0, T)) {
         return false;
+    }
+    // #409 step 3: a prefill chunk (more than the decode tiles' tokens) has no
+    // fixed key splits in the attention, so its key range cannot be staged: the
+    // prompt must fit the resident KV. Checked here, where the chunk's position
+    // and size are known, and only for the stack (the MTP block's cache is
+    // windowed and complete).
+    if (kv_split_ > 0 && il < h_.n_layer && T > omph::kernels::kAttentionDecTokens &&
+        pos0 + T > kv_split_) {
+        return fail("OMPH_KV_STREAM_MIB: the prompt does not fit the resident KV (a prefill "
+                    "chunk cannot attend to streamed rows yet; raise the budget)");
     }
     if (kv_only) {
         if (!kv.quant &&
@@ -248,27 +268,43 @@ bool Runner::gdn_layer(const int64_t il, const LayerWeights & L, const int64_t T
     return true;
 }
 
+// The device cache's per-layer pointers (#409 step 3: its strides are the
+// resident row count, not the context's).
 Runner::QuantKv Runner::quant_kv(const int64_t il) const {
     const int64_t kv_out = h_.n_head_kv * h_.head_dim;
     const int64_t nblk = h_.head_dim / 32;
     const int64_t kvl = kv_index_[il];
     return {static_cast<uint8_t *>(kv_kq_) + kv_kq_off_[(size_t) kvl],
-            static_cast<uint8_t *>(kv_ks_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2,
-            static_cast<uint8_t *>(kv_vq_) + kvl * max_seq_ * kv_out / 2,
-            static_cast<uint8_t *>(kv_vs_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2,
+            static_cast<uint8_t *>(kv_ks_) + kvl * kv_rows_ * h_.n_head_kv * nblk * 2,
+            static_cast<uint8_t *>(kv_vq_) + kvl * kv_rows_ * kv_out / 2,
+            static_cast<uint8_t *>(kv_vs_) + kvl * kv_rows_ * h_.n_head_kv * nblk * 2,
             static_cast<uint8_t *>(kv_k16_) + kvl * kv_ring_ * kv_out * 2,
             static_cast<uint8_t *>(kv_v16_) + kvl * kv_ring_ * kv_out * 2};
 }
 
-// #409 step 1: mirror the rows attn_prep just wrote into the pinned host store.
-// Copying the writes rather than counting rows is what makes a rewind free: a
-// rejected draft or a re-prefill rewrites the same rows and is mirrored again
-// (#122, #342). The store is not read yet (the ring of step 3 is what reads
-// it), so a run with OMPH_KV_STREAM must be bit-identical to one without.
-// OMPH_KV_STREAM_CHECK reads the same rows back once and compares them. It
-// catches a copy that failed and an offset that ran past the store; a
-// wrong-but-in-bounds offset is written and read by the same arithmetic, so it
-// is step 3's attention, reading the store, that is the content witness.
+// #409 step 3: the host store's per-layer pointers. It has the same layout as
+// the device cache, but spans the whole context (the rows past the resident
+// prefix live only here) -- hence its own K offset table.
+Runner::HostKv Runner::host_kv(const int64_t layer) const {
+    const int64_t kvl = kv_index_[(size_t) layer];
+    const int64_t kv_out = h_.n_head_kv * h_.head_dim;
+    const size_t sc_row = (size_t) h_.n_head_kv * (h_.head_dim / 32) * 2;
+    return {static_cast<const uint8_t *>(kv_sh_kq_) + kv_sh_kq_off_[(size_t) kvl],
+            static_cast<const uint8_t *>(kv_sh_ks_) + (size_t) kvl * max_seq_ * sc_row,
+            static_cast<const uint8_t *>(kv_sh_vq_) + (size_t) kvl * max_seq_ * kv_out / 2,
+            static_cast<const uint8_t *>(kv_sh_vs_) + (size_t) kvl * max_seq_ * sc_row};
+}
+
+// #409 step 1/3: publish the rows attn_prep just wrote into the pinned host
+// store, the authoritative copy of the whole history. Copying the writes rather
+// than counting rows is what makes a rewind free: a rejected draft or a
+// re-prefill rewrites the same rows and is published again (#122, #342). With
+// the streaming mode the device cache holds the resident prefix only, and the
+// rows at or beyond `kv_split_` come from the write staging instead (at their
+// token index in this call). OMPH_KV_STREAM_CHECK reads every range back once
+// and compares it: it catches a copy that failed and an offset that ran past
+// the store; a wrong-but-in-bounds offset is written and read by the same
+// arithmetic, so the attention reading the store is the content witness.
 // `layer` is the stack's attention layer; the MTP block's cache is not mirrored.
 bool Runner::kv_stream_mirror(const int64_t layer, const QuantKv & q, const int64_t pos0,
                               const int64_t T) {
@@ -281,39 +317,61 @@ bool Runner::kv_stream_mirror(const int64_t layer, const QuantKv & q, const int6
     const size_t sc_row = (size_t) h_.n_head_kv * (h_.head_dim / 32) * 2;
     const size_t v_row = (size_t) attn_kv / 2;
     const struct Part {
-        void * host;      // the mirror's per-layer base (the device's offsets)
-        const void * dev;
+        void * host;      // the store's per-layer base (over the whole context)
+        const void * dev;  // the device cache's per-layer base (the resident rows)
+        const void * wstg;  // the write staging (rows >= kv_split_)
         size_t row;
         const char * name;
     } parts[] = {
-        {static_cast<uint8_t *>(kv_sh_kq_) + kv_kq_off_[(size_t) kvl], q.kq, k_row, "K"},
-        {static_cast<uint8_t *>(kv_sh_ks_) + (size_t) kvl * max_seq_ * sc_row, q.ksc, sc_row,
-         "K scales"},
-        {static_cast<uint8_t *>(kv_sh_vq_) + (size_t) kvl * max_seq_ * v_row, q.vq, v_row, "V"},
-        {static_cast<uint8_t *>(kv_sh_vs_) + (size_t) kvl * max_seq_ * sc_row, q.vsc, sc_row,
-         "V scales"},
+        {static_cast<uint8_t *>(kv_sh_kq_) + kv_sh_kq_off_[(size_t) kvl], q.kq, kv_wstg_k_, k_row,
+         "K"},
+        {static_cast<uint8_t *>(kv_sh_ks_) + (size_t) kvl * max_seq_ * sc_row, q.ksc, kv_wstg_ks_,
+         sc_row, "K scales"},
+        {static_cast<uint8_t *>(kv_sh_vq_) + (size_t) kvl * max_seq_ * v_row, q.vq, kv_wstg_vq_,
+         v_row, "V"},
+        {static_cast<uint8_t *>(kv_sh_vs_) + (size_t) kvl * max_seq_ * sc_row, q.vsc, kv_wstg_vs_,
+         sc_row, "V scales"},
     };
-    for (const Part & p : parts) {
-        const size_t bytes = (size_t) T * p.row;
-        const uint8_t * from = static_cast<const uint8_t *>(p.dev) + (size_t) pos0 * p.row;
-        uint8_t * to = static_cast<uint8_t *>(p.host) + (size_t) pos0 * p.row;
+    // one contiguous range, device source -> the store, with the check
+    const auto publish = [&](const Part & p, const uint8_t * from, const int64_t a, const int64_t b) {
+        if (b <= a) {
+            return true;
+        }
+        const size_t bytes = (size_t) (b - a) * p.row;
+        uint8_t * to = static_cast<uint8_t *>(p.host) + (size_t) a * p.row;
         if (hipMemcpyAsync(to, from, bytes, hipMemcpyDeviceToHost, nullptr) != hipSuccess) {
-            return fail("host KV mirror copy failed");
+            return fail("host KV store copy failed");
         }
         if (kv_sh_scratch_ == nullptr) {
-            continue;
+            return true;
         }
         if (bytes > kv_sh_scratch_bytes_) {
-            return fail("host KV mirror check: chunk larger than max_tokens");
+            return fail("host KV store check: chunk larger than max_tokens");
         }
         if (hipMemcpy(kv_sh_scratch_, from, bytes, hipMemcpyDeviceToHost) != hipSuccess) {
-            return fail("host KV mirror check read failed");
+            return fail("host KV store check read failed");
         }
         if (std::memcmp(kv_sh_scratch_, to, bytes) != 0) {
             char msg[160];
-            std::snprintf(msg, sizeof(msg), "host KV mirror mismatch: layer %lld pos0 %lld, %s",
+            std::snprintf(msg, sizeof(msg), "host KV store mismatch: layer %lld pos0 %lld, %s",
                           (long long) layer, (long long) pos0, p.name);
             return fail(msg);
+        }
+        return true;
+    };
+    for (const Part & p : parts) {
+        // rows below the split (all of them, when the streaming mode is off)
+        const int64_t cut = kv_split_ > 0 ? std::min(pos0 + T, kv_split_) : pos0 + T;
+        if (!publish(p, static_cast<const uint8_t *>(p.dev) + (size_t) pos0 * p.row, pos0, cut)) {
+            return false;
+        }
+        // and the rows this call wrote to the write staging
+        if (kv_split_ > 0 && pos0 + T > kv_split_) {
+            const int64_t w0 = std::max(pos0, kv_split_);
+            if (!publish(p, static_cast<const uint8_t *>(p.wstg) + (size_t) (w0 - pos0) * p.row, w0,
+                         pos0 + T)) {
+                return false;
+            }
         }
     }
     return true;
@@ -325,49 +383,93 @@ bool Runner::kv_stream_mirror(const int64_t layer, const QuantKv & q, const int6
 // same one, so the result is bit-identical to the single call (#409,
 // bench/results/kv-stream-409-splits.txt); the staging and the staged base
 // (`kbase`) are the machinery step 3 points at the host store.
-bool Runner::attn_splits_staged(const omph::kernels::KvCache & kv, const bool q8, const int64_t t0,
-                                const int64_t n, const int64_t seq, const float scale) {
+bool Runner::attn_splits_staged(const omph::kernels::KvCache & kv, const int64_t layer,
+                                const bool q8, const int64_t t0, const int64_t n,
+                                const int64_t seq, const int64_t pos0, const float scale) {
     const int64_t qrow = h_.n_head * h_.head_dim;
+    // #409 step 3: a decode / verification keeps the WMMA decode tiles; a
+    // prefill chunk (more than kAttentionDecTokens tokens) has no fixed splits
+    // in the WMMA flash kernel, whose key loop cannot resume over staged ranges
+    // yet, so it runs the scalar kernel (step 5's item).
+    const bool wmma = n <= omph::kernels::kAttentionDecTokens;
     const auto call = [&](const omph::kernels::KvCache & c, const int64_t split0, const int64_t ns,
                           const bool merge) {
         return omph::kernels::attention_gqa_range(
             static_cast<const float *>(q_) + t0 * qrow, c,
             static_cast<const float *>(gate_) + t0 * qrow, nullptr, n, seq, h_.n_head, h_.n_head_kv,
             h_.head_dim, scale, q8, attn_work_, attn_work_bytes_, nullptr,
-            static_cast<__half *>(ffn16_) + t0 * qrow, !env_.attn_scalar, key_chunk_,
+            static_cast<__half *>(ffn16_) + t0 * qrow, !env_.attn_scalar && wmma, key_chunk_,
             !env_.attn_dec_scalar, split0, ns, merge);
     };
+    // step 3 runs the scalar kernel over the same fixed chunks for a prefill
+    // chunk (the WMMA flash kernel cannot resume over staged ranges yet, step 5)
     const omph::kernels::AttentionSplits sp = omph::kernels::attention_dec_splits(seq, key_chunk_);
     if (kv_groups_ < 2 || sp.splits <= 1 || sp.keys <= 0) {
         return call(kv, 0, 0, true);
     }
-    const int64_t groups = std::min(kv_groups_, sp.splits);
-    const int64_t per_group = (sp.splits + groups - 1) / groups;
     const int64_t kv_out = h_.n_head_kv * h_.head_dim;
     const size_t k_row = (size_t) (kv.k_q4 ? kv_out / 2 : kv_out);
     const size_t sc_row = (size_t) h_.n_head_kv * (h_.head_dim / 32) * 2;
     const size_t v_row = (size_t) kv_out / 2;
-    omph::kernels::KvCache staged = kv;
-    staged.k_q8 = static_cast<const uint8_t *>(kv_g_k_);
-    staged.k_scales = kv_g_ks_;
-    staged.v_q4 = static_cast<const uint8_t *>(kv_g_vq_);
-    staged.v_scales = kv_g_vs_;
-    for (int64_t split0 = 0; split0 < sp.splits; split0 += per_group) {
-        const int64_t ns = std::min(per_group, sp.splits - split0);
-        const int64_t r0 = split0 * sp.keys;
-        const int64_t r1 = std::min(r0 + ns * sp.keys, seq);
-        const size_t rows = (size_t) (r1 - r0);
-        const auto stage = [&](void * dst, const void * src, const size_t row) {
-            return hipMemcpyAsync(dst, static_cast<const uint8_t *>(src) + (size_t) r0 * row,
-                                  rows * row, hipMemcpyDeviceToDevice, nullptr) == hipSuccess;
-        };
-        if (!stage(kv_g_k_, kv.k_q8, k_row) || !stage(kv_g_ks_, kv.k_scales, sc_row) ||
-            !stage(kv_g_vq_, kv.v_q4, v_row) || !stage(kv_g_vs_, kv.v_scales, sc_row)) {
-            return fail("KV split staging failed");
-        }
-        staged.kbase = r0;
-        if (!call(staged, split0, ns, false)) {
-            return false;
+    // #409 step 3: every split below kv_split_ is resident, and they are one
+    // contiguous range of splits (kv_split_ is a whole number of chunks): one
+    // call with no copies at all.
+    int64_t split_res = kv_split_ > 0 ? std::min(kv_split_ / sp.keys, sp.splits) : 0;
+    if (split_res > 0 && !call(kv, 0, split_res, false)) {
+        return false;
+    }
+    const int64_t remaining = sp.splits - split_res;
+    if (remaining > 0) {
+        const int64_t groups = std::min(kv_groups_, remaining);
+        const int64_t per_group = (remaining + groups - 1) / groups;
+        omph::kernels::KvCache staged = kv;
+        staged.k_q8 = static_cast<const uint8_t *>(kv_g_k_);
+        staged.k_scales = kv_g_ks_;
+        staged.v_q4 = static_cast<const uint8_t *>(kv_g_vq_);
+        staged.v_scales = kv_g_vs_;
+        const HostKv store = kv_split_ > 0 && layer >= 0 ? host_kv(layer) : HostKv{};
+        for (int64_t split0 = split_res; split0 < sp.splits; split0 += per_group) {
+            const int64_t ns = std::min(per_group, sp.splits - split0);
+            const int64_t r0 = split0 * sp.keys;
+            const int64_t r1 = std::min(r0 + ns * sp.keys, seq);
+            // stage [a, b) of each component into the group buffer, whose row 0
+            // is r0: `src` is the device cache, the host store or the write
+            // staging, and `base` is the cache position of its row 0.
+            const auto stage = [&](const void * sk, const void * sks, const void * svq,
+                                   const void * svs, const int64_t a, const int64_t b,
+                                   const int64_t base, const bool host) {
+                if (b <= a) {
+                    return true;
+                }
+                const size_t rows = (size_t) (b - a);
+                const size_t off = (size_t) (a - r0);
+                const auto mv = [&](void * dst, const void * src, const size_t row) {
+                    return hipMemcpyAsync(static_cast<uint8_t *>(dst) + off * row,
+                                          static_cast<const uint8_t *>(src) + (size_t) (a - base) * row,
+                                          rows * row,
+                                          host ? hipMemcpyHostToDevice : hipMemcpyDeviceToDevice,
+                                          nullptr) == hipSuccess;
+                };
+                return mv(kv_g_k_, sk, k_row) && mv(kv_g_ks_, sks, sc_row) && mv(kv_g_vq_, svq, v_row) &&
+                       mv(kv_g_vs_, svs, sc_row);
+            };
+            if (kv_split_ > 0) {
+                // the rows this step has not written yet come from the store,
+                // the ones it just wrote from the write staging
+                const int64_t cut = std::min<int64_t>(r1, pos0);
+                const int64_t w0 = std::max<int64_t>(r0, pos0);
+                if (!stage(store.kq, store.ksc, store.vq, store.vsc, r0, cut, 0, true) ||
+                    !stage(kv_wstg_k_, kv_wstg_ks_, kv_wstg_vq_, kv_wstg_vs_, w0, r1, pos0, false)) {
+                    return fail("KV group staging failed");
+                }
+            } else if (!stage(kv.k_q8, kv.k_scales, kv.v_q4, kv.v_scales, r0, r1, 0, false)) {
+                // step 2's diagnostics mode: every group from the device cache
+                return fail("KV group staging failed");
+            }
+            staged.kbase = r0;
+            if (!call(staged, split0, ns, false)) {
+                return false;
+            }
         }
     }
     // the merge over every split: the partials are at their global indices
@@ -390,11 +492,15 @@ bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T
     const auto attend = [&](const omph::kernels::KvCache & kv, const bool q8) {
         for (int64_t t0 = 0; t0 < T; t0 += group) {
             const int64_t n = std::min(group, T - t0);
-            // #409 step 2: with the split groups on, a decode / verification
-            // call stages each group of key splits and merges at the end.
-            const bool grouped = kv_groups_ > 1 && n <= omph::kernels::kAttentionDecTokens;
+            // #409 step 2/3: with the split groups on (or the streaming working
+            // set), a call stages each group of key splits and merges at the end.
+            // The MTP block (layer < 0) keeps its whole windowed cache and its
+            // single call: its rows are not the stack's positions.
+            const bool grouped = kv_groups_ > 1 && kv_in.layer >= 0 &&
+                                 n <= omph::kernels::kAttentionDecTokens;
             const bool ok = grouped
-                                ? attn_splits_staged(kv, q8, t0, n, pos0 + t0 + n, scale)
+                                ? attn_splits_staged(kv, kv_in.layer, q8, t0, n, pos0 + t0 + n, pos0,
+                                                     scale)
                                 : omph::kernels::attention_gqa(
                                       static_cast<const float *>(q_) + t0 * qrow, kv,
                                       static_cast<const float *>(gate_) + t0 * qrow, nullptr, n,

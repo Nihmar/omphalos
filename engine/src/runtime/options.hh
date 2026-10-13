@@ -52,6 +52,13 @@ struct EnvOptions {
     // buffer of its own (#409 step 2: the shape host streaming needs, with the
     // rows still copied from VRAM). 0 or 1: the single call.
     int64_t attn_split_groups = 0;
+    // OMPH_KV_STREAM_MIB=N: how much VRAM the resident quantized KV may use
+    // (#409 step 3). The device cache keeps its first R rows, R derived from N
+    // and rounded down to whole key chunks (every split is then wholly resident
+    // or wholly streamed); rows at or beyond R live in the pinned host store
+    // and are staged a group of splits at a time. Requires OMPH_KV_STREAM.
+    // 0: off, the whole context resident (the pre-#409 behaviour).
+    int64_t kv_stream_mib = 0;
 
     // --- decode paths (A/B switches)
     bool overlap = false;       // OMPH_OVERLAP: a side stream for sibling GEMVs (#71; off by default, #189)

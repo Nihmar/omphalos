@@ -39,6 +39,9 @@ EnvOptions EnvOptions::from_env() {
     }
     o.kv_stream = flag("OMPH_KV_STREAM");
     o.kv_stream_check = flag("OMPH_KV_STREAM_CHECK");
+    if (const char * m = std::getenv("OMPH_KV_STREAM_MIB")) {
+        o.kv_stream_mib = std::atoll(m);
+    }
     if (const char * g = std::getenv("OMPH_ATTN_SPLIT_GROUPS")) {
         o.attn_split_groups = std::atoll(g);
     }

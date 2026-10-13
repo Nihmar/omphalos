@@ -1,0 +1,74 @@
+# #409 step 3 (decode): a capped resident KV, the rest streamed from the host store.
+# Engine feat/409-kv-stream-decode, RX 9060 XT 16 GB, 2026-10-13, desktop running.
+# Model Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph (models/ are symlinks to the speed disk).
+#
+# What the mode is: OMPH_KV_STREAM=1 OMPH_KV_STREAM_MIB=N caps the quantized
+# cache's VRAM. The device keeps a prefix of R rows (R derived from N, rounded
+# down to whole key chunks), rows at or beyond R are written to a small write
+# staging, published to the pinned host store, and streamed back a group of key
+# splits at a time when the attention needs them (the machinery of steps 1-2).
+# R and the store's size are reported at load under OMPH_TIMING.
+#
+# Prompt: /var/tmp/omphalos-prompts/wiki512.txt truncated to 256 ids (so that the
+# prompt fits R); the KV capacity is prompt + generate (+ margin), as omph-run
+# sizes it.
+
+## 1. Bit-identity: the streamed decode equals the resident one
+
+# 2000 generated tokens, MTP k = 3, budget 32 MiB (R = 1472 of 2264 rows,
+# ~700 rows streamed at the end):
+cmp <resident --gen-out> <streamed --gen-out>   # identical, 2000 ids
+# and at 600 tokens, each against its own resident reference:
+mixed K4/K8 (the default)     identical
+with OMPH_KV_K4=1 (K4/V4)     identical
+with OMPH_ATTN_DEC_SCALAR=1   identical (the scalar decode kernel's splits)
+with OMPH_KV_STREAM_CHECK=1   identical and no store mismatch (the check reads
+                              every published range back, the write staging
+                              included)
+cmp <2000-token resident --logits-tail 64> <same with 16/32/64 MiB>  # identical
+
+## 2. Cost (same 2000-token run, prompt 256, R = 1472 rows)
+
+#   resident:           12.78 ms per generated token, 27 s wall
+#   streamed (32 MiB):  13.17 ms per generated token, 27 s wall, +3 %
+# The streamed part grows during the generation (0 -> ~700 rows); the +0.39 ms
+# per token is 0.56 ms per step at the end, i.e. 15.8 MB / 28 GB/s: the phase-0
+# per-row cost (~0.9 us per stack row per step) at work. At a 100k-row streamed
+# tail it is ~80 ms per step (~35 ms/token at the measured acceptance) -- the
+# step-3b copy-stream overlap is what attacks that.
+
+## 3. The prefill guard, and why a streamed prefill is out of reach for now
+
+# A prefill chunk (more than the decode tiles' 8 tokens) runs the WMMA flash
+# kernel, which walks its whole key range in one launch and has no fixed splits:
+# it cannot read a partially staged cache. With streaming on, a chunk that would
+# read rows past R is refused:
+OMPH_KV_STREAM=1 OMPH_KV_STREAM_MIB=8 omph-run ... --tokens 4096 ...
+-> "OMPH_KV_STREAM_MIB: the prompt does not fit the resident KV (a prefill chunk
+   cannot attend to streamed rows yet; raise the budget)", engine exit 1.
+# The alternative -- staging the prefix for every prefill chunk -- is
+# quadratically expensive and cannot be fixed by the patch size: every chunk of C
+# queries reads the whole streamed prefix once, so a prompt of P tokens pays
+# P^2/(2C) stack rows of PCIe (22.5 KB each). At P = 262144, C = 512, that is
+# 1.5 TB, ~15 hours at 28 GB/s: a streamed prefill is not a slow path, it is an
+# unusable one. Keeping the prefix on the device is what makes prefill
+# affordable at all (1.5 TB at 318 GB/s = 4.7 s).
+# Consequence for the issue's goal: a 262144-token *prompt* cannot be streamed;
+# what the mode delivers is a *capped* KV for contexts that grow by generation
+# (a long agentic turn), where each step pays the streamed tail once.
+# Unlocking streamed prompts needs the flash kernel's key loop to resume over
+# staged ranges (write its m/l/acc state and continue) -- a kernel project, and
+# even then the traffic is P^2/(2C) per *phase*, so the prefill stays the place
+# where a resident KV pays for itself.
+
+## 4. VRAM
+
+# The KV is ~22.5 KB per stack row (mixed K4/K8 + V4), so the cap is real only
+# in the tens of thousands of rows: R = 1472 rows is 33 MiB, R = 100k rows is
+# 2.2 GiB. Together with the FP16 ring (~33 MiB) and the group and write staging
+# (a few tens of MiB), OMPH_KV_STREAM_MIB is the whole KV budget the engine uses
+# on the device.
+#
+# Smoke numbers at this scale (prompt 256, generate 8): load 11308 MiB resident
+# against 11306 MiB streamed -- the 272-row cache is too small for the saving to
+# show; it shows at contexts where the KV is gigabytes.
