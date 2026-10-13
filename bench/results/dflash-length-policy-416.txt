@@ -1,0 +1,55 @@
+# #416: the speculative length policy, measured (DFlash2)
+
+Engine main 15efa7d + `test/416-dflash-length-policy`, RX 9060 XT 16 GB. Drafter
+`Qwen3.8-27B-DFlash2-Q4_K_M.omph`, `omph-run --gemv --last-logits --generate 384
+--dflash`, three texts (`prose` 283 prompt tokens, `code2k` 2000, `repetitive`
+2477) plus `edit` (2311: a source file followed by its own head, so the output
+copies it). llama.cpp: v0.6.0 @ d81235049 (no llama.cpp run).
+
+Three runs per cell; the engine is deterministic, the spreads are 0.00-0.01 ms.
+
+| text | fixed 11 (default) | cap 15 + keep 0.12 | cap 15, no rule |
+|---|---:|---:|---:|
+| prose | 5.30 ms -> 188.7 t/s | 5.30 -> 188.7 (ties) | 5.12 -> 195.3 |
+| code2k | **6.08 -> 164.5** | 6.40 -> 156.2 (-5 %) | 6.42 -> 155.8 |
+| repetitive | 5.87 -> 170.4 | **5.56 -> 179.9 (+5.6 %)** | 5.57 -> 179.5 |
+| edit | 5.14 -> 194.6 | **4.89 -> 204.5 (+5.1 %)** | 4.89 -> 204.5 |
+
+## What the keep rule did
+
+The per-position keep rates are EMAs (`Runner::dflash_observe`). At the old
+weight 1/16 a tail position needed ~32 observations to fall below the 0.12
+threshold — longer than most generations — so the block stayed at its cap and
+the cap-15 runs behaved as fixed 15. At 1/4 the cut lands within ~6 steps:
+
+| text, cap 15 | drafted rows | per step | steps |
+|---|---:|---:|---:|
+| code2k, keep 0 | 585 | 15.0 | 39 |
+| code2k, keep 0.12 | 510 | 12.75 | 40 |
+| prose, keep 0 | 525 | 15.0 | 35 |
+| prose, keep 0.12 | 474 | 12.8 | 37 |
+
+So the rule cuts to ~12.8 on both prose and code: it does not discriminate the
+text where the tail is worthless (prose: the accepted total is the same, 350 vs
+351) from the one where the extra rows do not pay (code). And on prose the two
+extra steps it costs (~110 ms of ~1.9 s) outweigh the ~50 saved tail rows
+(~2 ms), which is why the rule loses there while fixed 15 wins.
+
+## Decision
+
+- The default stays **11 masks** (`OMPH_DFLASH_MASKS`), the best single length
+  on every text measured (#414's table).
+- The EMA weight is kept at 1/4: a strictly faster-adapting policy for users who
+  cap higher (`OMPH_DFLASH_MASKS=15`), inert at the default cap of 11 (where
+  the keep rates never drop below the threshold).
+- A rule that *beats* a fixed length needs a different statistic: the marginal
+  acceptance of position n (keep[n] - keep[n+1]) against the row's cost, not the
+  cumulative one, and a step-count-aware objective. The numbers above are what
+  such a rule has to beat (+5.1 to +5.6 % on two of four texts, -5 % on one).
+
+## Correction
+
+#414's result file said `omph-run` does not call `dflash_observe`; it does:
+`Runner::commit` calls it on every verification (`engine/src/model/runner.cc:1297,
+1364`) and `omph-run`'s loop calls `commit` (`engine/src/tools/run.cc:372`). The
+keep rates are live in both paths.
