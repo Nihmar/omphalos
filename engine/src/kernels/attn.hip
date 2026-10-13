@@ -10,6 +10,14 @@
 #include <cstdint>
 
 namespace omph::kernels {
+
+// OMPH_TEST_FA_ABL: the prefill attention's phases ablated for the profile
+// (#191, #422): diagnostic only, wrong results, valid timings. Bits: 1 K
+// staging, 2 V staging, 4 K q^T, 8 softmax (mask + max + exp2 + sum + P),
+// 16 V^T P, 32 O rescale. attention_set_ablation() sets it; the launcher
+// passes it down as a kernel argument.
+int g_fa_abl = 0;
+
 namespace {
 
 constexpr long long kKvBlock = 32;  // quantized KV block along head_dim (PLAN.md §13)
@@ -672,7 +680,7 @@ template <bool Q8>
 __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
     const float * __restrict__ q, const KvArgs kv, float * __restrict__ work,
     const long long tokens, const long long seq, const int nh, const int nkv,
-    const float scale) {
+    const float scale, const int abl) {
     __shared__ __attribute__((aligned(16))) _Float16 ks[kFaKeys * kFaKLd];
     __shared__ __attribute__((aligned(16))) _Float16 vt[2][kGqaHd * kFaKeys];
     const int tid = (int) threadIdx.x;
@@ -698,16 +706,20 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
     const long long n_keys = seq - tokens + (tokens - wg0 < kFaWgTokens ? tokens : wg0 + kFaWgTokens);
     const long long n_tiles = (n_keys + kFaKeys - 1) / kFaKeys;
     if (prod) {  // the staging waves' own loop: the same barriers as the computing waves'
-        fa_stage_k<Q8>(kv, ks, 0, n_keys, kvh, nkv, seq, ptid);
-        fa_stage_v<Q8>(kv, vt[0], 0, n_keys, kvh, nkv, seq, ptid);
+        if ((abl & 1) == 0) {
+            fa_stage_k<Q8>(kv, ks, 0, n_keys, kvh, nkv, seq, ptid);
+        }
+        if ((abl & 2) == 0) {
+            fa_stage_v<Q8>(kv, vt[0], 0, n_keys, kvh, nkv, seq, ptid);
+        }
         __syncthreads();
         const auto ptile = [&](const long long kt, _Float16 * vnext) {
             const long long s1 = (kt + 1) * kFaKeys;
-            if (kt + 1 < n_tiles) {
+            if (kt + 1 < n_tiles && (abl & 2) == 0) {
                 fa_stage_v<Q8>(kv, vnext, s1, n_keys, kvh, nkv, seq, ptid);
             }
             __syncthreads();  // K(kt) consumed
-            if (kt + 1 < n_tiles) {
+            if (kt + 1 < n_tiles && (abl & 1) == 0) {
                 fa_stage_k<Q8>(kv, ks, s1, n_keys, kvh, nkv, seq, ptid);
             }
             __syncthreads();  // K(kt + 1), V(kt + 1) staged; V(kt) consumed
@@ -776,7 +788,11 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
             for (int jt = 0; jt < kFaSt; ++jt) {
                 const wmma_half8 ka = *reinterpret_cast<const wmma_half8 *>(
                     &ks[ks_at(jt * 16 + (lane & 15), 2 * s + (lane >> 4))]);
-                st[jt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ka, qa[s], st[jt]);
+                if ((abl & 4) == 0) {
+                    st[jt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ka, qa[s], st[jt]);
+                } else {
+                    st[jt][0] += ka[0];
+                }
             }
         }
         // causal mask (none on a tile every query of the row tile sees in full)
@@ -785,6 +801,7 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
         const int rel = (int) (qpos0 - s0) + tr - hk;  // key jt * 16 + hk + v visible iff jt * 16 + v <= rel
         const bool row_in = tr < nt;
         float mx = -INFINITY;
+        if ((abl & 8) == 0) {
 #pragma unroll
         for (int jt = 0; jt < kFaSt; ++jt) {
 #pragma unroll
@@ -794,6 +811,7 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
                 mx = fmaxf(mx, x);
             }
         }
+        }
         mx = fmaxf(mx, half_xor(mx));
         const float m_new = fmaxf(m_run, mx);
         // branch-free: a token with no key yet (or a padding row) keeps m = -inf,
@@ -802,6 +820,7 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
         const float m_use = none ? 0.0f : m_new;
         const float corr = none ? 1.0f : __builtin_amdgcn_exp2f(m_run - m_use);
         float sum = 0.0f;
+        if ((abl & 8) == 0) {
 #pragma unroll
         for (int jt = 0; jt < kFaSt; ++jt) {
 #pragma unroll
@@ -810,6 +829,15 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
                 sum += w;
                 pb[jt][v] = (_Float16) w;
             }
+        }
+        } else {
+#pragma unroll
+        for (int jt = 0; jt < kFaSt; ++jt) {
+#pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                pb[jt][v] = (_Float16) st[jt][v];
+            }
+        }
         }
         sum += half_xor(sum);
         l_run = l_run * corr + sum;
@@ -824,7 +852,11 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
         for (int j = 0; j < kGqaHd / 16; ++j) {
 #pragma unroll
             for (int v = 0; v < 8; ++v) {
-                o[j][v] *= corr;
+                if ((abl & 32) == 0) {
+                    o[j][v] *= corr;
+                } else {
+                    o[j][v] += corr;
+                }
             }
         }
         // O^T (dims x tokens) += V^T (dims x keys) P^T
@@ -834,7 +866,11 @@ __global__ __launch_bounds__(kFaThreads) void attention_wmma_kernel(
             for (int j = 0; j < kGqaHd / 16; ++j) {
                 const wmma_half8 va = *reinterpret_cast<const wmma_half8 *>(
                     &vcur[vt_at(j * 16 + (lane & 15), 2 * s + (lane >> 4))]);
-                o[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(va, pb[s], o[j]);
+                if ((abl & 16) == 0) {
+                    o[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(va, pb[s], o[j]);
+                } else {
+                    o[j][0] += __half2float(va[0]);
+                }
             }
         }
         }
@@ -1320,6 +1356,10 @@ AttentionSplits attention_dec_splits(const int64_t seq, const int64_t key_chunk)
     return {(n_tiles + tiles_per_split - 1) / tiles_per_split, key_chunk};
 }
 
+void attention_set_ablation(const int abl) {
+    g_fa_abl = abl;
+}
+
 bool attention_gqa_merge(const float * work, const float * gate, float * out, void * out_f16,
                          const int64_t tokens, const int64_t nh, const int64_t splits,
                          const bool v_rotated, hipStream_t stream) {
@@ -1400,10 +1440,11 @@ bool attention_gqa_range(const float * q, const KvCache & kv, const float * gate
         const dim3 fgrid((unsigned) ((tokens + kFaWgTokens - 1) / kFaWgTokens), (unsigned) nkv);
         if (q8) {
             attention_wmma_kernel<true><<<fgrid, kFaThreads, 0, stream>>>(q, args, w, tokens, seq,
-                                                                         (int) nh, (int) nkv, scale);
+                                                                         (int) nh, (int) nkv, scale,
+                                                                         g_fa_abl);
         } else {
             attention_wmma_kernel<false><<<fgrid, kFaThreads, 0, stream>>>(
-                q, args, w, tokens, seq, (int) nh, (int) nkv, scale);
+                q, args, w, tokens, seq, (int) nh, (int) nkv, scale, g_fa_abl);
         }
         if (!merge) {
             return hipGetLastError() == hipSuccess;

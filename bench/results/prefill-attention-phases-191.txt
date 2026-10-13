@@ -1,0 +1,62 @@
+# #191: the prefill attention's phases, ablated on the current kernel
+
+Engine main 1e151d0 + this branch, RX 9060 XT 16 GB (160 W cap), wikitext prompts
+of **16384** and **74599** tokens (`omph-run <omph> ids /tmp/x.f32 --last-logits
+--gemv`, `OMPH_TIMING`'s `prefill wall`, one run per cell; the baseline was run
+twice at 74.6k: 123342 / 123748 ms, 0.3 % apart). llama.cpp: v0.6.0 @ d81235049
+(no llama.cpp run here).
+
+`OMPH_TEST_FA_ABL=N` (new, diagnostic, wrong results with valid timings) ablates
+the prefill WMMA kernel's phases: **1** K staging, **2** V staging, **4** the
+K q^T WMMAs, **8** the softmax (mask + max + exp2 + sum + P), **16** the V^T P
+WMMAs, **32** the O rescale, **63** all. Each ablation removes only its own
+work: the barriers, the LDS reads and the rest of the structure stay, so the
+deltas are lower bounds and they overlap (the individual deltas sum to 35.7 s
+against 33.4 s for the whole at 74.6k).
+
+## Prefill wall, ms (delta against the baseline)
+
+| ablation | 16k (18061 ms) | 74.6k (123342 ms) |
+|---|---:|---:|
+| 1 no K staging | | 117994 (-4.3 %) |
+| 2 no V staging | | 119170 (-3.5 %) |
+| 4 no K q^T | 17272 (-4.4 %) | 106008 (**-14.0 %**) |
+| 8 no softmax | 17035 (-5.7 %) | 117409 (-5.0 %) |
+| 16 no V^T P | | 120698 (-2.2 %) |
+| 32 no O rescale | | 123981 (-0.0 %) |
+| 63 all | 15801 (-12.5 %) | 89916 (-27.1 %) |
+
+## Reading
+
+- **The K q^T WMMAs are the critical path at long context**: 14 % of the whole
+  prefill at 74.6k, against 2.2 % for the V^T P WMMAs - the same 32 WMMAs per
+  (wave, 32-key tile). The difference is the dependency structure: the scores
+  feed the softmax which feeds P, while the P V accumulates into O off the
+  critical path.
+- **The softmax is the other half at short context** (5.7 % at 16k, 5.0 % at
+  74.6k) and it is at its ISA rates (#422: no packed exp, max3 worth ~3 % of
+  it). It is a floor, not a lever.
+- **The O rescale is free**: -0.0 % at 74.6k. Its 128 f32 multiplies per lane
+  and tile are entirely hidden (which is why the lazy-rescale experiment of #191
+  was a loss and stays dropped).
+- **The staging is balanced against the consumers' second phase**: K 4.3 % + V
+  3.5 % = 7.8 % against the softmax + P V's 7.2 %; the producers' 8 waves do
+  nothing during phase 1 (V only) and everything during phase 2 (K).
+- The residual -27.1 % - (16 % WMMAs + 5 % softmax + 7.8 % staging) leaves the
+  barriers, the LDS traffic and the wave structure with a real share at long
+  context, but removing any one phase also shortens the path the others wait on,
+  so the decomposition cannot separate them further with this method.
+
+## What the numbers point at (for the next restructuring round)
+
+1. **Break the K q^T critical path**: 32 dependent WMMAs per wave per tile with
+   only two independent chains (the two 16-key sub-tiles). Two key tiles in
+   flight (64-key phases) would double the ILP but need **K double-buffered**
+   (it is single-buffered today: `ks`, 8.4 KB; V already has two buffers) and
+   ~8.4 KB more LDS (the workgroup is at 1 per WGP, VGPR-bound, so the LDS
+   budget has room). The 64-key variant was rejected in #191's round 1 for LDS
+   pressure *then*; the buffers have changed since.
+2. **Rebalance the staging waves** across the two phases (e.g. half of K(t + 1)
+   during phase 1) so the producer phase is not the longer of the two at 8
+   waves.
+3. Do not touch the softmax (at its rates, #422) or the rescale (free).

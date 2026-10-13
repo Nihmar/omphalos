@@ -112,6 +112,9 @@ EnvOptions EnvOptions::from_env() {
     if (const char * q = std::getenv("OMPH_TEST_Q8ACT")) {
         o.test_q8act = std::atoi(q);
     }
+    if (const char * q = std::getenv("OMPH_TEST_FA_ABL")) {
+        o.test_fa_abl = std::atoi(q);
+    }
     // Ablations give wrong results with valid timings (the header says so): a
     // stale one in the environment must not look like an engine bug. Name the
     // ones that are on, once, where they are parsed (#315).
@@ -125,6 +128,7 @@ EnvOptions EnvOptions::from_env() {
         {"OMPH_SKIP_GEMV_TYPE", o.skip_gemv_type >= 0},
         {"OMPH_SKIP_STAGE", o.skip_stage},      {"OMPH_TEST_BAD_SIDE", o.test_bad_side > 0},
         {"OMPH_TEST_MROPE", o.test_mrope != 0}, {"OMPH_TEST_Q8ACT", o.test_q8act > 0},
+        {"OMPH_TEST_FA_ABL", o.test_fa_abl != 0},
     };
     for (const auto & a : ablations) {
         if (a.on) {

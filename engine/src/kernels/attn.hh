@@ -143,6 +143,11 @@ bool attention_gqa_range(const float * q, const KvCache & kv, const float * gate
                          hipStream_t stream, void * out_f16, bool allow_wmma, int64_t key_chunk,
                          bool dec_wmma, int64_t split0, int64_t nsplits, bool merge);
 
+// OMPH_TEST_FA_ABL: the prefill attention's phases ablated for the profile (#191,
+// #422): diagnostic only, wrong results, valid timings. Bits: 1 K staging, 2 V
+// staging, 4 K q^T, 8 softmax, 16 V^T P, 32 O rescale.
+void attention_set_ablation(int abl);
+
 // The merge alone: the `splits` partials in `work` into out/out_f16, in order.
 bool attention_gqa_merge(const float * work, const float * gate, float * out, void * out_f16,
                          int64_t tokens, int64_t nh, int64_t splits, bool v_rotated,

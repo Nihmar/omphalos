@@ -38,6 +38,8 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
             throw std::runtime_error(dflash + " is not an .omph file: convert the drafter GGUF with omph-convert");
         }
     }
+    // OMPH_TEST_FA_ABL: the prefill attention's phases ablated (#191, #422)
+    omph::kernels::attention_set_ablation(env_.test_fa_abl);
     timer_stage_.enable(env_.phases);
     timer_gemm_.enable(env_.phases);
     timer_gemv_.enable(env_.phases);
