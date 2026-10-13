@@ -70,7 +70,7 @@
 | Memory bandwidth (spec) | ~320 GB/s | **Measured (M0): 318.3 GB/s** streaming read — 99.5% of spec, not the usual 85–90% (`bench/bw_membench.hip`) |
 | FP16 matrix (WMMA) throughput | ~100 TFLOPS dense (spec) | **Measured (M8, #132): ~100 TFLOPS raw** (independent `v_wmma_f32_16x16x16_f16` chains, f32 accumulate; 70 with 4 chains); hipBLASLt ~46-49 at the model's M=512 shapes, the engine's own WMMA GEMM 60-64; INT8: hipBLASLt measured ~26 TOPS (0.57×), but the hardware's iu8 WMMA sustains **168.6 TOPS, 1.9× f16** (88.7 sustained with random operands under the 160 W cap; #203, `bench/results/ceilings-203.txt`) |
 | LDS | 64 KB per workgroup | Enough for IQ codebook tables + GEMM tiles |
-| Bus | PCIe 5.0 x16 | Host↔device transfers of embeddings/logits are cheap |
+| Bus | PCIe 5.0 x16 capable, **4.0 x16 effective** | The card's link negotiates 32 GT/s x16, but the root port it sits behind (`00:01.0`) is Gen4: `max` = `current` = 16 GT/s, and 26-28 GB/s is what copies measure (#176, #409). Enough for embeddings/logits; a KV streamed from host RAM pays 0.85-1.43 µs per stack row per step (§16.6, #409) |
 
 ### CPU — Intel Core i5-13400F
 
@@ -831,7 +831,7 @@ than to any measurement (#318):
 ### 14.1 Why
 
 - `mmproj` is ~0.9 GB BF16 (~450 M params) → **0.9 GB VRAM saved**, plus the ViT activations (attention over thousands of patches) which can be large.
-- The encoder runs once per image; output is small: e.g. 1024 image tokens × 5120 × 2 B ≈ 10 MB → negligible over PCIe 5.0.
+- The encoder runs once per image; output is small: e.g. 1024 image tokens × 5120 × 2 B ≈ 10 MB → negligible over PCIe (10 MB at ~27 GB/s, #409).
 - Latency is irrelevant for this project.
 
 ### 14.2 Flow
@@ -948,7 +948,7 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 - DeltaNet state allocated for the 48 recurrent layers only (#92).
 - **Prompt-prefix cache in host RAM**: store quantized KV + DeltaNet state checkpoint at the end of a system prompt / common prefix; restore with an upload (PCIe 5.0) instead of re-running prefill. Done for the state (#158): the KV of the checkpointed prefix is still in VRAM whenever the cached sequence starts with it, so only the state is copied. Switching between conversations is done too (#179): a prompt that leaves the cached sequence first saves it to pinned host RAM (its whole quantized KV, the MTP KV and the DFlash2 ring, and its state at its end and at its valid checkpoints; `--kv-ram`, default 8 GiB, LRU; sequences under 2048 tokens are not saved), and a prompt that continues one of those points restores it with an upload. Back to a 32k-token conversation after another one: 0.55 s instead of 38.7 s, same output (`tools/check_conversations.py`). The link was measured at 3.3 GB/s on 2026-10-02 (the upstream port trained at 2.5 GT/s) and at 24-28 GB/s on 2026-10-04 (16 GT/s x16, #176).
 - Preallocated arena → no fragmentation, predictable peak.
-- Extreme option (slow): offload old KV blocks to host RAM for very long contexts.
+- Extreme option (slow): offload old KV blocks to host RAM for very long contexts. Tracked in #409 (PLAN.md-consistent version: quantized host store, whole-row chunks through a bounded device ring, span attention); the phase-0 numbers are in `bench/results/kv-stream-409-pcie.txt` — ~10x the VRAM read per row, and the link's ~27 GB/s ceiling (§2).
 
 ### 16.7 Prefill-specific
 
