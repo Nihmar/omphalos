@@ -369,6 +369,23 @@ bool dflash_norm_rope(float * x, const int64_t T, const int64_t heads, const flo
     return hipGetLastError() == hipSuccess;
 }
 
+__global__ void tags_clear_kernel(int32_t * __restrict__ tags, const long long pos0, const long long n,
+                                  const long long slots) {
+    const long long i = blockIdx.x * (long long) blockDim.x + threadIdx.x;
+    if (i < n) {
+        tags[(pos0 + i) % slots] = -1;
+    }
+}
+
+bool dflash_tags_clear(int32_t * tags, const int64_t pos0, const int64_t n, const int64_t slots,
+                       hipStream_t stream) {
+    if (tags == nullptr || n <= 0 || slots <= 0 || pos0 < 0) {
+        return false;
+    }
+    tags_clear_kernel<<<(unsigned) ((n + 127) / 128), 128, 0, stream>>>(tags, pos0, n, slots);
+    return hipGetLastError() == hipSuccess;
+}
+
 bool dflash_ring_put(const float * src, const int64_t T, const int64_t row, const int64_t pos0, __half * ring,
                      int32_t * tags, const int64_t slots, hipStream_t stream) {
     if (src == nullptr || ring == nullptr || T <= 0 || row <= 0 || slots <= 0 || pos0 < 0) {

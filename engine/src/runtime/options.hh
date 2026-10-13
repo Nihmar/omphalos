@@ -108,6 +108,9 @@ struct EnvOptions {
                                 // candidate has softmax probability < P (#245)
     int64_t dflash_masks = 11;  // OMPH_DFLASH_MASKS=N: the DFlash2 block drafts N masks (1..15, #414).
                                 // 11 is the measured compromise; 7 is the trained block_size - 1
+    int64_t dflash_blocks = 1;  // OMPH_DFLASH_BLOCKS=2: chain two *trained* blocks (7 masks each) instead
+                                // of one long out-of-training block: the second is conditioned on the first
+                                // through the ring (#433)
     int test_q8act = 0;         // OMPH_TEST_Q8ACT=B: every prefill GEMM's input quantized to int8 in blocks
                                 // of B along k and back: an int8 GEMM's numerics (#213)
     int test_fa_abl = 0;        // OMPH_TEST_FA_ABL=N: the prefill attention's phases ablated (#191, #422):

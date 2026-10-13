@@ -204,8 +204,11 @@ public:
     // dflash_block() - 1 tokens after `token` at position `pos`: one pass of
     // the block [token, MASK...] and the selector's greedy path.
     bool dflash_on() const { return dfl_block_ > 0; }
-    int64_t dflash_block() const { return dfl_block_; }
+    int64_t dflash_block() const { return dfl_block_; }  // the whole chain (1 + every block's masks)
+    int64_t dflash_blocks() const { return dfl_blocks_; }
     bool dflash_draft(int32_t token, int64_t pos, int64_t k, std::vector<int32_t> & drafts);
+    bool dflash_tags_invalidate(int64_t pos0, int64_t T);  // the cascade's rollback (#433)
+    bool publish_block_rows(int64_t l, const float * bk, const float * bv, int64_t B, int64_t pos);
     // The next verification's drafts came from elsewhere (n-gram, #199): no length statistics.
     void dflash_no_draft() { dfl_drafted_ = 0; }
     int64_t spec_max() const { return spec_max_; }
@@ -487,7 +490,10 @@ private:
     bool dflash_inject(int64_t pos0, int64_t T);
     bool dflash_layer(const DflashLayer & L, int64_t l, int64_t B, int64_t pos);
     std::unique_ptr<omph::gguf::File> dft_file_;
-    int64_t dfl_block_ = 0;             // 0: no drafter
+    int64_t dfl_block_ = 0;             // the chain: 0: no drafter
+    int64_t dfl_blocks_ = 1;            // the chained trained blocks (#433)
+    int64_t dfl_masks_ = 0;             // the masks per block
+    int64_t dfl_publish_ = 0;           // rows to publish into the ring after a block pass (#433)
     std::vector<int64_t> dfl_capture_;  // target layers whose output is a feature, in feature order
     std::vector<DflashLayer> dfl_;
     Mat dfl_fc_, dfl_gate_w_;
@@ -520,6 +526,8 @@ private:
     // drafts were all kept" over the steps that drafted n; a step drafts the
     // positions above OMPH_DFLASH_KEEP, all of them every 8th step (exploring).
     std::vector<double> dfl_keep_;
+    std::vector<int64_t> dfl_reach_;  // per-position observations (diagnostics, OMPH_DFLASH_DEBUG)
+    std::vector<int64_t> dfl_kept_;
     int64_t dfl_drafted_ = 0;      // drafts of the last dflash_draft
     int64_t dfl_steps_ = 0;
     void dflash_observe(int64_t kept_drafts);

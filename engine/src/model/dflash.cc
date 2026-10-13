@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -131,7 +132,13 @@ void Runner::dflash_load() {
     // block itself is OMPH_DFLASH_MASKS + 1 (the trained block_size - 1 before
     // #414's measurement, 11 by default).
     const int64_t B = omph::kernels::kMaxBlock;
-    const int64_t masks = std::min<int64_t>(std::max<int64_t>(env_.dflash_masks, 1), B - 1);
+    // #433: a cascade chains whole *trained* blocks (block_size - 1 masks each);
+    // a single block may be longer than training (#414)
+    dfl_blocks_ = std::min<int64_t>(std::max<int64_t>(env_.dflash_blocks, 1), 2);
+    const int64_t masks = dfl_blocks_ > 1
+                              ? std::min<int64_t>(std::max<int64_t>(block - 1, 1), (B - 1) / dfl_blocks_)
+                              : std::min<int64_t>(std::max<int64_t>(env_.dflash_masks, 1), B - 1);
+    dfl_masks_ = masks;
     const int64_t kv = kKvHeads * kHd;
     const int64_t feat_rows = std::max<int64_t>(max_tokens_, 16);
     dfl_feat_ = mem_.device((size_t) feat_rows * dfl_fc_.gemv->k * 2, "out of VRAM (drafter features)");
@@ -150,7 +157,9 @@ void Runner::dflash_load() {
     dfl_vals_ = static_cast<float *>(mem_.device((size_t) (B - 1) * kTopK * 4));
     dfl_scores_ = static_cast<float *>(mem_.device((size_t) (B - 1) * kTopK * kTopK * 4));
     dfl_keep_.assign((size_t) B, 1.0);  // optimistic start: every position drafted
-    dfl_block_ = masks + 1;
+    dfl_reach_.assign((size_t) B + 1, 0);  // #414 follow-up: per-position observed counts
+    dfl_kept_.assign((size_t) B + 1, 0);
+    dfl_block_ = dfl_blocks_ * masks + 1;  // the chain: 1 + every block's masks
 }
 
 // The per-position keep rates are EMAs over the observations (#245): the
@@ -165,7 +174,34 @@ void Runner::dflash_observe(const int64_t kept_drafts) {
     for (int64_t n = 1; n <= dfl_drafted_; ++n) {
         double & e = dfl_keep_[(size_t) n];
         e += ((kept_drafts >= n ? 1.0 : 0.0) - e) / kKeepEmaWeight;
+        if (n < (int64_t) dfl_reach_.size()) {
+            ++dfl_reach_[(size_t) n];
+            if (kept_drafts >= n) {
+                ++dfl_kept_[(size_t) n];
+            }
+        }
     }
+    if (std::getenv("OMPH_DFLASH_DEBUG") != nullptr) {
+        std::fprintf(stderr, "per-position reached/kept:");
+        for (size_t n = 1; n < dfl_reach_.size(); ++n) {
+            if (dfl_reach_[n] == 0) {
+                break;
+            }
+            std::fprintf(stderr, " %zu:%lld/%lld", n, (long long) dfl_kept_[n], (long long) dfl_reach_[n]);
+        }
+        std::fprintf(stderr, "\n");
+    }
+}
+
+// #433: the cascade publishes a block's rows into the ring before the
+// verification decides; the rows the verification rejects must not be read
+// again. The tags are cleared for the whole verified range and dflash_inject
+// re-tags the kept rows right after.
+bool Runner::dflash_tags_invalidate(const int64_t pos0, const int64_t T) {
+    if (dfl_blocks_ <= 1 || T <= 0) {
+        return true;
+    }
+    return omph::kernels::dflash_tags_clear(dfl_tags_, pos0, T, dfl_swa_, nullptr);
 }
 
 bool Runner::dflash_inject(const int64_t pos0, const int64_t T) {
@@ -198,6 +234,27 @@ bool Runner::dflash_inject(const int64_t pos0, const int64_t T) {
     return true;
 }
 
+// #433: the cascade's context. This block's rows 1..n-1 (the drafts) go into the
+// ring at their positions, so the next block's queries see them; the
+// verification overwrites the kept ones with the target's features and clears
+// the tags of the rejected ones.
+bool Runner::publish_block_rows(const int64_t l, const float * bk, const float * bv, const int64_t B,
+                                const int64_t pos) {
+    if (dfl_publish_ <= 0) {
+        return true;
+    }
+    const int64_t kv = kKvHeads * kHd;
+    const int64_t n = std::min(dfl_publish_, B - 1);
+    auto * rk = static_cast<__half *>(dfl_ring_k_) + l * dfl_swa_ * kv;
+    auto * rv = static_cast<__half *>(dfl_ring_v_) + l * dfl_swa_ * kv;
+    if (!omph::kernels::dflash_ring_put(bk + kv, n, kv, pos + 1, rk, nullptr, dfl_swa_, nullptr) ||
+        !omph::kernels::dflash_ring_put(bv + kv, n, kv, pos + 1, rv,
+                                        l + 1 == (int64_t) dfl_.size() ? dfl_tags_ : nullptr, dfl_swa_, nullptr)) {
+        return fail("drafter: cascade ring publish failed");
+    }
+    return true;
+}
+
 // One draft layer on the B block rows in x_ (f32), in place.
 bool Runner::dflash_layer(const DflashLayer & L, const int64_t l, const int64_t B, const int64_t pos) {
     const int64_t ne = dfl_ne_;
@@ -226,6 +283,7 @@ bool Runner::dflash_layer(const DflashLayer & L, const int64_t l, const int64_t 
         !dflash_norm_rope(bk, B, kKvHeads, L.k_norm, dfl_eps_, pos, dfl_theta_, nullptr) ||
         !dflash_attention(q, rk, rv, dfl_tags_, dfl_swa_, bk, bv, B, pos, dfl_swa_, 1.0f / std::sqrt((float) kHd),
                           static_cast<float *>(dfl_attn_ws_), att, nullptr) ||
+        !publish_block_rows(l, bk, bv, B, pos) ||
         !cast_f32_to_f16(att, ffn16_, B * nq, nullptr) || !matmul(L.o, ffn16_, c, ne, nq, B) ||
         !dflash_conv(c, dyn, L.attn_conv_base, B, ne, dfl_group_, 1, a, nullptr) ||
         !add_out(a, x, b, B * ne, nullptr)) {  // b = ffn_inp
@@ -250,13 +308,13 @@ bool Runner::dflash_layer(const DflashLayer & L, const int64_t l, const int64_t 
 
 bool Runner::dflash_draft(const int32_t token, const int64_t pos, const int64_t k, std::vector<int32_t> & drafts) {
     drafts.clear();
-    const int64_t Bmax = dfl_block_;
+    const int64_t Bmax = dfl_block_;  // the chain: 1 + every block's masks
     int64_t n = std::min<int64_t>(k, Bmax - 1);
     if (!dflash_on() || n <= 0) {
         dfl_drafted_ = 0;  // nothing drafted: the keep rates see no step (#340)
         return dflash_on() || fail("drafter: not loaded");
     }
-    // Adaptive length: the *block* is chosen, not the verification after it, so
+    // Adaptive length: the *chain* is chosen, not the verification after it, so
     // the positions the drafts are not worth never cost their rows (#416). The
     // per-position keep rates are measured ones (dflash_observe), and every 8th
     // step drafts all of them, so a position that starts being kept is seen.
@@ -267,10 +325,17 @@ bool Runner::dflash_draft(const int32_t token, const int64_t pos, const int64_t 
         }
         n = m;
     }
-    const int64_t B = n + 1;  // the block is the anchor plus the drafts it will verify
+    if (std::getenv("OMPH_DFLASH_DEBUG") != nullptr) {
+        std::fprintf(stderr, "draft step %lld: cap %lld, n %lld, keep", (long long) dfl_steps_,
+                     (long long) (Bmax - 1), (long long) n);
+        for (size_t i = 1; i <= (size_t) (Bmax - 1); ++i) {
+            std::fprintf(stderr, " %.2f", dfl_keep_[i]);
+        }
+        std::fprintf(stderr, "\n");
+    }
     const int64_t ne = dfl_ne_;
-    // The drafter's block is at most 16 rows: its matmuls take the NT GEMVs, not
-    // the f16 GEMM path, which from gemm_min tokens would stage the 682 MiB head
+    // The drafter's rows are at most 16: its matmuls take the NT GEMVs, not the
+    // f16 GEMM path, which from gemm_min tokens would stage the 682 MiB head
     // (and the drafter's weights) as f16 (#414).
     struct ScopedDraftGemv {
         bool & flag;
@@ -278,68 +343,101 @@ bool Runner::dflash_draft(const int32_t token, const int64_t pos, const int64_t 
         explicit ScopedDraftGemv(bool & f) : flag(f), saved(f) { flag = true; }
         ~ScopedDraftGemv() { flag = saved; }
     } scoped_gemv(draft_gemv_);
-    std::vector<int32_t> toks((size_t) B, dfl_mask_);
-    toks[0] = token;
-    if (!embed(toks.data(), B, nullptr, static_cast<float *>(x_))) {
-        return false;
-    }
-    for (size_t l = 0; l < dfl_.size(); ++l) {
-        if (!dflash_layer(dfl_[l], (int64_t) l, B, pos)) {
+
+    // One block: [anchor, MASK x P] through the five layers and the selector
+    // (#245), P masks -> P drafts. The cascade runs it once per trained block.
+    const auto block_pass = [&](const int32_t anchor, const int64_t p0, const int64_t P,
+                                std::vector<int32_t> & out) -> bool {
+        const int64_t Bl = P + 1;
+        std::vector<int32_t> toks((size_t) Bl, dfl_mask_);
+        toks[0] = anchor;
+        if (!embed(toks.data(), Bl, nullptr, static_cast<float *>(x_))) {
             return false;
         }
-    }
-    // final norm, the selector gate and the MASK rows' logits through the target head
-    using namespace omph::kernels;
-    const int64_t P = B - 1;
-    // The candidates come from the first draft_vocab token ids while the recent
-    // text stays inside them, as MTP's drafts (#217): the head's Q4_K tiles hold
-    // those rows first, so one tile GEMV reads that fraction of the 682 MiB.
-    const GemvEntry * hg = head_.gemv;
-    const int64_t dv = draft_vocab_rows();  // OMPH_DRAFT_VOCAB in head tiles (#340)
-    const int64_t nv = dv > 0 && dv < h_.n_vocab && use_gemv_ && draft_oov_ < kDraftOovMax && hg != nullptr &&
-                               hg->type == 12 && hg->rows == h_.n_vocab
-                           ? dv
-                           : h_.n_vocab;
-    const void * hx = static_cast<const uint8_t *>(h16_) + ne * 2;
-    if (!rms_norm(static_cast<const float *>(x_), dfl_out_norm_, static_cast<float *>(cur_), B, ne, dfl_eps_, 1.0f,
-                  nullptr) ||
-        !cast_f32_to_f16(static_cast<const float *>(cur_), h16_, B * ne, nullptr) ||
-        !matmul(dfl_gate_w_, h16_, static_cast<float *>(dfl_sgate_), kRank, ne, B) ||
-        !(nv < h_.n_vocab
-              ? gemv_tokens(12, head_.dev, hx, static_cast<float *>(dfl_logits_), nv, ne, (int) P, nullptr)
-              : matmul(head_, hx, static_cast<float *>(dfl_logits_), h_.n_vocab, ne, P)) ||
-        !dflash_topk(static_cast<const float *>(dfl_logits_), P, nv, dfl_ids_, dfl_vals_, nullptr) ||
-        !dflash_selector(dfl_ids_, dfl_vals_, static_cast<const float *>(dfl_sgate_), token, dfl_sel_prev_,
-                         dfl_sel_next_, h_.n_vocab, P, dfl_scores_, nullptr)) {
-        return fail("drafter: head / selector failed");
-    }
-    std::vector<int32_t> ids((size_t) (P * kTopK));
-    std::vector<float> scores((size_t) (P * kTopK * kTopK));
-    if (hipMemcpy(ids.data(), dfl_ids_, ids.size() * 4, hipMemcpyDeviceToHost) != hipSuccess ||
-        hipMemcpy(scores.data(), dfl_scores_, scores.size() * 4, hipMemcpyDeviceToHost) != hipSuccess) {
-        return fail("drafter: lattice copy failed");
-    }
-    // the selector's greedy path from the anchor (llama.cpp: predecessor 0 at position 1)
-    int64_t pred = 0;
-    for (int64_t i = 0; i < n; ++i) {
-        const float * sc = scores.data() + (i * kTopK + pred) * kTopK;
-        int64_t best = 0;
-        for (int64_t j = 1; j < kTopK; ++j) {
-            if (sc[j] > sc[best]) {
-                best = j;
+        for (size_t l = 0; l < dfl_.size(); ++l) {
+            if (!dflash_layer(dfl_[l], (int64_t) l, Bl, p0)) {
+                return false;
             }
         }
-        if (env_.dflash_pmin > 0.0f) {  // softmax of the scores at the best: 1 / sum exp(s - s_best)
-            float sum = 0.0f;
-            for (int64_t j = 0; j < kTopK; ++j) {
-                sum += std::exp(sc[j] - sc[best]);
+        using namespace omph::kernels;
+        const GemvEntry * hg = head_.gemv;
+        const int64_t dv = draft_vocab_rows();  // OMPH_DRAFT_VOCAB in head tiles (#340)
+        const int64_t nv = dv > 0 && dv < h_.n_vocab && use_gemv_ && draft_oov_ < kDraftOovMax && hg != nullptr &&
+                                   hg->type == 12 && hg->rows == h_.n_vocab
+                               ? dv
+                               : h_.n_vocab;
+        const void * hx = static_cast<const uint8_t *>(h16_) + ne * 2;  // the MASK rows
+        if (!rms_norm(static_cast<const float *>(x_), dfl_out_norm_, static_cast<float *>(cur_), Bl, ne, dfl_eps_, 1.0f,
+                      nullptr) ||
+            !cast_f32_to_f16(static_cast<const float *>(cur_), h16_, Bl * ne, nullptr) ||
+            !matmul(dfl_gate_w_, h16_, static_cast<float *>(dfl_sgate_), kRank, ne, Bl) ||
+            !(nv < h_.n_vocab
+                  ? gemv_tokens(12, head_.dev, hx, static_cast<float *>(dfl_logits_), nv, ne, (int) P, nullptr)
+                  : matmul(head_, hx, static_cast<float *>(dfl_logits_), h_.n_vocab, ne, P)) ||
+            !dflash_topk(static_cast<const float *>(dfl_logits_), P, nv, dfl_ids_, dfl_vals_, nullptr) ||
+            !dflash_selector(dfl_ids_, dfl_vals_, static_cast<const float *>(dfl_sgate_), anchor, dfl_sel_prev_,
+                             dfl_sel_next_, h_.n_vocab, P, dfl_scores_, nullptr)) {
+            return fail("drafter: head / selector failed");
+        }
+        std::vector<int32_t> ids((size_t) (P * kTopK));
+        std::vector<float> scores((size_t) (P * kTopK * kTopK));
+        if (hipMemcpy(ids.data(), dfl_ids_, ids.size() * 4, hipMemcpyDeviceToHost) != hipSuccess ||
+            hipMemcpy(scores.data(), dfl_scores_, scores.size() * 4, hipMemcpyDeviceToHost) != hipSuccess) {
+            return fail("drafter: lattice copy failed");
+        }
+        // the selector's greedy path from the anchor (llama.cpp: predecessor 0 at position 1)
+        out.clear();
+        int64_t pred = 0;
+        for (int64_t i = 0; i < P; ++i) {
+            const float * sc = scores.data() + (i * kTopK + pred) * kTopK;
+            int64_t best = 0;
+            for (int64_t j = 1; j < kTopK; ++j) {
+                if (sc[j] > sc[best]) {
+                    best = j;
+                }
             }
-            if (1.0f / sum < env_.dflash_pmin) {
+            if (env_.dflash_pmin > 0.0f) {  // softmax of the scores at the best: 1 / sum exp(s - s_best)
+                float sum = 0.0f;
+                for (int64_t j = 0; j < kTopK; ++j) {
+                    sum += std::exp(sc[j] - sc[best]);
+                }
+                if (1.0f / sum < env_.dflash_pmin) {
+                    break;
+                }
+            }
+            pred = best;
+            out.push_back(ids[(size_t) (i * kTopK + pred)]);
+        }
+        return true;
+    };
+
+    if (dfl_blocks_ <= 1) {
+        if (!block_pass(token, pos, n, drafts)) {
+            return false;
+        }
+    } else {
+        // #433: whole trained blocks, each conditioned on the previous one's rows
+        // (published into the ring by dflash_layer).
+        int64_t left = n;
+        int32_t anchor = token;
+        int64_t p0 = pos;
+        std::vector<int32_t> part;
+        while (left > 0 && (int64_t) drafts.size() < n) {
+            const int64_t m = std::min(dfl_masks_, left);
+            dfl_publish_ = left > m ? m - 1 : 0;  // its rows feed the next block
+            const bool ok = block_pass(anchor, p0, m, part);
+            dfl_publish_ = 0;
+            if (!ok) {
+                return false;
+            }
+            drafts.insert(drafts.end(), part.begin(), part.end());
+            left -= m;
+            if (part.empty()) {
                 break;
             }
+            anchor = part.back();
+            p0 += m;
         }
-        pred = best;
-        drafts.push_back(ids[(size_t) (i * kTopK + pred)]);
     }
     // What was really drafted, the OMPH_DFLASH_PMIN cut included: the previous
     // step's count or the full n would record those positions as rejections (#340).
