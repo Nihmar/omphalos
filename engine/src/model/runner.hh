@@ -8,6 +8,7 @@
 #pragma once
 
 #include "format/gguf.hh"
+#include "kernels/attn.hh"
 #include "model/hparams.hh"
 #include "runtime/allocations.hh"
 #include "runtime/matmul.hh"
@@ -573,12 +574,24 @@ private:
     void * kv_sh_vs_ = nullptr;
     void * kv_sh_scratch_ = nullptr;  // OMPH_KV_STREAM_CHECK: what is read back
     size_t kv_sh_scratch_bytes_ = 0;
-    size_t kv_sh_bytes_ = 0;  // the store's total size (for the load report)
-    // Copies the rows [pos0, pos0 + T) of one attention layer's K, K scales, V
+    size_t kv_sh_bytes_ = 0;  // the store's total size (for the load report)    // Copies the rows [pos0, pos0 + T) of one attention layer's K, K scales, V
     // and V scales from the device cache into the mirror, and with
     // OMPH_KV_STREAM_CHECK compares them once more. `layer` is the stack's
     // attention layer; the f32 modes and the MTP block's cache are not mirrored.
     bool kv_stream_mirror(int64_t layer, const QuantKv & q, int64_t pos0, int64_t T);
+    // #409 step 2 (OMPH_ATTN_SPLIT_GROUPS): the quantized decode / verification
+    // attention run in groups of its fixed key splits, each group staged into
+    // these buffers first -- the split range + staged base path end to end,
+    // with the rows still coming from VRAM (step 3 makes them come from the
+    // host store). The groups keep their global split indices, so the merge is
+    // the same one and the result is bit-identical to the single call.
+    int64_t kv_groups_ = 0;  // groups per call (0/1: the single call)
+    void * kv_g_k_ = nullptr;
+    void * kv_g_ks_ = nullptr;
+    void * kv_g_vq_ = nullptr;
+    void * kv_g_vs_ = nullptr;
+    bool attn_splits_staged(const omph::kernels::KvCache & kv, bool q8, int64_t t0, int64_t n,
+                            int64_t seq, float scale);
     bool kv_host_ = false;  // f32 KV in pinned host RAM (validation reference)
     void * kv_stage_k_ = nullptr;
     // Overlap of independent GEMVs (#71): the decode forks a layer's sibling

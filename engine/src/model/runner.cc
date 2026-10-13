@@ -277,6 +277,24 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     attn_work_bytes_ = omph::kernels::attention_gqa_work_bytes(T, h_.n_head, h_.n_head_kv,
                                                                h_.head_dim, max_seq_, key_chunk_);
     alloc(&attn_work_, attn_work_bytes_);
+    if (env_.attn_split_groups > 1 && kv_q8q4_ && key_chunk_ > 0) {
+        // #409 step 2: one buffer per component, big enough for the largest
+        // group at the context's capacity (the split count only falls with a
+        // shorter sequence, so the group's row count cannot grow past this).
+        const omph::kernels::AttentionSplits sp =
+            omph::kernels::attention_dec_splits(max_seq_, key_chunk_);
+        if (sp.splits > 1) {
+            kv_groups_ = std::min(env_.attn_split_groups, sp.splits);
+            const int64_t per_group = (sp.splits + kv_groups_ - 1) / kv_groups_;
+            const size_t rows = (size_t) per_group * (size_t) sp.keys;
+            const size_t attn_kv = (size_t) h_.n_head_kv * h_.head_dim;
+            const size_t sc = (size_t) h_.n_head_kv * (h_.head_dim / 32) * 2;
+            alloc(&kv_g_k_, rows * attn_kv);
+            alloc(&kv_g_ks_, rows * sc);
+            alloc(&kv_g_vq_, rows * attn_kv / 2);
+            alloc(&kv_g_vs_, rows * sc);
+        }
+    }
     // MTP (#124): the block's own cache (Q8/Q4, no ring) and its h buffers.
     if (mtp_) {
         const int64_t nblk = h_.head_dim / 32;
@@ -342,6 +360,11 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
             std::fprintf(stderr, "kv stream: %zu MiB of pinned host KV (the device cache stays "
                                  "complete, the store is not read yet; #409 step 1)\n",
                          kv_sh_bytes_ >> 20);
+        }
+        if (kv_groups_ > 1) {
+            std::fprintf(stderr, "attn splits: %lld groups per decode / verification call "
+                                 "(#409 step 2)\n",
+                         (long long) kv_groups_);
         }
     }
 }

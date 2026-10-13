@@ -1,0 +1,73 @@
+# #409 step 2: the decode / verification attention over a range of its key splits.
+# Engine feat/409-span-attention, RX 9060 XT 16 GB, 2026-10-13, desktop session
+# running. Model: Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph (models/ is symlinks to the
+# speed disk), prompts /var/tmp/omphalos-prompts/wiki{512,4k,16k}.txt (token ids).
+#
+# What step 2 adds: attention_gqa_range(), which runs the splits
+# [split0, split0 + nsplits) of a decode / verification call -- the partials
+# still land at their *global* split indices in the work buffer, so the merge
+# (now its own entry point, attention_gqa_merge) is the same one and the result
+# is bit-identical to the single call. The quantized buffers may start at cache
+# position kv.kbase (a staged range); the FP16 ring stays indexed by the true
+# position. attention_gqa() is the whole range with the merge, unchanged for its
+# callers.
+#
+# OMPH_ATTN_SPLIT_GROUPS=N wires it into the runner: a decode / verification
+# call stages each group of splits into a buffer of its own (device-to-device
+# here) and calls the range entry per group. This is the machinery step 3 feeds
+# from the host store; with the rows still copied from VRAM it saves nothing and
+# is off by default.
+#
+# Split geometry at these prompts (attention_key_chunk, kDcKeys = 16):
+#   512 tokens: chunk 32, 16 splits | 4096: chunk 32, 128 splits | 16384: chunk 128, 128 splits
+
+## 1. The refactor alone changes nothing
+
+# Before the change (main): /tmp/plain.f32, /tmp/p4.f32 (64 logits rows each).
+# After it, with the switch off:
+cmp /tmp/plain.f32 <same run on the branch>   # 512 tokens: identical
+cmp /tmp/p4.f32   <same run on the branch>    # 4096 tokens: identical
+
+## 2. The staged groups are bit-identical to the single call
+
+# 4096-token prompt (128 splits), generate 8, --logits-tail 64, compare both the
+# 64 logits rows and the greedy ids against the no-switch run:
+OMPH_ATTN_SPLIT_GROUPS=2    omph-run ... -> identical
+OMPH_ATTN_SPLIT_GROUPS=4    omph-run ... -> identical
+OMPH_ATTN_SPLIT_GROUPS=8    omph-run ... -> identical
+OMPH_ATTN_SPLIT_GROUPS=16   omph-run ... -> identical
+OMPH_ATTN_SPLIT_GROUPS=128  omph-run ... -> identical   (one split per group)
+# 512-token prompt (16 splits), groups 4: identical.
+
+## 3. The paths that rewrite rows
+
+# Speculative decode, MTP k = 3, 32 tokens (the verification groups of <= 8
+# tokens take the staged path, rejections rewrite rows and re-merge):
+OMPH_ATTN_SPLIT_GROUPS=4 -> the 32 generated ids equal the plain run's, bit for bit
+# Oracle rollback (#122): every 3rd draft corrupted, 32 tokens, --draft-k 3
+# --draft-corrupt 3: both runs equal the plain greedy ids.
+# K4/V4 everywhere (OMPH_KV_K4=1, the half-width K row path), 4k, groups 4: logits
+# and ids equal the K4 run without the switch.
+# Scalar decode kernel (OMPH_ATTN_DEC_SCALAR=1), 4k, groups 4: equal to the scalar
+# run without the switch (the scalar path's split geometry is the same: 16-key
+# blocks, key_chunk per split).
+
+## 4. What the diagnostics mode costs (OMPH_TIMING, step gpu, last 3 of 6 steps)
+
+#   4k prompt:   no switch 41.7-42.2 ms   groups 4 43.1-43.4 (+3%)   groups 128 63.2 (+51%)
+#   16k prompt:  no switch 42.8 ms        groups 4 45.7-45.9 (+7%)   groups 128 92.6-93.7 (+118%)
+#
+# groups=128 is one split per group: 128 staged calls x 16 layers x 4 copies per
+# step, each at 16k covering 128 keys (213 KB) -- launch- and copy-bound, not
+# attention-bound. Step 3 wants few, large groups and the copies overlapped on
+# the copy stream; this is the per-group overhead to design against.
+
+## 5. Limits
+
+# - The prefill kernel (tokens >= 16) has no fixed splits: attention_gqa_range
+#   refuses a partial range there (the whole range only). Streaming a prefill
+#   would need the flash kernel's key loop split, and is on step 5's list.
+# - kbase applies to the quantized buffers only; the f32 modes and the FP16 ring
+#   keep their own addressing (the ring by true position).
+# - The staged buffers here are sized for the largest group at max_seq_; the
+#   runner reports the group count at load under OMPH_TIMING.
