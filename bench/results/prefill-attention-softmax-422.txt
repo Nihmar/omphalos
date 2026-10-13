@@ -1,0 +1,66 @@
+# #422: the prefill attention softmax — ISA rates and the budget
+
+Engine main 15efa7d + this branch, RX 9060 XT 16 GB (160 W cap, ~2.8 GHz).
+`tools/native/isa_probe.cpp` gained the softmax section; the budget uses the
+measured rates and the kernel's shape (`attention_wmma_kernel`: 12 computing
+waves x 16 tokens, 32-key tiles, 16 scores per lane per tile, 128 f32 of O per
+lane). llama.cpp: v0.6.0 @ d81235049 (no llama.cpp run).
+
+## What gfx1200 has (LLVM assembler, per target)
+
+| instruction | gfx1200 | note |
+|---|---|---|
+| `v_max3_f32`, `v_min3_f32` | yes | 3-input max/min |
+| `v_pk_max_f16`, `v_pk_add_f16`, `v_pk_mul_f16` | yes | two f16 per instruction |
+| `v_cvt_pkrtz_f16_f32` | yes | two f32 -> f16x2, **round-to-zero** |
+| `v_cvt_pk_f16_f32` | no | (the round-to-nearest pack) |
+| `v_exp_f16`, `v_max3_f16` | yes | |
+| `v_pk_exp_f16` | **no** | no packed exponential |
+
+## Rates (`isa_probe`, 16 dependency chains x 256 lanes x 256 workgroups)
+
+| op | ops/lane/cycle | vs the f32 VALU |
+|---|---:|---|
+| `v_max3_f32` | 0.84 | a 2-input `v_max_f32` measures 0.99: **max3 is free** (3 inputs for the price of 2) |
+| `v_pk_add_f16` | 0.98 | 1.96 f16 values/lane/cycle |
+| `v_exp_f32` (the softmax's `exp2`) | 0.26 | 1/4-rate SFU |
+
+## The budget per (wave, 32-key tile) per lane
+
+The WMMAs of one tile: 32 for `K q^T` + 32 for `V^T P^T` = 64 instructions =
+64 x 16.6 = **~1060 cycles** at the measured 88.7 TFLOPS f16.
+
+The softmax:
+
+| item | ops/lane | cycles | share of the WMMA time |
+|---|---:|---:|---:|
+| `exp2` (16 scores) | 16 | 96 | 9 % |
+| tile max (16 -> 6 with max3) | 16 | 16 | 1.5 % |
+| sum | 16 | 16 | 1.5 % |
+| score -> f16 for P | 16 | 15 | 1.4 % |
+| mask (the diagonal tiles only) | 16 | 16 | 1.5 % |
+| O rescale (128 f32 per lane) | 128 | 128 | 12 % |
+| **total** | | **~288** | **~27 %** |
+
+With `v_max3_f32`, `v_pk_max_f16`/`v_pk_add_f16` and `v_cvt_pkrtz_f16_f32` the
+same work is ~255 cycles (~24 %) — and the packed f16 max/sum would need the sum
+kept in f16 (a precision decision: a 32-term f16 sum, then f32 across tiles),
+while the packed conversion changes P's rounding to rtz.
+
+## Conclusion (closing as measured)
+
+- **The softmax ops are already at their ISA rates**: two thirds of its cycles
+  are the O rescale (12 % of the WMMA time) and the `exp2` (9 %), and neither is
+  reducible by a cheaper op — there is no packed exp, and the rescale was
+  already measured *slower* as a lazy rescale (+3-5 %, #191).
+- The available micro-optimizations (max3 for the tile max, packed f16 for
+  max/sum, a packed conversion for P) buy ~3 points of the 27 % at the price of
+  two numerics changes (f16 sums, rtz P). Not worth a numerics decision: the
+  kernel's distance from its FLOP ceiling is not in the softmax.
+- The same arithmetic says where the attention's loss is not: the softmax is at
+  most ~27 % of the kernel's *ideal* WMMA work, while the kernel as a whole runs
+  ~4x slower than that ideal (10.1 ms per 512-token chunk per layer at 32k,
+  23 % of its FLOP ceiling). So the remaining ~3x is in the structure around the
+  math — the 8 staging waves and their LDS traffic, the barriers, the occupancy
+  — which is what #191's register/staging restructuring targets. The softmax is
+  not the lever.
