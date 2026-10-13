@@ -676,8 +676,12 @@ private:
     int64_t gemm_min_ = 0;        // tokens from which a --gemv runner uses the GEMM path
     // T tokens through the multi-token GEMVs: below gemm_min_, and always in a
     // speculative verification (up to 16 tokens), whose rows must equal the
-    // single-token GEMV's bit for bit (#161, #244)
-    bool gemv_path(const int64_t T) const { return use_gemv_ && T > 1 && (T < gemm_min_ || verifying_); }
+    // single-token GEMV's bit for bit (#161, #244), or while a drafter runs its
+    // block (<= 16 rows, #414: the f16 GEMM path would stage the head).
+    bool gemv_path(const int64_t T) const {
+        return use_gemv_ && T > 1 && (T < gemm_min_ || verifying_ || draft_gemv_);
+    }
+    bool draft_gemv_ = false;     // inside a drafter's block pass (#414)
     int64_t key_chunk_ = 0;       // attention keys per split, fixed for the run (#136)
     // side-stream watchdog (#144)
     static constexpr double kSlowStep = 1.35;

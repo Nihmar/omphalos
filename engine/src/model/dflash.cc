@@ -126,8 +126,12 @@ void Runner::dflash_load() {
     }
     dfl_sel_prev_ = prev.dev;
     dfl_sel_next_ = next.dev;
-    // buffers: the features of a forward's rows, the ring, the block's scratch
-    const int64_t B = block;
+    // buffers: the features of a forward's rows, the ring, the block's scratch.
+    // The scratch holds the longest block the engine may run (kMaxBlock); the
+    // block itself is OMPH_DFLASH_MASKS + 1 (the trained block_size - 1 before
+    // #414's measurement, 11 by default).
+    const int64_t B = omph::kernels::kMaxBlock;
+    const int64_t masks = std::min<int64_t>(std::max<int64_t>(env_.dflash_masks, 1), B - 1);
     const int64_t kv = kKvHeads * kHd;
     const int64_t feat_rows = std::max<int64_t>(max_tokens_, 16);
     dfl_feat_ = mem_.device((size_t) feat_rows * dfl_fc_.gemv->k * 2, "out of VRAM (drafter features)");
@@ -146,7 +150,7 @@ void Runner::dflash_load() {
     dfl_vals_ = static_cast<float *>(mem_.device((size_t) (B - 1) * kTopK * 4));
     dfl_scores_ = static_cast<float *>(mem_.device((size_t) (B - 1) * kTopK * kTopK * 4));
     dfl_keep_.assign((size_t) B, 1.0);  // optimistic start: every position drafted
-    dfl_block_ = B;
+    dfl_block_ = masks + 1;
 }
 
 void Runner::dflash_observe(const int64_t kept_drafts) {
@@ -238,13 +242,16 @@ bool Runner::dflash_layer(const DflashLayer & L, const int64_t l, const int64_t 
 
 bool Runner::dflash_draft(const int32_t token, const int64_t pos, const int64_t k, std::vector<int32_t> & drafts) {
     drafts.clear();
-    const int64_t B = dfl_block_;
-    int64_t n = std::min<int64_t>(k, B - 1);
+    const int64_t Bmax = dfl_block_;
+    int64_t n = std::min<int64_t>(k, Bmax - 1);
     if (!dflash_on() || n <= 0) {
         dfl_drafted_ = 0;  // nothing drafted: the keep rates see no step (#340)
         return dflash_on() || fail("drafter: not loaded");
     }
-    // adaptive length: the positions still worth their verification
+    // Adaptive length: the *block* is chosen, not the verification after it, so
+    // the positions the drafts are not worth never cost their rows (#416). The
+    // per-position keep rates are measured ones (dflash_observe), and every 8th
+    // step drafts all of them, so a position that starts being kept is seen.
     if (env_.dflash_keep > 0.0f && ++dfl_steps_ % 8 != 0) {
         int64_t m = 1;
         while (m < n && dfl_keep_[(size_t) m + 1] >= env_.dflash_keep) {
@@ -252,7 +259,17 @@ bool Runner::dflash_draft(const int32_t token, const int64_t pos, const int64_t 
         }
         n = m;
     }
+    const int64_t B = n + 1;  // the block is the anchor plus the drafts it will verify
     const int64_t ne = dfl_ne_;
+    // The drafter's block is at most 16 rows: its matmuls take the NT GEMVs, not
+    // the f16 GEMM path, which from gemm_min tokens would stage the 682 MiB head
+    // (and the drafter's weights) as f16 (#414).
+    struct ScopedDraftGemv {
+        bool & flag;
+        bool saved;
+        explicit ScopedDraftGemv(bool & f) : flag(f), saved(f) { flag = true; }
+        ~ScopedDraftGemv() { flag = saved; }
+    } scoped_gemv(draft_gemv_);
     std::vector<int32_t> toks((size_t) B, dfl_mask_);
     toks[0] = token;
     if (!embed(toks.data(), B, nullptr, static_cast<float *>(x_))) {

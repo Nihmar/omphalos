@@ -106,6 +106,9 @@ EnvOptions EnvOptions::from_env() {
     if (const char * p = std::getenv("OMPH_DFLASH_PMIN")) {
         o.dflash_pmin = (float) std::atof(p);
     }
+    if (const char * p = std::getenv("OMPH_DFLASH_MASKS")) {
+        o.dflash_masks = std::atoll(p);
+    }
     if (const char * q = std::getenv("OMPH_TEST_Q8ACT")) {
         o.test_q8act = std::atoi(q);
     }

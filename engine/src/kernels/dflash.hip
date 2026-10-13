@@ -78,7 +78,14 @@ __global__ void ring_put_kernel(const float * __restrict__ src, const long long 
 // and the split's K / V in LDS (f16); partial (max, sum, acc[128]) per query.
 // Pass 2 merges the splits in order.
 constexpr int kSplit = 32;
-constexpr int kMaxQ = 4 * 8;  // T x 4 query heads per KV head, T <= 8 (the block)
+constexpr int kHeads = 32;    // query heads
+constexpr int kMaxQ = 4 * 8;  // query rows per LDS score tile (a third of a T = 8 block's)
+// The block's query rows (T x 32 heads): the score tile and the partials'
+// workspace are indexed by the row id t * kHeads + h, which is unique for any
+// T <= kMaxBlock (#414).
+constexpr int kQMax = kGqa * kMaxBlock;
+
+constexpr int kBlockRows = kHeads * kMaxBlock;
 
 __global__ __launch_bounds__(256) void attention_part_kernel(const float * __restrict__ q,
                                                              const __half * __restrict__ ring_k,
@@ -92,7 +99,7 @@ __global__ __launch_bounds__(256) void attention_part_kernel(const float * __res
     __shared__ __half ks[kSplit][kHd + 2];
     __shared__ __half vs[kSplit][kHd + 2];
     __shared__ long long kp[kSplit];  // the key's position, -1: invalid
-    __shared__ float sc[kMaxQ][kSplit + 1];
+    __shared__ float sc[kQMax][kSplit + 1];
     __shared__ __half qsh[kMaxQ][kHd + 2];
     const int kvh = (int) blockIdx.x;
     const int sp = (int) blockIdx.y;
@@ -136,7 +143,7 @@ __global__ __launch_bounds__(256) void attention_part_kernel(const float * __res
         for (int i = tid; i < kMaxQ * kHd; i += 256) {
             const int qi = q0 + i / kHd;
             qsh[i / kHd][i % kHd] = __float2half(
-                qi < nq ? q[((long long) (qi / kGqa) * 32 + kvh * kGqa + qi % kGqa) * kHd + i % kHd] : 0.0f);
+                qi < nq ? q[((long long) (qi / kGqa) * kHeads + kvh * kGqa + qi % kGqa) * kHd + i % kHd] : 0.0f);
         }
         __syncthreads();
         const int ql = tid >> 3;
@@ -181,7 +188,9 @@ __global__ __launch_bounds__(256) void attention_part_kernel(const float * __res
                 }
             }
         }
-        float * w = ws + (((long long) kvh * kMaxQ + qi) * nsp + sp) * (kHd + 2);
+        const long long qrow =
+            (long long) (qi / kGqa) * kHeads + kvh * kGqa + qi % kGqa;  // t * 32 + h
+        float * w = ws + ((qrow * nsp + sp) * (kHd + 2));
         if ((tid & 3) == 0) {
             w[0] = m;
             w[1] = l;
@@ -198,9 +207,8 @@ __global__ __launch_bounds__(kHd) void attention_merge_kernel(const float * __re
                                                               float * __restrict__ out) {
     const int h = (int) blockIdx.x;
     const int t = (int) blockIdx.y;
-    const int kvh = h / kGqa;
-    const int qi = t * kGqa + h % kGqa;
-    const float * w = ws + ((long long) kvh * kMaxQ + qi) * nsp * (kHd + 2);
+    const long long qrow = (long long) t * kHeads + h;
+    const float * w = ws + qrow * nsp * (kHd + 2);
     float m = -FLT_MAX;
     for (int s = 0; s < nsp; ++s) {
         m = fmaxf(m, w[s * (kHd + 2)]);
@@ -216,7 +224,7 @@ __global__ __launch_bounds__(kHd) void attention_merge_kernel(const float * __re
         l = fmaf(f, w[s * (kHd + 2) + 1], l);
         acc = fmaf(f, w[s * (kHd + 2) + 2 + threadIdx.x], acc);
     }
-    out[((long long) t * 32 + h) * kHd + threadIdx.x] = acc / l;
+    out[((long long) t * kHeads + h) * kHd + threadIdx.x] = acc / l;
 }
 
 __global__ void conv_kernel(const float * __restrict__ x, const float * __restrict__ dyn,
@@ -375,7 +383,7 @@ bool dflash_attention(const float * q, const __half * ring_k, const __half * rin
                       const int64_t slots, const float * bk, const float * bv, const int64_t T, const int64_t pos0,
                       const int64_t n_swa, const float scale, float * ws, float * out, hipStream_t stream) {
     if (q == nullptr || ring_k == nullptr || ring_v == nullptr || tags == nullptr || bk == nullptr ||
-        bv == nullptr || ws == nullptr || out == nullptr || T <= 0 || T > 8 || slots > 2048 || n_swa <= 0) {
+        bv == nullptr || ws == nullptr || out == nullptr || T <= 0 || T > kMaxBlock || slots > 2048 || n_swa <= 0) {
         return false;
     }
     long long lo0 = pos0 - n_swa + 1;  // the first query's window; later queries mask a few more
@@ -389,7 +397,9 @@ bool dflash_attention(const float * q, const __half * ring_k, const __half * rin
 }
 
 int64_t dflash_attention_ws_floats(const int64_t slots) {
-    return (int64_t) kKvHeads * kMaxQ * ((slots + 16 + kSplit - 1) / kSplit) * (kHd + 2);
+    // one row per (block token, query head), one column per key split; the key
+    // count is the ring (at most `slots`) plus the block (at most kMaxBlock)
+    return (int64_t) kBlockRows * ((slots + kMaxBlock + kSplit - 1) / kSplit) * (kHd + 2);
 }
 
 bool dflash_conv(const float * x, const float * dyn, const float * base, const int64_t T, const int64_t n,
