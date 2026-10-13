@@ -1,0 +1,57 @@
+# #420 step 1: what fusing the decode step's launches can win, measured
+
+Engine main 0571d06, RX 9060 XT 16 GB (160 W cap). `bench/launch/chain_size.hip`
+(new): a chain of the decode step's real GEMV sizes - 64 layers x (qkv+gate
+35 MiB, ssm_out 14, gate+up 72, down 39) plus the 682 MiB head, 257 segments,
+10.7 GiB, against the model's 11.28 GiB in ~256 GEMV launches (#203's profile).
+One launch per segment (A) against the same bytes as one launch with a
+device-side queue over 128 KiB blocks (B, the fully fused ideal: the blocks come
+off a global counter, so no workgroup idles at a segment's tail). Median of 5,
+after a 2 s warm-up; data laid out once over a 11.8 GiB pool, so neither L2 nor
+the Infinity Cache holds it.
+
+| variant | ms | GB/s | per segment |
+|---|---:|---:|---:|
+| A: a launch per segment (257 launches) | 37.29 | 286.1 | 145.1 us |
+| B: one queued launch | 35.56 | **299.9** | 138.4 us |
+| C: the same chain in 2 / 8 / 32 launches | 37.24 / 37.25 / 37.27 | ~286 | ~145.0 |
+
+**The memory-side prize of a fully fused step is A - B = 1.72 ms (4.6 % of A)**,
+i.e. ~6.7 us per launch of fill and drain at these sizes - the per-launch cost
+`stream_size.hip` measured (~3-11 us at 13-36 MiB), now confirmed end to end on
+the step's own mix.
+
+## Why this settles the megakernel's size
+
+- #203 estimated ~6 ms per step from the same data ("GEMV fill/drain ~3.6 ms +
+  idle 2.5 ms"). The fill/drain part is **1.7 ms**: the earlier estimate charged
+  the whole gap between the GEMVs' 41.2 ms and the 35.4 ms bandwidth bound to the
+  launches, but **a pure streaming chain of the same sizes already loses 3.8 ms
+  to them** (37.29 ms against the 33.5 ms the bytes need at 318 GB/s): most of
+  that gap is the sizes' own inefficiency (many 14-39 MiB segments do not reach
+  318 GB/s even with no other kernel in flight), which fusing cannot remove -
+  B is still 300 GB/s, not 318.
+- The engine's real GEMV chain (41.2 ms for the step's weights) is therefore
+  only ~2 ms off a *pure streaming read* of the same sizes (37.3 ms, with no
+  dequant, no dots, no f16 staging).
+- The other launch cost is the ~165 small kernels at ~15 us each (~2.5 ms,
+  #203's note "dominated by per-launch latency, not work"). A megakernel would
+  have to absorb those too, and their fusion was already measured: folding the
+  add + norm into the output GEMV's last workgroup was 0.2 ms *slower* and the
+  never-taken epilogue cost ~1.1 ms through the GEMVs (#103).
+
+## Decision (for the maintainer)
+
+The fully fused step's memory-side ceiling is **~1.7 ms** (plus up to ~2.5 ms if
+every small kernel's launch latency is also removed, at the measured cost of the
+epilogue fusions), on a plain step of ~42 ms: **4-10 % best case**, for the
+largest and riskiest change in the project (device-side barriers, a work queue,
+one template instantiation per type per phase, 64 grid syncs per step).
+
+Recommendation: **do not build it now.** If the launch overhead is to be
+attacked, the measured-and-cheaper route is fewer *groups* per layer (the #255
+direction: each group already merges 2-3 tensors; the remaining 4 launches per
+layer are per-input) and the small kernels' fusion only where #103 did not
+already measure it as a loss. Reopen this issue if a future step becomes
+launch-bound (e.g. an int8 GEMV path that halves the weight bytes, doubling the
+relative cost of the launches).
