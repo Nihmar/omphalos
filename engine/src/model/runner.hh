@@ -559,6 +559,26 @@ private:
     // into kv_kq_ (a Q4 layer's K takes half the bytes)
     std::vector<uint8_t> kv_k4_;
     std::vector<size_t> kv_kq_off_;
+    // #409 step 1: the quantized cache's authoritative mirror in pinned host
+    // RAM, laid out exactly like the device arrays (per layer: K at
+    // kv_kq_off_, K scales, V, V scales with the same strides as the device),
+    // so one layer's row range is four contiguous copies. Written row for row
+    // by attn_prep's output, never read yet. The FP16 ring is not mirrored: it
+    // is a device-side precision structure (#318), and so is the MTP block's
+    // windowed cache (#171).
+    bool kv_stream_ = false;
+    void * kv_sh_kq_ = nullptr;
+    void * kv_sh_ks_ = nullptr;
+    void * kv_sh_vq_ = nullptr;
+    void * kv_sh_vs_ = nullptr;
+    void * kv_sh_scratch_ = nullptr;  // OMPH_KV_STREAM_CHECK: what is read back
+    size_t kv_sh_scratch_bytes_ = 0;
+    size_t kv_sh_bytes_ = 0;  // the store's total size (for the load report)
+    // Copies the rows [pos0, pos0 + T) of one attention layer's K, K scales, V
+    // and V scales from the device cache into the mirror, and with
+    // OMPH_KV_STREAM_CHECK compares them once more. `layer` is the stack's
+    // attention layer; the f32 modes and the MTP block's cache are not mirrored.
+    bool kv_stream_mirror(int64_t layer, const QuantKv & q, int64_t pos0, int64_t T);
     bool kv_host_ = false;  // f32 KV in pinned host RAM (validation reference)
     void * kv_stage_k_ = nullptr;
     // Overlap of independent GEMVs (#71): the decode forks a layer's sibling

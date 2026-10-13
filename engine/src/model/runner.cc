@@ -197,6 +197,10 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     // budget at 4.9x less VRAM than f32 (#58, #61).
     kv_host_ = env_.kv_host;
     kv_q8q4_ = !kv_host_ && !env_.kv_f32;
+    if (env_.kv_stream && !kv_q8q4_) {
+        throw std::runtime_error(
+            "OMPH_KV_STREAM needs the quantized KV cache (not OMPH_KV_F32 / OMPH_KV_HOST)");
+    }
     if (kv_host_) {
         // Validation reference only: the exact f32 cache in pinned host RAM
         // (4.29 GB at 32k does not fit beside the weights), and one layer's
@@ -237,6 +241,26 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         kv_ring_ = kv_window_ > 0 ? kv_window_ + omph::kernels::kKvRingExtra : 0;
         alloc(&kv_k16_, (size_t) n_kv * kv_ring_ * attn_kv * 2);
         alloc(&kv_v16_, (size_t) n_kv * kv_ring_ * attn_kv * 2);
+        if (env_.kv_stream) {
+            // #409 step 1: the authoritative mirror in pinned host RAM, the
+            // same sizes and offsets as the device arrays above (K per layer at
+            // kv_kq_off_, the scales and V at per-layer strides), because it is
+            // the source of the ring's row copies later.
+            const size_t scales_bytes = (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2;
+            const char * what = "cannot allocate the host KV mirror (OMPH_KV_STREAM)";
+            kv_sh_kq_ = mem_.host(kq_bytes, what);
+            kv_sh_ks_ = mem_.host(scales_bytes, what);
+            kv_sh_vq_ = mem_.host((size_t) n_kv * kvcap * attn_kv / 2, what);
+            kv_sh_vs_ = mem_.host(scales_bytes, what);
+            kv_sh_bytes_ = kq_bytes + 2 * scales_bytes + (size_t) n_kv * kvcap * attn_kv / 2;
+            kv_stream_ = true;
+            if (env_.kv_stream_check) {
+                // One chunk of the widest row: K Q8 (attn_kv bytes) or its
+                // scales (64), V Q4 (attn_kv/2).
+                kv_sh_scratch_bytes_ = (size_t) T * attn_kv;
+                kv_sh_scratch_ = mem_.host(kv_sh_scratch_bytes_, what);
+            }
+        }
     }
     // Off by default (#189): with the persistent-warp GEMVs (#63) one GEMV
     // fills the GPU, and the measured step is 0.7 ms faster in order (44.2 vs
@@ -314,6 +338,11 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         (void) hipMemGetInfo(&free_b, &total_b);
         std::fprintf(stderr, "vram: %zu MiB used of %zu MiB after load\n",
                      (total_b - free_b) >> 20, total_b >> 20);
+        if (kv_stream_) {
+            std::fprintf(stderr, "kv stream: %zu MiB of pinned host KV (the device cache stays "
+                                 "complete, the store is not read yet; #409 step 1)\n",
+                         kv_sh_bytes_ >> 20);
+        }
     }
 }
 

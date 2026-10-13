@@ -107,6 +107,10 @@ bool Runner::attn_layer(const int64_t il, const LayerWeights & L, const int64_t 
     if (!proj_ok || !omph::kernels::attn_prep(prep, nullptr)) {
         return fail("attention prep failed");
     }
+    // #409 step 1: the KV the kernel just wrote goes to the host store too.
+    if (kv.quant && !kv_stream_mirror(kv.layer, kv.q, pos0, T)) {
+        return false;
+    }
     if (kv_only) {
         if (!kv.quant &&
             (hipMemcpy(kv.k_f32 + pos0 * kv_out, k_, (size_t) T * kv_out * 4, hipMemcpyDefault) !=
@@ -254,6 +258,63 @@ Runner::QuantKv Runner::quant_kv(const int64_t il) const {
             static_cast<uint8_t *>(kv_vs_) + kvl * max_seq_ * h_.n_head_kv * nblk * 2,
             static_cast<uint8_t *>(kv_k16_) + kvl * kv_ring_ * kv_out * 2,
             static_cast<uint8_t *>(kv_v16_) + kvl * kv_ring_ * kv_out * 2};
+}
+
+// #409 step 1: mirror the rows attn_prep just wrote into the pinned host store.
+// Copying the writes rather than counting rows is what makes a rewind free: a
+// rejected draft or a re-prefill rewrites the same rows and is mirrored again
+// (#122, #342). The store is not read yet (the ring of step 3 is what reads
+// it), so a run with OMPH_KV_STREAM must be bit-identical to one without.
+// OMPH_KV_STREAM_CHECK reads the same rows back once and compares them: the
+// per-layer offsets and the row sizes are the only thing that can be wrong
+// silently here, and the check names the layer and the row when they are.
+bool Runner::kv_stream_mirror(const int64_t layer, const QuantKv & q, const int64_t pos0,
+                              const int64_t T) {
+    if (!kv_stream_ || T <= 0 || layer < 0 || layer >= h_.n_layer) {
+        return true;
+    }
+    const int64_t kvl = kv_index_[(size_t) layer];
+    const int64_t attn_kv = h_.n_head_kv * h_.head_dim;
+    const size_t k_row = (size_t) (kv_k4_[(size_t) kvl] ? attn_kv / 2 : attn_kv);
+    const size_t sc_row = (size_t) h_.n_head_kv * (h_.head_dim / 32) * 2;
+    const size_t v_row = (size_t) attn_kv / 2;
+    const struct Part {
+        void * host;      // the mirror's per-layer base (the device's offsets)
+        const void * dev;
+        size_t row;
+        const char * name;
+    } parts[] = {
+        {static_cast<uint8_t *>(kv_sh_kq_) + kv_kq_off_[(size_t) kvl], q.kq, k_row, "K"},
+        {static_cast<uint8_t *>(kv_sh_ks_) + (size_t) kvl * max_seq_ * sc_row, q.ksc, sc_row,
+         "K scales"},
+        {static_cast<uint8_t *>(kv_sh_vq_) + (size_t) kvl * max_seq_ * v_row, q.vq, v_row, "V"},
+        {static_cast<uint8_t *>(kv_sh_vs_) + (size_t) kvl * max_seq_ * sc_row, q.vsc, sc_row,
+         "V scales"},
+    };
+    for (const Part & p : parts) {
+        const size_t bytes = (size_t) T * p.row;
+        const uint8_t * from = static_cast<const uint8_t *>(p.dev) + (size_t) pos0 * p.row;
+        uint8_t * to = static_cast<uint8_t *>(p.host) + (size_t) pos0 * p.row;
+        if (hipMemcpyAsync(to, from, bytes, hipMemcpyDeviceToHost, nullptr) != hipSuccess) {
+            return fail("host KV mirror copy failed");
+        }
+        if (kv_sh_scratch_ == nullptr) {
+            continue;
+        }
+        if (bytes > kv_sh_scratch_bytes_) {
+            return fail("host KV mirror check: chunk larger than max_tokens");
+        }
+        if (hipMemcpy(kv_sh_scratch_, from, bytes, hipMemcpyDeviceToHost) != hipSuccess) {
+            return fail("host KV mirror check read failed");
+        }
+        if (std::memcmp(kv_sh_scratch_, to, bytes) != 0) {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg), "host KV mirror mismatch: layer %lld pos0 %lld, %s",
+                          (long long) layer, (long long) pos0, p.name);
+            return fail(msg);
+        }
+    }
+    return true;
 }
 
 // KV write + attention, on either the f32 cache (memcpy) or the Q8/Q4 one
