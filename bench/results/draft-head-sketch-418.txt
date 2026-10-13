@@ -1,0 +1,42 @@
+# #418: a sketched draft head — the candidate recall kills it
+
+Engine main 0571d06. Offline probe, no GPU: the head's first 98304 rows
+(`output.weight`, Q4_K, dequantized with `gguf.quants.dequantize`), the probe
+vectors = the target's layer-63 hidden states of a 400-token prompt
+(`omph-run --trace-dir`, real hidden states, RMS-normalized with
+`output_norm.weight` as the head's input is), 256 probes. The sketch is a
+Johnson-Lindenstrauss projection: `S = H P`, `Xq = X P` with a fixed-seed
+Gaussian `P` (5120 x rank), the sketch scores `Xq S^T` against the true `X H^T`.
+Method implemented in `tools/sketch_probe.py`; the run takes ~5 minutes (the
+projected vocabulary is the cost).
+
+| rank | recall@16 | top-1 agreement | sketch, f16 |
+|---:|---:|---:|---:|
+| 128 | 0.0 % | 0.0 % | 24 MiB |
+| 256 | **34.5 %** | 24.2 % | 48 MiB |
+| 512 | **47.4 %** | 21.9 % | 96 MiB |
+
+## Reading
+
+The drafter feeds the selector the top-16 candidates of each block position and
+their values; a sketch with a third of the true top-16 would change most
+candidates and degrade the drafted tokens, and the selector's successor /
+predecessor tables are built over the full vocabulary ids (the sketch only
+reorders them).
+
+The prize side, measured in #414: the drafter's head pass costs **2.9 ms per
+step** (the full 682 MiB head against the 98304-row prefix). A rank-256 sketch
+would cut that to ~0.2 ms, i.e. **~2.5-2.7 ms of a ~57 ms step (4.5 %)**, at the
+price of an `.omph` format bump, a new tensor and a new GEMV. Against a 34.5 %
+candidate recall that is not a trade worth proposing.
+
+A rank-512 sketch (96 MiB) reaches 47.4 % and still costs less than the prefix
+head it replaces, but the recall curve says the head's top-16 needs a much
+higher rank than 256 (the vocabulary's rows are near-orthogonal in 5120 dims, so
+the Johnson-Lindenstrauss bound for 98k competitors is not met at these ranks).
+A truncated-SVD sketch would do better than a random projection at the same
+rank, but the order of magnitude (a >50 % loss of candidates at rank 512) does
+not suggest it changes the conclusion.
+
+Decision: **no sketched draft head.** The candidates stay with the real head,
+already reduced to the first 98304 rows (#217, #245).
