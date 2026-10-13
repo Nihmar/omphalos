@@ -15,7 +15,8 @@ namespace omph::kernels {
 // (#191, #422): diagnostic only, wrong results, valid timings. Bits: 1 K
 // staging, 2 V staging, 4 K q^T, 8 softmax (mask + max + exp2 + sum + P),
 // 16 V^T P, 32 O rescale, 64 the K staging's loads/dequant only (its stores
-// stay). attention_set_ablation() sets it; the launcher
+// stay), 128 K from the f16 ring for every position (the f16-K-cache probe).
+// attention_set_ablation() sets it; the launcher
 // passes it down as a kernel argument.
 int g_fa_abl = 0;
 
@@ -251,12 +252,25 @@ struct KvArgs {
 // Dimensions [16c, 16c + 16) of the K row of position p for KV head kvh, as one
 // 16-byte load for Q8 (dequantized; from position wstart on: the exact copy in
 // the FP16 ring).
-template <bool Q8>
+template <bool Q8, int ABL = 0>
 __device__ inline void gqa_load_k16(const KvArgs & kv, const long long p, const long long kvh,
                                     const long long nkv, const int c, const long long wstart,
                                     float * k) {
     const long long row = (p - kv.kbase) * nkv + kvh;
     if constexpr (Q8) {
+        if constexpr ((ABL & 128) != 0) {
+            // OMPH_TEST_FA_ABL=128: read K as f16 for *every* position (#191's
+            // f16-cache probe): the ring's data at the wrong positions, right
+            // instructions. The timing is what an f16 K cache would buy.
+            if (kv.k16 != nullptr) {
+                const __half * src = kv.k16 + ((p % kv.ring) * nkv + kvh) * kGqaHd + c * 16;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    k[i] = __half2float(src[i]);
+                }
+                return;
+            }
+        }
         if (kv.k16 != nullptr && p >= wstart) {
             const uint4 * src = reinterpret_cast<const uint4 *>(
                 kv.k16 + ((p % kv.ring) * nkv + kvh) * kGqaHd + c * 16);
@@ -636,7 +650,7 @@ __device__ inline void fa_stage_k(const KvArgs & kv, _Float16 * ks, const long l
                 kc[i] = 0.0f;
             }
         } else if (s0 + key < n_keys) {
-            gqa_load_k16<Q8>(kv, s0 + key, kvh, nkv, c, seq - kv.window, kc);
+            gqa_load_k16<Q8, ABL>(kv, s0 + key, kvh, nkv, c, seq - kv.window, kc);
         } else {
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
@@ -1383,6 +1397,7 @@ hipError_t fa_launch(const dim3 & fgrid, hipStream_t stream, const float * q, co
         case 16: attention_wmma_kernel<Q8, 16><<<fgrid, kFaThreads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
         case 32: attention_wmma_kernel<Q8, 32><<<fgrid, kFaThreads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
         case 64: attention_wmma_kernel<Q8, 64><<<fgrid, kFaThreads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
+        case 128: attention_wmma_kernel<Q8, 128><<<fgrid, kFaThreads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
         case 65: attention_wmma_kernel<Q8, 65><<<fgrid, kFaThreads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
         case 63: attention_wmma_kernel<Q8, 63><<<fgrid, kFaThreads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
         default: attention_wmma_kernel<Q8, 0><<<fgrid, kFaThreads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
