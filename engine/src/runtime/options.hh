@@ -110,6 +110,8 @@ struct EnvOptions {
                                 // 11 is the measured compromise; 7 is the trained block_size - 1
     int test_q8act = 0;         // OMPH_TEST_Q8ACT=B: every prefill GEMM's input quantized to int8 in blocks
                                 // of B along k and back: an int8 GEMM's numerics (#213)
+    int test_fa_abl = 0;        // OMPH_TEST_FA_ABL=N: the prefill attention's phases ablated (#191, #422):
+                                // 1 K staging, 2 V staging, 4 K q^T, 8 softmax, 16 V^T P, 32 O rescale
 
     static EnvOptions from_env();
 };

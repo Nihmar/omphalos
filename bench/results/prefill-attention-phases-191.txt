@@ -1,0 +1,66 @@
+# #191: the prefill attention's phases, ablated on the current kernel
+
+Engine main 1e151d0 + this branch, RX 9060 XT 16 GB (160 W cap), wikitext prompts
+of **16384** and **74599** tokens (`omph-run <omph> ids /tmp/x.f32 --last-logits
+--gemv`, `OMPH_TIMING`'s `prefill wall`). llama.cpp: v0.6.0 @ d81235049 (no
+llama.cpp run here).
+
+`OMPH_TEST_FA_ABL=N` (diagnostic, wrong results with valid timings) ablates the
+prefill WMMA kernel's phases: **1** K staging, **2** V staging, **4** the K q^T
+WMMAs, **8** the softmax (mask + max + exp2 + sum + P), **16** the V^T P WMMAs,
+**32** the O rescale, **63** all, **64** the K staging's loads and dequant (its
+stores stay), **65** = 1 | 64. Each ablation removes only its own work: the
+barriers, the LDS traffic of the other phases and the rest of the structure
+stay, so the deltas are lower bounds.
+
+**The ablations are compile-time** (`attention_wmma_kernel<Q8, ABL>`): the first
+attempt used a runtime flag in the kernel's inner loops and cost **8 % at 16k
+(18061 vs 16528 ms) and 26 % at 74.6k (123342 vs 97907 ms)** through the default
+path; the numbers below are from the compile-time build, whose `ABL = 0`
+timing matches main's within the run-to-run spread.
+
+## Prefill wall, ms (delta against the baseline)
+
+| ablation | 16k (baseline 16528-16773) | 74.6k (baseline 97907) |
+|---|---:|---:|
+| 1 no K staging | 15451-15538 (**-7.0 %**) | 84240 (**-14.0 %**) |
+| 2 no V staging | 16892-16933 (**+1.7 %**) | |
+| 4 no K q^T | 16564 (-0.2 %) | |
+| 8 no softmax | 15839 (**-4.6 %**) | 92250 (-5.8 %) |
+| 16 no V^T P | 16530 (-0.4 %) | |
+| 32 no O rescale | 16779 (+1.1 %) | |
+| 63 all | 14749 (**-11.2 %**) | 68089 (**-30.5 %**) |
+| 64 K loads/dequant only | 16514 (**-0.1 %**) | |
+| 65 K staging off (control for 64) | 15506 (-6.2 %) | |
+
+## Reading
+
+- **The K staging is the dominant item**, and within it **the swizzled LDS
+  stores**, not the dequant: removing the loads and the Q8 dequant of the K tile
+  changes the wall by 14 ms (-0.1 %), while removing the whole staging (same
+  loads, same consumers) saves 1022 ms (-6.2 %). The stores are two 16-byte
+  writes per job into `ks[ks_at(key, 2c)]` / `[2c + 1]`
+  (`engine/src/kernels/attn.hip: kFaKLd 264, XOR swizzle), 512 jobs per key tile
+  over 8 producer waves: an address pattern that conflicts in LDS (each 16-byte
+  store spans four banks, the 16 lanes of a half-warp write the same key row)
+  and whose index arithmetic is per element. This is quadratic in the context
+  (-7 % at 16k, -14 % at 74.6k): every query block re-stages the K range.
+- **The QK^T and P V WMMAs are hidden** (-0.2 % and -0.4 % at 16k): 64 WMMAs per
+  wave per tile cost nothing measurable, so the "critical path" reading of the
+  first (runtime-flag) run was an artifact of that flag.
+- **The softmax is -4.6 % / -5.8 %** and is at its ISA rates (#422): a floor.
+- The V staging, the O rescale and the "no V staging" cell are neutral or
+  slightly *negative* (removing the V staging is +1.7 %, probably because the
+  consumers then run on stale V and the pipeline interacts differently): no
+  lever there.
+- Everything together is -11.2 % at 16k and -30.5 % at 74.6k, so at 16k the K
+  staging plus the softmax account for the whole attention.
+
+## What the next round should try
+
+1. **The K staging's store pattern**: a conflict-free layout (the V staging's
+   `vt_at` pattern costs nothing; K's `ks_at` costs 7-14 %) or one 32-byte store
+   per job instead of two 16-byte ones, with the consumer's operand read adapted
+   to match (`&ks[ks_at(jt * 16 + (lane & 15), 2 * s + (lane >> 4))]`).
+2. Nothing else: the WMMAs and the rescale are hidden, the softmax is at its
+   rates (#422), and the V staging is neutral.
