@@ -203,20 +203,126 @@ __global__ __launch_bounds__(256) void gemm_t2(const uint8_t * __restrict__ wt,
     }
 }
 
+// #421: 8 waves x 64 rows (512 rows) x 64 tokens, four row tiles and four
+// token tiles per wave, so each B operand from LDS feeds four WMMAs (0.25
+// reads per WMMA against the 2 x 8 shape's 0.5) at the same 16 accumulators
+// per lane; the weight decode per output element is unchanged, the B reads
+// halve. The x buffer shrinks to 10 KB.
+template <class TD>
+__global__ __launch_bounds__(256) void gemm_t4(const uint8_t * __restrict__ wt,
+                                              const _Float16 * __restrict__ x, float * __restrict__ y,
+                                              const long long blocks, const int tokens, const long long ldy) {
+    constexpr int kTok = 64;
+    __shared__ __attribute__((aligned(16))) uint8_t tab[TD::kLds];
+    __shared__ _Float16 xs[2][kTok * kXLd];
+    const int tid = (int) threadIdx.x;
+    TD::init(tab);
+    const int lane = tid & 31;
+    const int wv = tid >> 5;
+    const int h = lane >> 4;
+    const long long tile = (long long) blockIdx.y * 32 + wv * 4;
+    const long long n0 = (long long) blockIdx.x * kTok;
+    const long long k = blocks * 256;
+    const long long tx = n0 + tid < tokens ? n0 + tid : 0;
+    const uint4 * xrow = reinterpret_cast<const uint4 *>(x + tx * k);
+    const auto stage = [&](const long long s, _Float16 * buf) {
+        if (tid >= kTok) {
+            return;
+        }
+        const uint4 * src = xrow + s * 4;
+        uint4 * dst = reinterpret_cast<uint4 *>(buf + tid * kXLd);
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = src[3];
+    };
+    float8 acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            acc[i][j] = float8{};
+        }
+    }
+    stage(0, xs[0]);
+    __syncthreads();
+    int buf = 0;
+    for (long long b = 0; b < blocks; ++b) {
+        const typename TD::Blk kb[4] = {TD::load(wt + ((tile + 0) * blocks + b) * TD::kBytes, lane),
+                                        TD::load(wt + ((tile + 1) * blocks + b) * TD::kBytes, lane),
+                                        TD::load(wt + ((tile + 2) * blocks + b) * TD::kBytes, lane),
+                                        TD::load(wt + ((tile + 3) * blocks + b) * TD::kBytes, lane)};
+#pragma unroll 1
+        for (int sb = 0; sb < 8; ++sb) {
+            const half8 a[4][2] = {{TD::frag(tab, kb[0], sb, 0, h), TD::frag(tab, kb[0], sb, 1, h)},
+                                   {TD::frag(tab, kb[1], sb, 0, h), TD::frag(tab, kb[1], sb, 1, h)},
+                                   {TD::frag(tab, kb[2], sb, 0, h), TD::frag(tab, kb[2], sb, 1, h)},
+                                   {TD::frag(tab, kb[3], sb, 0, h), TD::frag(tab, kb[3], sb, 1, h)}};
+#pragma unroll
+            for (int gl = 0; gl < 2; ++gl) {
+                if (gl == 0) {
+                    const long long s = b * 8 + sb;
+                    if (s + 1 < blocks * 8) {
+                        stage(s + 1, xs[buf ^ 1]);
+                    }
+                }
+                const _Float16 * cur = xs[buf];
+                half8 bv[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    bv[j] = *reinterpret_cast<const half8 *>(
+                        cur + (j * 16 + (lane & 15)) * kXLd + h * 16 + gl * 8);
+                }
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a[i][gl], bv[j], acc[i][j]);
+                    }
+                }
+                if (gl == 1) {
+                    __syncthreads();
+                    buf ^= 1;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const long long t = n0 + j * 16 + (lane & 15);
+            if (t < tokens) {
+                float * dst = y + t * ldy + (tile + i) * 16 + h * 8;
+                reinterpret_cast<float4 *>(dst)[0] = make_float4(acc[i][j][0], acc[i][j][1], acc[i][j][2], acc[i][j][3]);
+                reinterpret_cast<float4 *>(dst)[1] = make_float4(acc[i][j][4], acc[i][j][5], acc[i][j][6], acc[i][j][7]);
+            }
+        }
+    }
+}
+
 #define OMPH_TILE_BENCH(NAME, TID, TD)                                                                       \
     case TID: {                                                                                        \
         const dim3 g1((unsigned) ((tokens + 255) / 256), (unsigned) (rows / 128));                       \
         const dim3 g2((unsigned) ((tokens + 127) / 128), (unsigned) (rows / 256));                       \
+        const dim3 g4((unsigned) ((tokens + 63) / 64), (unsigned) (rows / 512));                         \
         const auto run1 = [&] { gemm_t1<TD><<<g1, 256>>>(w, x, y1, blocks, tokens, rows); };           \
         const auto run2 = [&] { gemm_t2<TD><<<g2, 256>>>(w, x, y2, blocks, tokens, rows); };           \
+        const auto run4 = [&] { gemm_t4<TD><<<g4, 256>>>(w, x, y3, blocks, tokens, rows); };           \
         run1();                                                                                         \
         run2();                                                                                         \
+        run4();                                                                                         \
         check(hipDeviceSynchronize(), #NAME);                                                           \
-        std::vector<float> a1((size_t) tokens * rows), a2(a1.size());                                    \
+        std::vector<float> a1((size_t) tokens * rows), a2(a1.size()), a4(a1.size());                    \
         check(hipMemcpy(a1.data(), y1, a1.size() * 4, hipMemcpyDeviceToHost), "copy");                   \
         check(hipMemcpy(a2.data(), y2, a2.size() * 4, hipMemcpyDeviceToHost), "copy");                   \
+        check(hipMemcpy(a4.data(), y3, a4.size() * 4, hipMemcpyDeviceToHost), "copy");                   \
         size_t differ = 0;                                                                              \
-        for (size_t i = 0; i < a1.size(); ++i) differ += std::memcmp(&a1[i], &a2[i], 4) != 0;            \
+        size_t differ4 = 0;                                                                             \
+        for (size_t i = 0; i < a1.size(); ++i) {                                                        \
+            differ += std::memcmp(&a1[i], &a2[i], 4) != 0;                                               \
+            differ4 += std::memcmp(&a1[i], &a4[i], 4) != 0;                                              \
+        }                                                                                               \
         const auto timeit = [&](const auto & fn) {                                                       \
             std::vector<float> v;                                                                        \
             for (int rep = 0; rep < reps; ++rep) {                                                       \
@@ -237,14 +343,18 @@ __global__ __launch_bounds__(256) void gemm_t2(const uint8_t * __restrict__ wt,
         for (int i = 0; i < 150; ++i) {  /* ~1 s: the clocks ramp first */                               \
             run1();                                                                                     \
             run2();                                                                                     \
+            run4();                                                                                     \
         }                                                                                               \
         check(hipDeviceSynchronize(), "warm-up");                                                       \
         const double flops = 2.0 * rows * (double) (blocks * 256) * tokens;                             \
         const float ms1 = timeit(run1);                                                                 \
         const float ms2 = timeit(run2);                                                                 \
-        std::printf("%-7s  128x256 %6.1f TFLOPS   2x8 %6.1f TFLOPS  (%+5.1f%%)  %s\n", #NAME,           \
-                    flops / ms1 / 1e9, flops / ms2 / 1e9, (ms1 / ms2 - 1) * 100,                         \
-                    differ == 0 ? "bit-identical" : "DIFFERS");                                          \
+        const float ms4 = timeit(run4);                                                                 \
+        std::printf("%-7s  128x256 %6.1f   2x8 %6.1f (%+5.1f%%)   4x4 %6.1f (%+5.1f%%)  %s %s\n", #NAME, \
+                    flops / ms1 / 1e9, flops / ms2 / 1e9, (ms1 / ms2 - 1) * 100,                      \
+                    flops / ms4 / 1e9, (ms1 / ms4 - 1) * 100,                                        \
+                    differ == 0 ? "bit-identical" : "2x8 DIFFERS",                                  \
+                    differ4 == 0 ? "bit-identical" : "4x4 DIFFERS");                                \
         break;                                                                                          \
     }
 
@@ -272,10 +382,12 @@ int main(int argc, char ** argv) {
         _Float16 * x;
         float * y1;
         float * y2;
+        float * y3;
         check(hipMalloc(&w, wh.size()), "malloc");
         check(hipMalloc(&x, xhv.size() * 2), "malloc");
         check(hipMalloc(&y1, (size_t) tokens * rows * 4), "malloc");
         check(hipMalloc(&y2, (size_t) tokens * rows * 4), "malloc");
+        check(hipMalloc(&y3, (size_t) tokens * rows * 4), "malloc");
         check(hipMemcpy(w, wh.data(), wh.size(), hipMemcpyHostToDevice), "copy");
         check(hipMemcpy(x, xhv.data(), xhv.size() * 2, hipMemcpyHostToDevice), "copy");
         switch (t.type) {
@@ -295,6 +407,7 @@ int main(int argc, char ** argv) {
         (void) hipFree(x);
         (void) hipFree(y1);
         (void) hipFree(y2);
+        (void) hipFree(y3);
     }
     return 0;
 }
