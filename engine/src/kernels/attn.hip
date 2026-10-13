@@ -228,6 +228,7 @@ struct KvArgs {
     long long window;  // a query reads its last `window` keys from the ring
     long long ring;    // the ring's slots
     bool k_q4;
+    long long kbase;  // cache position of the quantized buffers' row 0 (#409)
 };
 
 // Dimensions [16c, 16c + 16) of the K row of position p for KV head kvh, as one
@@ -237,7 +238,7 @@ template <bool Q8>
 __device__ inline void gqa_load_k16(const KvArgs & kv, const long long p, const long long kvh,
                                     const long long nkv, const int c, const long long wstart,
                                     float * k) {
-    const long long row = p * nkv + kvh;
+    const long long row = (p - kv.kbase) * nkv + kvh;
     if constexpr (Q8) {
         if (kv.k16 != nullptr && p >= wstart) {
             const uint4 * src = reinterpret_cast<const uint4 *>(
@@ -289,7 +290,7 @@ template <bool Q8>
 __device__ inline void gqa_load_v16(const KvArgs & kv, const long long p, const long long kvh,
                                     const long long nkv, const int c, const long long wstart,
                                     float * v) {
-    const long long row = p * nkv + kvh;
+    const long long row = (p - kv.kbase) * nkv + kvh;
     if constexpr (Q8) {
         if (kv.v16 != nullptr && p >= wstart) {
             const uint4 * src = reinterpret_cast<const uint4 *>(
@@ -361,7 +362,8 @@ template <bool Q8, int TQ>
 __global__ __launch_bounds__(kGqaHd) void attention_gqa_kernel(
     const float * __restrict__ q, const KvArgs kv, float * __restrict__ work,
     const long long tokens, const long long seq, const int nh, const int nkv,
-    const float scale, const int splits, const long long blocks_per_split, const bool per_query) {
+    const float scale, const int splits, const long long blocks_per_split, const bool per_query,
+    const int split0) {
     constexpr int G = kGqaGroup;
     constexpr int kRows = TQ * G;
     // Q rows in 16-dimension chunks padded to 20 floats: 16-byte aligned, so a
@@ -377,7 +379,7 @@ __global__ __launch_bounds__(kGqaHd) void attention_gqa_kernel(
     const int d = (int) threadIdx.x;
     const long long t0 = (long long) blockIdx.x * TQ;
     const int kvh = (int) blockIdx.y;
-    const int split = (int) blockIdx.z;
+    const int split = split0 + (int) blockIdx.z;  // global index of this split (#409)
     const int nt = (int) (tokens - t0 < TQ ? tokens - t0 : TQ);
     const int R = nt * G;
     const long long qpos0 = seq - tokens + t0;  // cache position of the tile's first query
@@ -887,7 +889,7 @@ constexpr int kDcDims = kGqaHd / kDcWaves;  // 64 per wave
 // -10 % at 100k, -25 % at 25k (#172)
 constexpr int kDcVLd = kDcKeys;
 constexpr int kDcPLd = kDcKeys + 8;         // ps row stride
-constexpr int kDcMaxTokens = 8;             // 48 rows: three 16-row tiles
+constexpr int kDcMaxTokens = (int) kAttentionDecTokens;  // 48 rows: three 16-row tiles
 
 // Dimensions [d, d + 8) of the K row of position p as f16 (#169): the B
 // operand of a score WMMA, loaded by the lane that uses it. Same values as
@@ -895,7 +897,7 @@ constexpr int kDcMaxTokens = 8;             // 48 rows: three 16-row tiles
 template <bool Q8>
 __device__ inline wmma_half8 dec_load_k8(const KvArgs & kv, const long long p, const long long kvh,
                                          const long long nkv, const int d, const long long wstart) {
-    const long long row = p * nkv + kvh;
+    const long long row = (p - kv.kbase) * nkv + kvh;
     wmma_half8 r;
     if constexpr (Q8) {
         if (kv.k16 != nullptr && p >= wstart) {
@@ -941,7 +943,7 @@ template <bool Q8, int NRT>
 __global__ __launch_bounds__(kDcThreads) void attention_dec_kernel(
     const float * __restrict__ q, const KvArgs kv, float * __restrict__ work,
     const long long tokens, const long long seq, const int nh, const int nkv, const float scale,
-    const int splits, const long long tiles_per_split) {
+    const int splits, const long long tiles_per_split, const int split0) {
     __shared__ __align__(16) _Float16 vt[kGqaHd * kDcVLd];
     __shared__ float part[kDcWaves][NRT][16][kDcKeys];          // score partials
     // P: each wave writes its rows' (the next pass's writes come after a barrier)
@@ -952,7 +954,7 @@ __global__ __launch_bounds__(kDcThreads) void attention_dec_kernel(
     const int lane = tid & 31;
     const int w = tid >> 5;
     const int kvh = (int) blockIdx.y;
-    const int split = (int) blockIdx.z;
+    const int split = split0 + (int) blockIdx.z;  // global index of this split (#409)
     const int nt = (int) tokens;
     const int rows = nt * kGqaGroup;
     const long long qpos0 = seq - tokens;  // cache position of the first query
@@ -1298,14 +1300,41 @@ size_t attention_gqa_work_bytes(const int64_t max_tokens, const int64_t nh, cons
     return worst * (size_t) (hd + 2) * sizeof(float);
 }
 
-bool attention_gqa(const float * q, const KvCache & kv, const float * gate, float * out,
-                   const int64_t tokens, const int64_t seq, const int64_t nh, const int64_t nkv,
-                   const int64_t hd, const float scale, const bool v_rotated, void * work,
-                   const size_t work_bytes, hipStream_t stream, void * out_f16,
-                   const bool allow_wmma, const int64_t key_chunk, const bool dec_wmma) {
+// #409 step 2: the fixed-split geometry of a decode / verification call with a
+// key chunk (the scalar and the WMMA decode kernels agree on it: blocks of 16
+// keys, `key_chunk` per split).
+AttentionSplits attention_dec_splits(const int64_t seq, const int64_t key_chunk) {
+    if (seq <= 0 || key_chunk <= 0 || key_chunk % kDcKeys != 0) {
+        return {};
+    }
+    const long long n_tiles = (seq + kDcKeys - 1) / kDcKeys;
+    const long long tiles_per_split = key_chunk / kDcKeys;
+    return {(n_tiles + tiles_per_split - 1) / tiles_per_split, key_chunk};
+}
+
+bool attention_gqa_merge(const float * work, const float * gate, float * out, void * out_f16,
+                         const int64_t tokens, const int64_t nh, const int64_t splits,
+                         const bool v_rotated, hipStream_t stream) {
+    if (work == nullptr || (out == nullptr && out_f16 == nullptr) || tokens <= 0 || nh <= 0 ||
+        splits <= 0 || splits > kGqaMaxSplits) {
+        return false;
+    }
+    attention_gqa_merge_kernel<<<dim3((unsigned) tokens, (unsigned) nh), kGqaHd, 0, stream>>>(
+        work, gate, out, static_cast<__half *>(out_f16), (int) nh, (int) splits, v_rotated);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool attention_gqa_range(const float * q, const KvCache & kv, const float * gate, float * out,
+                         const int64_t tokens, const int64_t seq, const int64_t nh,
+                         const int64_t nkv, const int64_t hd, const float scale,
+                         const bool v_rotated, void * work, const size_t work_bytes,
+                         hipStream_t stream, void * out_f16, const bool allow_wmma,
+                         const int64_t key_chunk, const bool dec_wmma, const int64_t split0,
+                         const int64_t nsplits, const bool merge) {
     const bool q8 = kv.k_q8 != nullptr;
     if (q == nullptr || (out == nullptr && out_f16 == nullptr) || work == nullptr || tokens <= 0 || seq < tokens ||
-        nh <= 0 || nkv <= 0 || nh / nkv != kGqaGroup || nh % nkv != 0 || hd != kGqaHd) {
+        nh <= 0 || nkv <= 0 || nh / nkv != kGqaGroup || nh % nkv != 0 || hd != kGqaHd || split0 < 0 ||
+        nsplits < 0) {
         return false;
     }
     if (q8 ? (kv.k_scales == nullptr || kv.v_q4 == nullptr || kv.v_scales == nullptr ||
@@ -1331,6 +1360,11 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
     if (splits > kGqaMaxSplits) {
         return false;
     }
+    // this call's share of the splits (#409 step 2)
+    const int ns = (int) (nsplits > 0 ? nsplits : (int64_t) splits - split0);
+    if (split0 + ns > splits || ns <= 0) {
+        return false;
+    }
     if ((size_t) tokens * nh * splits * (hd + 2) * sizeof(float) > work_bytes) {
         return false;
     }
@@ -1344,11 +1378,17 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
                       static_cast<const __half *>(kv.v16),
                       kv.window > 0 ? kv.window : 1,
                       kv.ring > 0 ? kv.ring : 1,
-                      kv.k_q4};
+                      kv.k_q4,
+                      kv.kbase};
     // every query its own window when the ring holds them all (#161)
     const bool per_query = tokens <= kKvRingExtra + 1 && kv.ring >= kv.window + kKvRingExtra;
     auto * w = static_cast<float *>(work);
     if (fa) {
+        // the prefill kernel walks the whole key range in one launch: only the
+        // whole range is available (no fixed splits, #409)
+        if (split0 != 0 || ns != splits) {
+            return false;
+        }
         const dim3 fgrid((unsigned) ((tokens + kFaWgTokens - 1) / kFaWgTokens), (unsigned) nkv);
         if (q8) {
             attention_wmma_kernel<true><<<fgrid, kFaThreads, 0, stream>>>(q, args, w, tokens, seq,
@@ -1356,6 +1396,9 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
         } else {
             attention_wmma_kernel<false><<<fgrid, kFaThreads, 0, stream>>>(
                 q, args, w, tokens, seq, (int) nh, (int) nkv, scale);
+        }
+        if (!merge) {
+            return hipGetLastError() == hipSuccess;
         }
         attention_gqa_merge_kernel<<<dim3((unsigned) tokens, (unsigned) nh), kGqaHd, 0, stream>>>(
             w, gate, out, static_cast<__half *>(out_f16), (int) nh, 1, v_rotated);
@@ -1371,11 +1414,12 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
         if (dsplits > kGqaMaxSplits || (size_t) tokens * nh * dsplits * (hd + 2) * sizeof(float) > work_bytes) {
             return false;
         }
-        const dim3 dgrid(1u, (unsigned) nkv, (unsigned) dsplits);
+        const dim3 dgrid(1u, (unsigned) nkv, (unsigned) ns);
         const int nrt = (int) ((tokens * kGqaGroup + 15) / 16);
 #define OMPH_DEC_LAUNCH(Q8, NRT)                                                                       \
     attention_dec_kernel<Q8, NRT><<<dgrid, kDcThreads, 0, stream>>>(q, args, w, tokens, seq, (int) nh, \
-                                                                    (int) nkv, scale, dsplits, tps)
+                                                                    (int) nkv, scale, dsplits, tps,   \
+                                                                    (int) split0)
         if (q8) {
             if (nrt == 1) OMPH_DEC_LAUNCH(true, 1);
             else if (nrt == 2) OMPH_DEC_LAUNCH(true, 2);
@@ -1386,15 +1430,18 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
             else OMPH_DEC_LAUNCH(false, 3);
         }
 #undef OMPH_DEC_LAUNCH
+        if (!merge) {
+            return hipGetLastError() == hipSuccess;
+        }
         attention_gqa_merge_kernel<<<dim3((unsigned) tokens, (unsigned) nh), kGqaHd, 0, stream>>>(
             w, gate, out, static_cast<__half *>(out_f16), (int) nh, dsplits, v_rotated);
         return hipGetLastError() == hipSuccess;
     }
     const int tq = gqa_tq(tokens);
-    const dim3 grid((unsigned) ((tokens + tq - 1) / tq), (unsigned) nkv, (unsigned) splits);
-#define OMPH_GQA_LAUNCH(Q8, TQ)                                                              \
-    attention_gqa_kernel<Q8, TQ><<<grid, kGqaHd, 0, stream>>>(q, args, w, tokens, seq, (int) nh, \
-                                                              (int) nkv, scale, splits, bps, per_query)
+    const dim3 grid((unsigned) ((tokens + tq - 1) / tq), (unsigned) nkv, (unsigned) ns);
+#define OMPH_GQA_LAUNCH(Q8, TQ)                                                                              \
+    attention_gqa_kernel<Q8, TQ><<<grid, kGqaHd, 0, stream>>>(q, args, w, tokens, seq, (int) nh, (int) nkv, \
+                                                              scale, splits, bps, per_query, (int) split0)
     if (q8) {
         if (tq == 4) {
             OMPH_GQA_LAUNCH(true, 4);
@@ -1413,9 +1460,22 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
         }
     }
 #undef OMPH_GQA_LAUNCH
+    if (!merge) {
+        return hipGetLastError() == hipSuccess;
+    }
     attention_gqa_merge_kernel<<<dim3((unsigned) tokens, (unsigned) nh), kGqaHd, 0, stream>>>(
         w, gate, out, static_cast<__half *>(out_f16), (int) nh, splits, v_rotated);
     return hipGetLastError() == hipSuccess;
+}
+
+bool attention_gqa(const float * q, const KvCache & kv, const float * gate, float * out,
+                   const int64_t tokens, const int64_t seq, const int64_t nh, const int64_t nkv,
+                   const int64_t hd, const float scale, const bool v_rotated, void * work,
+                   const size_t work_bytes, hipStream_t stream, void * out_f16,
+                   const bool allow_wmma, const int64_t key_chunk, const bool dec_wmma) {
+    return attention_gqa_range(q, kv, gate, out, tokens, seq, nh, nkv, hd, scale, v_rotated, work,
+                               work_bytes, stream, out_f16, allow_wmma, key_chunk, dec_wmma, 0, 0,
+                               true);
 }
 
 } // namespace omph::kernels

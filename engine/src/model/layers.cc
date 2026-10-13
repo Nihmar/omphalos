@@ -319,8 +319,63 @@ bool Runner::kv_stream_mirror(const int64_t layer, const QuantKv & q, const int6
     return true;
 }
 
-// KV write + attention, on either the f32 cache (memcpy) or the Q8/Q4 one
-// (quantize); attention_gqa then reads either, dequantizing on the fly.
+// #409 step 2 (OMPH_ATTN_SPLIT_GROUPS): a decode / verification call's fixed
+// key splits, run a group at a time with each group's rows staged into a buffer
+// of its own. The partials keep their global split indices and the merge is the
+// same one, so the result is bit-identical to the single call (#409,
+// bench/results/kv-stream-409-splits.txt); the staging and the staged base
+// (`kbase`) are the machinery step 3 points at the host store.
+bool Runner::attn_splits_staged(const omph::kernels::KvCache & kv, const bool q8, const int64_t t0,
+                                const int64_t n, const int64_t seq, const float scale) {
+    const int64_t qrow = h_.n_head * h_.head_dim;
+    const auto call = [&](const omph::kernels::KvCache & c, const int64_t split0, const int64_t ns,
+                          const bool merge) {
+        return omph::kernels::attention_gqa_range(
+            static_cast<const float *>(q_) + t0 * qrow, c,
+            static_cast<const float *>(gate_) + t0 * qrow, nullptr, n, seq, h_.n_head, h_.n_head_kv,
+            h_.head_dim, scale, q8, attn_work_, attn_work_bytes_, nullptr,
+            static_cast<__half *>(ffn16_) + t0 * qrow, !env_.attn_scalar, key_chunk_,
+            !env_.attn_dec_scalar, split0, ns, merge);
+    };
+    const omph::kernels::AttentionSplits sp = omph::kernels::attention_dec_splits(seq, key_chunk_);
+    if (kv_groups_ < 2 || sp.splits <= 1 || sp.keys <= 0) {
+        return call(kv, 0, 0, true);
+    }
+    const int64_t groups = std::min(kv_groups_, sp.splits);
+    const int64_t per_group = (sp.splits + groups - 1) / groups;
+    const int64_t kv_out = h_.n_head_kv * h_.head_dim;
+    const size_t k_row = (size_t) (kv.k_q4 ? kv_out / 2 : kv_out);
+    const size_t sc_row = (size_t) h_.n_head_kv * (h_.head_dim / 32) * 2;
+    const size_t v_row = (size_t) kv_out / 2;
+    omph::kernels::KvCache staged = kv;
+    staged.k_q8 = static_cast<const uint8_t *>(kv_g_k_);
+    staged.k_scales = kv_g_ks_;
+    staged.v_q4 = static_cast<const uint8_t *>(kv_g_vq_);
+    staged.v_scales = kv_g_vs_;
+    for (int64_t split0 = 0; split0 < sp.splits; split0 += per_group) {
+        const int64_t ns = std::min(per_group, sp.splits - split0);
+        const int64_t r0 = split0 * sp.keys;
+        const int64_t r1 = std::min(r0 + ns * sp.keys, seq);
+        const size_t rows = (size_t) (r1 - r0);
+        const auto stage = [&](void * dst, const void * src, const size_t row) {
+            return hipMemcpyAsync(dst, static_cast<const uint8_t *>(src) + (size_t) r0 * row,
+                                  rows * row, hipMemcpyDeviceToDevice, nullptr) == hipSuccess;
+        };
+        if (!stage(kv_g_k_, kv.k_q8, k_row) || !stage(kv_g_ks_, kv.k_scales, sc_row) ||
+            !stage(kv_g_vq_, kv.v_q4, v_row) || !stage(kv_g_vs_, kv.v_scales, sc_row)) {
+            return fail("KV split staging failed");
+        }
+        staged.kbase = r0;
+        if (!call(staged, split0, ns, false)) {
+            return false;
+        }
+    }
+    // the merge over every split: the partials are at their global indices
+    return omph::kernels::attention_gqa_merge(
+        static_cast<const float *>(attn_work_), static_cast<const float *>(gate_) + t0 * qrow,
+        nullptr, static_cast<__half *>(ffn16_) + t0 * qrow, n, h_.n_head, sp.splits, q8, nullptr);
+}
+
 // KV write + attention, on either the f32 cache (memcpy) or the Q8/Q4 one
 // (written by attn_prep); attention_gqa then reads either, dequantizing on the fly.
 bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T) {
@@ -335,12 +390,19 @@ bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T
     const auto attend = [&](const omph::kernels::KvCache & kv, const bool q8) {
         for (int64_t t0 = 0; t0 < T; t0 += group) {
             const int64_t n = std::min(group, T - t0);
-            if (!omph::kernels::attention_gqa(static_cast<const float *>(q_) + t0 * qrow, kv,
-                                              static_cast<const float *>(gate_) + t0 * qrow, nullptr, n,
-                                              pos0 + t0 + n, h_.n_head, h_.n_head_kv, h_.head_dim, scale, q8,
-                                              attn_work_, attn_work_bytes_, nullptr,
-                                              static_cast<__half *>(ffn16_) + t0 * qrow, !env_.attn_scalar,
-                                              key_chunk_, !env_.attn_dec_scalar)) {
+            // #409 step 2: with the split groups on, a decode / verification
+            // call stages each group of key splits and merges at the end.
+            const bool grouped = kv_groups_ > 1 && n <= omph::kernels::kAttentionDecTokens;
+            const bool ok = grouped
+                                ? attn_splits_staged(kv, q8, t0, n, pos0 + t0 + n, scale)
+                                : omph::kernels::attention_gqa(
+                                      static_cast<const float *>(q_) + t0 * qrow, kv,
+                                      static_cast<const float *>(gate_) + t0 * qrow, nullptr, n,
+                                      pos0 + t0 + n, h_.n_head, h_.n_head_kv, h_.head_dim, scale, q8,
+                                      attn_work_, attn_work_bytes_, nullptr,
+                                      static_cast<__half *>(ffn16_) + t0 * qrow, !env_.attn_scalar,
+                                      key_chunk_, !env_.attn_dec_scalar);
+            if (!ok) {
                 return false;
             }
         }

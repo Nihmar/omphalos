@@ -84,6 +84,11 @@ struct KvCache {
     int64_t window = 0;  // the keys a query reads from the FP16 ring: its last `window`
     int64_t ring = 0;    // the ring's slots (window + kKvRingExtra)
     bool k_q4 = false;  // k_q8 holds K in V's Q4 format (#81)
+    // #409 step 2: the cache position of the quantized buffers' first row, when
+    // they hold a staged range of the history instead of the whole of it (0:
+    // the buffers start at position 0, as everywhere else). The FP16 ring is
+    // indexed by the true position either way.
+    int64_t kbase = 0;
 };
 
 // Causal attention with GQA and the sigmoid output gate. q, gate, out:
@@ -104,8 +109,36 @@ bool attention_gqa(const float * q, const KvCache & kv, const float * gate, floa
                    int64_t key_chunk = 0,     // > 0: keys per split, fixed for the run (#136)
                    bool dec_wmma = true);     // with key_chunk, < 16 tokens: WMMA tiles (#169)
 
-// Keys per split for a run whose sequences reach max_seq (a multiple of 16).
-// With a fixed chunk every query sums its keys in the same order in any call
+// #409 step 2: the fixed-split geometry of a decode / verification call with a
+// key chunk -- how many splits it uses at this sequence length and the keys
+// each covers (a multiple of 16). splits == 0 when fixed chunks do not apply.
+// The most query tokens such a call serves at once (the WMMA decode tile).
+constexpr int64_t kAttentionDecTokens = 8;
+struct AttentionSplits {
+    int64_t splits = 0;
+    int64_t keys = 0;
+};
+AttentionSplits attention_dec_splits(int64_t seq, int64_t key_chunk);
+
+// The same call over the splits [split0, split0 + nsplits): the partials land
+// at their global split indices in `work`, and with `merge` false the caller
+// runs attention_gqa_merge at the end (the streaming design stages one group at
+// a time, so the merge must be its own step). The quantized buffers may start
+// at cache position `kv.kbase` (a staged range); the FP16 ring does not move.
+// nsplits == 0 means "to the end". The prefill kernel has no fixed splits, so
+// it only accepts the whole range (split0 0, nsplits 0 or 1).
+bool attention_gqa_range(const float * q, const KvCache & kv, const float * gate, float * out,
+                         int64_t tokens, int64_t seq, int64_t nh, int64_t nkv, int64_t hd,
+                         float scale, bool v_rotated, void * work, size_t work_bytes,
+                         hipStream_t stream, void * out_f16, bool allow_wmma, int64_t key_chunk,
+                         bool dec_wmma, int64_t split0, int64_t nsplits, bool merge);
+
+// The merge alone: the `splits` partials in `work` into out/out_f16, in order.
+bool attention_gqa_merge(const float * work, const float * gate, float * out, void * out_f16,
+                         int64_t tokens, int64_t nh, int64_t splits, bool v_rotated,
+                         hipStream_t stream);
+
+// Keys per split for a run whose sequences reach max_seq (a multiple of 16).// With a fixed chunk every query sums its keys in the same order in any call
 // (a decode step or a speculative batch), so the two agree bit for bit.
 int64_t attention_key_chunk(int64_t max_seq);
 
