@@ -9,10 +9,12 @@
 
 namespace omph::kernels {
 
-// The block attention runs at most this many query rows (kMaxQ = 4 query heads
-// per KV head, T <= 8): a drafter whose block_size does not fit is refused at
-// load (#340).
-constexpr int kMaxBlock = 8;
+// The block attention runs at most this many query rows (the block's T rows x
+// 32 query heads; T <= kMaxBlock): a drafter whose block_size does not fit is
+// refused at load (#340). The trained block of Qwen3.8-27B-DFlash2 is 8; a
+// longer block (OMPH_DFLASH_MASKS, #414) drafts more tokens per verification,
+// the acceptance of the out-of-training block being the measurement.
+constexpr int kMaxBlock = 16;
 
 // T rows of x (f32, row stride ld_x) into feat (f16, row stride ld_f) at
 // column col: one target layer's hidden states into the drafter's features.
