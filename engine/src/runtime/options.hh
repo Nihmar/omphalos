@@ -33,6 +33,20 @@ struct EnvOptions {
     // measurable step time (bench/results/fp16-window-318.txt); 256 and 128 are the
     // points below it, OMPH_KV_WINDOW=128 the pre-#318 behaviour.
     int64_t kv_window = 512;
+    // OMPH_KV_STREAM=1: keep the authoritative copy of the quantized cache in
+    // pinned host RAM (#409 step 1): every row attn_prep writes is mirrored
+    // there, byte for byte, in the device layout. The mirror is not read yet
+    // (the streaming ring comes in step 3), so a run with it must be
+    // bit-identical to one without, and the device cache stays complete. It
+    // needs the quantized cache: OMPH_KV_F32 / OMPH_KV_HOST refuse it.
+    bool kv_stream = false;
+    // OMPH_KV_STREAM_CHECK=1: after every mirror write, read the same rows back
+    // from the device and compare them with the mirror, stopping at the first
+    // difference. What it catches: a copy that failed and an offset that ran
+    // past the store (doubles that write's traffic). What it cannot catch: a
+    // wrong-but-in-bounds offset, read back by the same arithmetic that wrote
+    // it -- step 3, where attention reads the store, is the content witness.
+    bool kv_stream_check = false;
 
     // --- decode paths (A/B switches)
     bool overlap = false;       // OMPH_OVERLAP: a side stream for sibling GEMVs (#71; off by default, #189)
