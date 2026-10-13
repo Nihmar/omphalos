@@ -1,0 +1,89 @@
+# #414: a DFlash2 block longer than training (11 masks), measured
+
+Engine main 2174d81 + `feat/414-dflash-long-block`, RX 9060 XT 16 GB, CachyOS,
+desktop session active. Model `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph` (IQ3_S, the
+MTP block unused), drafter `Qwen3.8-27B-DFlash2-Q4_K_M.omph` (1.06 GiB, its
+trained `dflash.block_size = 8`). llama.cpp: v0.6.0 @ d81235049 (no llama.cpp
+run here: this is an engine-internal A/B).
+
+Method: `omph-run <omph> <ids> /tmp/x.f32 --last-logits --gemv --generate N
+--gen-out FILE --dflash <drafter.omph>`, `OMPH_DFLASH_MASKS=N` (7 = the trained
+block, 11 = the new default, 15 = the cap), `OMPH_DFLASH_KEEP=P`. Three texts:
+`prose` (283 tokens), `code2k` (the first 2000 ids of `continue-code.txt`),
+`repetitive` (2477). `ms/step = ms/token x tokens/step`. Single runs except the
+medians below.
+
+**Every greedy output is identical to plain greedy**, 384 tokens, 3 texts x 3
+configurations (`cmp` against the `--dflash`-less run), and at 128 tokens for
+7 / 11 / 15 masks: the longer block changes the drafts, never the tokens.
+
+## 1. The block length, 384 tokens (`OMPH_DFLASH_KEEP=0`, fixed lengths)
+
+| prompt | masks | steps | accepted / drafted | acc/step | ms/step | ms/token | t/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| prose | 7 | 51 | 337 / 357 | 6.61 | 51.4 | 6.82 | 146.6 |
+| prose | **11** | 38 | 355 / 418 | 9.34 | 53.5 | **5.29** | **189.0** |
+| prose | 15 | 35 | 350 / 525 | 10.00 | 56.0 | 5.10 | 196.1 |
+| code2k | 7 | 51 | 335 / 357 | 6.57 | 55.2 | 7.33 | 136.4 |
+| code2k | **11** | 39 | 345 / 429 | 8.85 | 59.9 | **6.08** | **164.5** |
+| code2k | 15 | 39 | 356 / 579 | 9.13 | 63.0 | 6.40 | 156.2 |
+| repetitive | 7 | 51 | 334 / 357 | 6.55 | 53.5 | 7.10 | 140.8 |
+| repetitive | **11** | 40 | 349 / 440 | 8.72 | 56.4 | **5.87** | **170.4** |
+| repetitive | 15 | 36 | 357 / 540 | 9.92 | 59.4 | 5.57 | 179.5 |
+
+- 11 masks against the trained 7: **+29 % prose, +21 % code, +21 % repetitive**
+  (5.29/6.82, 6.08/7.33, 5.87/7.10 ms/token).
+- 15 masks wins on prose (+4 % over 11) and repetitive (+5 %) and loses on code
+  (-5 %): the tail positions accept progressively less, which is why the default
+  is 11 and the per-step choice is left to #416.
+- The step grows with the block (51 -> 60 ms) but the tokens per step grow more
+  (7.5 -> 10).
+
+## 2. Five runs, prose, 256 tokens (`KEEP=0`) — medians
+
+| masks | ms/token (5 runs) | t/s |
+|---:|---|---:|
+| 7 | 7.06 / 7.06 / 7.06 / 7.05 / 7.05 | 141.7 |
+| 11 | 5.67 / 5.67 / 5.66 / 5.67 / 5.66 | 176.5 |
+
+**7.06 -> 5.665 ms/token, +24.6 %**, spread 0.02 ms.
+
+## 3. The routing bug this exposed
+
+A 16-row drafter pass (15 masks) made `Runner::matmul` take the *f16 GEMM* path
+for the drafter's own weights and head: `gemv_path(T)` is true only below
+`gemm_min_` (16) or inside a verification, and the drafter is neither. The
+phase report showed **46 `gemm(f16)` calls and ~16 ms per step** (the 682 MiB
+head staged as f16), and the first sweep measured 77.3 ms/step against the
+59.7 ms after the fix (`OMPH_PHASES=1`, repetitive, 64 tokens):
+
+| masks = 15 | gemv | blocks | gemm(f16) | ms/step |
+|---|---:|---:|---:|---:|
+| before | 25.7 | 20.6 | 16.3 | ~77 |
+| after | 25.7 | 20.6 | 0.0 | 59.7 |
+
+`Runner::draft_gemv_`, set for the drafter's block pass, adds the drafter to
+`gemv_path`; its rows (<= 16) then go through the NT tile GEMVs, as they already
+did for 7 and 11 masks.
+
+## 4. Cost and constraints
+
+- Scratch grows with the cap: the attention workspace 8.7 -> 17.3 MB, the
+  drafter's logits 7.4 -> 14.9 MB, ~25 MB of VRAM in total (computed from the
+  allocations, not measured).
+- The verification is 1 + masks rows (12 by default): `kVerifyRowsMax = 32`,
+  `enable_speculation(16)` and the NT tile GEMVs (up to 16) all cover it.
+- The block is per *step*: `OMPH_DFLASH_KEEP` chooses how many of the cap's
+  masks the step is worth (it used to truncate the verification *after* the
+  block had run, which no longer saves the drafter's rows).
+  `omph-run`'s own loop does not call `dflash_observe` yet, so the keep rates
+  stay optimistic there (the runs above are effectively fixed-length); the
+  Generator path (server, TUI) updates them. #416.
+
+## 5. Checks
+
+- `cmp` against plain greedy: 384 tokens x 3 texts x 3 configurations, and
+  128 tokens x 3 x 3: identical.
+- `ctest --test-dir engine/build-tests`: 13/13.
+- Plain decode and MTP are untouched by the change (`OMPH_DFLASH_MASKS` only
+  sizes and runs the drafter's block; `draft_gemv_` is false everywhere else).
