@@ -560,6 +560,28 @@ private:
     // into kv_kq_ (a Q4 layer's K takes half the bytes)
     std::vector<uint8_t> kv_k4_;
     std::vector<size_t> kv_kq_off_;
+    // #409 step 3: the device cache holds only its first `kv_rows_` rows, and
+    // rows at or beyond `kv_split_` (== kv_rows_ when the streaming mode is on,
+    // 0 when it is off) are written to the write staging and published to the
+    // host store instead. The store's own per-layer K offsets (over the whole
+    // context) are kv_sh_kq_off_.
+    int64_t kv_rows_ = 0;
+    int64_t kv_split_ = 0;
+    std::vector<size_t> kv_sh_kq_off_;
+    void * kv_wstg_k_ = nullptr;  // one call's rows >= kv_split_, index row - pos0
+    void * kv_wstg_ks_ = nullptr;
+    void * kv_wstg_vq_ = nullptr;
+    void * kv_wstg_vs_ = nullptr;
+    int64_t kv_wstg_rows_ = 0;
+    // The store's per-layer pointers for a layer (the device's quant_kv for the
+    // resident part, over the whole context for the store).
+    struct HostKv {
+        const uint8_t * kq;
+        const uint8_t * ksc;
+        const uint8_t * vq;
+        const uint8_t * vsc;
+    };
+    HostKv host_kv(int64_t layer) const;
     // #409 step 1: the quantized cache's authoritative mirror in pinned host
     // RAM, laid out exactly like the device arrays (per layer: K at
     // kv_kq_off_, K scales, V, V scales with the same strides as the device),
@@ -590,8 +612,8 @@ private:
     void * kv_g_ks_ = nullptr;
     void * kv_g_vq_ = nullptr;
     void * kv_g_vs_ = nullptr;
-    bool attn_splits_staged(const omph::kernels::KvCache & kv, bool q8, int64_t t0, int64_t n,
-                            int64_t seq, float scale);
+    bool attn_splits_staged(const omph::kernels::KvCache & kv, int64_t layer, bool q8, int64_t t0,
+                            int64_t n, int64_t seq, int64_t pos0, float scale);
     bool kv_host_ = false;  // f32 KV in pinned host RAM (validation reference)
     void * kv_stage_k_ = nullptr;
     // Overlap of independent GEMVs (#71): the decode forks a layer's sibling

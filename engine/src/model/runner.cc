@@ -217,20 +217,40 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         // K Q8 + V Q4 with 32-element blocks: 272 B and 144 B per head per
         // token, against 1024 B each in f32 (PLAN.md §13).
         const int64_t nblk = h_.head_dim / 32;
+        const size_t sc_row = (size_t) h_.n_head_kv * nblk * 2;
         // OMPH_KV_K4=1: K in V's Q4 format too (#81, experiment); or only on the
         // attention layers of OMPH_KV_K4_LAYERS (#175).
         kv_k4_.assign((size_t) n_kv, 0);
+        for (int64_t i = 0; i < n_kv; ++i) {
+            kv_k4_[(size_t) i] = env_.kv_k4 || (i < 64 && ((env_.kv_k4_layers >> i) & 1));
+        }
+        // #409 step 3: how much of the context stays on the device. The budget
+        // is rounded down to whole key chunks, so every fixed split is wholly
+        // resident or wholly streamed and no group straddles the border.
+        int64_t rows = kvcap;
+        if (env_.kv_stream && env_.kv_stream_mib > 0) {
+            const int64_t chunk = omph::kernels::attention_key_chunk(kvcap);
+            size_t per_row = 0;  // the stack's bytes per row of history
+            for (int64_t i = 0; i < n_kv; ++i) {
+                per_row += (size_t) attn_kv / (kv_k4_[(size_t) i] ? 2 : 1) + sc_row +
+                           (size_t) attn_kv / 2 + sc_row;
+            }
+            const int64_t r = (int64_t) (((size_t) env_.kv_stream_mib << 20) / per_row);
+            rows = std::min<int64_t>(r, kvcap) / chunk * chunk;
+            rows = std::max<int64_t>(rows, std::min<int64_t>(chunk, kvcap));
+        }
+        kv_rows_ = rows;
+        kv_split_ = rows < kvcap ? rows : 0;
         kv_kq_off_.assign((size_t) n_kv, 0);
         size_t kq_bytes = 0;
         for (int64_t i = 0; i < n_kv; ++i) {
-            kv_k4_[(size_t) i] = env_.kv_k4 || (i < 64 && ((env_.kv_k4_layers >> i) & 1));
             kv_kq_off_[(size_t) i] = kq_bytes;
-            kq_bytes += (size_t) kvcap * attn_kv / (kv_k4_[(size_t) i] ? 2 : 1);
+            kq_bytes += (size_t) kv_rows_ * attn_kv / (kv_k4_[(size_t) i] ? 2 : 1);
         }
         alloc(&kv_kq_, kq_bytes);
-        alloc(&kv_ks_, (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2);
-        alloc(&kv_vq_, (size_t) n_kv * kvcap * attn_kv / 2);
-        alloc(&kv_vs_, (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2);
+        alloc(&kv_ks_, (size_t) n_kv * kv_rows_ * sc_row);
+        alloc(&kv_vq_, (size_t) n_kv * kv_rows_ * attn_kv / 2);
+        alloc(&kv_vs_, (size_t) n_kv * kv_rows_ * sc_row);
         // FP16 window: the last `kv_window_` tokens exactly, in the same
         // rotated basis, in a ring (PLAN §13.4). 512 since #318: at 16k it
         // halves the mixed K4/K8 KL for ~25 MiB (the ring; the speculation
@@ -242,23 +262,37 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         alloc(&kv_k16_, (size_t) n_kv * kv_ring_ * attn_kv * 2);
         alloc(&kv_v16_, (size_t) n_kv * kv_ring_ * attn_kv * 2);
         if (env_.kv_stream) {
-            // #409 step 1: the authoritative mirror in pinned host RAM, the
-            // same sizes and offsets as the device arrays above (K per layer at
-            // kv_kq_off_, the scales and V at per-layer strides), because it is
-            // the source of the ring's row copies later.
-            const size_t scales_bytes = (size_t) n_kv * kvcap * h_.n_head_kv * nblk * 2;
+            // #409 step 1/3: the authoritative store in pinned host RAM. It
+            // spans the whole context, unlike the device cache: the rows past
+            // the resident prefix live only here.
+            kv_sh_kq_off_.assign((size_t) n_kv, 0);
+            size_t sh_kq = 0;
+            for (int64_t i = 0; i < n_kv; ++i) {
+                kv_sh_kq_off_[(size_t) i] = sh_kq;
+                sh_kq += (size_t) kvcap * attn_kv / (kv_k4_[(size_t) i] ? 2 : 1);
+            }
             const char * what = "cannot allocate the host KV mirror (OMPH_KV_STREAM)";
-            kv_sh_kq_ = mem_.host(kq_bytes, what);
-            kv_sh_ks_ = mem_.host(scales_bytes, what);
+            kv_sh_kq_ = mem_.host(sh_kq, what);
+            kv_sh_ks_ = mem_.host((size_t) n_kv * kvcap * sc_row, what);
             kv_sh_vq_ = mem_.host((size_t) n_kv * kvcap * attn_kv / 2, what);
-            kv_sh_vs_ = mem_.host(scales_bytes, what);
-            kv_sh_bytes_ = kq_bytes + 2 * scales_bytes + (size_t) n_kv * kvcap * attn_kv / 2;
+            kv_sh_vs_ = mem_.host((size_t) n_kv * kvcap * sc_row, what);
+            kv_sh_bytes_ = sh_kq + 2 * (size_t) n_kv * kvcap * sc_row +
+                           (size_t) n_kv * kvcap * attn_kv / 2;
             kv_stream_ = true;
             if (env_.kv_stream_check) {
                 // One chunk of the widest row: K Q8 (attn_kv bytes) or its
                 // scales (64), V Q4 (attn_kv/2).
                 kv_sh_scratch_bytes_ = (size_t) T * attn_kv;
                 kv_sh_scratch_ = mem_.host(kv_sh_scratch_bytes_, what);
+            }
+            if (kv_split_ > 0) {
+                // The write staging: one call's rows at or beyond the split, by
+                // token index (the group staging reads it for the newest rows).
+                kv_wstg_rows_ = T;
+                kv_wstg_k_ = mem_.device((size_t) T * attn_kv);
+                kv_wstg_ks_ = mem_.device((size_t) T * sc_row);
+                kv_wstg_vq_ = mem_.device((size_t) T * attn_kv / 2);
+                kv_wstg_vs_ = mem_.device((size_t) T * sc_row);
             }
         }
     }
@@ -277,14 +311,18 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     attn_work_bytes_ = omph::kernels::attention_gqa_work_bytes(T, h_.n_head, h_.n_head_kv,
                                                                h_.head_dim, max_seq_, key_chunk_);
     alloc(&attn_work_, attn_work_bytes_);
-    if (env_.attn_split_groups > 1 && kv_q8q4_ && key_chunk_ > 0) {
-        // #409 step 2: one buffer per component, big enough for the largest
-        // group at the context's capacity (the split count only falls with a
-        // shorter sequence, so the group's row count cannot grow past this).
+    if (kv_q8q4_ && key_chunk_ > 0) {
+        // #409 step 2's diagnostics switch, or step 3's streaming (whose
+        // default is 8 groups: the knee between the group-buffer size and the
+        // per-group overhead measured in bench/results/kv-stream-409-splits.txt,
+        // +3-7 % at 4 groups against +51 % at 128).
+        const int64_t groups_want = env_.attn_split_groups > 1 ? env_.attn_split_groups
+                                      : (kv_split_ > 0       ? 8
+                                                             : 0);
         const omph::kernels::AttentionSplits sp =
             omph::kernels::attention_dec_splits(max_seq_, key_chunk_);
-        if (sp.splits > 1) {
-            kv_groups_ = std::min(env_.attn_split_groups, sp.splits);
+        if (groups_want > 1 && sp.splits > 1) {
+            kv_groups_ = std::min(groups_want, sp.splits);
             const int64_t per_group = (sp.splits + kv_groups_ - 1) / kv_groups_;
             const size_t rows = (size_t) per_group * (size_t) sp.keys;
             const size_t attn_kv = (size_t) h_.n_head_kv * h_.head_dim;
@@ -357,9 +395,9 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         std::fprintf(stderr, "vram: %zu MiB used of %zu MiB after load\n",
                      (total_b - free_b) >> 20, total_b >> 20);
         if (kv_stream_) {
-            std::fprintf(stderr, "kv stream: %zu MiB of pinned host KV (the device cache stays "
-                                 "complete, the store is not read yet; #409 step 1)\n",
-                         kv_sh_bytes_ >> 20);
+            std::fprintf(stderr, "kv stream: %zu MiB of pinned host KV, %lld of %lld rows resident "
+                                 "on the device (#409)\n",
+                         kv_sh_bytes_ >> 20, (long long) kv_rows_, (long long) kvcap);
         }
         if (kv_groups_ > 1) {
             std::fprintf(stderr, "attn splits: %lld groups per decode / verification call "
@@ -759,26 +797,62 @@ bool Runner::kv_prefix_copy(void * host, const int64_t n, const int64_t m, const
     }
     const size_t attn_kv = (size_t) h_.n_head_kv * h_.head_dim;
     const size_t scales = (size_t) h_.n_head_kv * (h_.head_dim / 32) * 2;
+    // #409 step 3: with the streaming working set the store is the authority,
+    // so the blob is filled from (and emptied into) the store, host to host,
+    // and the resident prefix of the device cache is brought back from it.
+    const bool stream = kv_split_ > 0;
     auto * at = static_cast<uint8_t *>(host);
     // a part of `row` bytes per position: m rows, then skip to the next part
     const auto copy = [&](void * dev, const size_t row) {
         const size_t bytes = (size_t) m * row;
-        const hipError_t e = save ? hipMemcpyAsync(at, dev, bytes, hipMemcpyDeviceToHost, nullptr)
-                                  : hipMemcpyAsync(dev, at, bytes, hipMemcpyHostToDevice, nullptr);
+        hipError_t e = hipSuccess;
+        if (stream) {
+            if (save) {
+                std::memcpy(at, dev, bytes);
+            } else {
+                std::memcpy(dev, at, bytes);
+            }
+        } else {
+            e = save ? hipMemcpyAsync(at, dev, bytes, hipMemcpyDeviceToHost, nullptr)
+                     : hipMemcpyAsync(dev, at, bytes, hipMemcpyHostToDevice, nullptr);
+        }
         at += (size_t) n * row;
         return e == hipSuccess;
     };
     if (hipDeviceSynchronize() != hipSuccess) {
         return fail("saved conversation: device error");
     }
-    auto * kq = static_cast<uint8_t *>(kv_kq_);
-    auto * ks = static_cast<uint8_t *>(kv_ks_);
-    auto * vq = static_cast<uint8_t *>(kv_vq_);
-    auto * vs = static_cast<uint8_t *>(kv_vs_);
+    auto * kq = static_cast<uint8_t *>(stream ? kv_sh_kq_ : kv_kq_);
+    auto * ks = static_cast<uint8_t *>(stream ? kv_sh_ks_ : kv_ks_);
+    auto * vq = static_cast<uint8_t *>(stream ? kv_sh_vq_ : kv_vq_);
+    auto * vs = static_cast<uint8_t *>(stream ? kv_sh_vs_ : kv_vs_);
+    const int64_t stride_rows = stream ? max_seq_ : kv_rows_;
     bool ok = true;
     for (size_t i = 0; i < kv_k4_.size() && ok; ++i) {
-        ok = copy(kq + kv_kq_off_[i], attn_kv / (kv_k4_[i] ? 2 : 1)) && copy(ks + i * max_seq_ * scales, scales) &&
-             copy(vq + i * max_seq_ * attn_kv / 2, attn_kv / 2) && copy(vs + i * max_seq_ * scales, scales);
+        const size_t koff = stream ? kv_sh_kq_off_[i] : kv_kq_off_[i];
+        ok = copy(kq + koff, attn_kv / (kv_k4_[i] ? 2 : 1)) &&
+             copy(ks + i * stride_rows * scales, scales) &&
+             copy(vq + i * stride_rows * attn_kv / 2, attn_kv / 2) &&
+             copy(vs + i * stride_rows * scales, scales);
+    }
+    if (ok && stream && !save) {
+        // the device holds the resident prefix: it comes back from the store
+        const size_t rows = (size_t) std::min<int64_t>(m, kv_rows_);
+        for (size_t i = 0; i < kv_k4_.size() && ok; ++i) {
+            const size_t krow = attn_kv / (kv_k4_[i] ? 2 : 1);
+            ok = hipMemcpyAsync(static_cast<uint8_t *>(kv_kq_) + kv_kq_off_[i],
+                                static_cast<const uint8_t *>(kv_sh_kq_) + kv_sh_kq_off_[i],
+                                rows * krow, hipMemcpyHostToDevice, nullptr) == hipSuccess &&
+                 hipMemcpyAsync(static_cast<uint8_t *>(kv_ks_) + i * kv_rows_ * scales,
+                                static_cast<const uint8_t *>(kv_sh_ks_) + i * max_seq_ * scales,
+                                rows * scales, hipMemcpyHostToDevice, nullptr) == hipSuccess &&
+                 hipMemcpyAsync(static_cast<uint8_t *>(kv_vq_) + i * kv_rows_ * attn_kv / 2,
+                                static_cast<const uint8_t *>(kv_sh_vq_) + i * max_seq_ * attn_kv / 2,
+                                rows * attn_kv / 2, hipMemcpyHostToDevice, nullptr) == hipSuccess &&
+                 hipMemcpyAsync(static_cast<uint8_t *>(kv_vs_) + i * kv_rows_ * scales,
+                                static_cast<const uint8_t *>(kv_sh_vs_) + i * max_seq_ * scales,
+                                rows * scales, hipMemcpyHostToDevice, nullptr) == hipSuccess;
+        }
     }
     if (ok && mtp_kq_ != nullptr) {
         // a header (window base, its end, the rows saved), then the rows: the

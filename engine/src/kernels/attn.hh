@@ -61,6 +61,15 @@ struct AttnPrep {
     __half * v16 = nullptr;
     long long ring = 0;              // its slots (window + kKvRingExtra)
     bool k_q4 = false;               // quantize K as Q4 into k_q8 (V's format, #81)
+    // #409 step 3: with the streaming working set, rows at or beyond `kv_split`
+    // (a cache position) are written to the staged pointers instead, at index
+    // `t` of this call -- the device cache keeps only the resident prefix.
+    // 0: no split, every row to the cache (the MTP block and the other modes).
+    long long kv_split = 0;
+    uint8_t * kst_q8 = nullptr;
+    __half * kst_scales = nullptr;
+    uint8_t * vst_q4 = nullptr;
+    __half * vst_scales = nullptr;
     // The MTP block's KV fill (#124) writes K and V and nothing reads its q
     // heads: skip their blocks (a third of the grid) instead of normalizing and
     // rotating whatever fused_ holds (#315).
@@ -126,7 +135,8 @@ AttentionSplits attention_dec_splits(int64_t seq, int64_t key_chunk);
 // a time, so the merge must be its own step). The quantized buffers may start
 // at cache position `kv.kbase` (a staged range); the FP16 ring does not move.
 // nsplits == 0 means "to the end". The prefill kernel has no fixed splits, so
-// it only accepts the whole range (split0 0, nsplits 0 or 1).
+// it only accepts the whole range (split0 0, nsplits 0 or 1): a prefill chunk
+// that would read streamed rows is refused (see attn_layer's guard, #409).
 bool attention_gqa_range(const float * q, const KvCache & kv, const float * gate, float * out,
                          int64_t tokens, int64_t seq, int64_t nh, int64_t nkv, int64_t hd,
                          float scale, bool v_rotated, void * work, size_t work_bytes,
