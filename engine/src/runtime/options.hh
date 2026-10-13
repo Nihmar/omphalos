@@ -112,8 +112,9 @@ struct EnvOptions {
                                    // (#417 follow-up, bench/results/dflash-window-417.txt); 1024 wins
                                    // more on local text (code +6 %, repetitive +3 %) and loses badly on
                                    // tasks whose context is far back (file edits -40 %)
-    int64_t dflash_masks = 11;  // OMPH_DFLASH_MASKS=N: the DFlash2 block drafts N masks (1..15, #414).
-                                // 11 is the measured compromise; 7 is the trained block_size - 1
+    int64_t dflash_masks = 15;  // OMPH_DFLASH_MASKS=N: the DFlash2 block drafts N masks (1..15, #414).
+                                // 15 with the 1792 window measured >= 11 everywhere tried (prose +3.7 %,
+                                // edit +1.0 %, code and repetitive tie); 7 is the trained block_size - 1
     int64_t dflash_blocks = 1;  // OMPH_DFLASH_BLOCKS=2: chain two *trained* blocks (7 masks each) instead
                                 // of one long out-of-training block: the second is conditioned on the first
                                 // through the ring (#433)

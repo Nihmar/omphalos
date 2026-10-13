@@ -41,6 +41,28 @@ it shows the run-to-run spread is 0.01 ms.
   (code2k +5.9 % over 1792) and loses badly where the context is far back (the
   file-edit prompt -40 %), with the numbers above as the warning.
 
+## The masks interaction, and the new default pair
+
+With the window at 1792 the block length is re-measured (384 tokens, `KEEP=0`):
+
+| text | 11 masks | 15 masks |
+|---|---:|---:|
+| prose | 5.30 | **5.11** |
+| code2k | 6.05 | 6.06 (tie) |
+| repetitive | 5.71 | 5.70 (tie) |
+| edit | 4.81 | **4.76** |
+
+15 masks dominated 11 at the 2048 window on prose (+3.7 %) and lost on code
+(-5 %); at 1792 it wins on prose and edit and ties on code and repetitive, so the
+engine's default is now **15 masks with the 1792 window**. Against the previous
+default pair (2048 + 11), medians of 5: prose 5.290 -> **5.120** (+3.3 %), edit
+5.140 -> **4.76** (+7.4 %, three runs), repetitive 5.870 -> **5.70** (+2.9 %),
+code2k 6.080 -> 6.070 (a tie). Tokens equal to plain greedy in every
+configuration.
+
+(The 15-mask figure at 1792 is a single run on code2k/repetitive and three on
+edit; the 5-run medians are for the shipped pair on prose and code2k.)
+
 The measurement closes #417's "smaller LDS footprint" idea from the other side:
 the ring's *reads* can be cut, and the cost is the drafts' quality, not the
 kernel.
