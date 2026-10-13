@@ -1,0 +1,112 @@
+# #409 phase 0: the PCIe shapes the KV streaming design would issue.
+# Probe c8bfa74 (bench/pcie/pcie_bw.hip, the #409 modes), engine unchanged (main 3120bb0).
+# RX 9060 XT 16 GB, 2026-10-13 07:42, desktop session running (577 MiB VRAM in use at start).
+#
+# The question phase 0 had to answer: the streaming design holds the quantized KV in
+# pinned host RAM and pages it into a bounded device ring in whole-row chunks, one
+# attention layer at a time (two H2D per chunk: the layer's K rows and its V rows).
+# How fast can those copies go, do they survive a decode-like VRAM read running at
+# the same time, and what does a ready/consumed fence cost?
+#
+# Tool:  hipcc -O2 --offload-arch=gfx1200 -o bench/build/pcie_bw bench/pcie/pcie_bw.hip
+#        ./bench/build/pcie_bw                 # the #176 checkpoint probe (unchanged)
+#        ./bench/build/pcie_bw --rows R G      # KV-shaped H2D, R rows/chunk, G GiB per shape
+#        ./bench/build/pcie_bw --overlap G     # the copies with a 2 GiB/pass VRAM read
+#        ./bench/build/pcie_bw --fence
+#
+# Row shapes (PLAN.md §3, from the cache layout in runner.cc): 4 KV heads x 256
+# head_dim = 1024 B values + 4 * 8 * 2 B f16 scales -> K Q8 row 1088 B, K Q4 row
+# 576 B, V Q4 row 576 B. The #175 default is K4 on 8 of the 16 attention layers,
+# so a stack row is 22.0 KB by layout (22.5-26.0 KB measured at the device).
+
+## 1. The link: the root port is the bottleneck, not the card
+
+# #176 numbers reproduce (151 MiB, 4th of 4 repetitions, one piece):
+coherent     D2H   1 piece(s):    6.03 ms   26.3 GB/s  (gpu 32.0 GT/s PCIe x16, root 16.0 GT/s PCIe)
+coherent     H2D   1 piece(s):    5.71 ms   27.7 GB/s
+noncoherent  D2H   1 piece(s):    6.01 ms   26.4 GB/s
+noncoherent  H2D   1 piece(s):    5.69 ms   27.8 GB/s
+coherent     D2H  96 piece(s):    6.49 ms   24.4 GB/s
+coherent     H2D  96 piece(s):    6.17 ms   25.7 GB/s
+noncoherent  D2H  96 piece(s):    6.59 ms   24.0 GB/s
+noncoherent  H2D  96 piece(s):    6.18 ms   25.6 GB/s
+
+# The card's own port reports 32 GT/s x16 (Gen5), but the root port it sits behind
+# reports max = current = 16 GT/s x16 (Gen4): sysfs
+# /sys/bus/pci/devices/0000:00:01.0/{max,current}_link_speed = 16.0 GT/s.
+# The topology is root 00:01.0 -> 01:00.0 -> 02:00.0 -> 03:00.0 (the GPU).
+# So ~27 GB/s is the machine's ceiling; the 50-60 GB/s upside the issue hoped for
+# does not exist here, whatever the card could negotiate with its parent bridge.
+
+## 2. KV-row-shaped H2D (median of 5; warm-up and 2 GiB per shape)
+
+# rows/chunk   K8+V4 (K 1088 B)                    K4+V4 (K 576 B)
+#              ms       GB/s   us/pair  us/row     ms       GB/s   us/pair  us/row
+# 256          127.344  16.9   25.26    0.099      148.849  14.4   20.44    0.080
+# 512          101.987  21.1   40.47    0.079      112.955  19.0   31.03    0.061
+# 1024          89.433  24.0   70.98    0.069       94.836  22.6   52.11    0.051
+# 2048          83.280  25.8  132.19    0.065       85.934  25.0   94.43    0.046
+# 4096          80.250  26.8  254.76    0.062       81.529  26.3  179.18    0.044
+#
+# us/row is per layer (one K and one V chunk of that layer). Derived per stack row
+# of the mixed default (8 K4 + 8 K8 layers), per step, copy time only:
+#   256 rows 1.43 us   512 rows 1.12 us   1024 rows 0.96 us   2048 rows 0.89 us
+#   4096 rows 0.85 us
+# For comparison the same stack row read from VRAM at the measured 318 GB/s costs
+# 0.084 us (the known ~10x). Chunk size matters up to 2048 rows; past that the
+# rate is the large-copy one and the win flattens. 4096 rows = 6.8 MB for K8+V4,
+# i.e. a double-buffered shared ring of ~14 MB covers it.
+
+## 3. Overlap with the decode step's weight traffic
+
+  copies alone:      155.647 ms    20.7 GB/s     41.18 us/pair   0.080 us/row
+  under the copies:  181.009 ms    17.8 GB/s   read pass   7.325 ms (+10.0%), 23 passes overlapped
+  read side alone:     6.661 ms   322.4 GB/s  (single-op benchmark)
+# 3 GiB of 512-row copies (the copy stream stays busy 156 ms), a 2 GiB VRAM read per
+# pass (6.7 ms, 322 GB/s - the measured device bandwidth) timed pass by pass.
+# Both sides pay: the copies -14 % to 17.8 GB/s, the read side +10 % per pass.
+# Part of it is power/clock, part is the SDMA writes sharing the memory path.
+# The first run of this mode was serialized (one 155 ms read pass): on HIP the
+# legacy default stream (nullptr) waits for every blocking stream, so the copies
+# and the compute only overlap when the streams are created with
+# hipStreamNonBlocking. The engine's side stream already is (#71, runner.cc:247).
+
+## 4. Fences
+
+# fence:  3.82 us per record+wait enqueued (host side), chain 0.003 ms per iteration
+#         without vs 0.020 with two fences (+8.59 us per hop)
+# Per chunk the design needs one record+wait pair (the ready fence) and one for the
+# consumed side: 4 us of host cost, ~9 us of GPU scheduling latency per hop. At a
+# 4096-row chunk the copy itself is 255 us, so both are noise; at 256 rows (25 us)
+# they would not be. The waits are hidden as long as the host enqueues ahead.
+
+## 5. What it means for the design (the arithmetic, not a measurement)
+
+# The 262144-token budget: weights + MTP + scratch + desktop measured 12229 MiB at
+# 196608 (#237 minus its K4/V4 KV), and the mixed cache at 262144 costs
+# 262144 x 22.5 KB = 5.49 GiB = 5625 MiB -> 17854 MiB against ~15.5 GiB usable:
+# about 1.9 GiB has to leave the device. That is 95k stack rows, i.e. 36 % of the
+# history: at 0.85-0.95 us/row (4096-row chunks, overlap penalty included) the
+# step pays 81-90 ms of PCIe.
+# Today at 217088 with everything resident: 44.6 ms/token with MTP, step ~107 ms,
+# desktop evicted (#237). The streaming step lands in the same range: the estimate
+# is ~15-25 t/s at 262k with MTP, plus a +45k context and a usable desktop - and it
+# is an estimate, to be confirmed by the prototype (steps 1-3 of the issue).
+# K4/V4 everywhere would halve the streaming need (~1.0 GiB over at 262k, 40-45 ms
+# of PCIe), at K4's KL, over the quality budget of #81/#175: a maintainer decision.
+# Prefill: streaming the oldest rows costs them being re-read by every later chunk,
+# ~500 x 95k rows x 0.85 us = 40 s on a ~580 s 262k prefill (+7 %); a streamed
+# region later in the prompt is read by fewer chunks.
+
+## 6. Decision
+
+# GO for steps 1-2 of #409 (quantized host store + span attention): the copies are
+# ~10x the VRAM read but fast enough to keep a 262k decode in the same range as
+# today's 217k, and steps 1-2 are needed anyway to replace the quadratic f32
+# fallback of #316. The ring/fence step 3 is the one that turns the estimate into
+# a number; the fence and overlap measurements above say the pieces are there.
+# The expected 50 GB/s improvement is dead: the root port is Gen4 x16 (16 GT/s).
+#
+# Not measured here: the engine's own step under streaming (no model on this
+# machine), the D2H of the rows a step writes (a few rows, noise), and the
+# interaction with MTP/DFlash2 and the FP16 window.
