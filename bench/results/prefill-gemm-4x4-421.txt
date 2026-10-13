@@ -1,0 +1,64 @@
+# #421: prefill GEMM tile shapes — the 4x4 B-read variant loses to the 2x8
+
+Engine main 15efa7d + the `bench/gemm/tile2.hip` variant of this branch, RX 9060 XT 16 GB
+(160 W cap), random weights at the model's shapes (`tokens 512, rows 17408, k 5120` = the
+FFN up projection), 1 s warm-up, median of 5 x 20 launches. llama.cpp: v0.6.0 @ d81235049
+(no llama.cpp run; this is an engine-internal kernel comparison).
+
+The hypothesis (from #203's phase 1: "without the B operand reads from LDS 74 TFLOPS, with
+them 53"): give each wave four *row* tiles x four *token* tiles instead of two x eight, so a
+B operand read from LDS feeds four WMMAs instead of two (0.25 reads per WMMA), at the same 16
+accumulators per lane (128 f32), with the workgroup at 512 rows x 64 tokens. Every output is
+bit-identical to the 2x8 and to the pre-#326 kernel.
+
+## Measured (`/tmp/tile2 512 17408 5120`, TFLOPS)
+
+| type | 128x256 | 2x8 | 4x4 | 4x4 vs 2x8 | bit-identical |
+|---|---:|---:|---:|---:|---|
+| iq3s | 56.0 | 58.8 | 44.2 | -25 % | yes |
+| iq3xxs | 56.9 | 60.1 | 45.0 | -25 % | yes |
+| iq4xs | 59.7 | 62.6 | 43.0 | -31 % | yes |
+| q4k | 58.8 | 53.6 | 40.5 | -24 % | yes |
+| iq2s | 56.2 | 56.9 | 48.0 | -16 % | yes |
+| q2k | 57.8 | 62.6 | 52.5 | -16 % | yes |
+| iq2xs | 54.4 | 60.4 | 48.5 | -20 % | yes |
+| iq2xxs | 55.3 | 54.3 | 44.1 | -19 % | yes |
+| q6k | 48.3 | 51.8 | 36.0 | -30 % | yes |
+| iq1m | 55.5 | 58.2 | 46.6 | -20 % | yes |
+
+Every 4x4 figure is *worse* than the pre-#326 shape, not just the 2x8.
+
+## Cause: the register file, not the B reads
+
+`hipcc -S`, per-kernel metadata:
+
+| kernel | vgpr_count | spills | private segment |
+|---|---:|---:|---:|
+| gemm_t2 (IQ3_S) | 236 | 0 | 0 |
+| gemm_t4 (IQ3_S) | 256 | 28 | 108 B |
+| gemm_t2 (IQ3_XXS) | 227 | 0 | 0 |
+| gemm_t4 (IQ3_XXS) | 256 | 13 | 56 B |
+| gemm_t2 (IQ4_XS) | 220 | 0 | 0 |
+| gemm_t4 (IQ4_XS) | 256 | 2 | 80 B |
+
+The 2x8 already spends 220-236 VGPRs (128 of them the accumulator). Four weight-tile
+descriptors plus four A fragments push the kernel to the 256-VGPR wall and into spills; the
+B-read saving (up to ~0.5 VALU-equivalents per WMMA) is smaller than the spill cost. The
+same reason rules out the other shapes that would reduce the reads further:
+
+- 8x2 (0.125 B reads/WMMA): reads each weight tile once per 32 tokens instead of 128, i.e.
+  ~4x the DRAM traffic per chunk (45 GB -> 180 GB per 512-token chunk at 32k), which the
+  GEMM's ~30 % headroom cannot hide.
+- 4x3 (0.25 reads, 96 accumulator floats): 2.7x the DRAM traffic for the same reason.
+- f16 accumulators (64 VGPRs instead of 128): changes the numerics of a k=5120 reduction,
+  which the prefill's accuracy budget does not allow.
+
+## Conclusion
+
+The 2x8 shape (`gemm_tiles2_kernel`) stays; the remaining GEMM gap to the 88.7 TFLOPS f16
+ceiling is not in the B-operand structure. Within this operand-delivery family the register
+file is the binding constraint (236 of 256 VGPRs used), so a next attempt would have to
+change the delivery itself (fewer/wider LDS reads per WMMA, a different fragment layout, or
+an int8 path whose rescale is cheaper than #213 measured), not the tile aspect ratio.
+
+The 4x4 kernel stays in `bench/gemm/tile2.hip` as the control of that family.
