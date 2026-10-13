@@ -153,10 +153,18 @@ void Runner::dflash_load() {
     dfl_block_ = masks + 1;
 }
 
+// The per-position keep rates are EMAs over the observations (#245): the
+// weight is how fast a position that stops being reached falls out of the
+// drafted block (#416). At 1/16 a tail position needed ~32 steps to drop below
+// the threshold, long after a short generation had ended, so on code the block
+// stayed at its cap and the extra rows cost more than they accepted; 1/4 cuts
+// within ~6 steps, which is what makes the cap worth having.
+constexpr double kKeepEmaWeight = 4.0;
+
 void Runner::dflash_observe(const int64_t kept_drafts) {
     for (int64_t n = 1; n <= dfl_drafted_; ++n) {
         double & e = dfl_keep_[(size_t) n];
-        e += ((kept_drafts >= n ? 1.0 : 0.0) - e) / 16.0;
+        e += ((kept_drafts >= n ? 1.0 : 0.0) - e) / kKeepEmaWeight;
     }
 }
 
