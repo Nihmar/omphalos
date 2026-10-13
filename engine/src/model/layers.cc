@@ -265,9 +265,11 @@ Runner::QuantKv Runner::quant_kv(const int64_t il) const {
 // rejected draft or a re-prefill rewrites the same rows and is mirrored again
 // (#122, #342). The store is not read yet (the ring of step 3 is what reads
 // it), so a run with OMPH_KV_STREAM must be bit-identical to one without.
-// OMPH_KV_STREAM_CHECK reads the same rows back once and compares them: the
-// per-layer offsets and the row sizes are the only thing that can be wrong
-// silently here, and the check names the layer and the row when they are.
+// OMPH_KV_STREAM_CHECK reads the same rows back once and compares them. It
+// catches a copy that failed and an offset that ran past the store; a
+// wrong-but-in-bounds offset is written and read by the same arithmetic, so it
+// is step 3's attention, reading the store, that is the content witness.
+// `layer` is the stack's attention layer; the MTP block's cache is not mirrored.
 bool Runner::kv_stream_mirror(const int64_t layer, const QuantKv & q, const int64_t pos0,
                               const int64_t T) {
     if (!kv_stream_ || T <= 0 || layer < 0 || layer >= h_.n_layer) {

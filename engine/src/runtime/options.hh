@@ -42,8 +42,10 @@ struct EnvOptions {
     bool kv_stream = false;
     // OMPH_KV_STREAM_CHECK=1: after every mirror write, read the same rows back
     // from the device and compare them with the mirror, stopping at the first
-    // difference (validates the per-layer offsets and row sizes; doubles that
-    // write's traffic).
+    // difference. What it catches: a copy that failed and an offset that ran
+    // past the store (doubles that write's traffic). What it cannot catch: a
+    // wrong-but-in-bounds offset, read back by the same arithmetic that wrote
+    // it -- step 3, where attention reads the store, is the content witness.
     bool kv_stream_check = false;
 
     // --- decode paths (A/B switches)
