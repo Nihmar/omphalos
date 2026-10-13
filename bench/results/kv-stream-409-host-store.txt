@@ -1,0 +1,70 @@
+# #409 step 1: the quantized KV mirrored into pinned host RAM (OMPH_KV_STREAM).
+# Engine feat/409-kv-host-store (f6d7963 + the check-precision commit), RX 9060 XT 16 GB,
+# 2026-10-13, desktop session running. Model: Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph
+# converted with the current format (866 tensors, 409 repacked and verified bit-exact,
+# source sha256 58fd8267...) and run from /home/alessandro/mnt/speed/omphalos/ (the
+# project disk is short on space; models/ holds symlinks).
+#
+# What the store is: every row attn_prep writes is copied into pinned host RAM, byte
+# for byte, in the device layout (per attention layer: K at kv_kq_off_, K scales, V, V
+# scales with the device's strides). The store is not read yet; the device cache stays
+# complete, so the acceptance is (a) bit-identity of a run with and without it, and
+# (b) the opt-in copy check, which must not fire.
+#
+# Prompts: /var/tmp/omphalos-prompts/wiki512.txt (512 ids) and wiki4k.txt (4096 ids),
+# the same files the long-context benches use. Commands from the project root with
+# M=models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph.
+
+## 1. The mirror is side-effect free (bit-identity)
+
+# plain
+engine/build/omph-run $M wiki512.txt /tmp/plain.f32 --gemv --generate 8 --logits-tail 64 --gen-out /tmp/plain.txt
+# with the store
+OMPH_KV_STREAM=1 engine/build/omph-run $M wiki512.txt /tmp/stream.f32 --gemv --generate 8 --logits-tail 64 --gen-out /tmp/stream.txt
+cmp /tmp/plain.f32 /tmp/stream.f32   # 64 x 248320 rows: identical
+cmp /tmp/plain.txt /tmp/stream.txt   # the greedy ids: identical
+# K4/V4 everywhere, 4096-token prompt
+OMPH_KV_STREAM=1 OMPH_KV_STREAM_CHECK=1 OMPH_KV_K4=1 omph-run ... /tmp/s4.f32 --tokens 4096 ...
+OMPH_KV_K4=1 omph-run ... /tmp/k4plain.f32 --tokens 4096 ...
+cmp /tmp/s4.f32 /tmp/k4plain.f32 && cmp /tmp/s4.txt /tmp/k4plain.txt   # identical
+
+Passed: the store changes nothing that is read (the mirror is a dead copy in step 1).
+
+## 2. The copy check (OMPH_KV_STREAM_CHECK) does not fire
+
+#   a) 512-token prompt, speculative decode 32 tokens, MTP k = 3 (rejections rewrite rows)
+#   b) 4096-token prompt, default mixed K4/K8 (many chunks, every attention layer)
+#   c) 4096-token prompt, OMPH_KV_K4=1 (K4/V4 everywhere)
+OMPH_KV_STREAM=1 OMPH_KV_STREAM_CHECK=1 omph-run ... --gemv --generate 32 --last-logits --draft-mtp 3
+OMPH_KV_STREAM=1 OMPH_KV_STREAM_CHECK=1 omph-run ... --tokens 4096 --gemv --generate 8 --logits-tail 64
+OMPH_KV_STREAM=1 OMPH_KV_STREAM_CHECK=1 OMPH_KV_K4=1 omph-run ... --tokens 4096 ...
+
+No mismatch on any write. Load report at 512 tokens: "kv stream: 11 MiB of pinned host KV"
+(512 rows x 22.5 KB = 11.5 MB, as expected).
+
+## 3. Negative control: the check catches an out-of-store offset
+
+# Temporarily corrupting the mirror's K-scales layer stride (kvl * max_seq_ + 1 instead
+# of kvl * max_seq_) makes the write run past the store:
+OMPH_KV_STREAM=1 OMPH_KV_STREAM_CHECK=1 omph-run $M wiki512.txt ... --gemv --generate 2
+-> "host KV mirror copy failed: invalid argument", engine exit 1.
+# The check as designed catches a failed copy and an out-of-store offset. A
+# wrong-but-in-bounds offset is *not* caught: the write and the read-back use the same
+# arithmetic, so they agree with each other. The content witness is step 3, where the
+# attention reads the store: a wrong offset there shows as wrong logits. That limit is
+# in the option's own documentation (options.hh, AGENTS.md) rather than being implied.
+
+## 4. The f32 modes refuse the switch
+
+OMPH_KV_STREAM=1 OMPH_KV_F32=1 omph-run ...
+-> "error: OMPH_KV_STREAM needs the quantized KV cache (not OMPH_KV_F32 / OMPH_KV_HOST)"
+
+## 5. Non-GPU checks
+
+cmake --build engine/build -j        clean
+ctest --test-dir engine/build-tests  13/13 passed
+CI (PR #411): cpu-tests, python      pass
+
+# Not run here: OMPH_KV_STREAM with DFlash2 (the draft .omph is not on the machine) and
+# with a server conversation restore (--kv-ram); neither is needed for step 1, and both
+# are on the step 5 list of #409.
