@@ -1,0 +1,56 @@
+# Where a 32k prefill's 35 s go, per kernel, and the WY chunk size (#474)
+
+rocprofv3 --kernel-trace on `omph-run <omph> /tmp/tok_full.txt out.f32 --last-logits --gemv
+--tokens 32768`, engine main (PR #469/#471/#473 merged), RX 9060 XT 16 GB, 2026-10-14.
+
+Trace span 36.3 s, summed kernel time 35.3 s over 52677 launches (64 prefill chunks x 64
+layers): 1.08 ms per prompt token, and every launch accounted for.
+
+| kernel | ms | % of kernel time | launches |
+|---|---:|---:|---:|
+| prefill GEMM (fused dequant + WMMA, all types) | 26543 | **75.2 %** | 25600 |
+| flash attention (prefill) | 5425 | 15.4 % | 1024 |
+| `add_rms_norm_f16_kernel` | 842 | 2.4 % | 8192 |
+| `GdnStep` (conv + gate/alpha, both variants) | 1041 | 2.9 % | 9216 |
+| `delta_wy_b_kernel` (the serial state walk) | 540 | **1.5 %** | 3072 |
+| `delta_wy_a_kernel` (intra-chunk WY work) | 379 | 1.1 % | 3072 |
+| `attn_prep` (QKV prepare) | 332 | 0.9 % | 1024 |
+| `attention_gqa_merge_kernel` | 189 | 0.5 % | 1024 |
+| everything else | < 40 | < 0.1 % | ~240 |
+
+## The WY chunk size: worth 0.7 %, not worth the work
+
+The delta-net prefill's serial part is `delta_wy_b_kernel`: one launch per (layer, prefill
+chunk), 48 blocks (one per value head), each walking a 512-token chunk's eight 64-token WY
+chunks in order (kwC = 64). 540 ms of 35.3 s at 32k, and its share *shrinks* with length
+because it is linear in tokens while the attention is quadratic.
+
+Doubling kwC to 128 would halve the sequential depth: -270 ms, **-0.8 % of the prefill**.
+Against that: the intra-chunk work of phase A scales with C^2 (the WY inverse is C^3 per
+chunk, T/C chunks: 2x at C = 128), the C x C f32 staging (`am[kWyC * kWyAld]`) goes from
+17 KB to 67 KB and no longer fits the 64 KB LDS budget at all, and the WY form's own KL
+(0.0002-0.0005 vs the exact path, #240) would have to be re-measured since a larger inverse
+is the one thing that can move it. A kernel restructure for 0.8 % is not a trade this engine
+should make. Closed with the number.
+
+## What the table says about the rest
+
+The prefill is a GEMM with an attention attached (75 % + 15 %), and both are at measured
+structural walls, not at unexplored ones:
+
+- **GEMM, 53-62 TFLOPS.** The practical WMMA ceiling is ~87 with random operands (~107 with
+  constants), and the kernel's own ablations (bench/gemm/tile_ablate.hip, #213) put the LDS
+  B-operand read at ~61 TFLOPS, the weight loads at 58, the WMMA-only body at 91. All three
+  fixes have been tried and measured: the 4x4 shape (4x the B reuse) loses 25 % to VGPR
+  pressure (`prefill-gemm-4x4-421.txt`), the int8 iu8 path sustains 42.8-46.1 TOPS against
+  gemm_q's 53 because IQ3_S's per-32-weight scale forces a rescale every 2 WMMAs
+  (`int8-gemm-213.txt`), and the B-operand LDS/vector split is a wash (`#457`). The register
+  file holds the accumulator and the operands at once; that is the equilibrium.
+- **Attention, 15 %.** The flash kernel is issue-bound at 240 VGPRs / 6 waves/SIMD (#191,
+  #422); the small-query-count tail now takes the one-row-tile shape (#469, -4.4 % of the
+  agent turn at 60k).
+- **The small kernels, 5.7 %** (`add_rms_norm` + the delta-net's conv/gate + the attention's
+  prep and merge): each is bandwidth-bound with few VALU ops to hide, and every one is
+  already batched over 4-8 rows or heads (#240). Fusing the two norms into a neighbouring
+  epilogue is the only idea left, and it is ~2 % at the risk of a norm reduction order
+  change.
