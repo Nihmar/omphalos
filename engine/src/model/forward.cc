@@ -8,6 +8,7 @@
 #include "kernels/elementwise.hh"
 #include "kernels/gdn.hh"
 #include "kernels/gemv.hh"
+#include "kernels/gemm.hh"
 #include "kernels/moe.hh"
 
 #include <hip/hip_fp16.h>
@@ -155,10 +156,11 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
         }
     }
     const size_t idx_bytes = (size_t) T * topk * sizeof(int);
-    if (hipMemcpyAsync(xgi, host_xgi.data(), idx_bytes, hipMemcpyHostToDevice, hipStreamPerThread) !=
-            hipSuccess ||
-        hipMemcpyAsync(slot, host_slot.data(), idx_bytes, hipMemcpyHostToDevice,
-                       hipStreamPerThread) != hipSuccess) {
+    // Blocking: these come from pageable host vectors, and an async copy from
+    // pageable memory may outlive the vector (the kernel would read garbage
+    // counts and index out of bounds)
+    if (hipMemcpy(xgi, host_xgi.data(), idx_bytes, hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(slot, host_slot.data(), idx_bytes, hipMemcpyHostToDevice) != hipSuccess) {
         return fail("moe index upload failed");
     }
     // the expert slices (the expert dim is the outermost in the 3-D tensor)
@@ -182,30 +184,86 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
     const int64_t up_rows = (int64_t) L.ffn_up_exps.t->ne[1];
     const int64_t down_rows = (int64_t) L.ffn_down_exps.t->ne[1];
 
+    // Every expert's rows gathered once (the counting sort already ordered
+    // them by expert), then one grouped GEMM per matrix kind where the type has
+    // a tile kernel, and the per-expert shape on the gathered rows where it
+    // does not (#494).
+    const int64_t n_rows = T * topk;
     auto * xg = static_cast<__half *>(moe_xg_);
     auto * xo = static_cast<float *>(moe_xo_);
+    auto * ffn1 = static_cast<float *>(ffn1_);
+    auto * ffn2 = static_cast<float *>(ffn2_);
+    auto * down_out = static_cast<float *>(moe_down_);
+    if (!omph::kernels::moe_gather(h16_, ne, xgi, n_rows, xg, hipStreamPerThread)) {
+        return fail("moe gather (batched) failed");
+    }
+    std::vector<int> host_off((size_t) n_expert + 1);
+    int64_t max_rows = 0;
     for (int e = 0, at = 0; e < n_expert; ++e) {
+        host_off[(size_t) e] = at;
         const int64_t n_e = moe_counts_[(size_t) e];
-        if (n_e == 0) {
-            continue;
+        at += (int) n_e;
+        max_rows = n_e > max_rows ? n_e : max_rows;
+    }
+    host_off[(size_t) n_expert] = T * topk;
+    if (hipMemcpy(moe_off_, host_off.data(), ((size_t) n_expert + 1) * sizeof(int),
+                  hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(moe_cnt_, moe_counts_.data(), (size_t) n_expert * sizeof(int),
+                  hipMemcpyHostToDevice) != hipSuccess) {
+        return fail("moe offsets upload failed");
+    }
+    // The x of a grouped GEMM is the gathered rows (gate / up) or the swiglu
+    // output on the same rows (down): both are laid out per gathered row.
+    const bool no_group = std::getenv("OMPH_MOE_NO_GROUP") != nullptr;  // A/B (#494)
+    const auto grouped = [&](const Mat & w, const int64_t per_expert, const void * x,
+                             const int64_t n_out, const int64_t k, float * y, const int64_t ldy) {
+        if (no_group) {
+            return false;
         }
-        const int64_t off = at;
-        at += n_e;
-        if (!omph::kernels::moe_gather(h16_, ne, xgi + off, n_e, xg, hipStreamPerThread) ||
-            !matmul(slice(L.ffn_gate_exps, (int64_t) e * gate_stride, gate_rows, ne), xg,
-                    static_cast<float *>(ffn1_), ffn, ne, n_e) ||
-            !matmul(slice(L.ffn_up_exps, (int64_t) e * up_stride, up_rows, ne), xg,
-                    static_cast<float *>(ffn2_), ffn, ne, n_e) ||
-            !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
-                                       static_cast<const float *>(ffn2_), ffn16_, n_e * ffn,
-                                       hipStreamPerThread) ||
-            !matmul(slice(L.ffn_down_exps, (int64_t) e * down_stride, down_rows, ffn), ffn16_,
-                    static_cast<float *>(moe_down_), ne, ffn, n_e) ||
-            !omph::kernels::moe_scatter_store(xo, static_cast<const float *>(moe_down_),
-                                              slot + off, xgi + off, n_e, ne, topk,
-                                              hipStreamPerThread)) {
-            return fail("moe expert (batched) failed");
+        return omph::kernels::gemm_q_grouped(w.t->type, w.dev, per_expert, x,
+                                             static_cast<const int *>(moe_off_),
+                                             static_cast<const int *>(moe_cnt_), n_expert, max_rows, y,
+                                             n_out, k, ldy, hipStreamPerThread);
+    };
+    // gate and up: grouped when the type has a tile kernel, else one expert at a
+    // time, both writing at the gathered row offsets
+    if (!grouped(L.ffn_gate_exps, gate_stride, xg, ffn, ne, ffn1, ffn) ||
+        !grouped(L.ffn_up_exps, up_stride, xg, ffn, ne, ffn2, ffn)) {
+        for (int e = 0, at = 0; e < n_expert; ++e) {
+            const int64_t n_e = moe_counts_[(size_t) e];
+            const int64_t off = at;
+            at += n_e;
+            if (n_e > 0 &&
+                (!matmul(slice(L.ffn_gate_exps, (int64_t) e * gate_stride, gate_rows, ne),
+                         xg + off * ne, ffn1 + off * ffn, ffn, ne, n_e) ||
+                 !matmul(slice(L.ffn_up_exps, (int64_t) e * up_stride, up_rows, ne), xg + off * ne,
+                         ffn2 + off * ffn, ffn, ne, n_e))) {
+                return fail("moe gate/up (batched) failed");
+            }
         }
+    }
+    // the swiglu first: the down projections read its output
+    if (!omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
+                                   static_cast<const float *>(ffn2_), ffn16_, n_rows * ffn,
+                                   hipStreamPerThread)) {
+        return fail("moe swiglu (batched) failed");
+    }
+    if (!grouped(L.ffn_down_exps, down_stride, ffn16_, ne, ffn, down_out, ne)) {
+        for (int e = 0, at = 0; e < n_expert; ++e) {
+            const int64_t n_e = moe_counts_[(size_t) e];
+            const int64_t off = at;
+            at += n_e;
+            if (n_e > 0 &&
+                !matmul(slice(L.ffn_down_exps, (int64_t) e * down_stride, down_rows, ffn),
+                        reinterpret_cast<const __half *>(ffn16_) + off * ffn, down_out + off * ne, ne,
+                        ffn, n_e)) {
+                return fail("moe down (batched) failed");
+            }
+        }
+    }
+    if (!omph::kernels::moe_scatter_store(xo, down_out, slot, xgi, n_rows, ne, topk,
+                                          hipStreamPerThread)) {
+        return fail("moe store (batched) failed");
     }
     // the routed output: the slot-ordered weighted sum
     if (!omph::kernels::moe_combine(static_cast<float *>(cur_), xo, weights, T, topk, ne,

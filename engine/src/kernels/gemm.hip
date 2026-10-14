@@ -339,19 +339,38 @@ template <class TD, bool SWI>
 __global__ __launch_bounds__(256) void gemm_tiles_kernel(const uint8_t * __restrict__ wt,
                                                         const _Float16 * __restrict__ x, float * __restrict__ y,
                                                         const long long blocks, const int tokens,
-                                                        const long long ldy, const Epi epi) {
+                                                        const long long ldy, const Epi epi,
+                                                        const uint8_t * __restrict__ exps = nullptr,
+                                                        const long long per_expert = 0,
+                                                        const int * __restrict__ offs = nullptr,
+                                                        const int * __restrict__ counts = nullptr) {
     __shared__ __attribute__((aligned(16))) uint8_t tab[TD::kLds];
     __shared__ _Float16 xs[2][kGtTok * kGtXLd];
     const int tid = (int) threadIdx.x;
     TD::init(tab);
+    // Expert grouping (#494): blockIdx.z picks the expert, its weight slice and
+    // its rows of x; without it the call is exactly the one-tensor GEMM above.
+    const int e = exps != nullptr ? (int) blockIdx.z : 0;
+    const int nt = counts != nullptr ? counts[e] : tokens;
+    const long long kk = blocks * 256;
+    const long long row0 = offs != nullptr ? (long long) offs[e] : 0;
+    const uint8_t * const wt_e = wt + (exps != nullptr ? (long long) e * per_expert : 0);
+    const _Float16 * const x_e = x + row0 * kk;
+    float * const y_e = y + row0 * ldy;
     const int lane = tid & 31;
     const int wv = tid >> 5;
     const int h = lane >> 4;
     const long long tile = (long long) blockIdx.y * 8 + wv;
     const long long n0 = (long long) blockIdx.x * kGtTok;
-    const long long k = blocks * 256;
-    const long long tx = n0 + tid < tokens ? n0 + tid : 0;
-    const uint4 * xrow = reinterpret_cast<const uint4 *>(x + tx * k);
+    // An expert with no rows in this chunk (or a row block past its count)
+    // has nothing to compute - and its `offs` is the next expert's, which can
+    // be one row past the end of x (#494)
+    if (nt <= 0 || n0 >= nt) {
+        return;
+    }
+    const long long k = kk;
+    const long long tx = n0 + tid < nt ? n0 + tid : 0;
+    const uint4 * xrow = reinterpret_cast<const uint4 *>(x_e + tx * k);
     const auto stage = [&](const long long s, _Float16 * buf) {
         const uint4 * src = xrow + s * 4;
         uint4 * dst = reinterpret_cast<uint4 *>(buf + tid * kGtXLd);
@@ -369,7 +388,7 @@ __global__ __launch_bounds__(256) void gemm_tiles_kernel(const uint8_t * __restr
     __syncthreads();
     int buf = 0;
     for (long long b = 0; b < blocks; ++b) {
-        const typename TD::Blk kb = TD::load(wt + (tile * blocks + b) * TD::kBytes, lane);
+        const typename TD::Blk kb = TD::load(wt_e + (tile * blocks + b) * TD::kBytes, lane);
 #pragma unroll 1
         for (int sb = 0; sb < 8; ++sb) {
             const long long s = b * 8 + sb;
@@ -394,8 +413,8 @@ __global__ __launch_bounds__(256) void gemm_tiles_kernel(const uint8_t * __restr
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
         const long long t = n0 + j * 16 + (lane & 15);
-        if (t < tokens) {
-            store8<SWI>(acc[j], y, epi, t * ldy + tile * 16 + h * 8);
+        if (t < nt) {
+            store8<SWI>(acc[j], y_e, epi, t * ldy + tile * 16 + h * 8);
         }
     }
 }
@@ -417,19 +436,33 @@ template <class TD, bool SWI>
 __global__ __launch_bounds__(256) void gemm_tiles2_kernel(const uint8_t * __restrict__ wt,
                                                          const _Float16 * __restrict__ x, float * __restrict__ y,
                                                          const long long blocks, const int tokens,
-                                                         const long long ldy, const Epi epi) {
+                                                         const long long ldy, const Epi epi,
+                                                         const uint8_t * __restrict__ exps = nullptr,
+                                                         const long long per_expert = 0,
+                                                         const int * __restrict__ offs = nullptr,
+                                                         const int * __restrict__ counts = nullptr) {
     __shared__ __attribute__((aligned(16))) uint8_t tab[TD::kLds];
     __shared__ _Float16 xs[2][kG2Tok * kG2XLd];
     const int tid = (int) threadIdx.x;
     TD::init(tab);
+    const int e = exps != nullptr ? (int) blockIdx.z : 0;
+    const int nt = counts != nullptr ? counts[e] : tokens;
+    const long long kk = blocks * 256;
+    const long long row0 = offs != nullptr ? (long long) offs[e] : 0;
+    const uint8_t * const wt_e = wt + (exps != nullptr ? (long long) e * per_expert : 0);
+    const _Float16 * const x_e = x + row0 * kk;
+    float * const y_e = y + row0 * ldy;
     const int lane = tid & 31;
     const int wv = tid >> 5;
     const int h = lane >> 4;
     const long long tile = (long long) blockIdx.y * 16 + wv * 2;
     const long long n0 = (long long) blockIdx.x * kG2Tok;
-    const long long k = blocks * 256;
-    const long long tx = n0 + tid < tokens ? n0 + tid : 0;
-    const uint4 * xrow = reinterpret_cast<const uint4 *>(x + tx * k);
+    if (nt <= 0 || n0 >= nt) {
+        return;  // see gemm_tiles_kernel (#494)
+    }
+    const long long k = kk;
+    const long long tx = n0 + tid < nt ? n0 + tid : 0;
+    const uint4 * xrow = reinterpret_cast<const uint4 *>(x_e + tx * k);
     const auto stage = [&](const long long s, _Float16 * buf) {
         if (tid >= kG2Tok) {
             return;
@@ -453,8 +486,8 @@ __global__ __launch_bounds__(256) void gemm_tiles2_kernel(const uint8_t * __rest
     __syncthreads();
     int buf = 0;
     for (long long b = 0; b < blocks; ++b) {
-        const typename TD::Blk kb[2] = {TD::load(wt + (tile * blocks + b) * TD::kBytes, lane),
-                                        TD::load(wt + ((tile + 1) * blocks + b) * TD::kBytes, lane)};
+        const typename TD::Blk kb[2] = {TD::load(wt_e + (tile * blocks + b) * TD::kBytes, lane),
+                                        TD::load(wt_e + ((tile + 1) * blocks + b) * TD::kBytes, lane)};
 #pragma unroll 1
         for (int sb = 0; sb < 8; ++sb) {
             const half8 a[2][2] = {{TD::frag(tab, kb[0], sb, 0, h), TD::frag(tab, kb[0], sb, 1, h)},
@@ -493,8 +526,8 @@ __global__ __launch_bounds__(256) void gemm_tiles2_kernel(const uint8_t * __rest
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const long long t = n0 + j * 16 + (lane & 15);
-            if (t < tokens) {
-                store8<SWI>(acc[i][j], y, epi, t * ldy + (tile + i) * 16 + h * 8);
+            if (t < nt) {
+                store8<SWI>(acc[i][j], y_e, epi, t * ldy + (tile + i) * 16 + h * 8);
             }
         }
     }
@@ -519,9 +552,23 @@ bool gemm_f16(const void * w, const void * x, float * y, const int64_t n_out, co
 
 namespace {
 
+// Expert grouping for the tile GEMMs (#494): the grid's z dimension picks one
+// expert of a 3-D tensor, its own rows of x and its slice of the weights. An
+// empty group (the default) is exactly the one-tensor GEMM.
+struct GemmGroup {
+    const uint8_t * exps = nullptr;  // the whole expert tensor (tile layout)
+    int64_t per_expert = 0;          // its bytes per expert
+    const int * offs = nullptr;      // device: the first gathered row per expert
+    const int * counts = nullptr;    // device: rows per expert
+    int n_experts = 0;
+    int64_t max_rows = 0;            // the grid's token bound
+    bool active() const { return exps != nullptr; }
+};
+
 template <bool SWI>
 bool gemm_q_impl(const uint32_t type, const void * packed, const void * x, float * y, const int64_t n_out,
-                 const int64_t k, const int64_t tokens, const int64_t ldy, const Epi epi, hipStream_t stream) {
+                 const int64_t k, const int64_t tokens, const int64_t ldy, const Epi epi, hipStream_t stream,
+                 const GemmGroup & g = GemmGroup{}) {
     const auto aligned = [](const void * p) { return ((uintptr_t) p & 15) == 0; };
     if (packed == nullptr || x == nullptr || y == nullptr || n_out <= 0 || tokens <= 0 ||
         k <= 0 || k % 256 != 0 || n_out % 16 != 0 || ldy < n_out || ldy % 4 != 0 ||
@@ -530,12 +577,21 @@ bool gemm_q_impl(const uint32_t type, const void * packed, const void * x, float
         return false;
     }
     const auto * base = static_cast<const uint8_t *>(packed);
+    // The grouped call exists only for the tile kernels (#494): a row count
+    // that would fall back to the plain kernel is refused here so the caller
+    // can take its own fallback instead of getting a silent no-op.
+    if (g.active() && n_out % 128 != 0) {
+        return false;
+    }
     const int64_t n_blocks = n_out * (k / 256);
     const long long blocks = k / 256;
     // 256 tokens per block halves the decode work per FLOP (512 tokens: 625 ->
     // 577 ms of prefill); up to 256 tokens the 128-wide tile keeps more blocks
     // busy and wins (T = 256: 327 vs 335 ms, #141).
     const auto launch = [&](const auto dec) {
+        if (g.active()) {
+            return;  // only the tile kernels group (#494)
+        }
         const auto * xh = static_cast<const _Float16 *>(x);
         if (tokens > 256) {
             const dim3 grid((unsigned) ((tokens + 255) / 256), (unsigned) ((n_out + kBM - 1) / kBM));
@@ -547,16 +603,21 @@ bool gemm_q_impl(const uint32_t type, const void * packed, const void * x, float
                 dec, xh, y, (int) n_out, (int) k, (int) tokens, (long long) ldy, epi);
         }
     };
+    const int64_t rows = g.active() ? g.max_rows : tokens;
     const auto tiles = [&](const auto td) {
-        const dim3 grid((unsigned) ((tokens + kGtTok - 1) / kGtTok), (unsigned) (n_out / 128));
+        const dim3 grid((unsigned) ((rows + kGtTok - 1) / kGtTok), (unsigned) (n_out / 128),
+                        (unsigned) (g.active() ? g.n_experts : 1));
         gemm_tiles_kernel<decltype(td), SWI><<<grid, 256, 0, stream>>>(
-            base, static_cast<const _Float16 *>(x), y, blocks, (int) tokens, (long long) ldy, epi);
+            base, static_cast<const _Float16 *>(x), y, blocks, (int) tokens, (long long) ldy, epi,
+            g.exps, g.per_expert, g.offs, g.counts);
     };
     // 2 x 8 rows/tokens per wave (#326); needs a whole 256-row workgroup
     const auto tiles2 = [&](const auto td) {
-        const dim3 grid((unsigned) ((tokens + kG2Tok - 1) / kG2Tok), (unsigned) (n_out / 256));
+        const dim3 grid((unsigned) ((rows + kG2Tok - 1) / kG2Tok), (unsigned) (n_out / 256),
+                        (unsigned) (g.active() ? g.n_experts : 1));
         gemm_tiles2_kernel<decltype(td), SWI><<<grid, 256, 0, stream>>>(
-            base, static_cast<const _Float16 *>(x), y, blocks, (int) tokens, (long long) ldy, epi);
+            base, static_cast<const _Float16 *>(x), y, blocks, (int) tokens, (long long) ldy, epi,
+            g.exps, g.per_expert, g.offs, g.counts);
     };
     switch (type) {
         case 21:
@@ -626,6 +687,21 @@ bool gemm_q_impl(const uint32_t type, const void * packed, const void * x, float
 bool gemm_q(const uint32_t type, const void * packed, const void * x, float * y, const int64_t n_out,
             const int64_t k, const int64_t tokens, const int64_t ldy, hipStream_t stream) {
     return gemm_q_impl<false>(type, packed, x, y, n_out, k, tokens, ldy, Epi{nullptr, nullptr}, stream);
+}
+
+bool gemm_q_grouped(const uint32_t type, const void * exps, const int64_t per_expert, const void * x,
+                    const int * offs, const int * counts, const int64_t n_experts,
+                    const int64_t max_rows, float * y, const int64_t n_out, const int64_t k,
+                    const int64_t ldy, hipStream_t stream) {
+    if (exps == nullptr || offs == nullptr || counts == nullptr || n_experts <= 0 || max_rows <= 0) {
+        return false;
+    }
+    GemmGroup g{static_cast<const uint8_t *>(exps), per_expert, offs, counts, (int) n_experts, max_rows};
+    // the token count argument is only the bound the non-grouped shape would
+    // use; every block reads its expert's count
+    const bool ok = gemm_q_impl<false>(type, exps, x, y, n_out, k, (int64_t) g.max_rows, ldy,
+                                       Epi{nullptr, nullptr}, stream, g);
+    return ok && hipGetLastError() == hipSuccess;
 }
 
 bool gemm_q_swiglu(const uint32_t type, const void * packed, const void * x, const float * gate, void * out_f16,

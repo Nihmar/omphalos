@@ -181,18 +181,25 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     // output, which the GDN writes into the same buffer (out16, ssm_inner per
     // token: 4096 for the second model against n_ff_exp 512).
     ffn_n_ = std::max(h_.n_ff, std::max(std::max(h_.n_ff_exp, h_.n_ff_shexp), h_.ssm_inner));
+    if (h_.moe()) {
+        // the batched MoE keeps every selected expert's rows at once (#494)
+        ffn_n_ = std::max(ffn_n_, h_.n_expert_used * h_.n_ff_exp);
+    }
     alloc(&ffn1_, T * ffn_n_ * 4);
     alloc(&ffn2_, T * ffn_n_ * 4);
     alloc(&ffn16_, T * ffn_n_ * 2);
     if (h_.moe()) {
         alloc(&moe_ids_, (size_t) T * h_.n_expert_used * sizeof(int));
         alloc(&moe_w_, (size_t) T * h_.n_expert_used * sizeof(float));
-        alloc(&moe_down_, (size_t) T * ne * 4);
+        // the batched path keeps one down output per gathered row (#494)
+        alloc(&moe_down_, (size_t) T * h_.n_expert_used * ne * 4);
         alloc(&moe_gate_, (size_t) T * sizeof(float));
-        alloc(&moe_xg_, (size_t) T * ne * 2);
+        alloc(&moe_xg_, (size_t) T * h_.n_expert_used * ne * 2);
         alloc(&moe_xo_, (size_t) T * h_.n_expert_used * ne * 4);
         alloc(&moe_xgi_, (size_t) T * h_.n_expert_used * sizeof(int));
         alloc(&moe_slot_, (size_t) T * h_.n_expert_used * sizeof(int));
+        alloc(&moe_off_, ((size_t) h_.n_expert + 1) * sizeof(int));
+        alloc(&moe_cnt_, (size_t) h_.n_expert * sizeof(int));
         moe_host_ids_.resize((size_t) T * h_.n_expert_used);
         moe_counts_.resize((size_t) h_.n_expert);
     }

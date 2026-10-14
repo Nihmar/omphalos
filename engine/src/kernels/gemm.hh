@@ -25,6 +25,14 @@ bool gemm_q(uint32_t type, const void * packed, const void * x, float * y, int64
 // out_f16[t][r] = f16(silu(gate[t][r]) * up[t][r]), up never written; both
 // T x n_out row-major (stride n_out). Bit-identical to gemm_q into up, then
 // swiglu_f16(gate, up).
+// One call for every expert of a 3-D tensor (#494): the weights are the
+// experts' slices of the tile layout (`per_expert` bytes each), `offs` /
+// `counts` (device int arrays) say where each expert's rows are in the
+// gathered x and how many, and the grid's z dimension is the expert.
+bool gemm_q_grouped(uint32_t type, const void * exps, int64_t per_expert, const void * x,
+                    const int * offs, const int * counts, int64_t n_experts, int64_t max_rows,
+                    float * y, int64_t n_out, int64_t k, int64_t ldy, hipStream_t stream);
+
 bool gemm_q_swiglu(uint32_t type, const void * packed, const void * x, const float * gate, void * out_f16,
                    int64_t n_out, int64_t k, int64_t tokens, hipStream_t stream);
 

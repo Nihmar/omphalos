@@ -36,3 +36,25 @@ the card has, so this is grid/launch bound, not bandwidth bound.
   `--chunk 128` is bit-identical (KL 0.000000 nats, top-1 100 %): the per-slot
   store plus the slot-ordered combine make the expert sums independent of the
   chunking (no atomics)
+
+## The grouped expert GEMM (the same chunk, one launch per matrix kind)
+
+`gemm_q_grouped` (the tile kernels with an expert grid dimension: `blockIdx.z`
+picks the expert, its weight slice and its rows of x) replaces the per-expert
+GEMMs; the fallback stays for the types without a tile kernel (this file's Q3_K
+down projections, half of them) and for the A/B (`OMPH_MOE_NO_GROUP=1`):
+
+| tokens | per-expert GEMMs | grouped | grouped t/s |
+|---:|---:|---:|---:|
+| 512 | 1373.6 ms | 811.7 ms | **631** |
+| 1024 | - | 1876.3 ms | 546 |
+| 2000 | - | 3754.8 ms | 533 |
+
+Same logits either way (KL 0.004501 vs llama.cpp, top-1 100 %) and still
+chunk-invariant (KL 0.000000). The remaining time is the per-layer ids readback
+and the Q3_K down projections through the f16 staging path (#492 step 2).
+
+The launch count per layer went from ~256 x 5 to ~6; the achieved weight
+bandwidth from ~14 GB/s to ~31 GB/s (the whole expert set per layer, 464 MiB,
+over ~15 ms). llama.cpp's own numbers on this machine: 959 t/s at 512 tokens
+(Q4_K_M, 25 layers' experts on GPU) and 651 t/s at 128k depth.

@@ -725,6 +725,8 @@ private:
     void * moe_xo_ = nullptr;    // tokens x topk x n_embd f32: the experts' down outputs
     void * moe_xgi_ = nullptr;   // tokens x topk int: the gather / store row indices
     void * moe_slot_ = nullptr;  // tokens x topk int: the slot of each gathered row
+    void * moe_off_ = nullptr;   // n_expert + 1 int: the first gathered row per expert
+    void * moe_cnt_ = nullptr;   // n_expert int: the rows per expert
     std::vector<int> moe_host_ids_;  // the selection, read back for the expert slices
     std::vector<int> moe_counts_;    // per-expert rows in the batched path
     void * logits_ = nullptr;
