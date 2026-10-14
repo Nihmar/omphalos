@@ -177,6 +177,15 @@ private:
     };
     void save_snapshot(const std::vector<int32_t> & prompt, const std::vector<std::string> & images,
                        GenerateResult & res);
+    // Pinned buffers for the snapshot store, kept and handed back out instead of
+    // hipHostMalloc + hipHostFree per conversation switch. Multi-GB pinned
+    // alloc/free churn stalls the amdgpu driver: #375 is the server spinning in
+    // kernel time with no syscall and the GPU idle, reproduced by switching
+    // conversations with --kv-ram. One spare buffer is held at most - what a
+    // save already needed transiently - and the eviction accounting ignores it.
+    void * snap_host(size_t bytes);
+    void snap_release(void * host, size_t bytes);
+    std::vector<std::pair<void *, size_t>> snap_free_;
 
     Config config_;
     omph::runtime::EnvOptions env_;

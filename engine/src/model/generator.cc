@@ -72,6 +72,40 @@ Generator::~Generator() {
     for (const Snapshot & s : snapshots_) {
         (void) hipHostFree(s.host);
     }
+    for (const auto & [p, bytes] : snap_free_) {
+        (void) p;
+        (void) bytes;
+        (void) hipHostFree(p);
+    }
+}
+
+// One spare pinned buffer, reused by the next save (#375: the driver stalls on
+// the alloc/free churn of multi-GB regions, not on their content).
+void * Generator::snap_host(const size_t bytes) {
+    for (size_t i = 0; i < snap_free_.size(); ++i) {
+        if (snap_free_[i].second >= bytes) {
+            void * p = snap_free_[i].first;
+            snap_free_.erase(snap_free_.begin() + (std::ptrdiff_t) i);
+            return p;
+        }
+    }
+    void * p = nullptr;
+    if (hipHostMalloc(&p, bytes) != hipSuccess) {
+        (void) hipGetLastError();
+        return nullptr;
+    }
+    return p;
+}
+
+void Generator::snap_release(void * host, const size_t bytes) {
+    if (host == nullptr) {
+        return;
+    }
+    if (snap_free_.empty()) {  // keep at most one: the peak does not grow
+        snap_free_.emplace_back(host, bytes);
+        return;
+    }
+    (void) hipHostFree(host);
 }
 
 std::string Generator::chat_template() const {
@@ -289,9 +323,8 @@ void Generator::save_snapshot(const std::vector<int32_t> & prompt, const std::ve
     const size_t budget = (size_t) config_.kv_ram_mib << 20;
     if (bytes > budget) return;
     const double t0 = omph::runtime::now_ms();
-    void * host = nullptr;
-    if (hipHostMalloc(&host, bytes) != hipSuccess) {
-        (void) hipGetLastError();
+    void * host = snap_host(bytes);
+    if (host == nullptr) {
         return;  // no pinned memory: the conversation will be prefilled again
     }
     Snapshot snap{seq_, host, bytes, kv, {}, ++clock_, seq_images_};
@@ -308,12 +341,16 @@ void Generator::save_snapshot(const std::vector<int32_t> & prompt, const std::ve
     if (!ok) {
         // The snapshots it would have merged stay valid: they used to be freed
         // before this check, losing every saved conversation (#337).
-        (void) hipHostFree(host);
+        snap_release(host, bytes);
         return;
     }
     for (size_t q = merged.size(); q-- > 0;) {  // their points live on in snap
-        (void) hipHostFree(snapshots_[merged[q]].host);
-        snapshot_total_ -= snapshots_[merged[q]].bytes;
+        Snapshot & old = snapshots_[merged[q]];
+        if (old.disk != nullptr && !old.disk->load()) {
+            continue;  // the writer is still reading its buffer (#437): keep it, its points are in snap
+        }
+        snap_release(old.host, old.bytes);
+        snapshot_total_ -= old.bytes;
         snapshots_.erase(snapshots_.begin() + (std::ptrdiff_t) merged[q]);
     }
     while (!snapshots_.empty() && snapshot_total_ + bytes > budget) {  // the least recently used go
@@ -329,7 +366,7 @@ void Generator::save_snapshot(const std::vector<int32_t> & prompt, const std::ve
         if (lru == snapshots_.end()) {
             break;  // every snapshot is being written: over budget until the writer catches up
         }
-        (void) hipHostFree(lru->host);
+        snap_release(lru->host, lru->bytes);
         snapshot_total_ -= lru->bytes;
         snapshots_.erase(lru);
     }
@@ -413,8 +450,8 @@ int64_t Generator::resume(const std::vector<int32_t> & prompt, const std::vector
             std::vector<uint8_t> blob;
             if (disk_.load(*e, blob) && !blob.empty() &&
                 blob.size() <= (size_t) config_.kv_ram_mib << 20) {
-                void * host = nullptr;
-                if (hipHostMalloc(&host, blob.size()) == hipSuccess) {
+                void * host = snap_host(blob.size());
+                if (host != nullptr) {
                     std::memcpy(host, blob.data(), blob.size());
                     Snapshot s;
                     s.tokens = e->tokens;
