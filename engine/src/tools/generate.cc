@@ -97,6 +97,8 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--ctx")) cfg.context = omph::cli::integer(val(), "--ctx");
         else if (!std::strcmp(argv[i], "--cache-mib")) cfg.cache_mib = omph::cli::integer(val(), "--cache-mib");
         else if (!std::strcmp(argv[i], "--kv-ram")) cfg.kv_ram_mib = omph::cli::integer(val(), "--kv-ram");
+        else if (!std::strcmp(argv[i], "--cache-dir")) cfg.cache_dir = val();
+        else if (!std::strcmp(argv[i], "--cache-dir-mib")) cfg.cache_dir_mib = omph::cli::integer(val(), "--cache-dir-mib");
         else if (!std::strcmp(argv[i], "--repeat")) repeat = (int) omph::cli::integer(val(), "--repeat");
         else if (!std::strcmp(argv[i], "--then")) then_path = val();
         else if (!std::strcmp(argv[i], "--mmproj")) mmproj = val();

@@ -74,6 +74,10 @@ public:
     Listener & operator=(const Listener &) = delete;
     // Waits for the next connection: its descriptor, or -1 on an error.
     int accept_one();
+    // Makes a blocked accept_one() return (a signal handler may call this: it
+    // is a shutdown(2), not a close). #437: the server exits on SIGINT/SIGTERM
+    // so the destructors run and the cache writes are flushed.
+    void stop();
 
 private:
     int fd_ = -1;

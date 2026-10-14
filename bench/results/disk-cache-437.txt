@@ -1,0 +1,62 @@
+# #437: the saved conversations on disk — a restart resumes a long context
+
+Engine main 0571d06 + `feat/437-disk-cache`, RX 9060 XT 16 GB. `omph-server
+<model.omph> --ctx 65536 --cache-dir DIR --cache-dir-mib 8192`, one run per cell:
+a prompt of code-like text (the engine's own sources), 8 generated tokens, then
+a "ok?" turn so the first conversation is *saved* (and written), a clean SIGTERM
+(the server now stops the accept loop instead of the process, so the destructors
+run), a restart, and the same prompt again. `timings.prompt_ms` from the
+response; llama.cpp: v0.6.0 @ d81235049 (no llama.cpp run here).
+
+| prompt | cold (prefill) | warm (from disk) | speedup | blob | `cached_tokens` |
+|---:|---:|---:|---:|---:|---:|
+| 9.4k tokens | 9365 ms | **754 ms** | **12.4x** | 0.46 GiB | 9396 |
+| 29.7k tokens | 32348 ms | **1558 ms** | **20.8x** | 0.89 GiB | 29710 |
+
+The server logs `restored from disk` for both warm requests. The SIGTERM path
+exits in 0.2 s (the pending cache write is flushed by the destructor).
+
+## What the warm time is
+
+The blob is read whole (one `read`), verified with an FNV-1a 64 over its bytes
+(~2.5 GB/s, so ~0.2 s for 0.46 GiB) and uploaded as the KV prefix; the rest is
+the remaining prefill (a handful of tokens) and the request's own cost. Both
+terms scale with the context, so a 100k conversation (~3 GiB, `K8/V4`) is
+expected at ~5-6 s against the ~147 s prefill.
+
+## Mechanics
+
+- `Runner::kv_prefix_bytes/save/restore` already existed (#158/#179): one
+  contiguous blob per conversation — every attention layer's K (Q8/Q4) and
+  scales, V (Q4) and scales, the MTP block's cache and the DFlash2 drafter's
+  ring and tags — plus one checkpoint per point. `DiskCache` writes it to
+  `DIR/omph-<model8>-<n>-<key16>.kvc` with a 32-byte header (magic, version, n,
+  bytes, FNV-1a) and an entry in `DIR/index.tsv`.
+- The index carries the entry's **tokens** and image digests, not a hash of
+  them: a request can match an *inner checkpoint* of a saved conversation
+  (a shorter prompt), which a whole-sequence hash cannot express. The lookup is
+  the same `prefix_equal` the in-RAM store uses, so the two agree by
+  construction.
+- The files are keyed by the model's `omph.source_sha256`: a reconverted or
+  re-quantized model never reuses one (and the entries of another key are
+  dropped at open). The `--cache-dir-mib` budget evicts least-recently-used.
+- The write happens on a background thread as soon as a conversation is saved
+  (it reads the pinned snapshot buffer; the in-RAM LRU skips a snapshot whose
+  write is pending). A `SIGKILL` within that window loses the file; a SIGTERM
+  flushes it.
+- The blob is only *trusted* after the header, the entry's own fields and the
+  FNV agree: a corrupted file is discarded and the prompt is prefilled.
+
+## Tests
+
+`engine/tests/test_diskcache.cc` (CPU, in CI): the index and blob round trip
+across two `DiskCache` instances, the prefix matching (including a divergent
+prefix and a point past the entry), a flipped blob byte being refused, the
+model-key filter and the LRU budget. 14/14 CPU tests pass.
+
+## Not done
+
+- The FNV is scalar; a hardware CRC or an 8-byte FNV would roughly halve the
+  verify time at 100k.
+- The disk write on *every* save (not only a clean exit) is what the current
+  code does; a periodic/on-idle flush could bound the loss window further.

@@ -120,6 +120,10 @@ engine/build/omph-capi-demo <model.omph> [<mmproj.gguf> <image>]
 # 2048) --kv-ram MIB (whole conversations in host RAM: a prompt that leaves the cached one saves
 # it, one that continues a saved one restores it, #179; default 8192) --mmproj FILE (images as base64 data: URLs, #160) --alias --api-key --cors ORIGIN, request defaults --temp
 # --top-k --top-p --min-p --max-tokens (default greedy: speculative MTP decoding), and
+# --cache-dir DIR --cache-dir-mib N: the saved conversations mirrored to disk (#437,
+#     default off / 8192 MiB): a restart resumes a 9.4k context in 754 ms against a
+#     9365 ms prefill, 29.7k in 1558 ms against 32348 ms (bench/results/disk-cache-437.txt);
+#     the files are keyed by the .omph's source digest and verified (FNV) before use
 # --chat-template original|sharp (#392: the GGUF's own template or the vendored Qwen Sharp,
 # whose `terse` / effort aliases / tool_call_format / max_tool_*_chars kwargs go through
 # chat_template_kwargs; /props reports it as chat_template_name), and

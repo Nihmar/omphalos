@@ -106,6 +106,8 @@ speculation statistics on stderr (`--ids` prints the token ids instead).
 | `--ctx N` | `8192` | KV capacity |
 | `--cache-mib N` | `2048` | pinned host RAM for sequence checkpoints (`0`: none, #158) |
 | `--kv-ram N` | `8192` | pinned host RAM for whole conversations (`0`: none, #179) |
+| `--cache-dir DIR` | off | mirror the saved conversations to DIR (#437): a restart resumes a long context with a read instead of a prefill |
+| `--cache-dir-mib N` | `8192` | the disk budget, least recently used first |
 | `--repeat N` | `1` | run the same request N times: the second and later restore the checkpoint before the generation prompt (#158) |
 | `--then FILE` | off | then a second chat request from FILE: a conversation's next turn, which continues the cached sequence when it extends it |
 | `--mmproj FILE` | off | the vision encoder (a build with `OMPH_LLAMA_DIR`, #160) |
