@@ -1,0 +1,44 @@
+# The "cheap OOV fallback" for the draft head (a #453 follow-up idea) — measured, not adopted
+
+The idea: with `OMPH_DRAFT_VOCAB` = 98304 the head falls back to all 682 MiB when
+the output leaves the prefix (#217), which on Italian chat is 83 % of the draft
+steps (~2.1 ms/step of extra GEMV). Since only ~70 distinct out-of-prefix ids
+appear in a whole Italian generation, gather their head rows into a small buffer
+once and score [prefix | those rows] instead: ~30 us/step instead of 2.1 ms.
+Implemented (`hot_commit` on each committed out-of-prefix token, the gathered
+rows in whole 16-row head tiles with a -inf mask on the padding, `dflash_topk`
+with an id map, the same for the MTP's argmax) and measured.
+
+Gate first, offline: the cumulative set covers **79.3 %** of the OOV output tokens
+at a cap of 64 ids (0.6 MiB of rows); the recent-window variant 74 %; seeding the
+set from the *prompt's* OOV ids makes it worse (44 %, the prompt's rare words are
+not the output's).
+
+Then the A/B, Italian chat, 1024 greedy tokens (output bit-identical in every
+configuration - the verification decides):
+
+| config | steps | drafts accepted | ms/token | fallback steps |
+|---|---:|---|---:|---:|
+| whole-head fallback (`OMPH_DRAFT_HOT=0`, today) | 437 | 587 / 1824 (32.2 %) | **22.00** | 335 / 437 |
+| gathered hot rows (`OMPH_DRAFT_HOT=64`) | 604 | 419 / 1752 (23.9 %) | **29.22** | 0 / 604 |
+
+The step itself is 2.1 ms *cheaper* with the hot rows (51.6 -> 49.5 ms/step,
+exactly the head's bytes, as predicted), but the accepted drafts per step collapse
+(2.34 -> 1.70): the ~20 % of OOV tokens whose first occurrence is not in the set
+break their chains, and the chain amplifies a 10-20 % per-row miss into 27 % fewer
+tokens per weight pass. Net: **-27 % throughput**.
+
+On the English/code scenarios (where the fallback never fires) the gathered set is
+inert: prose 44.1 vs 44.0 t/s, edit-cc 259.8 both, identical drafts and hashes.
+
+## Reading
+
+The negative validates the design it tested: the whole-head fallback's **2.1
+ms/step buys +27 % acceptance on Italian**, which is far more than it costs (one
+weight pass is ~50 ms, so 2.3 accepted tokens per step are worth ~15 ms). A draft
+set that is 79 % right is not a cheaper fallback, it is a worse drafter.
+
+Nothing changes: `OMPH_DRAFT_HOT` and the gathered path are reverted, the #217
+fallback stays, and the record is the answer for anyone who tries this again
+(the gate to pass is not coverage of the *tokens* but the *chain survival*, which
+tolerates almost no misses).
