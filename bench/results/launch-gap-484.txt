@@ -1,0 +1,26 @@
+# Is a decode step still launch-bound? (#484) — measured, deferred
+
+Engine main 2026-10-14 (after #477), RX 9060 XT.
+
+`omph-graph-probe`: a chain of 1861 tiny dependent kernels, median of 5.
+
+| | per kernel | total |
+|---|---:|---:|
+| launched one by one | 2.82 us | 5.254 ms |
+| replayed as a HIP graph | 2.58 us | 4.793 ms |
+| saved | 0.25 us | 0.461 ms (8.8 %) |
+
+`rocprofv3 --kernel-trace` on a real verification step (8k prompt, oracle drafts, 8 rows):
+
+| | kernels | span | kernel sum | device gap |
+|---|---:|---:|---:|---:|
+| 2 verify steps | 1438 | 106.32 ms | 100.36 ms | **5.97 ms (5.6 %)**, 4.15 us/kernel |
+| per step | ~719 | ~53.2 ms | ~50.2 ms | **~3.0 ms** |
+
+Composition per step: gemv_group 254, gemv_tiles 218, add_rms_norm 257, swiglu 128, delta_* 384.
+A graph would recover ~9 % of the gap (~0.3 ms/step, ~0.5 %); a persistent megakernel could aim
+at the whole ~3 ms (5.6 %) at the cost of folding every kernel family and the per-step attention
+geometry into one kernel. ROCprofv3 perturbs the trace, so 5.6 % is an upper bound. PLAN.md
+§11's "revisit only if a future step becomes launch-bound" still holds.
+
+Decision: deferred with the numbers.

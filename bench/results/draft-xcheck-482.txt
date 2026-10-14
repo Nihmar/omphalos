@@ -1,0 +1,19 @@
+# Cross-source draft disagreement, n-gram against the model drafter (#482) — measured, not adopted
+
+Engine main 2026-10-14 + an `OMPH_TEST_DRAFT_XCHECK=1` diagnostic (reverted): with
+`OMPH_NGRAM=0`, every step also computes the n-gram's proposal for the same history
+(`NgramIndex::propose`, a pure function) and logs it next to the drafter's first draft and the
+target's own token at that position (`am[0]`). Greedy.
+
+| workload | steps | n-gram fired | agreed | disagreed | when disagreed: n-gram right | drafter right |
+|---|---:|---:|---:|---:|---:|---:|
+| verbatim copy, 31k (MTP) | 76 | 74 | 72 | 2 | **0** | 2 |
+| `edit-cc`, 2k (MTP) | 151 | 150 | 140 | **10 (6.7 %)** | **0** | 10 |
+
+The two sources pick the same first token 93-97 % of the time, and in the 12 disagreements the
+n-gram was right zero times. A V-tree at position 1 would gain ~0.07 tokens/step at a cost of
+one extra verification row (2.15 ms at 63k, 1.4 at 32k) plus, on n-gram steps, the drafter pass
+they skip today (MTP measured 6.6 ms/step): ~0.4 ms of value against >= 2.15 ms. Loses.
+
+Decision: measured, not adopted. (The copy workload is easy for MTP alone: 448/452 drafts
+accepted on edit-cc; the n-gram's value there is chain length, 15 against MTP's 4 — #262.)
