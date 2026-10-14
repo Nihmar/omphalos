@@ -1,0 +1,52 @@
+# The second model runs: validation and the v1 timing (#493)
+
+Model: Ornith-1.5-35B-A3B-Q2_K_L.omph (12.65 GiB, fully VRAM-resident; #495 is
+needed for Q4_K_M). Reference: llama.cpp at the pin, CPU backend (`-ngl 0`),
+`tools/native/dump_tensors`, prompt "The capital of France is" (5 tokens:
+760 6511 314 9338 369), one chunk.
+
+## End to end
+
+- logits of the last prompt position vs llama.cpp's `result_output`:
+  KL mean 0.004501 nats, top-1 agreement 100.00 %
+- greedy, engine: 328 314 279 369 11751
+
+## Per layer (`l_out-N` vs the dump, f32)
+
+| layer | rel max | rel mean |
+|---:|---:|---:|
+| 0 | 4.8e-3 | 2.6e-2 |
+| 1 | 5.2e-3 | 3.1e-2 |
+| 2 | 2.9e-3 | 2.9e-2 |
+| 3 | 9.9e-3 | 3.5e-2 |
+| 4 | 1.1e-2 | 4.4e-2 |
+| 9 | 1.1e-2 | 6.0e-2 |
+| 19 | 1.5e-3 | 5.3e-2 |
+| 29 | 1.9e-3 | 5.4e-2 |
+| 39 | 6.1e-2 | 8.3e-2 |
+
+The router itself is exact: the top-8 ids and the normalized weights match the
+dump's `ffn_moe_weights_norm-0` to six decimals (logits agree to 7e-7
+relative), and one expert's routed output matches its dump view to ~1 %.
+
+## v1 timing (the baseline for #494 / #495)
+
+- decode: `step gpu 77.18 ms`, `step wall 77.44 ms` (~13 t/s); `--generate 5`
+- this is the correctness-first shape of #493: the selected ids are read back
+  once per layer (40 device synchronizations per step), and the expert down
+  projections - Q3_K in the GGUF layout, no fused kernel yet - go through the
+  f16 staging path
+
+## The bug found by the per-expert comparison
+
+The down projections of the experts have no fused GEMV in this file (Q3_K,
+identity layout), so `matmul` took the staged path, which staged the weights by
+tensor name - every expert read expert 0's rows. `Mat::sliced` +
+`Runner::stage_slice` stage from the slice's own pointer now. Before the fix the
+end-to-end KL was 0.962 nats (top-1 still 100 %).
+
+The residual 0.0045 nats is the engine's existing approximation class (f16
+activations, the q8-quantized inputs of the fused GEMMs, f16 scale application
+in the staged paths), not a MoE-specific term: the per-layer agreement is
+0.5-1.5 % up to layer 29. The same comparison against the first model, with the
+same probe, is the control that says whether it can be tightened.

@@ -8,6 +8,7 @@
 #include "kernels/elementwise.hh"
 #include "kernels/gdn.hh"
 #include "kernels/gemv.hh"
+#include "kernels/moe.hh"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -93,6 +94,121 @@ bool Runner::embed(const int32_t * toks, const int64_t T, const ForwardInputs * 
         }
     }
     return rows(run0, T) || fail("embedding dequant failed");
+}
+
+
+// The mixture-of-experts FFN (#493): the routed part through the selected
+// experts, then the shared expert gated by a sigmoid, accumulated into cur_.
+//
+// The routed gate runs once for the whole chunk (one block per token). v1 reads
+// the selection back to the host: the expert slices are picked by pointer, so
+// the dispatch needs their ids here. A device-side indexed GEMV removes the
+// round trip later (#493 step 2).
+bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
+    const int64_t ne = h_.n_embd;
+    const int64_t ffn = h_.n_ff_exp;
+    const int64_t shexp = h_.n_ff_shexp;
+    const int topk = (int) h_.n_expert_used;
+    auto * ids = static_cast<int *>(moe_ids_);
+    auto * weights = static_cast<float *>(moe_w_);
+
+    // cur_ accumulates the experts' weighted down outputs
+    if (hipMemsetAsync(cur_, 0, (size_t) T * ne * 4, gemv_stream_) != hipSuccess) {
+        return fail("moe memset failed");
+    }
+    if (!omph::kernels::moe_route(L.ffn_gate_inp.dev, h16_, ids, weights, T, ne, h_.n_expert, topk,
+                                  hipStreamPerThread)) {
+        return fail("moe_route failed");
+    }
+    if (hipStreamSynchronize(hipStreamPerThread) != hipSuccess ||
+        hipMemcpy(moe_host_ids_.data(), ids, (size_t) T * topk * sizeof(int),
+                  hipMemcpyDeviceToHost) != hipSuccess) {
+        return fail("moe_route readback failed");
+    }
+
+    // The expert dim is the outermost: one expert is a contiguous run of tiles
+    // (and of GGUF blocks), so a slice is a pointer plus the entries' rows/k.
+    const auto slice = [this](const Mat & base, const int64_t off, const int64_t rows,
+                              const int64_t k) -> Mat {
+        Mat m = base;
+        m.dev = static_cast<const uint8_t *>(base.dev) + off;
+        m.sliced = true;
+        if (base.gemv != nullptr) {
+            // the entry's rows/k describe the whole tensor: the slice needs its
+            // own, kept alive in a member for the call that follows
+            slice_gemv_ = *base.gemv;
+            slice_gemv_.rows = rows;
+            slice_gemv_.k = k;
+            m.gemv = &slice_gemv_;
+        }
+        return m;
+    };
+    const int64_t gate_stride =
+        h_.n_expert > 0 ? (int64_t) L.ffn_gate_exps.t->stored / h_.n_expert : 0;
+    const int64_t up_stride = h_.n_expert > 0 ? (int64_t) L.ffn_up_exps.t->stored / h_.n_expert : 0;
+    const int64_t down_stride =
+        h_.n_expert > 0 ? (int64_t) L.ffn_down_exps.t->stored / h_.n_expert : 0;
+    const int64_t gate_rows = (int64_t) L.ffn_gate_exps.t->ne[1];
+    const int64_t up_rows = (int64_t) L.ffn_up_exps.t->ne[1];
+    const int64_t down_rows = (int64_t) L.ffn_down_exps.t->ne[1];
+
+    for (int64_t t = 0; t < T; ++t) {
+        const auto * x16 = static_cast<const __half *>(h16_) + t * ne;
+        float * out_t = static_cast<float *>(cur_) + t * ne;
+        for (int s = 0; s < topk; ++s) {
+            const int e = moe_host_ids_[(size_t) t * topk + s];
+            if (e < 0 || e >= h_.n_expert) {
+                return fail("moe_route chose an out-of-range expert");
+            }
+            const char * what = nullptr;
+            if (!matmul(slice(L.ffn_gate_exps, e * gate_stride, gate_rows, ne), x16,
+                        static_cast<float *>(ffn1_), ffn, ne, 1)) {
+                what = "gate projection";
+            } else if (!matmul(slice(L.ffn_up_exps, e * up_stride, up_rows, ne), x16,
+                               static_cast<float *>(ffn2_), ffn, ne, 1)) {
+                what = "up projection";
+            } else if (!omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
+                                                  static_cast<const float *>(ffn2_), ffn16_, ffn,
+                                                  gemv_stream_)) {
+                what = "swiglu";
+            } else if (!matmul(slice(L.ffn_down_exps, e * down_stride, down_rows, ffn), ffn16_,
+                               static_cast<float *>(moe_down_), ne, ffn, 1)) {
+                what = "down projection";
+            } else if (!omph::kernels::moe_acc(out_t, static_cast<const float *>(moe_down_),
+                                               weights + t * topk, 1, topk, s, ne, gemv_stream_)) {
+                what = "accumulate";
+            }
+            if (what != nullptr) {
+                return fail((std::string("moe expert ") + what + " failed").c_str());
+            }
+        }
+        // the shared expert: SwiGLU 2048 -> 512 -> 2048, gated by sigmoid(x . w)
+        if (!matmul(L.ffn_gate_shexp, x16, static_cast<float *>(ffn1_), shexp, ne, 1)) {
+            return fail("moe shared expert: gate projection");
+        }
+        if (!matmul(L.ffn_up_shexp, x16, static_cast<float *>(ffn2_), shexp, ne, 1)) {
+            return fail("moe shared expert: up projection");
+        }
+        if (!omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
+                                       static_cast<const float *>(ffn2_), ffn16_, shexp,
+                                       gemv_stream_)) {
+            return fail("moe shared expert: swiglu");
+        }
+        if (!matmul(L.ffn_down_shexp, ffn16_, static_cast<float *>(moe_down_), ne, shexp, 1)) {
+            return fail("moe shared expert: down projection");
+        }
+        if (!omph::kernels::moe_shexp_gate(L.ffn_gate_inp_shexp, x16,
+                                           static_cast<float *>(moe_gate_) + t, 1, ne,
+                                           gemv_stream_)) {
+            return fail("moe shared expert: sigmoid gate");
+        }
+        if (!omph::kernels::moe_acc(out_t, static_cast<const float *>(moe_down_),
+                                    static_cast<const float *>(moe_gate_) + t, 1, 1, 0, ne,
+                                    gemv_stream_)) {
+            return fail("moe shared expert: accumulate");
+        }
+    }
+    return true;
 }
 
 bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & logits,
@@ -198,22 +314,29 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
                                              T, ne, (float) h_.eps, nullptr)) {
             return fail("residual/norm failed");
         }
-        // a prefill chunk: gate, then up with SwiGLU in its GEMM's epilogue (#221)
-        const bool fused = up_swiglu_ok(L.ffn_up, h_.n_ff, ne, T);
-        const bool act_ok =
-            fused ? matmul(L.ffn_gate, h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T) &&
-                        up_swiglu(L.ffn_up, h16_, static_cast<const float *>(ffn1_), ffn16_, h_.n_ff, ne, T)
-                  : (grouped(h16_, ne, T, {{&L.ffn_up, ffn2_, h_.n_ff}, {&L.ffn_gate, ffn1_, h_.n_ff}}) ||
-                     fork_join(
-                         T,
-                         [&] { return matmul(L.ffn_up, h16_, static_cast<float *>(ffn2_), h_.n_ff, ne, T); },
-                         [&] {
-                             return matmul(L.ffn_gate, h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T);
-                         })) &&
-                        omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
-                                                  static_cast<const float *>(ffn2_), ffn16_, T * h_.n_ff, nullptr);
-        if (!act_ok || !matmul(L.ffn_down, ffn16_, static_cast<float *>(cur_), ne, h_.n_ff, T)) {
-            return fail("ffn failed");
+        if (h_.moe()) {
+            // the second model's FFN (#493): chosen once, at load time
+            if (!moe_ffn(L, T)) {
+                return fail("moe ffn failed");
+            }
+        } else {
+            // a prefill chunk: gate, then up with SwiGLU in its GEMM's epilogue (#221)
+            const bool fused = up_swiglu_ok(L.ffn_up, h_.n_ff, ne, T);
+            const bool act_ok =
+                fused ? matmul(L.ffn_gate, h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T) &&
+                            up_swiglu(L.ffn_up, h16_, static_cast<const float *>(ffn1_), ffn16_, h_.n_ff, ne, T)
+                      : (grouped(h16_, ne, T, {{&L.ffn_up, ffn2_, h_.n_ff}, {&L.ffn_gate, ffn1_, h_.n_ff}}) ||
+                         fork_join(
+                             T,
+                             [&] { return matmul(L.ffn_up, h16_, static_cast<float *>(ffn2_), h_.n_ff, ne, T); },
+                             [&] {
+                                 return matmul(L.ffn_gate, h16_, static_cast<float *>(ffn1_), h_.n_ff, ne, T);
+                             })) &&
+                            omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
+                                                      static_cast<const float *>(ffn2_), ffn16_, T * h_.n_ff, nullptr);
+            if (!act_ok || !matmul(L.ffn_down, ffn16_, static_cast<float *>(cur_), ne, h_.n_ff, T)) {
+                return fail("ffn failed");
+            }
         }
         // x = ffn + resid; for all but the last layer, the same launch also
         // writes the next layer's attn_norm(x) into h16_.

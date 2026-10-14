@@ -212,7 +212,7 @@ bool Runner::matmul(const Mat & m, const void * x16, float * y, const int64_t n_
     const int64_t rows = stage_rows(n_out, k);
     for (int64_t r0 = 0; r0 < n_out; r0 += rows) {
         const int64_t nr = std::min(rows, n_out - r0);
-        void * w = stage_w(m.name, r0, nr);
+        void * w = m.sliced ? stage_slice(m, r0, nr) : stage_w(m.name, r0, nr);
         timer_gemm_.start();
         const bool ok = linear_.run(w, x16, y + r0, nr, k, T, n_out);
         timer_gemm_.stop(t_gemm_);

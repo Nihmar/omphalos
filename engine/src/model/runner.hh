@@ -61,6 +61,8 @@ class Runner {
         const omph::gguf::TensorInfo * t = nullptr;  // null: not in the file
         const GemvEntry * gemv = nullptr;            // repacked for a fused GEMV
         const void * dev = nullptr;                  // its bytes in the weight image
+        bool sliced = false;  // dev is one expert of a 3-D tensor (#493): the
+                              // staged path must read from it, not by name
     };
     struct LayerWeights {
         bool recurrent = false;
@@ -280,6 +282,13 @@ private:
 
     bool gdn_layer(const int64_t il, const LayerWeights & L, const int64_t T);
 
+    // The mixture-of-experts FFN (#493): the routed experts and the shared one,
+    // accumulated into cur_ for all T tokens. The routed gate runs once per
+    // call, the experts one at a time (their weights are contiguous slices of
+    // the 3-D tensor, so the existing GEMV / GEMM entry points take them by
+    // pointer).
+    bool moe_ffn(const LayerWeights & L, const int64_t T);
+
     // One attention layer's slice of the quantized cache (indexed by attention
     // layer, kv_index_, not by model layer: 16 of the 64 layers have one).
     struct QuantKv {
@@ -382,6 +391,8 @@ private:
 
     void * stage_scratch(size_t bytes);
     void * stage_w(const std::string & name, int64_t row0 = 0, int64_t nrows = -1);
+    // The same, from a Mat's own pointer (an expert slice of a 3-D tensor, #493).
+    void * stage_slice(const Mat & m, int64_t row0, int64_t nrows);
     int64_t stage_rows(int64_t n_out, int64_t k) const;
 
     Mat resolve(const std::string & name) const;
@@ -700,6 +711,13 @@ private:
     void * ffn1_ = nullptr;
     void * ffn2_ = nullptr;
     void * ffn16_ = nullptr;
+    int64_t ffn_n_ = 0;  // the FFN scratch width (n_ff, or the experts' on a MoE model)
+    GemvEntry slice_gemv_;  // one expert's slice of a 3-D tensor, for the call in flight (#493)
+    void * moe_ids_ = nullptr;   // tokens x topk int: the routed gate's selection (#493)
+    void * moe_w_ = nullptr;     // tokens x topk float: its renormalized weights
+    void * moe_down_ = nullptr;  // tokens x n_embd float: one expert's down output
+    void * moe_gate_ = nullptr;  // tokens float: the shared expert's sigmoid gate
+    std::vector<int> moe_host_ids_;  // the selection, read back for the expert slices
     void * logits_ = nullptr;
     void * argmax_key_ = nullptr;  // 8 bytes: the greedy decode's packed argmax (#102)
     void * tmp_logits_ = nullptr;
