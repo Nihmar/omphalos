@@ -176,9 +176,19 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     alloc(&gate_, T * attn_q * 4);
     alloc(&k_, T * attn_kv * 4);  // attention only: the delta-net reads qkv itself
     alloc(&v_, T * attn_kv * 4);
-    alloc(&ffn1_, T * h_.n_ff * 4);
-    alloc(&ffn2_, T * h_.n_ff * 4);
-    alloc(&ffn16_, T * h_.n_ff * 2);
+    // The FFN scratch: the dense width, or the expert / shared width on an
+    // expert model (#493; there n_ff is 0).
+    ffn_n_ = h_.n_ff > 0 ? h_.n_ff : (h_.n_ff_exp > h_.n_ff_shexp ? h_.n_ff_exp : h_.n_ff_shexp);
+    alloc(&ffn1_, T * ffn_n_ * 4);
+    alloc(&ffn2_, T * ffn_n_ * 4);
+    alloc(&ffn16_, T * ffn_n_ * 2);
+    if (h_.moe()) {
+        alloc(&moe_ids_, (size_t) T * h_.n_expert_used * sizeof(int));
+        alloc(&moe_w_, (size_t) T * h_.n_expert_used * sizeof(float));
+        alloc(&moe_down_, (size_t) T * ne * 4);
+        alloc(&moe_gate_, (size_t) T * sizeof(float));
+        moe_host_ids_.resize((size_t) T * h_.n_expert_used);
+    }
     last_logits_only_ = last_logits_only;
     // The head's rows go to the host in batches of kHeadRows: a whole chunk
     // of f32 logits would be T x 248320 x 4 = 508 MB at T = 512 (#93).
@@ -305,7 +315,11 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     // 44.9 ms), while a side stream the calibration keeps can still cost
     // ~9 ms per step (53.6) below the watchdog's threshold. OMPH_OVERLAP=1
     // brings it back, with the calibration and the watchdog.
-    overlap_ = use_gemv_ && env_.overlap;
+    overlap_ = use_gemv_ && env_.overlap && !h_.moe();
+    // A MoE model keeps everything on one stream (#493): the FFN mixes the
+    // staged f16 path (the null stream) with the fused GEMVs, and the overlap's
+    // non-blocking side stream would race with it. The dense model is
+    // unaffected (h_.moe() is false there).
     if (overlap_ && (hipStreamCreateWithFlags(&side_, hipStreamNonBlocking) != hipSuccess ||
                      hipEventCreateWithFlags(&ev_fork_, hipEventDisableTiming) != hipSuccess ||
                      hipEventCreateWithFlags(&ev_join_, hipEventDisableTiming) != hipSuccess)) {
@@ -1196,14 +1210,6 @@ void Runner::resolve_layers() {
     const omph::gguf::TensorInfo * te = file_.tensor("token_embd.weight");
     if (head_.t == nullptr || out_norm_ == nullptr || te == nullptr || embd_host_ == nullptr) {
         throw std::runtime_error("output.weight / output_norm / token_embd missing");
-    }
-    if (h_.moe()) {
-        // The weights, the layouts and the hyperparameters loaded; this is the
-        // first piece the engine does not have yet. #493 adds the kernels (the
-        // router, the expert GEMVs/GEMM, the shared expert).
-        throw std::runtime_error(
-            "this model is a mixture of experts (qwen35moe): the weights loaded fine, "
-            "the MoE FFN kernels are #493");
     }
     embd_type_ = te->type;
     embd_row_bytes_ = (int64_t) (te->nbytes / te->ne[1]);

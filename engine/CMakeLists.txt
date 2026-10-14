@@ -51,6 +51,7 @@ add_library(omphalos SHARED
     src/kernels/attn.hip
     src/kernels/gdn.hip
     src/kernels/gemv.hip
+    src/kernels/moe.hip
     src/kernels/gemm.hip
     src/kernels/dflash.hip
 )
