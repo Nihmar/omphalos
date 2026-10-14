@@ -51,6 +51,13 @@ struct EnvOptions {
     // prompt row again, as before #449 (the A/B; the default injects only the
     // rows that can still be in the drafter's ring when the prompt ends).
     bool dflash_full_inject = false;
+    // OMPH_ATTN_SHORT_TOKENS=N: a prefill chunk of N rows or fewer takes the
+    // decode path's fixed key splits instead of the flash kernel, whose grid is
+    // one workgroup per 32 rows (#450). 32 is the measured default (a 32-token
+    // turn: -13 % of the prefill at 60k, -16 % at 100k, -3 % at 25k); a 64-row
+    // chunk measured *slower* (the fixed splits then re-read the cache once per
+    // 8-row group), so the threshold stays at 32. 0: the flash path.
+    int64_t attn_short_tokens = 32;
     // OMPH_ATTN_SPLIT_GROUPS=N: run the quantized decode / verification
     // attention in N groups of its fixed key splits, each group staged into a
     // buffer of its own (#409 step 2: the shape host streaming needs, with the

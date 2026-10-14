@@ -491,7 +491,18 @@ bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T
     // attention_gqa leaves the decode kernel's fixed key chunks (9..15: splits
     // by token count; 16+: the prefill kernel), and its rows would no longer
     // be the decode step's bit for bit (#161).
-    const int64_t group = verifying_ ? 8 : T;
+    // #450: a short prefill chunk at a long context leaves the flash kernel's
+    // grid nearly empty (one workgroup per 32 rows, 16 in flight - a 32-token
+    // turn at 60k costs 4.6 ms per layer for what the 512-row chunk does at
+    // 35 us/token), while the decode path's fixed key splits fill the GPU. It is
+    // exact for groups of up to kKvRingExtra rows: the ring holds window +
+    // kKvRingExtra slots, so every query of the group still reads its own last
+    // window (#161, #342). The split geometry is a function of (seq, key_chunk),
+    // so a run stays deterministic.
+    const bool fa_short = env_.attn_short_tokens > 0 && !verifying_ && T <= env_.attn_short_tokens &&
+                          T <= omph::kernels::kKvRingExtra + 1 && kv_in.quant && kv_window_ > 0 &&
+                          kv_in.q.k16 != nullptr && kv_ring_ >= kv_window_ + omph::kernels::kKvRingExtra;
+    const int64_t group = (verifying_ || fa_short) ? 8 : T;
     const int64_t qrow = h_.n_head * h_.head_dim;
     const auto attend = [&](const omph::kernels::KvCache & kv, const bool q8) {
         for (int64_t t0 = 0; t0 < T; t0 += group) {
@@ -505,6 +516,14 @@ bool Runner::attn_impl(const KvView & kv_in, const int64_t pos0, const int64_t T
             const bool ok = grouped
                                 ? attn_splits_staged(kv, kv_in.layer, q8, t0, n, pos0 + t0 + n, pos0,
                                                      scale)
+                                : fa_short
+                                ? omph::kernels::attention_gqa_range(
+                                      static_cast<const float *>(q_) + t0 * qrow, kv,
+                                      static_cast<const float *>(gate_) + t0 * qrow, nullptr, n,
+                                      pos0 + t0 + n, h_.n_head, h_.n_head_kv, h_.head_dim, scale, q8,
+                                      attn_work_, attn_work_bytes_, nullptr,
+                                      static_cast<__half *>(ffn16_) + t0 * qrow, false, key_chunk_,
+                                      !env_.attn_dec_scalar, 0, 0, true)
                                 : omph::kernels::attention_gqa(
                                       static_cast<const float *>(q_) + t0 * qrow, kv,
                                       static_cast<const float *>(gate_) + t0 * qrow, nullptr, n,

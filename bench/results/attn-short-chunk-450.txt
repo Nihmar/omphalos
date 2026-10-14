@@ -1,0 +1,77 @@
+# #450: the prefill attention of a short chunk takes the decode path's key splits
+
+Engine main after #449 + this change, RX 9060 XT 16 GB, 2026-10-14.
+
+## The measurement first (the issue's step 1)
+
+`omph-attn-bench --seq 25000,60000,100000 --tokens 16..512`, one layer, one call,
+K8/V4 (per layer, µs):
+
+| seq | 16 | 32 | 64 | 128 | 256 | 512 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 25000 | 1891 | 1929 | 1938 | 2061 | 3886 | 7298 |
+| 60000 | 4511 | 4617 | 4624 | 4835 | 9437 | 17993 |
+| 100000 | 7651 | 7632 | 7609 | 7947 | 15677 | 30562 |
+
+At a long context a short chunk costs almost what 64 rows cost: the flash kernel
+walks the whole key range with `ceil(tokens/32) * nkv` workgroups (4 at 32 rows,
+16 WGPs on the GPU), so a 32-token turn at 60k spends 4617 µs *per layer* - 74 ms
+across the 16 attention layers - for what the 512-row chunk does at 35 µs/token.
+The WMMA and scalar kernels are the same speed here (ratio 1.00): the walk, not
+the queries, is the cost.
+
+## What changed
+
+The decode path already has fixed key splits (`attention_gqa_range` with
+`split0 = 0, nsplits = all`: the same partials and the same merge as the decode
+step, bit-identically, #409 step 2) and it is exact for a group of up to
+`kKvRingExtra` rows. So a prefill chunk of `OMPH_ATTN_SHORT_TOKENS` rows or fewer
+now runs as groups of 8 rows through it:
+
+- `kKvRingExtra` 15 -> 63 (the ring's extra slots; the ring is `window + 63` now,
+  +1.5 MiB at 16 layers) so a 32- or 64-row chunk's every query still reads its
+  own exact last window (#161, #342). The speculation backup is a separate buffer
+  and is unaffected;
+- the work buffer already covers the worst case (`attention_gqa_work_bytes`
+  iterates the token counts and takes the fixed-chunk split count for the small
+  ones), so nothing is reallocated;
+- the split geometry is a function of `(seq, key_chunk)` and the grouping is a
+  fixed 8 rows, so runs stay bit-deterministic.
+
+## The agent turn, measured through the server
+
+A 60k/100k/25k context, then appends of the turn size (each cached on the
+previous), median of 6, `prefill_ms` of the extension request:
+
+| context | turn | flash kernel | split path | change |
+|---:|---:|---:|---:|---:|
+| 25000 | 32 | 181.5 ms | 176.2 ms | -2.9 % |
+| 60000 | 32 | 229.6 ms | **200.5 ms** | **-12.7 %** |
+| 100000 | 32 | 282.7 ms | **237.1 ms** | **-16.1 %** |
+| 60000 | 64 | 233.5 ms | 250.8 ms | +7.4 % (measured, **not adopted**) |
+
+The 64-row chunk is slower: the fixed splits re-read the cache once per 8-row
+group (4-8 x the bytes), which at 64 rows costs more than the flash kernel's
+half-empty rounds save. The threshold is 32 for that reason; `OMPH_ATTN_SHORT_TOKENS=N` (0: the flash
+path, 64 for the experiment, 32 the default).
+
+## Numerics
+
+The two paths are different kernels, so the chunk's own rows move: `omph-run
+--tokens 4160 --logits-tail 64` (the last chunk is the 64 routed rows) with and
+without the switch, `compare_logits.py`:
+
+| comparison | KL mean | median | p99 | max | top-1 |
+|---|---:|---:|---:|---:|---:|
+| split path vs flash | 0.000040 | 0.000007 | 0.000567 | 0.000983 | 100.00 % |
+
+For scale: the quantized KV costs 0.0012-0.0015 nats against f32 KV and #240's WY
+form 0.0002-0.0005; this is 10-40x smaller. `check_server.py` (80 checks) and
+`check_conversations.py` (both drafters) pass with the new default.
+
+## Decision
+
+Adopted, `OMPH_ATTN_SHORT_TOKENS=32` by default: the agent-turn TTFT (the case
+#233/#234 measured) gains 13-16 % at 60-100k, the numerics stay an order of
+magnitude inside the KV budget, and there is no VRAM cost beyond the ring's 1.5
+MiB.
