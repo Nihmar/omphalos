@@ -27,8 +27,12 @@ DEFAULT_LIB = Path(
 
 C_SYMBOL = {
     GT.BF16: "ggml_bf16_to_fp32_row",
+    GT.Q4_0: "dequantize_row_q4_0",
+    GT.Q8_0: "dequantize_row_q8_0",
     GT.Q2_K: "dequantize_row_q2_K",
+    GT.Q3_K: "dequantize_row_q3_K",
     GT.Q4_K: "dequantize_row_q4_K",
+    GT.Q5_K: "dequantize_row_q5_K",
     GT.Q6_K: "dequantize_row_q6_K",
     GT.IQ1_M: "dequantize_row_iq1_m",
     GT.IQ2_XXS: "dequantize_row_iq2_xxs",
