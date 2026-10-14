@@ -80,6 +80,11 @@ class Runner {
         Mat attn_qkv, attn_gate, ssm_out;
         // FFN
         Mat ffn_up, ffn_gate, ffn_down;
+        // MoE FFN (qwen35moe, h_.moe(); the weights load here, the kernels are #493)
+        Mat ffn_gate_inp;  // the router, F32 [n_embd, n_expert]
+        Mat ffn_gate_exps, ffn_up_exps, ffn_down_exps;  // [k, n_ff_exp, n_expert]
+        const float * ffn_gate_inp_shexp = nullptr;     // [n_embd]
+        Mat ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp;
     };
 
 public:

@@ -103,11 +103,8 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 const int64_t k = (int64_t) t.ne[0];
                 // the same row count omph-convert computed (#346: ne[1] alone
                 // missed the higher dimensions of a 3-D quantized tensor)
-                const int64_t bb = (int64_t) omph::format::quant_block_bytes(t.type);
-                const int64_t rows = bb > 0 && k % 256 == 0
-                                         ? (int64_t) (t.nbytes / (uint64_t) bb) / (k / 256)
-                                         : 1;
-                if (t.layout != omph::format::engine_layout(t.type, rows) ||
+                const int64_t rows = omph::format::quant_rows(t.type, k, t.nbytes);
+                if (rows == 0 || t.layout != omph::format::engine_layout(t.type, rows) ||
                     t.stored != (uint64_t) omph::format::engine_layout_bytes(t.type, rows, k)) {
                     throw std::runtime_error(name + ": not in this engine's layout (reconvert with omph-convert)");
                 }
@@ -1109,9 +1106,29 @@ void Runner::resolve_layers() {
         if (L.attn_norm == nullptr || L.post_norm == nullptr) {
             throw std::runtime_error("missing layer norms in " + p);
         }
-        L.ffn_up = resolve(p + "ffn_up.weight");
-        L.ffn_gate = resolve(p + "ffn_gate.weight");
-        L.ffn_down = resolve(p + "ffn_down.weight");
+        if (h_.moe()) {
+            // The routed experts' weights are a flat block array per tensor
+            // (the expert is the outermost dimension: quant_rows counts
+            // ne[1] x ne[2] rows, #491).
+            L.ffn_gate_inp = resolve(p + "ffn_gate_inp.weight");
+            L.ffn_gate_exps = resolve(p + "ffn_gate_exps.weight");
+            L.ffn_up_exps = resolve(p + "ffn_up_exps.weight");
+            L.ffn_down_exps = resolve(p + "ffn_down_exps.weight");
+            L.ffn_gate_inp_shexp = resolve_f32(p + "ffn_gate_inp_shexp.weight");
+            L.ffn_gate_shexp = resolve(p + "ffn_gate_shexp.weight");
+            L.ffn_up_shexp = resolve(p + "ffn_up_shexp.weight");
+            L.ffn_down_shexp = resolve(p + "ffn_down_shexp.weight");
+            if (L.ffn_gate_inp.t == nullptr || L.ffn_gate_exps.t == nullptr ||
+                L.ffn_up_exps.t == nullptr || L.ffn_down_exps.t == nullptr ||
+                L.ffn_gate_inp_shexp == nullptr || L.ffn_gate_shexp.t == nullptr ||
+                L.ffn_up_shexp.t == nullptr || L.ffn_down_shexp.t == nullptr) {
+                throw std::runtime_error("MoE FFN tensors missing in " + p);
+            }
+        } else {
+            L.ffn_up = resolve(p + "ffn_up.weight");
+            L.ffn_gate = resolve(p + "ffn_gate.weight");
+            L.ffn_down = resolve(p + "ffn_down.weight");
+        }
         if (L.recurrent) {
             L.dt_bias = resolve_f32(p + "ssm_dt.bias");
             L.ssm_a = resolve_f32(p + "ssm_a");
@@ -1172,6 +1189,14 @@ void Runner::resolve_layers() {
     const omph::gguf::TensorInfo * te = file_.tensor("token_embd.weight");
     if (head_.t == nullptr || out_norm_ == nullptr || te == nullptr || embd_host_ == nullptr) {
         throw std::runtime_error("output.weight / output_norm / token_embd missing");
+    }
+    if (h_.moe()) {
+        // The weights, the layouts and the hyperparameters loaded; this is the
+        // first piece the engine does not have yet. #493 adds the kernels (the
+        // router, the expert GEMVs/GEMM, the shared expert).
+        throw std::runtime_error(
+            "this model is a mixture of experts (qwen35moe): the weights loaded fine, "
+            "the MoE FFN kernels are #493");
     }
     embd_type_ = te->type;
     embd_row_bytes_ = (int64_t) (te->nbytes / te->ne[1]);

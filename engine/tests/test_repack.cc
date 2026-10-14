@@ -127,6 +127,18 @@ int main() {
           "Q6_K takes the tiles when rows %% 16 == 0 (#258)");
     CHECK(omph::format::engine_layout_bytes(29, 16, 512) == 2 * 16 * 56 && omph::format::engine_layout(29, 8) == 1,
           "IQ1_M takes the tiles when rows %% 16 == 0 (#275)");
+    // #491: the row count of a quantized tensor, for the types of the second
+    // model (a 3-D expert tensor counts ne[1] x ne[2] rows) and for the
+    // 32-wide legacy blocks
+    CHECK(omph::format::quant_rows(12, 256, 12 * 144) == 12, "Q4_K rows");
+    CHECK(omph::format::quant_rows(12, 256, 4 * 3 * 144) == 12, "a 3-D expert tensor counts every row");
+    CHECK(omph::format::quant_rows(8, 256, 8 * 8 * 34) == 8, "Q8_0: 32-wide blocks");
+    CHECK(omph::format::quant_rows(2, 512, 16 * 16 * 18) == 16, "Q4_0: 32-wide blocks");
+    CHECK(omph::format::quant_rows(13, 512, 5 * 2 * 176) == 5 &&
+              omph::format::quant_rows(11, 512, 5 * 2 * 110) == 5,
+          "Q5_K / Q3_K rows");
+    CHECK(omph::format::quant_rows(12, 200, 144) == 0 && omph::format::quant_rows(0, 256, 1024) == 0,
+          "a partial block or a type without blocks has no rows");
     std::printf("test_repack: %d failure(s)\n", omph_test::failures);
     return omph_test::failures == 0 ? 0 : 1;
 }

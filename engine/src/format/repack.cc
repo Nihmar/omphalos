@@ -393,18 +393,43 @@ void unrepack_q2k(const void * src, const int64_t n_blocks, void * dst) {
 
 int64_t quant_block_bytes(const uint32_t type) {
     switch (type) {
+        case 2: return 18;     // Q4_0  (identity: no kernel yet, #492)
+        case 8: return 34;     // Q8_0  (identity, #492)
         case 10: return 84;    // Q2_K
-        case 29: return 56;    // IQ1_M  (identity layout: the GGUF bytes)
+        case 11: return 110;   // Q3_K  (identity; the Q2_K_L comparison file, #492)
         case 12: return 144;   // Q4_K
+        case 13: return 176;   // Q5_K  (identity, #492)
         case 14: return 210;   // Q6_K
         case 16: return 66;    // IQ2_XXS
         case 17: return 74;    // IQ2_XS
-        case 22: return 82;    // IQ2_S
         case 18: return 98;    // IQ3_XXS
+        case 20: return 18;    // IQ4_NL (identity, #492)
         case 21: return 110;   // IQ3_S
+        case 22: return 82;    // IQ2_S
         case 23: return 136;   // IQ4_XS
+        case 29: return 56;    // IQ1_M  (identity layout: the GGUF bytes)
         default: return 0;
     }
+}
+
+int64_t quant_block_weights(const uint32_t type) {
+    switch (type) {
+        case 2: case 8: case 20: return 32;  // the legacy 32-wide blocks
+        case 10: case 11: case 12: case 13: case 14: case 29:
+        case 16: case 17: case 18: case 21: case 22: case 23: return 256;
+        default: return 0;
+    }
+}
+
+int64_t quant_rows(const uint32_t type, const int64_t k, const uint64_t nbytes) {
+    const int64_t bb = quant_block_bytes(type);
+    const int64_t bw = quant_block_weights(type);
+    if (bb <= 0 || bw <= 0 || k <= 0 || k % bw != 0) {
+        return 0;
+    }
+    // ne[1] x ne[2] x ... rows: the row count does not depend on the block
+    // width, so a 3-D expert tensor comes out right (#346).
+    return (int64_t) (nbytes / (uint64_t) bb) / (k / bw);
 }
 
 int64_t repacked_bytes(const uint32_t type, const int64_t n_blocks) {
