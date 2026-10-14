@@ -1,0 +1,116 @@
+# K8/V4 definitive speeds: omphalos vs llama.cpp, decode and prefill, with and without DFlash2 (#396)
+
+Engine **main 9175738** (this branch adds results only). RX 9060 XT 16 GB, CachyOS, desktop
+session active, card at its 182 W cap, no other GPU work, fresh processes for every cell.
+
+llama.cpp: **the pin's RX 9060 XT overlay f19c20f9** (v0.6.0 base 6c7a87f7), the HIP reference
+of `bench/llama.cpp.pin`. The upstream pin build d8123504 is *not* the K8/V4 reference: its
+`GGML_CUDA_FA_QUANTS` has no `q8_0-q4_0`, so llama-server logs "converting K and V to f16
+instead (slow)" and its tg128 at 32k is 14.20 against the overlay's 16.65 t/s (its numbers are
+kept in the campaign B table for the record).
+
+Model `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` / `.omph`. KV: **K Q8 + V Q4 on every layer**
+(omphalos `OMPH_KV_K4_LAYERS=none`; llama `-ctk q8_0 -ctv q4_0`). Greedy, context 32768.
+
+## A. Plain decode and prefill (omphalos: median of 5 runs; llama-bench: mean +- sd over 5,
+3 for the two longest prompts)
+
+### Prefill of a fresh prompt (t/s)
+
+| tokens | omphalos | llama.cpp overlay | llama.cpp upstream |
+|---:|---:|---:|---:|
+| 512 | **961** | 634 | 580 |
+| 4096 | **1031** | 620 | 623 |
+| 16384 | **981** | 585 | 585 |
+| 32768 | **913** | 544 | 538 |
+
+### Decode, tg128 (t/s)
+
+| depth | omphalos | ms/token | llama overlay | llama upstream |
+|---:|---:|---:|---:|---:|
+| ~0 (32) | **24.4** | 40.9 | 20.70 | 20.73 |
+| 4096 | **24.0** | 41.6 | 20.14 | 20.13 |
+| 16384 | **23.4** | 42.8 | 18.62 | 16.95 |
+| 32768 | **22.5** | 44.4 | 16.65 | 14.20 |
+
+### A 512-token chunk prefilled at a depth (llama-bench pp512, t/s)
+
+| depth | llama overlay | llama upstream |
+|---:|---:|---:|
+| 0 | 634 | 580 |
+| 4096 | 593 | 544 |
+| 16384 | 527 | 495 |
+| 32768 | 461 | 440 |
+
+The omphalos equivalent (the server's `prompt_ms` of an appending turn) is in #234: ~715-770 t/s
+for a 1.7k append at 20k. llama's chunk drops to 461 t/s at a 32k depth (K8/V4).
+
+## B. Speculation: the #262 scenarios through both servers (one run per cell, greedy)
+
+t/s, and the generated tokens in parentheses:
+
+| engine | spec | ngram | prose | edit-cc | edit-py |
+|---|---|---:|---:|---:|---:|
+| omphalos | plain | 0 | 24.1 (949) | 24.0 (2006) | 23.9 (4328) |
+| omphalos | plain | 1 | 24.2 (949) | 24.1 (2006) | 23.9 (4328) |
+| omphalos | mtp | 0 | 43.3 (949) | 78.5 (2006) | 75.7 (4328) |
+| omphalos | mtp | 1 | 43.0 (949) | 266.5 (2006) | 229.1 (4328) |
+| omphalos | dflash | 0 | 42.9 (949) | 134.9 (2006) | 93.4 (4328) |
+| omphalos | dflash | 1 | 43.3 (949) | 258.9 (2006) | 244.0 (4328) |
+| llama overlay | plain | 0 | 20.5 (972) | 20.0 (2042) | 19.8 (4338) |
+| llama overlay | plain | 1 | 20.6 (972) | 175.4 (2042) | 117.2 (4328) |
+| llama overlay | mtp | 0 | 23.2 (1011) | 40.2 (2042) | 39.0 (4328) |
+| llama overlay | mtp | 1 | 23.3 (1011) | 200.0 (2042) | 109.4 (4478) |
+| llama overlay | dflash | 0 | 20.0 (1171) | 49.8 (2042) | 38.4 (4332) |
+| llama overlay | dflash | 1 | 20.1 (1171) | 205.7 (2042) | 160.1 (4334) |
+
+accepted / drafted:
+
+| engine | spec | ngram | prose | edit-cc | edit-py |
+|---|---|---:|---:|---:|---:|
+| omphalos | plain | 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| omphalos | plain | 1 | 0 / 0 | 0 / 0 | 0 / 0 |
+| omphalos | mtp | 0 | 518 / 1290 | 1502 / 1509 | 3219 / 3324 |
+| omphalos | mtp | 1 | 516 / 1332 | 1858 / 2193 | 3965 / 4459 |
+| omphalos | dflash | 0 | 514 / 1743 | 1743 / 2807 | 3478 / 6230 |
+| omphalos | dflash | 1 | 513 / 1758 | 1858 / 2205 | 4002 / 4671 |
+| llama overlay | plain | 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| llama overlay | plain | 1 | 0 / 0 | 1933 / 2209 | 3840 / 4249 |
+| llama overlay | mtp | 0 | 567 / 1335 | 1530 / 1536 | 3232 / 3288 |
+| llama overlay | mtp | 1 | 567 / 1335 | 1975 / 2203 | 4146 / 4824 |
+| llama overlay | dflash | 0 | 736 / 3045 | 1743 / 2093 | 3522 / 5670 |
+| llama overlay | dflash | 1 | 736 / 3045 | 1983 / 2169 | 4167 / 4625 |
+
+### The upstream pin build (d8123504), for the record: no q8_0-q4_0 flash-attention kernel
+
+| engine | spec | ngram | prose | edit-cc | edit-py |
+|---|---|---:|---:|---:|---:|
+| llama upstream | plain | 0 | 20.7 (1030) | 20.3 (2042) | 19.6 (4338) |
+| llama upstream | plain | 1 | 20.4 (1030) | 165.0 (2042) | 31.9 (8000) |
+| llama upstream | mtp | 0 | 25.3 (1021) | 45.3 (2042) | 43.9 (4328) |
+| llama upstream | mtp | 1 | 25.4 (1021) | 202.2 (2042) | 155.7 (4328) |
+| llama upstream | dflash | 0 | 20.6 (1008) | 53.3 (2042) | 41.5 (4338) |
+| llama upstream | dflash | 1 | 20.6 (1008) | 205.0 (2042) | 166.5 (4338) |
+
+Prefill of the scenario prompts (first request): omphalos 2073 tokens in 2132-2230 ms (930-973
+t/s) and 4073 in 4008-4184 (974-1016); llama overlay 2073 in 3530-3705 (560-587) and 4073 in
+6690-7070 (576-609); llama upstream 2073 in 3528-3882 and 4073 in 6690-7627. DFlash2's prefill
+injection costs omphalos ~1.4 % of that prefill and llama ~5-10 %.
+
+## Reading
+
+- **Prefill**: omphalos leads llama.cpp by 1.5-1.7x on a fresh prompt at every length, and the
+  gap widens with the depth (llama's 512-chunk at 32k is 461 t/s against its 634 at depth 0).
+- **Plain decode**: omphalos 22.5-24.4 t/s against llama's 16.7-20.6 (1.2-1.35x); the gap grows
+  with the context (22.5 vs 16.7 at 32k), which is the KV/attention path.
+- **DFlash2** (overlay): omphalos 43.3 t/s on prose against llama's 20.1 (2.2x, and llama's own
+  DFlash2 is at parity with its plain decode there); with the n-gram on, 259 vs 206 on edit-cc,
+  244 vs 160 on edit-py. MTP: 43.0 vs 23.3 on prose, 266.5 vs 200.0 on edit-cc, 229.1 vs 109.4
+  on edit-py. Without any n-gram the drafter alone: dflash 134.9 vs 49.8 on edit-cc, 93.4 vs 38.4
+  on edit-py.
+- The n-gram is what makes the edit scenarios fast on both engines (llama's ngram-simple alone
+  takes plain edit-cc from 20 to 175 t/s); omphalos' advantage there is the drafter's chain
+  length on top of it.
+- Caveats: one run per cell (the #262 convention); the two engines' outputs diverge at the same
+  config (KV numerics), so the token counts and the content after the divergence differ; the
+  scenarios are short prompts (34-4073 tokens, the generation growing the context).
