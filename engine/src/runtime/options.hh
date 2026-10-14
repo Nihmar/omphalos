@@ -58,6 +58,11 @@ struct EnvOptions {
     // chunk measured *slower* (the fixed splits then re-read the cache once per
     // 8-row group), so the threshold stays at 32. 0: the flash path.
     int64_t attn_short_tokens = 32;
+    // OMPH_SPEC_ROWS=N: the verification's row budget (drafts + 1). 16 is the
+    // measured default; 24/32 let an n-gram chain run to its match instead of
+    // being cut by the budget (#415, #454). Costs ~25 MB of buffers and a
+    // longer verification per step.
+    int64_t spec_rows = 16;
     // OMPH_ATTN_SPLIT_GROUPS=N: run the quantized decode / verification
     // attention in N groups of its fixed key splits, each group staged into a
     // buffer of its own (#409 step 2: the shape host streaming needs, with the
