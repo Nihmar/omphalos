@@ -75,6 +75,27 @@ def dequantize_q2_K(blocks: np.ndarray) -> np.ndarray:
     return out.reshape(-1)
 
 
+def dequantize_q4_0(blocks: np.ndarray) -> np.ndarray:
+    """Q4_0: 32-wide blocks, d f16 then 16 bytes of nibbles (the low ones are
+    the block's first 16 weights, as in the reference)."""
+    nb = blocks.shape[0]
+    d = _f16b(blocks[:, 0:2])
+    q = blocks[:, 2:18]
+    low = (q & np.uint8(0x0F)).astype(np.float32) - 8.0
+    high = (q >> np.uint8(4)).astype(np.float32) - 8.0
+    out = np.empty((nb, 32), dtype=np.float32)
+    out[:, :16] = d * low
+    out[:, 16:] = d * high
+    return out.reshape(-1)
+
+
+def dequantize_q8_0(blocks: np.ndarray) -> np.ndarray:
+    """Q8_0: 32-wide blocks, d f16 then 32 int8."""
+    d = _f16b(blocks[:, 0:2])
+    q = blocks[:, 2:34].view(np.int8).astype(np.float32)
+    return (d * q).reshape(-1)
+
+
 def _get_scale_min_k4(sc: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """q4_K/q5_K scale+min unpacker, (nb, 12) uint8 -> two (nb, 8) uint8."""
     nb = sc.shape[0]
@@ -103,6 +124,71 @@ def dequantize_q4_K(blocks: np.ndarray) -> np.ndarray:
     for j in range(4):
         out[:, j, 0, :] = dl[:, 2 * j, None] * (q[:, j] & np.uint8(0xF)) - ml[:, 2 * j, None]
         out[:, j, 1, :] = dl[:, 2 * j + 1, None] * (q[:, j] >> np.uint8(4)) - ml[:, 2 * j + 1, None]
+    return out.reshape(-1)
+
+
+def dequantize_q5_K(blocks: np.ndarray) -> np.ndarray:
+    nb = blocks.shape[0]
+    d = _f16b(blocks[:, 0:2])
+    dmin = _f16b(blocks[:, 2:4])
+    sc, sm = _get_scale_min_k4(blocks[:, 4:16])
+    dl = d * sc.astype(np.float32)
+    ml = dmin * sm.astype(np.float32)
+    qh = blocks[:, 16:48]
+    ql = blocks[:, 48:176].reshape(nb, 4, 32)
+
+    out = np.empty((nb, 4, 2, 32), dtype=np.float32)
+    for j in range(4):
+        lo = (ql[:, j] & np.uint8(0x0F)) + (
+            ((qh >> np.uint8(2 * j)) & np.uint8(1)) << np.uint8(4)
+        )
+        hi = (ql[:, j] >> np.uint8(4)) + (
+            ((qh >> np.uint8(2 * j + 1)) & np.uint8(1)) << np.uint8(4)
+        )
+        out[:, j, 0, :] = dl[:, 2 * j, None] * lo.astype(np.float32) - ml[:, 2 * j, None]
+        out[:, j, 1, :] = dl[:, 2 * j + 1, None] * hi.astype(np.float32) - ml[:, 2 * j + 1, None]
+    return out.reshape(-1)
+
+
+def dequantize_q3_K(blocks: np.ndarray) -> np.ndarray:
+    nb = blocks.shape[0]
+    hm = blocks[:, 0:32]
+    q = blocks[:, 32:96].reshape(nb, 2, 32)
+    d_all = _f16(blocks[:, 108:110])
+
+    # the reference's aux[] shuffle: 12 bytes -> 16 6-bit scales, as bytes 0..63
+    raw = blocks[:, 96:108].astype(np.uint32)
+
+    def word(off: int) -> np.ndarray:
+        return (raw[:, off] | (raw[:, off + 1] << np.uint32(8)) |
+                (raw[:, off + 2] << np.uint32(16)) | (raw[:, off + 3] << np.uint32(24)))
+
+    a0, a1, a2 = word(0), word(4), word(8)
+    kmask1 = np.uint32(0x03030303)
+    kmask2 = np.uint32(0x0F0F0F0F)
+    words = (
+        (a0 & kmask2) | (((a2 >> np.uint32(0)) & kmask1) << np.uint32(4)),
+        (a1 & kmask2) | (((a2 >> np.uint32(2)) & kmask1) << np.uint32(4)),
+        ((a0 >> np.uint32(4)) & kmask2) | (((a2 >> np.uint32(4)) & kmask1) << np.uint32(4)),
+        ((a1 >> np.uint32(4)) & kmask2) | (((a2 >> np.uint32(6)) & kmask1) << np.uint32(4)),
+    )
+    scales = np.empty((nb, 16), dtype=np.float32)
+    for k, w in enumerate(words):
+        for b in range(4):
+            scales[:, 4 * k + b] = ((w >> np.uint32(8 * b)) & np.uint32(0xFF)).astype(np.float32) - 32.0
+
+    out = np.empty((nb, 2, 4, 2, 16), dtype=np.float32)
+    for n in range(2):
+        for j in range(4):
+            # `m` in the reference walks 1..128 across both 128-weight halves
+            bit = np.uint8(1 << (n * 4 + j))
+            for half in range(2):
+                dl = d_all * scales[:, n * 8 + 2 * j + half]
+                qs = q[:, n, half * 16:(half + 1) * 16]
+                hmb = hm[:, half * 16:(half + 1) * 16]
+                v = ((qs >> np.uint8(2 * j)) & np.uint8(3)).astype(np.float32)
+                v -= np.where((hmb & bit) != 0, np.float32(0.0), np.float32(4.0))
+                out[:, n, j, half, :] = dl[:, None] * v
     return out.reshape(-1)
 
 
@@ -313,8 +399,12 @@ def dequantize_f32(blocks: np.ndarray) -> np.ndarray:
 _DEQUANTIZERS = {
     GT.F32: dequantize_f32,
     GT.BF16: dequantize_bf16,
+    GT.Q4_0: dequantize_q4_0,
+    GT.Q8_0: dequantize_q8_0,
     GT.Q2_K: dequantize_q2_K,
+    GT.Q3_K: dequantize_q3_K,
     GT.Q4_K: dequantize_q4_K,
+    GT.Q5_K: dequantize_q5_K,
     GT.Q6_K: dequantize_q6_K,
     GT.IQ1_M: dequantize_iq1_m,
     GT.IQ2_XXS: dequantize_iq2_xxs,
