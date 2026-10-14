@@ -1,0 +1,55 @@
+# #456: prefetching the next GEMV's head into the MALL during the decode's gaps — the bench says no
+
+Engine main after #451 + the `#456` section in `bench/launch/chain_size.hip`, RX
+9060 XT 16 GB, 2026-10-14. The bench is #420's chain of the step's real GEMV
+sizes (257 segments, ~11 GiB) with a latency-bound FMA dummy between segments (the
+decode's ~165 small kernels, ~2.5 ms of DRAM-idle time per step) and, on a side
+stream, a cacheable read of the next segment's head:
+
+    hipcc -O3 --offload-arch=gfx1200 -o /var/tmp/chain456 bench/launch/chain_size.hip && /var/tmp/chain456
+
+## Two regimes
+
+**With a 352 us gap** (the harness's first calibration, ~23x the real gap): the
+prefetch has all the time it needs and the MALL *does* hold its bytes -
+
+| prefetch | chain | GB/s |
+|---|---:|---:|
+| none | 126.10 ms | 84.6 |
+| 2 MiB | **124.59 ms** | 85.6 |
+| 4 MiB | 124.88 ms | 85.4 |
+| 8 MiB | 126.06 ms | 84.6 |
+| 16 MiB | 127.63 ms | 83.6 |
+| 24 MiB | 130.35 ms | 81.8 |
+
+2-4 MiB win ~1.2-1.5 ms per step's worth of chain and 16-24 MiB lose (the MALL is
+32 MB and the segments' own streaming evicts the rest). That is the issue's "16-24
+MB" idea at the size it can actually hold - and it is roughly the upper bound:
+~1.3 ms of the ~3.8 ms a pure streaming chain loses to its cold starts.
+
+**With the real 17 us gap** (calibrated to #203's ~15 us per small kernel), the
+same prefetches all *lose*:
+
+| prefetch | chain | GB/s | delta |
+|---|---:|---:|---:|
+| none | 39.34 ms | 271.2 | |
+| 2 MiB | 41.05 ms | 259.8 | +1.71 ms |
+| 4 MiB | 41.74 ms | 255.5 | +2.40 ms |
+| 8 MiB | 44.67 ms | 238.8 | +5.33 ms |
+| 16 MiB | 50.74 ms | 210.2 | +11.40 ms |
+| 24 MiB | 55.47 ms | 192.3 | +16.13 ms |
+
+The 2 MiB row's +1.71 ms is exactly the prefetch's own DRAM time (2 MiB x 256
+segments / 318 GB/s = 1.7 ms): with a 17 us window the prefetched bytes do not
+survive to the next segment, so they are a second read of the same data. The
+scaling with the size follows the same arithmetic, and even the *smallest* useful
+prefetch pays a launch (~3.5-8 us) for a window worth 2-5 us of DRAM time: the
+launch's fill/drain is the same order as the ramp it removes, 257 times per step.
+
+## Decision
+
+**Closed with the bench number**, as the issue's constraint allows. The MALL does
+hold a small prefetched head when there is time (the first table), but the decode
+step's real gaps are too short for the traffic to amortize: the prefetch's own
+launch and bytes cost ~1.7 ms per step where the whole opportunity is ~1.3-3.8 ms,
+and it measured *negative* at every size. No engine-side switch is added.
