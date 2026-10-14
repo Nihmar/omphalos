@@ -32,3 +32,9 @@ Loading is I/O-bound (20 GiB read + 15 GiB uploaded + 7 GiB registered) and, on
 a machine whose RAM is already full, the file's pages and the pinned experts
 compete: the first load after a cold cache takes minutes. After it, the runs
 start in ~2 s.
+
+## Validation
+
+Against llama.cpp's CPU dump (`tools/native/dump_tensors -ngl 0`) for the same
+prompt: **KL 0.004053 nats, top-1 100 %** (the Q2_K_L is 0.004377; the two files
+and llama.cpp all agree on the 5-token prompt's greedy tokens).
