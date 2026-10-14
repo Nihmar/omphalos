@@ -97,6 +97,11 @@ SCHEMA: tuple[Option, ...] = (
          "pinned host RAM for sequence checkpoints (MiB); 0 is none"),
     _opt("kv_ram", "cache", "flag", "--kv-ram", "int", 8192,
          "pinned host RAM for whole conversations (MiB); 0 is none"),
+    _opt("cache_dir", "cache", "flag", "--cache-dir", "path", "",
+         "mirror the saved conversations to DIR: a restart resumes them instead of "
+         "prefilling (#437)"),
+    _opt("cache_dir_mib", "cache", "flag", "--cache-dir-mib", "int", 8192,
+         "the disk budget (MiB), least recently used first"),
     _opt("kv_k4_layers", "cache", "env", "OMPH_KV_K4_LAYERS", "enum", "2,4,5,6,7,9,11,15",
          "K in Q4 on those attention layers (0-15), Q8 on the rest",
          choices=("2,4,5,6,7,9,11,15", "none", "2,5,7,15"), note="the default is the measured mix"),
