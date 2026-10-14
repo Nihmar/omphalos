@@ -61,6 +61,8 @@ class Runner {
         const omph::gguf::TensorInfo * t = nullptr;  // null: not in the file
         const GemvEntry * gemv = nullptr;            // repacked for a fused GEMV
         const void * dev = nullptr;                  // its bytes in the weight image
+        bool sliced = false;  // dev is one expert of a 3-D tensor (#493): the
+                              // staged path must read from it, not by name
     };
     struct LayerWeights {
         bool recurrent = false;
@@ -389,6 +391,8 @@ private:
 
     void * stage_scratch(size_t bytes);
     void * stage_w(const std::string & name, int64_t row0 = 0, int64_t nrows = -1);
+    // The same, from a Mat's own pointer (an expert slice of a 3-D tensor, #493).
+    void * stage_slice(const Mat & m, int64_t row0, int64_t nrows);
     int64_t stage_rows(int64_t n_out, int64_t k) const;
 
     Mat resolve(const std::string & name) const;

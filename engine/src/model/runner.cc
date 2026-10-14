@@ -988,6 +988,42 @@ bool Runner::has_gemv_type(const uint32_t type) {
 // The f16 scratch for one weight slice. It holds one slice at a time: the
 // GEMM that reads it runs, in stream order, before the next dequant
 // overwrites it.
+// An expert's slice of a quantized tensor, dequantized into the f16 staging
+// buffer (#493). stage_w resolves the tensor by name and could only ever stage
+// the whole tensor: a slice's weights are at its own `dev` (the tile layout)
+// or at a row offset inside it (the GGUF layout).
+void * Runner::stage_slice(const Mat & m, const int64_t row0, const int64_t nrows) {
+    const omph::gguf::TensorInfo * t = m.t;
+    if (t == nullptr) {
+        throw std::runtime_error("missing tensor " + m.name);
+    }
+    const int64_t k = (int64_t) t->ne[0];
+    const int64_t n = nrows * k;
+    void * dst = stage_scratch((size_t) n * 2);
+    timer_stage_.start();
+    bool ok = false;
+    if (m.gemv != nullptr) {
+        // the slice's own rows/k describe its layout (the tile / repack
+        // offsets are a function of the tile and block index alone)
+        ok = omph::kernels::dequant_repacked(m.gemv->type, m.dev, dst, m.gemv->rows, m.gemv->k,
+                                             nullptr, row0, nrows);
+    } else {
+        int64_t rows_all = 1;
+        for (size_t i = 1; i < t->ne.size(); ++i) {
+            rows_all *= (int64_t) t->ne[i];
+        }
+        const int64_t row_bytes = (int64_t) (t->nbytes / (uint64_t) rows_all);
+        ok = omph::kernels::dequantize(t->type,
+                                       static_cast<const uint8_t *>(m.dev) + row0 * row_bytes, dst, n,
+                                       true, nullptr);
+    }
+    timer_stage_.stop(t_stage_);
+    if (!ok) {
+        throw std::runtime_error("dequant failed for " + m.name);
+    }
+    return dst;
+}
+
 void * Runner::stage_scratch(const size_t bytes) {
     if (!scratch_ready_) {
         scratch_.init(mem_.device(scratch_bytes_, "out of VRAM (weight scratch)"), scratch_bytes_,
