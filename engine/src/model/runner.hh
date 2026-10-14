@@ -77,6 +77,7 @@ class Runner {
         const float * conv_w = nullptr;
         const uint16_t * w_beta = nullptr;   // BF16 rows, dotted inside gdn_step
         const uint16_t * w_alpha = nullptr;
+        bool ssm_ab_f32 = false;  // the two are F32 (qwen35moe): the dot is #493
         Mat attn_qkv, attn_gate, ssm_out;
         // FFN
         Mat ffn_up, ffn_gate, ffn_down;

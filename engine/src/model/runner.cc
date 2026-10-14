@@ -119,7 +119,11 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
             places.push_back({f, &t, name, total});
             total += ((size_t) t.stored + 255) & ~(size_t) 255;
         }
-        dev_weights_ = mem_.device(total, "cannot allocate the weight image");
+        char what[160];
+        std::snprintf(what, sizeof what, "cannot allocate the weight image of %.2f GiB%s",
+                      (double) total / 1073741824.0,
+                      h_.moe() ? ": this model's experts need the host placement of #495" : "");
+        dev_weights_ = mem_.device(total, what);
         auto * base = static_cast<uint8_t *>(dev_weights_);
         for (const Place & p : places) {
             if (hipMemcpy(base + p.off, p.f->tensor_data(*p.t), (size_t) p.t->stored, hipMemcpyHostToDevice) !=
@@ -1136,14 +1140,17 @@ void Runner::resolve_layers() {
             L.conv_w = resolve_f32(p + "ssm_conv1d.weight");
             const Mat wb = resolve(p + "ssm_beta.weight");
             const Mat wa = resolve(p + "ssm_alpha.weight");
+            const bool ab_f32 = wb.t->type == 0 && wa.t->type == 0;
             if (L.dt_bias == nullptr || L.ssm_a == nullptr || L.ssm_norm == nullptr ||
                 L.conv_w == nullptr || wb.t == nullptr || wa.t == nullptr ||
-                wb.t->type != 30 || wa.t->type != 30) {
+                wb.t->type != wa.t->type || (wb.t->type != 30 && !ab_f32)) {
                 throw std::runtime_error("delta-net tensors missing in " + p +
-                                         " (ssm_beta / ssm_alpha must be BF16)");
+                                         " (ssm_beta / ssm_alpha must be BF16, or both F32: "
+                                         "the F32 dot lands in #493)");
             }
             L.w_beta = static_cast<const uint16_t *>(wb.dev);
             L.w_alpha = static_cast<const uint16_t *>(wa.dev);
+            L.ssm_ab_f32 = ab_f32;
             L.attn_qkv = resolve(p + "attn_qkv.weight");
             L.attn_gate = resolve(p + "attn_gate.weight");
             L.ssm_out = resolve(p + "ssm_out.weight");
