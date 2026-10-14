@@ -43,22 +43,42 @@ int64_t numel(const omph::gguf::TensorInfo & t) {
 
 HParams read_hparams(const omph::gguf::File & f) {
     HParams h;
-    meta_int(f, "qwen35.embedding_length", h.n_embd);
-    meta_int(f, "qwen35.block_count", h.n_layer);
-    meta_int(f, "qwen35.attention.head_count", h.n_head);
-    meta_int(f, "qwen35.attention.head_count_kv", h.n_head_kv);
-    meta_int(f, "qwen35.attention.key_length", h.head_dim);
-    meta_int(f, "qwen35.rope.dimension_count", h.n_rot);
-    meta_int(f, "qwen35.feed_forward_length", h.n_ff);
-    meta_int(f, "qwen35.ssm.group_count", h.ssm_n_kh);
-    meta_int(f, "qwen35.ssm.time_step_rank", h.ssm_n_vh);
-    meta_int(f, "qwen35.ssm.state_size", h.ssm_s);
-    meta_int(f, "qwen35.ssm.inner_size", h.ssm_inner);
-    meta_int(f, "qwen35.ssm.conv_kernel", h.ssm_conv_k);
-    h.eps = meta_float(f, "qwen35.attention.layer_norm_rms_epsilon", 1e-6);
-    h.freq_base = meta_float(f, "qwen35.rope.freq_base", 10000.0);
-    if (f.find("qwen35.rope.dimension_sections") != nullptr) {
-        const std::vector<int64_t> sec = f.int_array("qwen35.rope.dimension_sections");
+    h.arch = "qwen35";
+    if (const omph::gguf::Value * a = f.find("general.architecture")) {
+        std::string_view s;
+        if (a->as_str(s)) h.arch = std::string(s);
+    }
+    // The prefix of every hyperparameter key is the architecture name. This
+    // engine runs the qwen35 family; anything else is refused here, before a
+    // single tensor is read, rather than by a kernel that cannot say why.
+    if (h.arch != "qwen35" && h.arch != "qwen35moe") {
+        throw std::runtime_error("unsupported architecture '" + h.arch +
+                                 "' (this engine runs qwen35 and qwen35moe, #490)");
+    }
+    const bool moe = h.arch == "qwen35moe";
+    const std::string p = h.arch + ".";
+    meta_int(f, (p + "embedding_length").c_str(), h.n_embd);
+    meta_int(f, (p + "block_count").c_str(), h.n_layer);
+    meta_int(f, (p + "attention.head_count").c_str(), h.n_head);
+    meta_int(f, (p + "attention.head_count_kv").c_str(), h.n_head_kv);
+    meta_int(f, (p + "attention.key_length").c_str(), h.head_dim);
+    meta_int(f, (p + "rope.dimension_count").c_str(), h.n_rot);
+    meta_int(f, (p + "feed_forward_length").c_str(), h.n_ff);
+    meta_int(f, (p + "ssm.group_count").c_str(), h.ssm_n_kh);
+    meta_int(f, (p + "ssm.time_step_rank").c_str(), h.ssm_n_vh);
+    meta_int(f, (p + "ssm.state_size").c_str(), h.ssm_s);
+    meta_int(f, (p + "ssm.inner_size").c_str(), h.ssm_inner);
+    meta_int(f, (p + "ssm.conv_kernel").c_str(), h.ssm_conv_k);
+    if (moe) {
+        meta_int(f, (p + "expert_count").c_str(), h.n_expert);
+        meta_int(f, (p + "expert_used_count").c_str(), h.n_expert_used);
+        meta_int(f, (p + "expert_feed_forward_length").c_str(), h.n_ff_exp);
+        meta_int(f, (p + "expert_shared_feed_forward_length").c_str(), h.n_ff_shexp);
+    }
+    h.eps = meta_float(f, (p + "attention.layer_norm_rms_epsilon").c_str(), 1e-6);
+    h.freq_base = meta_float(f, (p + "rope.freq_base").c_str(), 10000.0);
+    if (f.find(p + "rope.dimension_sections") != nullptr) {
+        const std::vector<int64_t> sec = f.int_array(p + "rope.dimension_sections");
         for (size_t i = 0; i < 3 && i < sec.size(); ++i) h.rope_sections[i] = (int) sec[i];
         // The engine maps the first three sections and gives every pair past
         // them position 0: the three must cover n_rot / 2 exactly and the
@@ -83,9 +103,12 @@ HParams read_hparams(const omph::gguf::File & f) {
         --h.n_layer;
     }
     if (h.n_embd <= 0 || h.n_layer <= 0 || h.n_vocab <= 0 || h.n_head <= 0 ||
-        h.n_head_kv <= 0 || h.head_dim <= 0 || h.n_rot <= 0 || h.n_ff <= 0 ||
+        h.n_head_kv <= 0 || h.head_dim <= 0 || h.n_rot <= 0 ||
         h.ssm_n_kh <= 0 || h.ssm_n_vh <= 0 || h.ssm_s <= 0 || h.ssm_inner <= 0 ||
-        h.ssm_conv_k <= 1) {
+        h.ssm_conv_k <= 1 || (moe ? (h.n_expert <= 0 || h.n_expert_used <= 0 ||
+                                     h.n_expert_used > h.n_expert || h.n_ff_exp <= 0 ||
+                                     h.n_ff_shexp <= 0)
+                                 : h.n_ff <= 0)) {
         throw std::runtime_error("incomplete hyperparameters");
     }
     // What the kernels hard-code for this model (single-model engine): the
@@ -94,19 +117,25 @@ HParams read_hparams(const omph::gguf::File & f) {
     // before 11 GiB of tensors are read, instead of failing on the first layer
     // that runs with a message that does not say why.
     const omph::gguf::TensorInfo * out = f.tensor("output.weight");
-    const auto refuse = [](const std::string & what) {
+    const auto refuse = [&h](const std::string & what) {
         throw std::runtime_error("unsupported model: " + what +
-                                 " (this engine runs one model: Qwen3.8-27B, PLAN.md)");
+                                 " (this engine runs qwen35 and qwen35moe, #490)");
     };
     if (h.head_dim != omph::kernels::kHeadDim || h.n_rot > h.head_dim || h.n_rot % 2 != 0) {
         refuse("attention head_dim " + std::to_string(h.head_dim) + " with rope " +
                std::to_string(h.n_rot) + ": the kernels need head_dim " +
                std::to_string(omph::kernels::kHeadDim) + " and an even rope");
     }
-    if (h.n_head != h.n_head_kv * omph::kernels::kGqaGroup) {
+    if (h.n_head % h.n_head_kv != 0) {
         refuse("attention " + std::to_string(h.n_head) + " query heads / " +
-               std::to_string(h.n_head_kv) + " kv heads: the kernels need " +
-               std::to_string(omph::kernels::kGqaGroup) + " query heads per KV head");
+               std::to_string(h.n_head_kv) + " kv heads: whole KV groups are required");
+    }
+    h.gqa_group = h.n_head / h.n_head_kv;
+    if (h.gqa_group != omph::kernels::kGqaGroup && h.gqa_group != omph::kernels::kGqaGroupMoe) {
+        refuse("attention " + std::to_string(h.n_head) + " query heads / " +
+               std::to_string(h.n_head_kv) + " kv heads: the kernels have " +
+               std::to_string(omph::kernels::kGqaGroup) + " and " +
+               std::to_string(omph::kernels::kGqaGroupMoe) + " query heads per KV head");
     }
     if (h.ssm_s != omph::kernels::kDeltaS || h.ssm_inner % h.ssm_n_vh != 0 ||
         h.ssm_n_vh % h.ssm_n_kh != 0) {
