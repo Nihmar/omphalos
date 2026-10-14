@@ -127,6 +127,13 @@ void Runner::dflash_load() {
     }
     dfl_sel_prev_ = prev.dev;
     dfl_sel_next_ = next.dev;
+    // #417's follow-up: the attention window may be shortened (the ring's
+    // allocation and the tags stay the model's); a shorter window reads fewer
+    // ring rows per layer per step and measured >= the trained 2048 on every
+    // text tried (bench/results/dflash-window-417.txt)
+    dfl_swa_eff_ = env_.dflash_window > 0
+                       ? std::min<int64_t>(std::max<int64_t>(env_.dflash_window, 16), dfl_swa_)
+                       : dfl_swa_;
     // buffers: the features of a forward's rows, the ring, the block's scratch.
     // The scratch holds the longest block the engine may run (kMaxBlock); the
     // block itself is OMPH_DFLASH_MASKS + 1 (the trained block_size - 1 before
@@ -281,7 +288,7 @@ bool Runner::dflash_layer(const DflashLayer & L, const int64_t l, const int64_t 
         !matmul(L.k, h16_, bk, kv, ne, B) || !matmul(L.v, h16_, bv, kv, ne, B) ||
         !dflash_norm_rope(q, B, kHeads, L.q_norm, dfl_eps_, pos, dfl_theta_, nullptr) ||
         !dflash_norm_rope(bk, B, kKvHeads, L.k_norm, dfl_eps_, pos, dfl_theta_, nullptr) ||
-        !dflash_attention(q, rk, rv, dfl_tags_, dfl_swa_, bk, bv, B, pos, dfl_swa_, 1.0f / std::sqrt((float) kHd),
+        !dflash_attention(q, rk, rv, dfl_tags_, dfl_swa_, bk, bv, B, pos, dfl_swa_eff_, 1.0f / std::sqrt((float) kHd),
                           static_cast<float *>(dfl_attn_ws_), att, nullptr) ||
         !publish_block_rows(l, bk, bv, B, pos) ||
         !cast_f32_to_f16(att, ffn16_, B * nq, nullptr) || !matmul(L.o, ffn16_, c, ne, nq, B) ||

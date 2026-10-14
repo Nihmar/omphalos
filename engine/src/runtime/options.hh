@@ -106,8 +106,15 @@ struct EnvOptions {
                                 // that drafts 1..n are all kept is >= P (0: always all, #245)
     float dflash_pmin = 0.0f;   // OMPH_DFLASH_PMIN=P: DFlash2 drafts stop where the selector's best
                                 // candidate has softmax probability < P (#245)
-    int64_t dflash_masks = 11;  // OMPH_DFLASH_MASKS=N: the DFlash2 block drafts N masks (1..15, #414).
-                                // 11 is the measured compromise; 7 is the trained block_size - 1
+    int64_t dflash_window = 1792;  // OMPH_DFLASH_WINDOW=N: the drafter's attention window (0: the model's
+                                   // dflash.attention.sliding_window). The default deviates from the
+                                   // trained 2048 because 1792 measured >= 2048 on every text tried
+                                   // (#417 follow-up, bench/results/dflash-window-417.txt); 1024 wins
+                                   // more on local text (code +6 %, repetitive +3 %) and loses badly on
+                                   // tasks whose context is far back (file edits -40 %)
+    int64_t dflash_masks = 15;  // OMPH_DFLASH_MASKS=N: the DFlash2 block drafts N masks (1..15, #414).
+                                // 15 with the 1792 window measured >= 11 everywhere tried (prose +3.7 %,
+                                // edit +1.0 %, code and repetitive tie); 7 is the trained block_size - 1
     int64_t dflash_blocks = 1;  // OMPH_DFLASH_BLOCKS=2: chain two *trained* blocks (7 masks each) instead
                                 // of one long out-of-training block: the second is conditioned on the first
                                 // through the ring (#433)

@@ -504,7 +504,8 @@ private:
     int32_t dfl_mask_ = 0;
     int64_t dfl_ne_ = 0;       // drafter width (5120)
     int64_t dfl_ff_ = 0;       // its FFN (17408)
-    int64_t dfl_swa_ = 0;      // sliding window (2048) = ring slots
+    int64_t dfl_swa_ = 0;
+    int64_t dfl_swa_eff_ = 0;           // the attention window actually read (#417 follow-up)      // sliding window (2048) = ring slots
     size_t dfl_ring_bytes_ = 0;  // each of dfl_ring_k_ / dfl_ring_v_
     int64_t dfl_group_ = 0;    // conv group size (16)
     float dfl_eps_ = 0.0f;
