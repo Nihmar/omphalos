@@ -388,6 +388,18 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
             throw std::runtime_error("cannot clear the MTP h");
         }
     }
+    // The delta-net's prefill scratch, when the FFN scratch cannot hold it
+    // (#494: the expert models' FFN scratch is the experts' width)
+    if (h_.moe() && h_.ssm_n_vh > 0) {
+        const int64_t work = omph::kernels::gdn_work_floats(T, h_.ssm_n_vh, h_.ssm_n_kh);
+        const int64_t wy = omph::kernels::gdn_wy_floats(T, h_.ssm_n_vh, h_.ssm_n_kh);
+        if (work * 4 > T * ffn_n_ * 4) {
+            alloc(&gdn_work_, (size_t) work * 4);
+        }
+        if (wy * 4 > (size_t) T * ffn_n_ * 4) {
+            alloc(&gdn_wy_, (size_t) wy * 4);
+        }
+    }
     // Delta-net state + the two conv tails, for the recurrent layers only
     // (the attention layers have none), in one allocation (#92).
     conv_flip_.assign((size_t) h_.n_layer, 0);
