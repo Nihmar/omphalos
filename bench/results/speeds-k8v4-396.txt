@@ -33,17 +33,23 @@ Model `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` / `.omph`. KV: **K Q8 + V Q4 on every
 | 16384 | **23.4** | 42.8 | 18.62 | 16.95 |
 | 32768 | **22.5** | 44.4 | 16.65 | 14.20 |
 
-### A 512-token chunk prefilled at a depth (llama-bench pp512, t/s)
+### A 512-token chunk prefilled at a depth (t/s)
 
-| depth | llama overlay | llama upstream |
-|---:|---:|---:|
-| 0 | 634 | 580 |
-| 4096 | 593 | 544 |
-| 16384 | 527 | 495 |
-| 32768 | 461 | 440 |
+llama.cpp: `llama-bench pp512 -d D`. omphalos: `omph-server` filled to the depth, then five
+512-token continuations (each prefills only its new tokens, `prompt_n = 512` through the
+sequence cache), median of the five; the fills run once per depth. Same KV setting (K8/V4);
+the prompt's literal `<|image_pad|>` ids were replaced (the server refuses a placeholder with
+no image, #292) -- irrelevant for a speed measurement.
 
-The omphalos equivalent (the server's `prompt_ms` of an appending turn) is in #234: ~715-770 t/s
-for a 1.7k append at 20k. llama's chunk drops to 461 t/s at a 32k depth (K8/V4).
+| depth | omphalos | llama overlay | llama upstream |
+|---:|---:|---:|---:|
+| 0 | **1051** | 634 | 580 |
+| 4096 | **1013** | 593 | 544 |
+| 16384 | **905** | 527 | 495 |
+| 32768 | **793** | 461 | 440 |
+
+The omphalos chunk decays with the depth like llama's (the whole prefix is attended once per
+new chunk), from a higher level: 793 t/s at 32k against llama's 461.
 
 ## B. Speculation: the #262 scenarios through both servers (one run per cell, greedy)
 
