@@ -72,9 +72,9 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
             const omph::gguf::TensorInfo * t;
             std::string name;
             size_t off;
+            bool host = false;
         };
         std::vector<Place> places;
-        size_t total = 0;
         std::vector<std::pair<const omph::gguf::File *, const omph::gguf::TensorInfo *>> all;
         for (const omph::gguf::TensorInfo & t : file_.tensors()) {
             all.emplace_back(&file_, &t);
@@ -84,6 +84,52 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 all.emplace_back(dft_file_.get(), &t);
             }
         }
+        // Which tensors are a routed expert, and its layer (#495)
+        const auto is_expert = [](const std::string & n) {
+            return n.find(".ffn_gate_exps.") != std::string::npos ||
+                   n.find(".ffn_up_exps.") != std::string::npos ||
+                   n.find(".ffn_down_exps.") != std::string::npos;
+        };
+        const auto aligned = [](const uint64_t bytes) { return ((size_t) bytes + 255) & ~(size_t) 255; };
+        // The residency plan: a MoE model whose experts do not fit keeps a
+        // prefix of them in pinned host memory the kernels read over PCIe
+        // (#495). OMPH_MOE_HOST_MIB sets the budget; the default is what it
+        // takes to fit the card, leaving a margin for the KV, the activations
+        // and the runtime's own allocations.
+        int64_t host_budget = 0;
+        if (h_.moe() && env_.moe_host_mib != 0) {
+            int64_t total_bytes = 0;
+            int64_t expert_bytes = 0;
+            for (const auto & [f, tp] : all) {
+                if (f != &file_ || !in_stack(tp->name)) {
+                    continue;
+                }
+                total_bytes += (int64_t) aligned(tp->stored);
+                if (is_expert(tp->name)) {
+                    expert_bytes += (int64_t) aligned(tp->stored);
+                }
+            }
+            if (env_.moe_host_mib > 0) {
+                host_budget = (int64_t) env_.moe_host_mib << 20;
+            } else {
+                // the HIP context does not exist yet: without this hipMemGetInfo
+                // fails and reports zero free (which would place *every* expert
+                // in host memory)
+                (void) hipSetDevice(0);
+                size_t free_vram = 0;
+                size_t total_vram = 0;
+                if (hipMemGetInfo(&free_vram, &total_vram) != hipSuccess || free_vram == 0) {
+                    throw std::runtime_error(
+                        "cannot read the free VRAM for the expert placement: set OMPH_MOE_HOST_MIB");
+                }
+                const int64_t margin = 768 << 20;
+                host_budget = std::max<int64_t>(0, total_bytes + margin - (int64_t) free_vram);
+            }
+            host_budget = std::min(host_budget, expert_bytes);
+        }
+        int64_t host_used = 0;
+        size_t dev_total = 0;
+        size_t host_total = 0;
         for (const auto & [f, tp] : all) {
             const omph::gguf::TensorInfo & t = *tp;
             const std::string name = f == &file_ ? t.name : "dflash." + t.name;
@@ -109,28 +155,47 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                     throw std::runtime_error(name + ": not in this engine's layout (reconvert with omph-convert)");
                 }
                 GemvEntry e;
-                e.off = total;
                 e.bytes = (size_t) t.stored;
                 e.rows = rows;
                 e.k = (int64_t) t.ne[0];
                 e.type = t.type;
                 gems_[name] = e;
             }
-            places.push_back({f, &t, name, total});
-            total += ((size_t) t.stored + 255) & ~(size_t) 255;
+            const bool host = f == &file_ && is_expert(name) && host_used < host_budget;
+            const size_t bytes = aligned(t.stored);
+            Place pl{f, &t, name, host ? host_total : dev_total, host};
+            if (host) {
+                host_total += bytes;
+                host_used += (int64_t) bytes;
+            } else {
+                dev_total += bytes;
+            }
+            places.push_back(pl);
         }
-        char what[160];
-        std::snprintf(what, sizeof what, "cannot allocate the weight image of %.2f GiB%s",
-                      (double) total / 1073741824.0,
-                      h_.moe() ? ": this model's experts need the host placement of #495" : "");
-        dev_weights_ = mem_.device(total, what);
-        auto * base = static_cast<uint8_t *>(dev_weights_);
+        if (dev_total > 0) {
+            char what[192];
+            std::snprintf(what, sizeof what, "cannot allocate the weight image of %.2f GiB%s",
+                          (double) dev_total / 1073741824.0,
+                          h_.moe() ? " (raise OMPH_MOE_HOST_MIB)" : "");
+            dev_weights_ = mem_.device(dev_total, what);
+        }
+        if (host_total > 0) {
+            host_weights_ = mem_.host(host_total, "cannot allocate the host weight image");
+            host_weight_bytes_ = host_total;
+        }
         for (const Place & p : places) {
-            if (hipMemcpy(base + p.off, p.f->tensor_data(*p.t), (size_t) p.t->stored, hipMemcpyHostToDevice) !=
-                hipSuccess) {
+            uint8_t * base = p.host ? static_cast<uint8_t *>(host_weights_)
+                                    : static_cast<uint8_t *>(dev_weights_);
+            if (hipMemcpy(base + p.off, p.f->tensor_data(*p.t), (size_t) p.t->stored,
+                          p.host ? hipMemcpyHostToHost : hipMemcpyHostToDevice) != hipSuccess) {
                 throw std::runtime_error("cannot upload " + p.name);
             }
-            off_[p.name] = p.off;
+            weight_ptr_[p.name] = base + p.off;
+        }
+        if (env_.timing && host_total > 0) {
+            std::fprintf(stderr, "weights: %.2f GiB device, %.2f GiB host-mapped (OMPH_MOE_HOST_MIB=%lld)\n",
+                         (double) dev_total / 1073741824.0, (double) host_total / 1073741824.0,
+                         (long long) env_.moe_host_mib);
         }
     }
 
@@ -992,7 +1057,7 @@ const void * Runner::raw_bytes(const std::string & name) {
     if (gems_.find(name) != gems_.end()) {
         throw std::runtime_error("raw bytes of the repacked " + name + " are not kept");
     }
-    return static_cast<const uint8_t *>(dev_weights_) + off_.at(name);
+    return static_cast<const uint8_t *>(weight_ptr_.at(name));
 }
 
 // Types that have a fused GEMV kernel: for these the f16 form is never worth
@@ -1140,8 +1205,7 @@ void * Runner::stage_w(const std::string & name, const int64_t row0, int64_t nro
     const auto g = gems_.find(name);
     const bool ok = g != gems_.end()
                         ? omph::kernels::dequant_repacked(g->second.type,
-                                                          static_cast<const uint8_t *>(dev_weights_) +
-                                                              g->second.off,
+                                                          static_cast<const uint8_t *>(weight_ptr_.at(name)),
                                                           dst, g->second.rows, g->second.k, nullptr,
                                                           row0, nrows)
                         : omph::kernels::dequantize(t->type,
@@ -1163,9 +1227,9 @@ Runner::Mat Runner::resolve(const std::string & name) const {
     m.name = name;
     const bool dft = name.rfind("dflash.", 0) == 0;
     m.t = dft ? (dft_file_ != nullptr ? dft_file_->tensor(name.substr(7)) : nullptr) : file_.tensor(name);
-    const auto off = off_.find(name);
-    if (m.t != nullptr && off != off_.end()) {
-        m.dev = static_cast<const uint8_t *>(dev_weights_) + off->second;
+    const auto at = weight_ptr_.find(name);
+    if (m.t != nullptr && at != weight_ptr_.end()) {
+        m.dev = at->second;
     }
     const auto g = gems_.find(name);
     if (g != gems_.end()) {

@@ -1,0 +1,34 @@
+# Expert placement: the Q4_K_M runs (#495)
+
+Ornith-1.5-35B-A3B-Q4_K_M.omph is 20.36 GiB of weights against a 16.30 GiB card
+(0.4 GiB of it is the desktop): it cannot be one device image. The loader now
+places a prefix of the routed expert tensors in pinned host memory the kernels
+read over PCIe (`hipHostRegister` on the .omph's own mmap'd pages: no second
+copy in RAM, which matters on this machine - 31 GiB of RAM, zram swap),
+`Mat.dev` points at either image and nothing else changes.
+
+`OMPH_MOE_HOST_MIB=N` sets the budget; without it the loader sizes the device
+image to the free VRAM minus a 768 MiB margin (the KV, the activations, the
+runtime). 5.2 GiB in host is what the auto budget lands on; chunk 1024 needs
+more headroom for its buffers, so the numbers below use 7168 (12.52 GiB device,
+7.12 GiB host).
+
+| run (chunk) | omphalos | llama.cpp (same file) | ratio |
+|---|---:|---:|---:|
+| prefill 512 (512) | 355.3 ms (1441 t/s) | ~534 ms (959 t/s, -ncmoe 14) | 1.5x |
+| prefill 4096 (1024) | 1552.3 ms (2639 t/s) | - | |
+| prefill 128k (1024) | **77.6 s** (1689 t/s) | 201 s (651 t/s) | **2.6x** |
+| decode | 33.2 ms/step (30 t/s) | 23 ms (43 t/s, -ncmoe 16) | 0.70x |
+
+The same prompt (5 tokens "The capital of France is") gives the same greedy
+tokens on the Q2_K_L and the Q4_K_M, and the same as llama.cpp's dump.
+
+Decode is the known v1 shape: the router's selection is read back once per layer
+(40 device synchronizations per step) and the verification kernels are not
+grouped; the host-mapped experts cost ~6 MB per step over PCIe (the 8 selected
+experts of the layers that are not resident).
+
+Loading is I/O-bound (20 GiB read + 15 GiB uploaded + 7 GiB registered) and, on
+a machine whose RAM is already full, the file's pages and the pinned experts
+compete: the first load after a cold cache takes minutes. After it, the runs
+start in ~2 s.
