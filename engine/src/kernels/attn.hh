@@ -151,6 +151,9 @@ bool attention_gqa_range(const float * q, const KvCache & kv, const float * gate
 // #422): diagnostic only, wrong results, valid timings. Bits: 1 K staging, 2 V
 // staging, 4 K q^T, 8 softmax, 16 V^T P, 32 O rescale.
 void attention_set_ablation(int abl);
+// OMPH_FA_RT1=N: the one-row-tile prefill shape below N tokens (#450 follow-up);
+// 0 turns it off.
+void attention_set_fa_rt1(int64_t tokens);
 
 // The merge alone: the `splits` partials in `work` into out/out_f16, in order.
 bool attention_gqa_merge(const float * work, const float * gate, float * out, void * out_f16,

@@ -63,6 +63,10 @@ struct EnvOptions {
     // being cut by the budget (#415, #454). Costs ~25 MB of buffers and a
     // longer verification per step.
     int64_t spec_rows = 16;
+    // OMPH_FA_RT1=N: the prefill attention takes the one-row-tile shape below N
+    // query rows (#450 follow-up: the grid doubles where it does not fill the
+    // CUs). Default 64; 0: always the two-row-tile shape.
+    int64_t fa_rt1 = 64;
     // OMPH_ATTN_SPLIT_GROUPS=N: run the quantized decode / verification
     // attention in N groups of its fixed key splits, each group staged into a
     // buffer of its own (#409 step 2: the shape host streaming needs, with the

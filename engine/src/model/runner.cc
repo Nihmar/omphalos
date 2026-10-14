@@ -40,6 +40,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     }
     // OMPH_TEST_FA_ABL: the prefill attention's phases ablated (#191, #422)
     omph::kernels::attention_set_ablation(env_.test_fa_abl);
+    omph::kernels::attention_set_fa_rt1(env_.fa_rt1);
     timer_stage_.enable(env_.phases);
     timer_gemm_.enable(env_.phases);
     timer_gemv_.enable(env_.phases);
