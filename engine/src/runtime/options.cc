@@ -76,6 +76,9 @@ EnvOptions EnvOptions::from_env() {
     o.no_bf16_gemv = flag("OMPH_NO_BF16_GEMV");
     o.no_f16_cache = flag("OMPH_NO_F16_CACHE");
     o.host_argmax = flag("OMPH_HOST_ARGMAX");
+    if (const char * v = std::getenv("OMPH_MOE_HOST_MIB")) {
+        o.moe_host_mib = std::atoll(v);
+    }
     o.gdn_per_token = flag("OMPH_GDN_PER_TOKEN");
     o.skip_attn = flag("OMPH_SKIP_ATTN");
     o.skip_ffn = flag("OMPH_SKIP_FFN");

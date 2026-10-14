@@ -424,7 +424,12 @@ private:
     std::vector<std::pair<hipEvent_t, hipEvent_t>> t_stage_;
     std::vector<std::pair<hipEvent_t, hipEvent_t>> t_gemm_;
     std::vector<std::pair<hipEvent_t, hipEvent_t>> t_block_;
-    std::unordered_map<std::string, size_t> off_;
+    // The actual pointer of every tensor in the weight images (#495): the
+    // resident ones in the device image, the routed experts a MoE model cannot
+    // fit in the host-mapped one.
+    std::unordered_map<std::string, const void *> weight_ptr_;
+    void * host_weights_ = nullptr;  // the host-mapped image (#495)
+    size_t host_weight_bytes_ = 0;
     std::unordered_map<std::string, GemvEntry> gems_;
     std::vector<LayerWeights> layers_;  // resolved at load, by resolve_layers()
     Mat head_;

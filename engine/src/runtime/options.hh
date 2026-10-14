@@ -98,6 +98,10 @@ struct EnvOptions {
     bool no_bf16_gemv = false;  // OMPH_NO_BF16_GEMV: BF16 weights through the f16 path
     bool no_f16_cache = false;  // OMPH_NO_F16_CACHE: re-convert f16-path weights every call
     bool host_argmax = false;   // OMPH_HOST_ARGMAX: greedy argmax on the host (#102)
+    // OMPH_MOE_HOST_MIB=N: how many MiB of a mixture-of-experts model's routed
+    // expert weights live in pinned host memory instead of VRAM (#495). -1:
+    // as much as it takes to fit the card (what is free minus a margin).
+    int64_t moe_host_mib = -1;
     bool gdn_per_token = false; // OMPH_GDN_PER_TOKEN: one delta-net launch per token (#96)
 
     // --- ablations (wrong results, valid timings)
