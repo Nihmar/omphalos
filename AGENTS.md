@@ -236,6 +236,7 @@ tools/native/build.sh <llama.cpp-dir> && tools/native/dump_tensors ...   # also 
 | `--gen-logits FILE` / `--gen-force FILE` | write each decode step's logits (N - 1 rows) / decode the tokens of FILE instead of the greedy ones: decode-step comparisons between KV settings or kernels (#138) |
 | `--last-logits` / `--logits-tail N` | write only the last row / the last N rows of logits (long prompts) |
 | `--tokens N` | use only the first N prompt tokens |
+| `--chunk N` | prefill chunk (default 512, or the prompt): the per-forward token count, as `omph-server --chunk`; the activation and logits buffers are allocated for it, so a bigger one costs VRAM (#446) |
 | `--trace-dir DIR` | dump every layer's output (one-chunk prompts only) |
 | `--dflash FILE` | speculative greedy decode with the DFlash2 drafter .omph (#245): 7 drafts per step, the MTP block not loaded; output identical to plain greedy |
 | `--draft-mtp K` | speculative greedy decode with K MTP drafts per step (#124, #126); output identical to plain greedy, bit for bit (#161). K = 3 is the measured best (1.8-2.4x the plain decode); costs +0.5 GB VRAM (MTP block + alternate delta-net state) |

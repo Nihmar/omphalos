@@ -954,7 +954,10 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 
 - ~~INT8 WMMA path (IQ values fit int8) vs FP16 path — measure speed vs KL.~~ Measured (#213): KL fine, speed 0.8x the f16 kernel; rejected (§10.5).
 - Double-buffered LDS tiles, overlapping load / dequant / WMMA.
-- Tune ubatch size (512 vs 1024 vs 2048) against VRAM scratch.
+- Tune ubatch size (512 vs 1024 vs 2048) against VRAM scratch. **Measured (#446):** 1024 is
+  +0.6 % at 32k, -0.9 % at 4k and +212 MiB (768 worse everywhere); the 5120-row GEMMs gain
+  0.4 %, not the 4-5 % the half-empty round suggested, because the grouped launches fill
+  the tail. 512 stays.
 - KV-only MTP shadow pass instead of full MTP layer (§12.2).
 
 ---

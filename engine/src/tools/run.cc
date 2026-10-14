@@ -5,7 +5,7 @@
 //   tokens.txt          token ids separated by whitespace
 //   --last-logits       write only the last row of logits (long prompts)
 //   --logits-tail N     write only the last N rows
-//   --tokens N          use only the first N prompt tokens
+//   --chunk N           prefill chunk (default: 512, or the prompt)
 //   --generate N        greedy-decode N tokens after the prompt ...
 //   --gen-out FILE      ... and write them here (one id per line); required with --generate
 //   --gen-logits FILE   also write each decode step's logits (generate - 1 rows of f32)
@@ -71,6 +71,7 @@ int main(int argc, char ** argv) {
     std::string gen_logits_path;
     std::string gen_force_path;
     int64_t max_tokens = 0;
+    int64_t chunk = 0;  // --chunk N: the prefill chunk (default: 512, or the prompt)
     bool last_logits = false;
     int64_t logits_tail = 0;
     int64_t generate = 0;
@@ -97,6 +98,8 @@ int main(int argc, char ** argv) {
             last_logits = true;
         } else if (std::strcmp(argv[i], "--logits-tail") == 0 && has_value) {
             if (!count(argv[++i], logits_tail)) return usage();
+        } else if (std::strcmp(argv[i], "--chunk") == 0 && has_value) {
+            if (!count(argv[++i], chunk) || chunk < 1) return usage();
         } else if (std::strcmp(argv[i], "--tokens") == 0 && has_value) {
             if (!count(argv[++i], max_tokens)) return usage();
         } else if (std::strcmp(argv[i], "--generate") == 0 && has_value) {
@@ -183,7 +186,16 @@ int main(int argc, char ** argv) {
                                      : 7 * df_blocks;
         const int64_t total_len = (int64_t) toks.size() + generate +
                                   std::max<int64_t>(!dflash.empty() ? df_masks : draft_k, 7) + 1;
+        // The chunk is the model's per-forward token count: the activation and
+        // logits buffers are allocated for it, so a bigger one costs VRAM
+        // (what omph-server's --chunk trades; #446).
         int64_t act_chunk = total_len < 512 ? total_len : 512;
+        if (chunk > 0) {
+            act_chunk = chunk;
+        }
+        if (total_len > 0 && total_len < act_chunk) {
+            act_chunk = total_len;
+        }
         if (max_tokens > 0 && max_tokens < act_chunk) {
             act_chunk = max_tokens;
         }

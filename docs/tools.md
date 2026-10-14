@@ -219,6 +219,7 @@ chunks of 512.
 | `--last-logits` | off | write only the last row (long prompts) |
 | `--logits-tail N` | off | write only the last N rows |
 | `--tokens N` | all | use only the first N prompt tokens |
+| `--chunk N` | 512 | prefill chunk (the per-forward token count; as `omph-server --chunk`; #446) |
 | `--generate N` | `0` | greedy-decode N tokens after the prompt |
 | `--gen-out FILE` | -- | where the generated ids go (required with `--generate`) |
 | `--gen-logits FILE` | off | each decode step's logits (`N - 1` rows) |
