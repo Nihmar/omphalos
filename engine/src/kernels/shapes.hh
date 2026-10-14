@@ -10,6 +10,10 @@
 namespace omph::kernels {
 
 constexpr int kGqaGroup = 6;   // query heads per KV head (24 / 4), attn.hip
+constexpr int kGqaGroupMoe = 8;  // the qwen35moe group (16 / 2): the second
+                                 // instantiation the attention kernels get in
+                                 // #493; until then the load accepts it and the
+                                 // attention wrapper refuses it by name
 constexpr int kHeadDim = 256;  // attention head_dim (kPrepHd, kGqaHd), attn.hip
 constexpr int kDeltaS = 128;   // delta-net state size, gdn.hip
 constexpr int kMaxConv = 4;    // the conv kernel's window, gdn.hip

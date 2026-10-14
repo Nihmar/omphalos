@@ -150,6 +150,16 @@ void unrepack_q2k(const void * src, int64_t n_blocks, void * dst);
 // Byte size of one quantized block of `type` (0 when unsupported).
 int64_t quant_block_bytes(uint32_t type);
 
+// The weights one block covers: 256 for the k-quants and the IQ types, 32 for
+// the legacy ones (Q4_0, Q8_0, IQ4_NL); 0 when the type has no blocks.
+int64_t quant_block_weights(uint32_t type);
+
+// The rows of a quantized tensor whose ne[0] is `k`: nbytes / block bytes /
+// blocks per row. Handles the higher dimensions (a 3-D expert tensor has
+// ne[1] x ne[2] rows); 0 when the type has no blocks or k is not a whole
+// number of them.
+int64_t quant_rows(uint32_t type, int64_t k, uint64_t nbytes);
+
 // Dispatch helpers over the types with a repacked layout + GEMV kernel.
 // Size in bytes of repack_any's output, without doing the repack (0: no layout).
 int64_t repacked_bytes(uint32_t type, int64_t n_blocks);
