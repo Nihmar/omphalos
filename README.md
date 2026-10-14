@@ -65,13 +65,19 @@ Speculative decoding on the #262 scenarios (prose / edit-cc / edit-py), n-gram d
 
 | spec | omphalos | llama.cpp |
 |---|---:|---:|
-| plain | 24.2 / 24.1 / 23.9 t/s | 20.6 / 175.4 / 117.2 t/s |
+| plain | 24.2 / 24.1 / 23.9 t/s | 20.5 / 20.0 / 19.8 t/s |
 | MTP | **43.0 / 266.5 / 229.1 t/s** | 23.3 / 200.0 / 109.4 t/s |
 | DFlash2 | **43.3 / 258.9 / 244.0 t/s** | 20.1 / 205.7 / 160.1 t/s |
 
 Without the n-gram (the drafter alone, prose / edit-cc / edit-py): MTP 43.3 / 78.5 / 75.7
 against 23.2 / 40.2 / 39.0, DFlash2 42.9 / 134.9 / 93.4 against 20.0 / 49.8 / 38.4. llama.cpp's
 DFlash2 is at parity with its own plain decode on prose (20.0 against 20.5 t/s).
+
+The **plain** row is plain decode on both engines (0 drafts). llama.cpp's n-gram alone, without a
+drafter, is a separate row of the result file (`--spec-type ngram-simple`, the `plain, ngram=1`
+cell): 175.4 t/s on edit-cc and 117.2 on edit-py. omphalos has no n-gram-without-a-drafter mode:
+its n-gram drafts fire inside an MTP/DFlash2 step and show up in the rows above (266.5 and 244.0
+t/s on the same scenarios).
 
 ### Measured, not adopted
 

@@ -70,6 +70,11 @@ t/s, and the generated tokens in parentheses:
 | llama overlay | dflash | 0 | 20.0 (1171) | 49.8 (2042) | 38.4 (4332) |
 | llama overlay | dflash | 1 | 20.1 (1171) | 205.7 (2042) | 160.1 (4334) |
 
+For llama.cpp, `plain, ngram=1` is `--spec-type ngram-simple` (its own n-gram speculation,
+no drafter: 175.4 / 117.2 t/s on edit-cc / edit-py); the `plain, ngram=0` row is the true plain
+decode (0 drafts). omphalos' plain is plain either way (`--no-mtp`: no speculation at all, its
+n-gram only drafts inside an MTP/DFlash2 step).
+
 accepted / drafted:
 
 | engine | spec | ngram | prose | edit-cc | edit-py |
