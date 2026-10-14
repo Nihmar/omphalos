@@ -1,0 +1,77 @@
+# #446: the prefill chunk (512 / 768 / 1024) — measured, 512 stays
+
+Engine main after #445 + the `--chunk N` option on `omph-run` (added here: the
+server had it, the runner did not, and the issue's step 3 needs its logits).
+RX 9060 XT 16 GB, CachyOS, 2026-10-14, the card's settings unchanged (MCLK
+1279 MHz, cap 182 W — see #447's comment).
+
+Hypothesis to test (the issue): the 2x8-tile GEMM covers 256 W rows per
+workgroup, 32 workgroups run at once, so the 5120-row shapes (ffn_down, the
+attn/delta-net outputs: 20 x 4 = 80 workgroups) leave the third round half empty,
+worth ~4-5 % of the prefill; a 1024-token chunk lands every shape on whole rounds.
+
+## The matrix
+
+`omph-server --chunk C --cache-ram 0 --ctx 131072`, the same 4096/16384/32768
+token prompts, 5 runs per cell, the median of the prefill wall (`prompt_ms` of the
+response) and the peak VRAM `rocm-smi` reports while the request runs:
+
+| chunk | 4096 | 16384 | 32768 | peak VRAM |
+|---:|---:|---:|---:|---:|
+| **512** | **3934.0 ms (1041.2 t/s)** | 16801.9 (975.1) | 36188.9 (905.5) | **15157 MiB** |
+| 768 | 4053.3 (1010.5) | 17057.1 (960.5) | 36486.3 (898.1) | 15273 MiB |
+| 1024 | 3968.1 (1032.2) | 16778.0 (976.5) | **35979.5 (910.7)** | 15369 MiB |
+
+The spread inside a cell is 0.2-0.5 %, and the 512/4k cell re-measured at the end
+of the session gives the same 3934.0 ms, so the ordering is not drift. `omph-run
+--chunk C` at 16384 tokens reproduces it independently: 16529.8 / 16854.8 /
+16662.0 ms.
+
+1024 is the fastest only at 32768 (+0.6 %); it loses at 4096 (-0.9 %) and ties at
+16384 (+0.14 %), and it costs **+212 MiB** of VRAM. 768 is worse everywhere.
+
+## Why the hypothesis does not pay: the kernels, 16384 tokens
+
+`rocprofv3`, the same run at 512 and 1024 (total kernel time 16510 against
+16476 ms, -0.2 %, 26437 against 13317 launches):
+
+| kernel | 512 ms | 1024 ms | delta |
+|---|---:|---:|---:|
+| `gemm_tiles2_kernel` (the prefill GEMM) | 12539.8 | 12487.6 | **-52 (-0.4 %)** |
+| `attention_wmma_kernel` (prefill attention) | 1363.0 | 1315.7 | -47 (-3.5 %) |
+| `delta_wy_b_kernel` / `delta_wy_a_kernel` | 461.4 | 431.5 | -30 |
+| `add_rms_norm_f16_kernel` | 422.1 | 470.4 | **+48 (+11 %)** |
+| `delta_conv_kernel` | 163.3 | 217.2 | **+54 (+33 %)** |
+| `delta_gate_kernel`, `delta_post_kernel`, `attn_prep_kernel` | 527.8 | 530.4 | +3 |
+
+The GEMM gains **0.4 %, not 4-5 %**: the 5120-row shapes are launched *grouped*
+with their siblings, and the next tensor's workgroups fill the tail of the half
+round, so the quantization the issue computed is mostly absorbed. Whatever the
+bigger chunk buys (the attention's 3.5 %, fewer launches in the WY form) is paid
+back by the elementwise kernels, whose per-row cost grows with the batch (the
+norm +11 %, the conv +33 % at this shape).
+
+## Numerics
+
+The chunk moves the arithmetic: the delta-net state is rounded to f16 at every
+prefill-chunk boundary, so a 1024-token chunk has half as many round trips. Two
+witnesses, 16384 tokens, `omph-run --logits-tail 64`:
+
+| comparison | KL mean | p99 | max | top-1 |
+|---|---:|---:|---:|---:|
+| 768 vs 512 | 0.000741 | 0.0059 | 0.0063 | 98.44 % |
+| 1024 vs 512 | 0.000812 | 0.0064 | 0.0079 | 96.88 % |
+
+For scale: the default quantized KV costs 0.0012-0.0015 nats against f32 KV
+(#175) and #240's WY form 0.0002-0.0005. A greedy answer can differ in wording -
+the chat check over the same 19k-token prompt gave "serves as a design note" at
+512 against "identifies the document as design notes" at 768 and 1024 - which is
+the expected effect of a different but equally acceptable rounding path, not an
+error: nothing here is bit-identical across chunk sizes by design.
+
+## Decision
+
+**512 stays the default.** The predicted 4-5 % is not there (-0.4 % in the GEMM;
++0.6 % at 32k, -0.9 % at 4k, +212 MiB), and the issue's step 4 (a 128-row tile
+variant for the 5120-row shapes, or split-K over k) would be aimed at a cost that
+this measurement says the grouped launches already hide.
