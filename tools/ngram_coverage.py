@@ -36,9 +36,11 @@ HE = ("Complete the following Python function. Reply with the complete function 
 
 
 def scenarios() -> dict[str, dict]:
+    """The #199 scenario set. The wikitext and HumanEval scenarios need the
+    datasets under models/datasets (local-only); when they are absent the rest
+    of the set is still returned, so a harness can run what it has (#262)."""
     py = (HERE / "pelican.py").read_text()
     cc = (ROOT / "engine/src/runtime/options.cc").read_text()
-    wiki = (ROOT / "models/datasets/wikitext-2-raw/wiki.test.raw").read_text()[20000:27000]
     s = {
         "edit-py": {"msg": EDIT.format(lang="python", src=py, task="Add a --runs N option that repeats every "
                                        "configuration N times and reports the median of each speed."),
@@ -49,15 +51,20 @@ def scenarios() -> dict[str, dict]:
         "edit-cc": {"msg": EDIT.format(lang="cpp", src=cc, task="Add an integer option OMPH_GDN_CHUNK (default "
                                        "64), parsed like OMPH_STAGE_MIB, in the struct's field order."),
                     "think": False, "max": 6000},
-        "quote": {"msg": "Summarize the following text in six bullet points, each quoting its key sentence "
-                         "verbatim.\n\n" + wiki, "think": False, "max": 2000},
         "prose": {"msg": "Write a 700-word short story about a lighthouse keeper who finds a message in a bottle.",
                   "think": False, "max": 2000},
     }
-    with gzip.open(ROOT / "models/datasets/human-eval/data/HumanEval.jsonl.gz", "rt") as f:
-        problems = [json.loads(line) for line in f]
-    for p in problems[::16]:  # 11 problems across the set, thinking on
-        s["he-" + p["task_id"].split("/")[1]] = {"msg": HE.format(p["prompt"]), "think": True, "max": 4096}
+    wiki = ROOT / "models/datasets/wikitext-2-raw/wiki.test.raw"
+    if wiki.exists():
+        s["quote"] = {"msg": "Summarize the following text in six bullet points, each quoting its key "
+                             "sentence verbatim.\n\n" + wiki.read_text()[20000:27000],
+                      "think": False, "max": 2000}
+    he = ROOT / "models/datasets/human-eval/data/HumanEval.jsonl.gz"
+    if he.exists():
+        with gzip.open(he, "rt") as f:
+            problems = [json.loads(line) for line in f]
+        for p in problems[::16]:  # 11 problems across the set, thinking on
+            s["he-" + p["task_id"].split("/")[1]] = {"msg": HE.format(p["prompt"]), "think": True, "max": 4096}
     return s
 
 
