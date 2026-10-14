@@ -21,7 +21,11 @@ namespace omph::kernels {
 // every query of a chunk of up to kKvRingExtra + 1 tokens reads its own last
 // `window` keys from it, so a token's attention does not depend on how many
 // tokens its step runs (a verification row is bit-identical to a decode step).
-constexpr long long kKvRingExtra = 15;
+// 63 since #450: a short prefill chunk (an agent turn's tool result) takes the
+// decode path's fixed splits instead of the flash kernel, and every query of it
+// must still read its own exact window - 64 rows need this many extra slots
+// (1.5 MiB of ring at 16 layers). Speculation's own backup is a separate buffer.
+constexpr long long kKvRingExtra = 63;
 
 // --- fused attention prep (#79) -------------------------------------------
 //
