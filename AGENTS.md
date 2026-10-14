@@ -169,6 +169,9 @@ uv run python check_tokenizer.py <model> <llama.cpp>/bin/llama-tokenize [--fuzz 
 uv run python check_chat_template.py <model>      # chat template vs jinja2, byte for byte; with a
     # second argument (llama-tokenize) the chat ids of the same renderings too (#344);
     # --template sharp runs the vendored Qwen Sharp template instead (#392)
+uv run python freq_prefix_probe.py --states <trace>/l_out-63.f32 --freq <gen-out> \
+    --sizes 32768,98304  # #453: the draft prefix's recall/OOV for an id-ordered vs a
+    # frequency-ordered head (offline: gguf-py + the layer-63 hidden states)
 uv run python check_chat_template_ab.py [--dflash FILE] --temp 0.6  # #392: the two templates A/B
     # end to end (markers answered, drafts accepted, ms/token); CSV with --out
 uv run python check_conversations.py [--spec mtp,dflash] [--image FILE]  # #179: back to a saved

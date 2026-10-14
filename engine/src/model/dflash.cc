@@ -189,6 +189,12 @@ void Runner::dflash_observe(const int64_t kept_drafts) {
         }
     }
     if (std::getenv("OMPH_DFLASH_DEBUG") != nullptr) {
+        // #453: the draft vocabulary prefix's health - the OOV EMA of the output
+        // tokens (what makes the head fall back to its whole 682 MiB) and the
+        // share of draft steps that did.
+        std::fprintf(stderr, "draft head: prefix %lld rows, oov %.4f, full-head steps %lld/%lld\n",
+                     (long long) draft_vocab_rows(), draft_oov_, (long long) dfl_head_fallback_,
+                     (long long) dfl_head_steps_);
         std::fprintf(stderr, "per-position reached/kept:");
         for (size_t n = 1; n < dfl_reach_.size(); ++n) {
             if (dfl_reach_[n] == 0) {
@@ -387,10 +393,16 @@ bool Runner::dflash_draft(const int32_t token, const int64_t pos, const int64_t 
         using namespace omph::kernels;
         const GemvEntry * hg = head_.gemv;
         const int64_t dv = draft_vocab_rows();  // OMPH_DRAFT_VOCAB in head tiles (#340)
-        const int64_t nv = dv > 0 && dv < h_.n_vocab && use_gemv_ && draft_oov_ < kDraftOovMax && hg != nullptr &&
-                                   hg->type == 12 && hg->rows == h_.n_vocab
-                               ? dv
-                               : h_.n_vocab;
+        const bool prefix_ok = dv > 0 && dv < h_.n_vocab && use_gemv_ && draft_oov_ < kDraftOovMax &&
+                               hg != nullptr && hg->type == 12 && hg->rows == h_.n_vocab;
+        // #453: how often the draft head has to score the whole 682 MiB instead
+        // of the OMPH_DRAFT_VOCAB-row prefix, and why (the OOV EMA of the output
+        // tokens against the prefix).
+        ++dfl_head_steps_;
+        if (!prefix_ok) {
+            ++dfl_head_fallback_;
+        }
+        const int64_t nv = prefix_ok ? dv : h_.n_vocab;
         const void * hx = static_cast<const uint8_t *>(h16_) + ne * 2;  // the MASK rows
         if (!rms_norm(static_cast<const float *>(x_), dfl_out_norm_, static_cast<float *>(cur_), Bl, ne, dfl_eps_, 1.0f,
                       nullptr) ||
