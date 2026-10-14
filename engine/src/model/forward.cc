@@ -125,67 +125,15 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
         !omph::kernels::moe_topk(moe_logits_, ids, weights, T, n_expert, topk, hipStreamPerThread)) {
         return fail("moe route failed");
     }
-    if (hipStreamSynchronize(hipStreamPerThread) != hipSuccess ||
-        hipMemcpy(moe_host_ids_.data(), ids, (size_t) T * topk * sizeof(int),
-                  hipMemcpyDeviceToHost) != hipSuccess) {
-        return fail("moe_route readback failed");
-    }
-    // order the (token, slot) pairs by expert: a stable counting sort, and the
-    // gather / store indices it produces
-    std::fill(moe_counts_.begin(), moe_counts_.end(), 0);
-    for (int64_t i = 0; i < T * topk; ++i) {
-        ++moe_counts_[(size_t) moe_host_ids_[(size_t) i]];
-    }
+    // The routing table, the gather / store indices and the per-expert offsets
+    // are all built on the device (#493): a batched step (a prefill chunk or a
+    // verification) has no host round trip left.
     auto * xgi = static_cast<int *>(moe_xgi_);
     auto * slot = static_cast<int *>(moe_slot_);
-    // built on the host, uploaded once (the device buffers are not host-mapped)
-    std::vector<int> host_xgi((size_t) T * topk);
-    std::vector<int> host_slot((size_t) T * topk);
-    std::vector<int> fill(moe_counts_.size());
-    for (int e = 0, at = 0; e < n_expert; ++e) {
-        fill[(size_t) e] = at;
-        at += moe_counts_[(size_t) e];
+    if (!omph::kernels::moe_order(ids, T * topk, n_expert, topk, moe_cnt_, moe_off_, xgi, slot,
+                                  moe_cnt_max_, hipStreamPerThread)) {
+        return fail("moe order failed");
     }
-    for (int64_t t = 0; t < T; ++t) {
-        for (int s = 0; s < topk; ++s) {
-            const int e = moe_host_ids_[(size_t) (t * topk + s)];
-            if (e < 0 || e >= n_expert) {
-                return fail("moe_route chose an out-of-range expert");
-            }
-            const int i = fill[(size_t) e]++;
-            host_xgi[(size_t) i] = (int) t;
-            host_slot[(size_t) i] = s;
-        }
-    }
-    const size_t idx_bytes = (size_t) T * topk * sizeof(int);
-    // Blocking: these come from pageable host vectors, and an async copy from
-    // pageable memory may outlive the vector (the kernel would read garbage
-    // counts and index out of bounds)
-    if (hipMemcpy(xgi, host_xgi.data(), idx_bytes, hipMemcpyHostToDevice) != hipSuccess ||
-        hipMemcpy(slot, host_slot.data(), idx_bytes, hipMemcpyHostToDevice) != hipSuccess) {
-        return fail("moe index upload failed");
-    }
-    // the expert slices (the expert dim is the outermost in the 3-D tensor)
-    const auto slice = [this](const Mat & base, const int64_t off, const int64_t rows,
-                              const int64_t k) -> Mat {
-        Mat m = base;
-        m.dev = static_cast<const uint8_t *>(base.dev) + off;
-        m.sliced = true;
-        if (base.gemv != nullptr) {
-            slice_gemv_ = *base.gemv;
-            slice_gemv_.rows = rows;
-            slice_gemv_.k = k;
-            m.gemv = &slice_gemv_;
-        }
-        return m;
-    };
-    const int64_t gate_stride = (int64_t) L.ffn_gate_exps.t->stored / h_.n_expert;
-    const int64_t up_stride = (int64_t) L.ffn_up_exps.t->stored / h_.n_expert;
-    const int64_t down_stride = (int64_t) L.ffn_down_exps.t->stored / h_.n_expert;
-    const int64_t gate_rows = (int64_t) L.ffn_gate_exps.t->ne[1];
-    const int64_t up_rows = (int64_t) L.ffn_up_exps.t->ne[1];
-    const int64_t down_rows = (int64_t) L.ffn_down_exps.t->ne[1];
-
     // Every expert's rows gathered once (the counting sort already ordered
     // them by expert), then one grouped GEMM per matrix kind where the type has
     // a tile kernel, and the per-expert shape on the gathered rows where it
@@ -199,21 +147,42 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
     if (!omph::kernels::moe_gather(h16_, ne, xgi, n_rows, xg, hipStreamPerThread)) {
         return fail("moe gather (batched) failed");
     }
-    std::vector<int> host_off((size_t) n_expert + 1);
-    int64_t max_rows = 0;
-    for (int e = 0, at = 0; e < n_expert; ++e) {
-        host_off[(size_t) e] = at;
-        const int64_t n_e = moe_counts_[(size_t) e];
-        at += (int) n_e;
-        max_rows = n_e > max_rows ? n_e : max_rows;
+    // The grid's row bound: the largest per-expert count, read from the device
+    // for a chunk (one 4-byte copy per layer, amortized over hundreds of rows);
+    // for a step or a verification the bound is the token count itself, so no
+    // host round trip happens
+    int64_t max_rows = T;
+    if (T > 64) {
+        int mx = 0;
+        if (hipMemcpy(&mx, moe_cnt_max_, sizeof(int), hipMemcpyDeviceToHost) != hipSuccess) {
+            return fail("moe max count readback failed");
+        }
+        max_rows = mx > 0 ? mx : 1;
     }
-    host_off[(size_t) n_expert] = T * topk;
-    if (hipMemcpy(moe_off_, host_off.data(), ((size_t) n_expert + 1) * sizeof(int),
-                  hipMemcpyHostToDevice) != hipSuccess ||
-        hipMemcpy(moe_cnt_, moe_counts_.data(), (size_t) n_expert * sizeof(int),
-                  hipMemcpyHostToDevice) != hipSuccess) {
-        return fail("moe offsets upload failed");
-    }
+    // The expert slices (the expert dim is the outermost in the 3-D tensor)
+    // and the x of a grouped GEMM (the gathered rows for gate / up, the
+    // swiglu output on the same rows for the down)
+    const int64_t gate_stride = (int64_t) L.ffn_gate_exps.t->stored / h_.n_expert;
+    const int64_t up_stride = (int64_t) L.ffn_up_exps.t->stored / h_.n_expert;
+    const int64_t down_stride = (int64_t) L.ffn_down_exps.t->stored / h_.n_expert;
+    const int64_t gate_rows = (int64_t) L.ffn_gate_exps.t->ne[1];
+    const int64_t up_rows = (int64_t) L.ffn_up_exps.t->ne[1];
+    const int64_t down_rows = (int64_t) L.ffn_down_exps.t->ne[1];
+    // The expert slices: the expert dim is the outermost in the 3-D tensor, so
+    // a slice is a pointer plus a GemvEntry with the slice's rows/k
+    const auto slice = [this](const Mat & base, const int64_t off, const int64_t rows,
+                              const int64_t k) -> Mat {
+        Mat m = base;
+        m.dev = static_cast<const uint8_t *>(base.dev) + off;
+        m.sliced = true;
+        if (base.gemv != nullptr) {
+            slice_gemv_ = *base.gemv;
+            slice_gemv_.rows = rows;
+            slice_gemv_.k = k;
+            m.gemv = &slice_gemv_;
+        }
+        return m;
+    };
     // The x of a grouped GEMM is the gathered rows (gate / up) or the swiglu
     // output on the same rows (down): both are laid out per gathered row.
     const bool no_group = std::getenv("OMPH_MOE_NO_GROUP") != nullptr;  // A/B (#494)
@@ -227,10 +196,28 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
                                              static_cast<const int *>(moe_cnt_), n_expert, max_rows, y,
                                              n_out, k, ldy, hipStreamPerThread);
     };
+    // The per-expert fallback (a type without a tile kernel) walks the experts
+    // in order, so it needs the counts on the host: one readback, once.
+    bool host_counts = false;
+    const auto ensure_host_counts = [&]() {
+        if (host_counts) {
+            return true;
+        }
+        const bool ok =
+            hipMemcpy(moe_counts_.data(), moe_cnt_, (size_t) n_expert * sizeof(int),
+                      hipMemcpyDeviceToHost) == hipSuccess &&
+            hipMemcpy(moe_host_ids_.data(), ids, (size_t) T * topk * sizeof(int),
+                      hipMemcpyDeviceToHost) == hipSuccess;
+        host_counts = ok;
+        return ok;
+    };
     // gate and up: grouped when the type has a tile kernel, else one expert at a
     // time, both writing at the gathered row offsets
     if (!grouped(L.ffn_gate_exps, gate_stride, xg, ffn, ne, ffn1, ffn) ||
         !grouped(L.ffn_up_exps, up_stride, xg, ffn, ne, ffn2, ffn)) {
+        if (!ensure_host_counts()) {
+            return fail("moe fallback readback failed");
+        }
         for (int e = 0, at = 0; e < n_expert; ++e) {
             const int64_t n_e = moe_counts_[(size_t) e];
             const int64_t off = at;
@@ -251,6 +238,9 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
         return fail("moe swiglu (batched) failed");
     }
     if (!grouped(L.ffn_down_exps, down_stride, ffn16_, ne, ffn, down_out, ne)) {
+        if (!ensure_host_counts()) {
+            return fail("moe fallback readback failed");
+        }
         for (int e = 0, at = 0; e < n_expert; ++e) {
             const int64_t n_e = moe_counts_[(size_t) e];
             const int64_t off = at;
@@ -796,8 +786,10 @@ bool Runner::head_chunked(const void * x16, const int64_t T, float * out) {
         void * wh = head16;
         timer_stage_.start();
         // the repacked head's rows v0.. straight from its layout (M8)
+        // a GemvEntry's bytes are a repacked layout *unless* it is one of the
+        // legacy types, which keep the GGUF blocks (#492)
         const bool head_dq =
-            head_.gemv != nullptr
+            head_.gemv != nullptr && !head_.gemv->gguf
                 ? omph::kernels::dequant_repacked(head_.gemv->type, head_src, wh, h_.n_vocab, ne,
                                                   nullptr, v0, rows)
                 : omph::kernels::dequantize(head->type, head_src + v0 * head_row_bytes, wh,

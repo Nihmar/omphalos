@@ -95,6 +95,52 @@ __global__ void moe_acc_kernel(float * __restrict__ out, const float * __restric
     }
 }
 
+// The routing table on the device (#493): per-expert counts, their exclusive
+// prefix sum, and the gather (xgi = the token) / slot arrays in expert-major
+// order - so a batched step needs no host round trip. The order *inside* an
+// expert's rows does not affect any result: the outputs are summed back per
+// (token, slot), and the combine runs in slot order.
+__global__ void moe_order_kernel(const int * __restrict__ ids, const int n_pairs, const int n_expert,
+                                 const int topk, int * __restrict__ counts, int * __restrict__ offs,
+                                 int * __restrict__ xgi, int * __restrict__ slot,
+                                 int * __restrict__ max_count) {
+    extern __shared__ int cnt[];  // n_expert + 1 counters
+    const int e = threadIdx.x;
+    if (e < n_expert) {
+        // every thread counts all the pairs: the thread is the *bin*, the loop
+        // is over the pairs (a strided read here would compare ids[i] with i)
+        int c = 0;
+        for (int i = 0; i < n_pairs; ++i) {
+            c += ids[i] == e;
+        }
+        cnt[e] = c;
+        counts[e] = c;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int at = 0;
+        for (int i = 0; i < n_expert; ++i) {
+            offs[i] = at;
+            const int c = cnt[i];
+            cnt[i] = at;
+            at += c;
+        }
+        offs[n_expert] = at;
+        int mx = 0;
+        for (int i = 0; i < n_expert; ++i) {
+            const int c = offs[i + 1 > n_expert ? n_expert : i + 1] - offs[i];
+            mx = c > mx ? c : mx;
+        }
+        *max_count = mx;
+    }
+    __syncthreads();
+    for (int i = (int) threadIdx.x; i < n_pairs; i += (int) blockDim.x) {
+        const int at = atomicAdd(&cnt[ids[i]], 1);
+        xgi[at] = i / topk;
+        slot[at] = i % topk;
+    }
+}
+
 // one block per row: copy k f16 values (the gather of an expert's rows)
 __global__ void moe_gather_kernel(const __half * __restrict__ x, const long long k,
                                   const int * __restrict__ ids, __half * __restrict__ dst) {
@@ -162,6 +208,22 @@ bool moe_topk(const void * logits, int * ids, float * weights, const int64_t tok
     const size_t sh_bytes = (size_t) n_expert * sizeof(float);
     moe_topk_kernel<<<(unsigned) tokens, kTopkThreads, sh_bytes, stream>>>(
         static_cast<const float *>(logits), ids, weights, (int) n_expert, topk);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool moe_order(const void * ids, const int64_t n_pairs, const int64_t n_expert, const int64_t topk,
+               void * counts, void * offs, void * xgi, void * slot, void * max_count,
+               hipStream_t stream) {
+    if (ids == nullptr || counts == nullptr || offs == nullptr || xgi == nullptr || slot == nullptr ||
+        max_count == nullptr || n_pairs <= 0 || n_expert <= 0 || n_expert > 4096 || topk <= 0) {
+        return false;
+    }
+    const size_t sh_bytes = (size_t) (n_expert + 1) * sizeof(int);
+    moe_order_kernel<<<1, 256, sh_bytes, stream>>>(static_cast<const int *>(ids), (int) n_pairs,
+                                                   (int) n_expert, (int) topk,
+                                                   static_cast<int *>(counts), static_cast<int *>(offs),
+                                                   static_cast<int *>(xgi), static_cast<int *>(slot),
+                                                   static_cast<int *>(max_count));
     return hipGetLastError() == hipSuccess;
 }
 

@@ -3137,4 +3137,95 @@ bool gemv_q4_0(const void * blocks, const void * x_f16, float * y, const int64_t
     return gemv_legacy32<false>(blocks, x_f16, y, rows, k, stream);
 }
 
+
+// -------------------------------------------------------------- Q5_K
+//
+// 176-byte blocks (d, dmin, 12 scale bytes, 32 qh bytes, 128 qs bytes) read
+// from the GGUF layout (#492, like the legacy 32-wide ones): the fifth bit of
+// each weight comes from qh and the 6-bit scales from get_scale_min_k4.
+__global__ void gemv_q5k_kernel(const uint8_t * __restrict__ blocks,
+                                const __half * __restrict__ x, float * __restrict__ y,
+                                const long long rows, const long long n_sub,
+                                const long long chunk_sub) {
+    extern __shared__ __half xs[];
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kLegacyRows;
+    const long long rlast = rows - 1;
+    const long long nblk = n_sub / 8;  // 256-weight blocks per row
+    float acc[kLegacyRows] = {};
+    for (long long base = 0; base < n_sub; base += chunk_sub) {
+        const long long len = n_sub - base < chunk_sub ? n_sub - base : chunk_sub;
+        for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
+            xs[i] = x[base * 32 + i];
+        }
+        __syncthreads();
+        if (row0 < rows) {
+            for (long long s = base + lane; s < base + len; s += 32) {
+                const long long blk = s / 8;   // the 256-weight block
+                const int ib = (int) (s % 8);  // the sub-block in it
+                const __half * xv = xs + (s - base) * 32;
+                float xsum = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 32; ++j) {
+                    xsum += __half2float(xv[j]);
+                }
+                // the sub-block's 64-weight group and nibble half
+                const int grp = ib / 2;
+                const bool high = (ib % 2) != 0;
+#pragma unroll
+                for (int r = 0; r < kLegacyRows; ++r) {
+                    const long long row = row0 + r <= rlast ? row0 + r : rlast;
+                    const uint8_t * b = blocks + (row * nblk + blk) * 176;
+                    const float d = __half2float(*reinterpret_cast<const __half *>(b));
+                    const float dmin = __half2float(*reinterpret_cast<const __half *>(b + 2));
+                    uint8_t sc = 0;
+                    uint8_t mn = 0;
+                    qd::scale_min_k4(ib, b + 4, sc, mn);
+                    const float dl = d * (float) sc;
+                    const float ml = dmin * (float) mn;
+                    const uint8_t * qs = b + 48 + grp * 32;
+                    const int bit = 2 * grp + (high ? 1 : 0);
+                    float part = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < 32; ++j) {
+                        const int q = (high ? (qs[j] >> 4) : (qs[j] & 15)) +
+                                      (((b[16 + j] >> bit) & 1) ? 16 : 0);
+                        part = fmaf((float) q, __half2float(xv[j]), part);
+                    }
+                    acc[r] = fmaf(dl, part, fmaf(-ml, xsum, acc[r]));
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < kLegacyRows; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down(v, off);
+        }
+        if (lane == 0 && row0 + r < rows) {
+            y[row0 + r] = v;
+        }
+    }
+}
+
+bool gemv_q5k(const void * blocks, const void * x_f16, float * y, const int64_t rows,
+              const int64_t k, hipStream_t stream) {
+    if (blocks == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
+        k % 256 != 0) {
+        return false;
+    }
+    const int64_t n_sub = k / 32;
+    const int64_t chunk = n_sub < kLegacyChunkSub ? n_sub : kLegacyChunkSub;
+    const size_t smem = (size_t) chunk * 64;
+    const dim3 grid((unsigned) ((rows + 8 * kLegacyRows - 1) / (8 * kLegacyRows)));
+    gemv_q5k_kernel<<<grid, 256, smem, stream>>>(static_cast<const uint8_t *>(blocks),
+                                                 static_cast<const __half *>(x_f16), y, rows, n_sub,
+                                                 chunk);
+    return hipGetLastError() == hipSuccess;
+}
+
 } // namespace omph::kernels

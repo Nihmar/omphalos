@@ -144,7 +144,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 std::memcpy(embd_host_, file_.tensor_data(t), (size_t) t.nbytes);
                 continue;
             }
-            if (t.layout == omph::gguf::kLayoutGguf && (t.type == 2 || t.type == 8)) {
+            if (t.layout == omph::gguf::kLayoutGguf && (t.type == 2 || t.type == 8 || t.type == 13)) {
                 // Q4_0 / Q8_0 keep the GGUF blocks and their GEMV reads them as
                 // they are (#492)
                 GemvEntry e;
@@ -282,6 +282,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         alloc(&moe_off_, ((size_t) h_.n_expert + 1) * sizeof(int));
         alloc(&moe_cnt_, (size_t) h_.n_expert * sizeof(int));
         alloc(&moe_logits_, (size_t) T * h_.n_expert * 4);
+        alloc(&moe_cnt_max_, sizeof(int));
         moe_host_ids_.resize((size_t) T * h_.n_expert_used);
         moe_counts_.resize((size_t) h_.n_expert);
     }
@@ -1083,6 +1084,7 @@ bool Runner::has_gemv_type(const uint32_t type) {
         case 8:
         case 10:
         case 12:
+        case 13:
         case 14:
         case 16:
         case 17:
@@ -1337,9 +1339,21 @@ void Runner::resolve_layers() {
         L.attn_k = resolve(p + "attn_k.weight");
         L.attn_v = resolve(p + "attn_v.weight");
         L.attn_output = resolve(p + "attn_output.weight");
-        L.ffn_up = resolve(p + "ffn_up.weight");
-        L.ffn_gate = resolve(p + "ffn_gate.weight");
-        L.ffn_down = resolve(p + "ffn_down.weight");
+        if (h_.moe()) {
+            // the second model's MTP block has a MoE FFN too (#496)
+            L.ffn_gate_inp = resolve(p + "ffn_gate_inp.weight");
+            L.ffn_gate_exps = resolve(p + "ffn_gate_exps.weight");
+            L.ffn_up_exps = resolve(p + "ffn_up_exps.weight");
+            L.ffn_down_exps = resolve(p + "ffn_down_exps.weight");
+            L.ffn_gate_inp_shexp = resolve_f32(p + "ffn_gate_inp_shexp.weight");
+            L.ffn_gate_shexp = resolve(p + "ffn_gate_shexp.weight");
+            L.ffn_up_shexp = resolve(p + "ffn_up_shexp.weight");
+            L.ffn_down_shexp = resolve(p + "ffn_down_shexp.weight");
+        } else {
+            L.ffn_up = resolve(p + "ffn_up.weight");
+            L.ffn_gate = resolve(p + "ffn_gate.weight");
+            L.ffn_down = resolve(p + "ffn_down.weight");
+        }
         mtp_eh_ = resolve(p + "nextn.eh_proj.weight");
         mtp_enorm_ = resolve_f32(p + "nextn.enorm.weight");
         mtp_hnorm_ = resolve_f32(p + "nextn.hnorm.weight");
@@ -1347,7 +1361,7 @@ void Runner::resolve_layers() {
         if (L.attn_norm == nullptr || L.post_norm == nullptr || L.q_norm == nullptr ||
             L.k_norm == nullptr || mtp_eh_.t == nullptr || mtp_enorm_ == nullptr ||
             mtp_hnorm_ == nullptr || mtp_head_norm_ == nullptr || L.attn_q.t == nullptr ||
-            L.ffn_down.t == nullptr) {
+            (h_.moe() ? L.ffn_gate_exps.t == nullptr : L.ffn_down.t == nullptr)) {
             throw std::runtime_error("the model has no complete MTP block (" + p + "nextn.*)");
         }
     }
