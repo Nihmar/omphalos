@@ -177,7 +177,10 @@ int main(int argc, char ** argv) {
         const omph::runtime::EnvOptions env = omph::runtime::EnvOptions::from_env();
         // --dflash: the drafts per step are the runtime block's masks (#414):
         // OMPH_DFLASH_MASKS (1..15, 11 by default, 7 = the trained block_size - 1).
-        const int64_t df_masks = !dflash.empty() ? std::min<int64_t>(std::max<int64_t>(env.dflash_masks, 1), 15) : 7;
+        const int64_t df_blocks = !dflash.empty() ? std::min<int64_t>(std::max<int64_t>(env.dflash_blocks, 1), 2) : 1;
+        const int64_t df_masks = !dflash.empty() && df_blocks <= 1
+                                     ? std::min<int64_t>(std::max<int64_t>(env.dflash_masks, 1), 15)
+                                     : 7 * df_blocks;
         const int64_t total_len = (int64_t) toks.size() + generate +
                                   std::max<int64_t>(!dflash.empty() ? df_masks : draft_k, 7) + 1;
         int64_t act_chunk = total_len < 512 ? total_len : 512;

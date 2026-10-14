@@ -1297,7 +1297,8 @@ bool Runner::commit(const int64_t accepted, const int64_t drafts_accepted) {
             }
         }
         dflash_observe(kept_drafts);
-        return (!mtp_ || mtp_fill(accepted)) && dflash_inject(verify_pos0_, accepted);
+        return dflash_tags_invalidate(verify_pos0_, T) && (!mtp_ || mtp_fill(accepted)) &&
+               dflash_inject(verify_pos0_, accepted);
     }
     const int64_t n_kh = h_.ssm_n_kh;
     const int64_t n_vh = h_.ssm_n_vh;
@@ -1364,7 +1365,8 @@ bool Runner::commit(const int64_t accepted, const int64_t drafts_accepted) {
         }
     }
     dflash_observe(kept_drafts);
-    return (!mtp_ || mtp_fill(accepted)) && dflash_inject(verify_pos0_, accepted);
+    return dflash_tags_invalidate(verify_pos0_, T) && (!mtp_ || mtp_fill(accepted)) &&
+           dflash_inject(verify_pos0_, accepted);
 }
 
 // OMPH_SPEC_CHECK: the replay of all T recorded tokens onto the state the

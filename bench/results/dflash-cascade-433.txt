@@ -1,0 +1,64 @@
+# #433: the DFlash2 cascade (two trained blocks) — measured, not adopted
+
+Engine main 0571d06 + the `feat/433-dflash-cascade` branch, RX 9060 XT 16 GB.
+Prose prompt (283 tokens), 256 generated, `omph-run --last-logits --gemv
+--generate 256 --dflash <drafter.omph>`, `OMPH_DFLASH_KEEP=0`, one block of 11
+masks against `OMPH_DFLASH_BLOCKS=2` (two trained 7-mask blocks, the second
+conditioned on the first through the drafter's ring). llama.cpp: v0.6.0 @
+d81235049 (no llama.cpp run).
+
+Correctness: the cascade is deterministic (two runs byte-identical) and its
+tokens equal plain greedy (`cmp`). The per-position counters below are
+`dflash_observe`'s (reached / kept, cumulative over the run).
+
+## Per-position acceptance (prose, 256 tokens)
+
+| position | 1 block, 11 masks (27 steps) | cascade, 2 x 7 (28 steps) |
+|---|---:|---:|
+| 1 | 1.00 | 1.00 |
+| 2 | 0.96 | 0.96 |
+| 3 | 0.96 | 0.96 |
+| 4 | 0.81 | 0.86 |
+| 5 | 0.81 | 0.86 |
+| 6 | 0.78 | 0.79 |
+| 7 | 0.78 | **0.75** |
+| 8 | **0.78** | **0.54** |
+| 9 | 0.63 | 0.36 |
+| 10 | 0.59 | 0.25 |
+| 11 | 0.56 | 0.25 |
+| 12 | - | 0.21 |
+| 13 | - | 0.18 |
+| 14 | - | 0.18 |
+| accepted/step | 8.67 | 8.14 |
+| ms/token | **5.30** | 6.61 |
+
+The first block's seven positions accept about as well as the single block's
+first seven (0.75 against 0.78 at position 7), so the *trained* shape is not the
+problem. The second block's positions collapse (0.54 at its own position 1,
+against the single block's 0.78 at position 8): the cascade loses on acceptance
+*and* pays the second drafter pass, 5.30 -> 6.61 ms/token.
+
+## Why the hypothesis failed
+
+The cascade's second block is seeded with a *drafted* token and its context rows
+are the first block's own K/V (published into the ring). The model's ring rows
+are otherwise the *target's* features through `fc` (`dflash_inject`): the second
+block therefore attends to a representation it never saw as context, and the
+measured result says the long single block - out of training as it is - handles
+those positions better. The block-diffusion mechanism (all rows inside one
+non-causal block) conditions the far positions better than a ring-based
+two-stage chain.
+
+## Verdict
+
+Not adopted. `OMPH_DFLASH_BLOCKS=2` stays as an off-by-default switch and the
+diagnostics (`OMPH_DFLASH_DEBUG`'s per-position counters, `dfl_reach_` /
+`dfl_kept_`) stay with it: they are what the 11-vs-15 medians of #414 were
+missing, and they show the current design's real limit - the *chain's* cumulative
+reach, not the block's training length.
+
+The same counters also say what would move the needle: at position 8 the single
+block still accepts 0.78, at 9 0.63, at 10 0.59, at 11 0.56 - the tail is worth
+having, and the break-even is a marginal of ~0.11. The lever is therefore a
+drafter whose *far* positions are better (a better draft model), not a different
+way to chain the existing one.

@@ -27,6 +27,11 @@ bool dflash_capture(const float * x, int64_t T, int64_t n, int64_t ld_x, __half 
 bool dflash_norm_rope(float * x, int64_t T, int64_t heads, const float * w, float eps, int64_t pos0, float theta,
                       hipStream_t stream);
 
+// The position tags of [pos0, pos0 + n) cleared (#433): the cascade publishes a
+// block's rows into the ring before knowing whether the verification keeps
+// them; the ones it rejects must never be read again.
+bool dflash_tags_clear(int32_t * tags, int64_t pos0, int64_t n, int64_t slots, hipStream_t stream);
+
 // T rows of src (f32, `row` floats each) into the ring (f16, `slots` rows of
 // `row`) at slot (pos0 + t) % slots, and the slot's position tag.
 bool dflash_ring_put(const float * src, int64_t T, int64_t row, int64_t pos0, __half * ring, int32_t * tags,
