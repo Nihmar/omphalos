@@ -35,12 +35,57 @@ Measured on the RX 9060 XT (details and conditions in `bench/results/`):
 |---|---|
 | decode, speculative greedy (MTP, k = 3) | 19-25 ms/token (40-52 t/s), depending on the text |
 | decode, speculative greedy (DFlash2 + n-gram, #245) | 79-265 t/s on code, quotes and edits, 46 on prose |
-| decode, plain | 45.8 ms/token (21.8 t/s; llama.cpp: 48.5 ms) |
-| prefill | ~860 t/s at 512 tokens, ~875 t/s at 2k, ~745 t/s at 16k (llama.cpp pp512: 622 t/s) |
+| decode, plain, K8/V4 | 40.9-44.4 ms/token (22.5-24.4 t/s at 0-32k; llama.cpp 16.7-20.6 t/s) |
+| prefill, K8/V4 | 961 t/s at 512 tokens, 1031 at 4k, 981 at 16k, 913 at 32k (llama.cpp 634 / 620 / 585 / 544) |
 | VRAM | 12.0 GiB of the 16 in use after load with an 8k context and the MTP head, 11.7 without it; at a 128K context (K4/V4) a 100k-token prompt peaks at 15.0 GiB with DFlash2, 14.4 with MTP, 13.6 plain — it fits (device total, the desktop included). A full 196k-token prompt with K4/V4 + MTP loads at 15.3 GiB, prefills at 511 t/s and decodes at 67 t/s, and a 190k NIAH haystack finds 4/4 needles (#237, [bench/results/max-context-237.txt](bench/results/max-context-237.txt)); 205k and 217k load too, but the decode falls to 37 and 22 t/s as the driver starts evicting the desktop |
 | a long reasoning task (#229: an animated SVG, 15-65k tokens of thinking, 64K context) | speculative 60.7 / 47.0 t/s at temperature 0 / 1 with MTP and 77.5 / 47.3 with DFlash2, vs llama.cpp's MTP 30.1 / 27.4, peak VRAM 13.8 vs 15.5 GB; greedy output byte-identical to plain greedy over 34k tokens ([bench/results/pelican-229](bench/results/pelican-229/README.md)) |
 | model load | <1 s from the `.omph` file (in the page cache): a 3-token run takes 0.89 s |
 | an image (640x488, 300 tokens) | 2.8 s to encode on the CPU, overlapping the prefill of the text before it (first token -22 % to -41 %, #180), then a normal prefill |
+
+## Measured against llama.cpp (K8/V4)
+
+The definitive comparison of 2026-10-14 (engine `main` 9175738, [PR #486](https://github.com/Nihmar/omphalos/pull/486)):
+K Q8 + V Q4 on **every** layer (omphalos `OMPH_KV_K4_LAYERS=none`, llama.cpp
+`-ctk q8_0 -ctv q4_0`), greedy, context 32768, desktop session active. omphalos is the median
+of 5 fresh runs, llama.cpp `llama-bench -r 5` (3 for the two longest prompts); the scenario
+cells are one run each through the two servers. The full tables, the raw JSONLs and the
+conditions are in [bench/results/speeds-k8v4-396.txt](bench/results/speeds-k8v4-396.txt).
+
+llama.cpp is the pin's **RX 9060 XT overlay** (`f19c20f9`, `bench/llama.cpp.pin`): the upstream
+pin build (d8123504) was built without the `q8_0-q4_0` flash-attention kernel, converts K and V
+to f16 instead and loses 15 % of tg at 32k (its cells are in the same result file).
+
+| | omphalos | llama.cpp |
+|---|---:|---:|
+| prefill, fresh prompt, 512 / 4k / 16k / 32k tokens | **961 / 1031 / 981 / 913 t/s** | 634 / 620 / 585 / 544 t/s |
+| prefill, a 512-token chunk at depth 0 / 4k / 16k / 32k | (server appends ~715-770 t/s at 20k, #234) | 634 / 593 / 527 / 461 t/s |
+| decode, tg128, at depth ~0 / 4k / 16k / 32k | **24.4 / 24.0 / 23.4 / 22.5 t/s** | 20.6 / 20.1 / 18.6 / 16.7 t/s |
+
+Speculative decoding on the #262 scenarios (prose / edit-cc / edit-py), n-gram drafts on:
+
+| spec | omphalos | llama.cpp |
+|---|---:|---:|
+| plain | 24.2 / 24.1 / 23.9 t/s | 20.6 / 175.4 / 117.2 t/s |
+| MTP | **43.0 / 266.5 / 229.1 t/s** | 23.3 / 200.0 / 109.4 t/s |
+| DFlash2 | **43.3 / 258.9 / 244.0 t/s** | 20.1 / 205.7 / 160.1 t/s |
+
+Without the n-gram (the drafter alone, prose / edit-cc / edit-py): MTP 43.3 / 78.5 / 75.7
+against 23.2 / 40.2 / 39.0, DFlash2 42.9 / 134.9 / 93.4 against 20.0 / 49.8 / 38.4. llama.cpp's
+DFlash2 is at parity with its own plain decode on prose (20.0 against 20.5 t/s).
+
+### Measured, not adopted
+
+The 2026-10-14 experiments, each closed in its issue with the numbers on disk (PLAN.md §17);
+they are the answers for anyone about to try the same thing.
+
+| idea | verdict | result |
+|---|---|---|
+| verification row budget by context ([#478](https://github.com/Nihmar/omphalos/issues/478)) | the keep EMA already self-calibrates; a 16-row cap pays at 31k and 63k | [verify-row-budget-478.txt](bench/results/verify-row-budget-478.txt) |
+| 16-row verification in one attention call ([#479](https://github.com/Nihmar/omphalos/issues/479)) | 256 VGPRs and 170 spills at NRT=6: 2.3x slower than two 8-row calls; two streams share L2 for <=5 % | [verify-16-attn-479.txt](bench/results/verify-16-attn-479.txt) |
+| fp8 e4m3 prefill GEMM ([#481](https://github.com/Nihmar/omphalos/issues/481)) | KL 0.0147 and top-1 95.70 % at 32k: ~10x the KV budget | [fp8-gate-481.txt](bench/results/fp8-gate-481.txt) |
+| cross-source draft tree ([#482](https://github.com/Nihmar/omphalos/issues/482)) | the n-gram and the drafter disagree on 6.7 % of steps and the n-gram is right 0/12 times | [draft-xcheck-482.txt](bench/results/draft-xcheck-482.txt) |
+| FFN activation sparsity ([#483](https://github.com/Nihmar/omphalos/issues/483)) | no block below 1e-3 (no exact zeros); a 0.25 %-energy skip is ~1.3 % of a step for ~5 % noise | [ffn-sparsity-483.txt](bench/results/ffn-sparsity-483.txt) |
+| decode megakernel ([#484](https://github.com/Nihmar/omphalos/issues/484)) | ~3 ms of device gap per verify step (5.6 %); a graph recovers ~0.3 ms of it | [launch-gap-484.txt](bench/results/launch-gap-484.txt) |
 
 ## Build
 
