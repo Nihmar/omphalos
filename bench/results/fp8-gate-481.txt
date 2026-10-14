@@ -1,0 +1,33 @@
+# The fp8 e4m3 accuracy gate for the prefill GEMM (#481) — measured, not adopted
+
+Engine main 2026-10-14 + the gate below, RX 9060 XT 16 GB. The gate rounds both operands of
+the prefill GEMM to e4m3 and back inside the f16 kernels (dequantized weights in
+gemm_tiles_kernel / gemm_tiles2_kernel / gemm_q_kernel, and the activation tile on its way
+into LDS), with the hardware v_cvt_pk_fp8_f32 / cvt_f32_fp8 (round-to-nearest-even, clamped
+to +-448). No fp8 kernel was written: the accuracy does not depend on the consuming WMMA.
+
+    OMPH_TEST_FP8=1 omph-run <omph> /tmp/tok.txt /tmp/fp8.f32 --logits-tail 512 --tokens 32768
+    omph-run <omph> /tmp/tok.txt /tmp/ref.f32 --logits-tail 512 --tokens 32768
+    uv run python compare_logits.py /tmp/ref.f32 /tmp/fp8.f32
+
+| | KL mean | median | p99 | max | top-1 |
+|---|---:|---:|---:|---:|---:|
+| f16 GEMM (reference) | 0 | 0 | 0 | 0 | 100 % |
+| **e4m3 weights + activations** | **0.0147** | 0.00088 | 0.150 | 0.263 nats | **95.70 %** |
+
+Accepted budgets at 32k for scale: K8/V4 0.00072, mixed K4/K8 0.0014, K4 0.0021, llama.cpp
+q8_0/q4_0 0.00135, the WY prefill form 0.0002-0.0005. The fp8 rounding is ~10x the KV budget
+with top-1 95.7 % against the 98.6 % the KV choices keep; greedy tokens diverge a few hundred
+positions in. The gate cost +20 % of the prefill wall (37.4 -> 44.9 s at 32k) in the f16
+kernel, which an fp8 kernel would not pay.
+
+Why: e4m3 has a 3-bit mantissa, ~3 % relative error per weight on top of the model's own
+~3.5 bpw quantization, and the same on every activation. The IQ sub-block scales fold into fp8
+exactly as into f16, so the int8 path's rescale problem (#213) would not reappear — the
+accuracy is what fails. Rounding only one operand is not expressible on gfx12: the fp8 WMMA
+pairs are fp8_fp8 / fp8_bf8 / bf8_fp8 / bf8_bf8, no f16 x fp8.
+
+Decision: measured, not adopted; the gate patch was reverted (hook points in the issue).
+
+The fp8 question on the attention's Q/K/V/P (#480) is separate: those values are already
+Q8/Q4-quantized, so the added error is small relative to the cache's own.

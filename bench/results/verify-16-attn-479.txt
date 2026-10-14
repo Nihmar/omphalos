@@ -1,0 +1,41 @@
+# 16 verification rows in one decode-attention call (#479) — measured, not adopted
+
+Engine main 2026-10-14 (after #477), RX 9060 XT 16 GB. Two experiments on
+`omph-attn-bench` (512-key chunks, K8/V4, random cache, median of 10 after 3 warm-ups).
+
+## A. One 16-row call: dead on the register file
+
+The tile kernel widened to 16 tokens (`kDcMaxTokens = 16`, `NRT` 4..6 instantiated), the
+bench forcing the decode path past the flash threshold:
+
+| inst. | VGPRs | waves/SIMD | spills | LDS/block | us/layer @32k |
+|---|---:|---:|---:|---:|---:|
+| NRT=3 (today, 8 rows) | 256 | 5 | 3 | 22,976 | 445 (one call) |
+| NRT=4 | 256 | 4 | 44 | 27,904 | — |
+| NRT=5 | 256 | 3 | 101 | 32,832 | — |
+| NRT=6 (16 rows) | 256 | 3 | **170** | — | **2133** |
+
+| seq | 8 rows | 2 x 8 | 16 rows one call | gain |
+|---:|---:|---:|---:|---:|
+| 8192 | 133 | 257 | 717 | 0.36 |
+| 32768 | 445 | 928 | 2134 | 0.43 |
+| 65536 | 840 | 1736 | 4105 | 0.42 |
+
+The O accumulator needs `rows x dims / threads` VGPRs: 96 rows x 256 dims over 128 threads
+is 192 per lane on top of qa (96). The file is 256; the spills cost 2.3x.
+
+## B. The two halves on two streams (K/V shared through L2): <= 5%
+
+| seq | 2 x 8 sequential | concurrent | gain |
+|---:|---:|---:|---:|
+| 8192 | 258 | 271 | 0.95 |
+| 32768 | 858 | 819 | 1.05 |
+| 65536 | 1553 | 1515 | 1.03 |
+
+The decode tiles run at 116-130 GB/s against the 318 ceiling: they are issue/latency-bound,
+not DRAM-bound, so the second read's L2 residency buys almost nothing.
+
+Decision: measured, not adopted. The 8-row grouping stays (16 rows per verification = two
+calls). A future attempt needs a work partition that shares the K/V load *and* fits the
+register file (8 waves x 32 dims with two-level score reduction, or O in LDS) — both cost
+occupancy.
