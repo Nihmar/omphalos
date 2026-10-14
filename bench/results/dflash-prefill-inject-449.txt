@@ -1,0 +1,46 @@
+# #449: the DFlash2 prefill injection only for the rows the ring can hold
+
+Engine main after #446 + this change, RX 9060 XT 16 GB, 2026-10-14.
+
+## What was wasted
+
+`dflash_inject` ran on every prefill chunk: the drafter's `fc` over the target
+features, then the K/V projections of its 5 layers, for every prompt token. The
+drafter's ring holds `dflash.attention.sliding_window` = 2048 rows, so for a
+32,768-token prompt ~30,700 rows of that work were overwritten before the first
+draft ever read them. The MTP block's window (#171) already fills only what it
+keeps; this is the same idea one layer down.
+
+`Runner::dflash_prompt(n)` (called with the prompt's length, next to
+`mtp_prompt`) sets the first row worth projecting, `n - 2048`, and
+`dflash_inject` clips its chunk to `[dflash_prompt, end)`: one branch plus the
+row offsets on the `fc`, the norm and the five K/V blocks. The ring's *slots*
+stay fully covered - 2048 consecutive positions mod 2048 are all of them - so no
+tag is left stale from a skipped row.
+
+## The prize, measured (`omph-run --dflash <drafter> --generate 2`, 5 runs each)
+
+| prompt | full injection (`OMPH_DFLASH_FULL_INJECT=1`, pre-#449) | clipped (default) | change |
+|---:|---:|---:|---:|
+| 4096 | 3978.0 ms | 3954.5 ms | **-23.5 ms (-0.59 %)** |
+| 32768 | 36368.6 ms | 36287.3 ms | **-81.3 ms (-0.22 %)** |
+
+The 4096 cells spread 67 ms (3906-3973 against 3976-3979), so the small-prompt
+gain is at the edge of the noise; the 32768 one is 81 ms against ±20 ms. Both are
+in the 0.5-1 % the issue estimated, and the work removed is real by
+construction.
+
+## The witnesses: the ring at the end of the prompt is the same
+
+- **Greedy tokens identical** with and without the clip, at 4096 and 32768 tokens
+  (`cmp` of the two `--gen-out` files): the drafts the drafter produces after the
+  prompt are unchanged, which is what the ring's content decides.
+- **`check_conversations.py --spec dflash`** (all five cases: the two back-to-back
+  turns, the compaction rewrite, the negative control, thinking off and on) passes
+  with `--text` pointing at a local corpus: the saved conversations carry the
+  drafter's ring and the resume path still answers exactly as the cold prefill,
+  so the clipped chunks interact correctly with the checkpoints and the restored
+  ring.
+
+Adopted: the clip is the default, `OMPH_DFLASH_FULL_INJECT=1` restores the
+pre-#449 behaviour for A/B.

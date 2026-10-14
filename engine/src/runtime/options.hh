@@ -47,6 +47,10 @@ struct EnvOptions {
     // wrong-but-in-bounds offset, read back by the same arithmetic that wrote
     // it -- step 3, where attention reads the store, is the content witness.
     bool kv_stream_check = false;
+    // OMPH_DFLASH_FULL_INJECT=1: the drafter's prefill injection runs over every
+    // prompt row again, as before #449 (the A/B; the default injects only the
+    // rows that can still be in the drafter's ring when the prompt ends).
+    bool dflash_full_inject = false;
     // OMPH_ATTN_SPLIT_GROUPS=N: run the quantized decode / verification
     // attention in N groups of its fixed key splits, each group staged into a
     // buffer of its own (#409 step 2: the shape host streaming needs, with the

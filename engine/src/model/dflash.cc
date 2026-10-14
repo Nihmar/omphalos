@@ -217,23 +217,41 @@ bool Runner::dflash_inject(const int64_t pos0, const int64_t T) {
     }
     const int64_t ne = h_.n_embd;
     const int64_t kv = kKvHeads * kHd;
+    // #449: only the rows that can still be in the ring when the prompt ends are
+    // worth projecting - the drafter reads its last dfl_swa_ rows, everything
+    // older is overwritten before the first draft. A chunk that ends before
+    // dfl_fill_from_ is skipped whole; the ring's slots stay covered because
+    // dfl_swa_ consecutive positions mod dfl_swa_ are all of them, so no tag is
+    // left stale.
+    int64_t row0 = 0;
+    if (!env_.dflash_full_inject && dfl_fill_from_ > pos0) {
+        row0 = std::min<int64_t>(dfl_fill_from_ - pos0, T);
+    }
+    if (row0 >= T) {
+        return true;  // nothing of this chunk outlives the prompt
+    }
+    const int64_t from = pos0 + row0;
+    const int64_t n = T - row0;
     // g = enc_norm(fc(features)) as f16 into h16_
-    if (!matmul(dfl_fc_, dfl_feat_, static_cast<float *>(cur_), dfl_ne_, dfl_fc_.gemv->k, T) ||
-        !omph::kernels::add_rms_norm_f16(static_cast<const float *>(cur_), nullptr, nullptr, dfl_enc_norm_, h16_, T,
-                                         dfl_ne_, dfl_eps_, nullptr)) {
+    const auto * feat = static_cast<const __half *>(dfl_feat_) + row0 * dfl_fc_.gemv->k;  // f16 rows
+    if (!matmul(dfl_fc_, feat, static_cast<float *>(cur_) + row0 * dfl_ne_,
+                dfl_ne_, dfl_fc_.gemv->k, n) ||
+        !omph::kernels::add_rms_norm_f16(static_cast<const float *>(cur_) + row0 * dfl_ne_, nullptr, nullptr,
+                                         dfl_enc_norm_, h16_ + row0 * dfl_ne_, n, dfl_ne_, dfl_eps_, nullptr)) {
         return fail("drafter: fc failed");
     }
     (void) ne;
-    auto * k32 = static_cast<float *>(q_);
-    auto * v32 = static_cast<float *>(gate_);
+    auto * k32 = static_cast<float *>(q_) + row0 * kv;
+    auto * v32 = static_cast<float *>(gate_) + row0 * kv;
+    auto * hs = static_cast<const __half *>(h16_) + row0 * dfl_ne_;
     for (size_t l = 0; l < dfl_.size(); ++l) {
         const DflashLayer & L = dfl_[l];
         auto * rk = static_cast<__half *>(dfl_ring_k_) + l * dfl_swa_ * kv;
         auto * rv = static_cast<__half *>(dfl_ring_v_) + l * dfl_swa_ * kv;
-        if (!matmul(L.k, h16_, k32, kv, dfl_ne_, T) || !matmul(L.v, h16_, v32, kv, dfl_ne_, T) ||
-            !omph::kernels::dflash_norm_rope(k32, T, kKvHeads, L.k_norm, dfl_eps_, pos0, dfl_theta_, nullptr) ||
-            !omph::kernels::dflash_ring_put(k32, T, kv, pos0, rk, nullptr, dfl_swa_, nullptr) ||
-            !omph::kernels::dflash_ring_put(v32, T, kv, pos0, rv, l + 1 == dfl_.size() ? dfl_tags_ : nullptr,
+        if (!matmul(L.k, hs, k32, kv, dfl_ne_, n) || !matmul(L.v, hs, v32, kv, dfl_ne_, n) ||
+            !omph::kernels::dflash_norm_rope(k32, n, kKvHeads, L.k_norm, dfl_eps_, from, dfl_theta_, nullptr) ||
+            !omph::kernels::dflash_ring_put(k32, n, kv, from, rk, nullptr, dfl_swa_, nullptr) ||
+            !omph::kernels::dflash_ring_put(v32, n, kv, from, rv, l + 1 == dfl_.size() ? dfl_tags_ : nullptr,
                                             dfl_swa_, nullptr)) {
             return fail("drafter: KV injection failed");
         }
