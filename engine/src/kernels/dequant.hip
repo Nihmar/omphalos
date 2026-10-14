@@ -139,6 +139,40 @@ __global__ void dequant_q4_k_kernel(const uint8_t * __restrict__ src, T * __rest
     dst[e] = to_out<T>(dl * (float) (high ? (q >> 4) : (q & 15)) - ml);
 }
 
+// ---------------------------------------------------------------- Q4_0 / Q8_0
+//
+// The legacy 32-wide blocks (#492): Q4_0 is 18 bytes (d f16, then 16 bytes of
+// nibbles: the low ones are the first 16 weights, as in the reference), Q8_0 is
+// 34 (d f16, then 32 int8).
+
+template <typename T>
+__global__ void dequant_q4_0_kernel(const uint8_t * __restrict__ src, T * __restrict__ dst,
+                                    const long long n) {
+    const long long e = thread_index();
+    if (e >= n) {
+        return;
+    }
+    const uint8_t * blk = src + (e >> 5) * 18;
+    const int r = (int) (e & 31);
+    const float d = f16_at(blk);
+    const uint8_t q = blk[2 + (r & 15)];
+    const int v = (r < 16) ? (q & 15) : (q >> 4);
+    dst[e] = to_out<T>(d * (float) (v - 8));
+}
+
+template <typename T>
+__global__ void dequant_q8_0_kernel(const uint8_t * __restrict__ src, T * __restrict__ dst,
+                                    const long long n) {
+    const long long e = thread_index();
+    if (e >= n) {
+        return;
+    }
+    const uint8_t * blk = src + (e >> 5) * 34;
+    const int r = (int) (e & 31);
+    const float d = f16_at(blk);
+    dst[e] = to_out<T>(d * (float) (int8_t) blk[2 + r]);
+}
+
 // -------------------------------------------------------------------- Q6_K
 
 template <typename T>
@@ -199,6 +233,86 @@ __global__ void dequant_iq4_xs_kernel(const uint8_t * __restrict__ src, T * __re
     const uint8_t q = blk[8 + ib * 16 + (j & 15)];
     const int idx = (j < 16) ? (q & 15) : (q >> 4);
     dst[e] = to_out<T>(dl * (float) kKvaluesIq4nl[idx]);
+}
+
+// -------------------------------------------------------------------- Q5_K
+
+template <typename T>
+__global__ void dequant_q5_k_kernel(const uint8_t * __restrict__ src, T * __restrict__ dst,
+                                    const long long n) {
+    const long long e = thread_index();
+    if (e >= n) {
+        return;
+    }
+    // d(2) dmin(2) scales(12) qh(32) qs(128)
+    const uint8_t * blk = src + (e >> 8) * 176;
+    const int r = (int) (e & 255);
+    const int j = r >> 6;          // the 64-wide group
+    const int within = r & 63;
+    const int high = within >> 5;  // the group's second 32 weights: the high nibbles
+    const int l = within & 31;
+
+    const float d = f16_at(blk);
+    const float dmin = f16_at(blk + 2);
+    uint8_t s = 0;
+    uint8_t m = 0;
+    scale_min_k4(2 * j + high, blk + 4, s, m);
+    const uint8_t q = blk[48 + j * 32 + l];
+    const bool up = (blk[16 + l] & (uint8_t) (1u << (2 * j + high))) != 0;
+
+    const float dl = d * (float) s;
+    const float ml = dmin * (float) m;
+    const int v = (high ? (q >> 4) : (q & 15)) + (up ? 16 : 0);
+    dst[e] = to_out<T>(dl * (float) v - ml);
+}
+
+// -------------------------------------------------------------------- Q3_K
+
+// The 16 6-bit scales of a Q3_K block, unpacked from the 12 bytes at `p` the
+// way the reference's aux[] shuffle does: byte `s` is in 0..63, the reference
+// subtracts 32 (a scale in -32..31).
+__device__ __forceinline__ uint8_t q3k_scale(const uint8_t * p, const int s) {
+    constexpr uint32_t kmask1 = 0x03030303u;
+    constexpr uint32_t kmask2 = 0x0f0f0f0fu;
+    const uint32_t a0 = u32_at(p);
+    const uint32_t a1 = u32_at(p + 4);
+    const uint32_t a2 = u32_at(p + 8);
+    uint32_t w;
+    switch (s >> 2) {
+        case 0: w = (a0 & kmask2) | (((a2 >> 0) & kmask1) << 4); break;
+        case 1: w = (a1 & kmask2) | (((a2 >> 2) & kmask1) << 4); break;
+        case 2: w = ((a0 >> 4) & kmask2) | (((a2 >> 4) & kmask1) << 4); break;
+        default: w = ((a1 >> 4) & kmask2) | (((a2 >> 6) & kmask1) << 4); break;
+    }
+    return (uint8_t) (w >> (8 * (s & 3)));
+}
+
+template <typename T>
+__global__ void dequant_q3_k_kernel(const uint8_t * __restrict__ src, T * __restrict__ dst,
+                                    const long long n) {
+    const long long e = thread_index();
+    if (e >= n) {
+        return;
+    }
+    // hmask(32) qs(64) scales(12) d(2)
+    const uint8_t * blk = src + (e >> 8) * 110;
+    const int r = (int) (e & 255);
+    const int half_block = r >> 7;  // the block's two 128-weight halves
+    const int rr = r & 127;
+    const int j = rr >> 5;  // the 16-wide group: bits j*2 of qs, hmask bit j
+    const int within = rr & 31;
+    const int l = within & 15;
+    const int half = within >> 4;  // qs[l] then qs[l + 16], hmask as well
+
+    const float d_all = f16_at(blk + 108);
+    const int sc = (int) q3k_scale(blk + 96, half_block * 8 + 2 * j + half) - 32;
+    const uint8_t q = blk[32 + half_block * 32 + (half ? 16 : 0) + l];
+    const uint8_t hm = blk[(half ? 16 : 0) + l];
+    // the hmask bit: `m` in the reference walks 1..128 across both 128-weight
+    // halves without resetting, so it is 1 << (half_block * 4 + j)
+    const int bit = half_block * 4 + j;
+    const int v = (int) ((q >> (2 * j)) & 3) - ((hm & (uint8_t) (1u << bit)) ? 0 : 4);
+    dst[e] = to_out<T>(d_all * (float) sc * (float) v);
 }
 
 // ---------------------------------------------------------------- IQ2_XXS
@@ -416,12 +530,25 @@ bool launch(const uint32_t type, const void * src, void * dst, const int64_t n,
         dequant_bf16_kernel<T><<<grid, kDequantBlock, 0, stream>>>(reinterpret_cast<const uint16_t *>(s), d, ll);
         return true;
     }
+    if (type == 2 || type == 8) {  // the legacy 32-wide blocks (#492)
+        if (n % 32 != 0) {
+            return false;
+        }
+        if (type == 2) {
+            dequant_q4_0_kernel<T><<<grid, kDequantBlock, 0, stream>>>(s, d, ll);
+        } else {
+            dequant_q8_0_kernel<T><<<grid, kDequantBlock, 0, stream>>>(s, d, ll);
+        }
+        return true;
+    }
     if (n % 256 != 0) {
         return false;
     }
     switch (type) {
         case 10: dequant_q2_k_kernel<T><<<grid, kDequantBlock, 0, stream>>>(s, d, ll); return true;
+        case 11: dequant_q3_k_kernel<T><<<grid, kDequantBlock, 0, stream>>>(s, d, ll); return true;
         case 12: dequant_q4_k_kernel<T><<<grid, kDequantBlock, 0, stream>>>(s, d, ll); return true;
+        case 13: dequant_q5_k_kernel<T><<<grid, kDequantBlock, 0, stream>>>(s, d, ll); return true;
         case 14: dequant_q6_k_kernel<T><<<grid, kDequantBlock, 0, stream>>>(s, d, ll); return true;
         case 16: dequant_iq2_xxs_kernel<T><<<grid, kDequantBlock, 0, stream>>>(s, d, ll); return true;
         case 17: dequant_iq2_xs_kernel<T><<<grid, kDequantBlock, 0, stream>>>(s, d, ll); return true;
