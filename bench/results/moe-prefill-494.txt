@@ -1,0 +1,38 @@
+# The MoE prefill of the second model: the batched path (#494)
+
+Model: Ornith-1.5-35B-A3B-Q2_K_L.omph (12.65 GiB, VRAM-resident). Prompt: a
+repeated sentence (2001 tokens), one to four 512-token chunks. Same machine,
+desktop active, one run per point (the prefill is per-chunk deterministic and
+the numbers vary by <1 % across runs).
+
+The v1 (per-token loop, #493) is ~77 ms per token = ~13 t/s of prefill; the
+batched path is what this measures.
+
+| tokens | chunks | prefill wall | t/s |
+|---:|---:|---:|---:|
+| 512 | 1 | 1332.4 ms | 384 |
+| 1024 | 2 | 2522.9 ms | 406 |
+| 2000 | 4 | 4630.3 ms | 432 |
+
+`OMPH_PHASES=1` for one 512-token chunk:
+
+```
+phases: stage_w 74.9 ms  gemm(f16) 608.8 ms  gemv 0.0 ms  blocks 123.8 ms
+        | calls 2490/15435/0/40
+prefill wall 1335.9 ms (512 tokens)
+```
+
+The f16 GEMMs are 46 % of the chunk: the 256 experts of every layer are 256
+small GEMMs (M=512 / 2048, N~16, K=2048 / 512) with a launch each - ~30k
+launches per chunk. The grouped expert GEMM (one grid over expert x tile) is
+the next step; the achieved weight bandwidth is ~14 GB/s against the ~400 GB/s
+the card has, so this is grid/launch bound, not bandwidth bound.
+
+## Correctness
+
+- the batched path gives the same logits as the per-token one: KL 0.004501
+  nats vs llama.cpp's CPU dump, top-1 100 % (the same as `qwen35moe-493.txt`)
+- **chunk-invariant**: a 512-token prompt with `--chunk 512` and with
+  `--chunk 128` is bit-identical (KL 0.000000 nats, top-1 100 %): the per-slot
+  store plus the slot-ordered combine make the expert sums independent of the
+  chunking (no atomics)

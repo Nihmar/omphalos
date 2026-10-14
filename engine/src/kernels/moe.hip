@@ -119,6 +119,48 @@ __global__ void moe_shexp_gate_kernel(const float * __restrict__ w, const __half
     out[t] = 1.0f / (1.0f + expf(-acc));
 }
 
+// one block per row: copy k f16 values
+__global__ void moe_gather_kernel(const __half * __restrict__ x, const long long k,
+                                  const int * __restrict__ ids, __half * __restrict__ dst) {
+    const long long i = blockIdx.x;
+    const __half * s = x + (size_t) ids[i] * (size_t) k;
+    __half * d = dst + (size_t) i * (size_t) k;
+    for (long long j = threadIdx.x; j < k; j += blockDim.x) {
+        d[j] = s[j];
+    }
+}
+
+// one block per gathered row: store it at its (token, slot) in the per-slot
+// buffer (a plain store: every (token, slot) pair appears once)
+__global__ void moe_scatter_store_kernel(float * __restrict__ xo, const float * __restrict__ y,
+                                         const int * __restrict__ slot, const int * __restrict__ dst,
+                                         const long long ne, const int topk) {
+    const long long i = blockIdx.x;
+    const long long at = ((size_t) dst[i] * (size_t) topk + (size_t) slot[i]) * (size_t) ne;
+    const float * yrow = y + (size_t) i * (size_t) ne;
+    float * orow = xo + at;
+    for (long long j = threadIdx.x; j < ne; j += blockDim.x) {
+        orow[j] = yrow[j];
+    }
+}
+
+// one block per token: the slot-ordered weighted sum
+__global__ void moe_combine_kernel(float * __restrict__ out, const float * __restrict__ xo,
+                                   const float * __restrict__ weights, const long long ne,
+                                   const int topk) {
+    const long long t = blockIdx.x;
+    const float * wrow = weights + (size_t) t * (size_t) topk;
+    const float * xrow = xo + (size_t) t * (size_t) topk * (size_t) ne;
+    float * orow = out + (size_t) t * (size_t) ne;
+    for (long long j = threadIdx.x; j < ne; j += blockDim.x) {
+        float acc = 0.0f;
+        for (int e = 0; e < topk; ++e) {
+            acc += wrow[e] * xrow[(size_t) e * (size_t) ne + j];
+        }
+        orow[j] = acc;
+    }
+}
+
 } // namespace
 
 bool moe_route(const void * router, const void * x_f16, int * ids, float * weights, const int64_t tokens,
@@ -144,6 +186,40 @@ bool moe_acc(float * out, const float * y, const float * weights, const int64_t 
     moe_acc_kernel<<<(unsigned) tokens, threads, 0, stream>>>(out, y, weights, (long long) n, (int) stride,
                                                               slot);
     return true;
+}
+
+bool moe_gather(const void * x_f16, const int64_t k, const int * ids, const int64_t n, void * dst,
+                hipStream_t stream) {
+    if (x_f16 == nullptr || ids == nullptr || dst == nullptr || k <= 0 || n <= 0) {
+        return false;
+    }
+    moe_gather_kernel<<<(unsigned) n, 256, 0, stream>>>(static_cast<const __half *>(x_f16),
+                                                        (long long) k, ids,
+                                                        static_cast<__half *>(dst));
+    return hipGetLastError() == hipSuccess;
+}
+
+bool moe_scatter_store(float * xo, const float * y, const int * slot, const int * dst, const int64_t n,
+                       const int64_t ne, const int topk, hipStream_t stream) {
+    if (xo == nullptr || y == nullptr || slot == nullptr || dst == nullptr || n <= 0 || ne <= 0 ||
+        topk <= 0) {
+        return false;
+    }
+    const unsigned threads = ne < 256 ? (unsigned) ne : 256;
+    moe_scatter_store_kernel<<<(unsigned) n, threads, 0, stream>>>(xo, y, slot, dst, (long long) ne,
+                                                                   topk);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool moe_combine(float * out, const float * xo, const float * weights, const int64_t tokens,
+                 const int topk, const int64_t ne, hipStream_t stream) {
+    if (out == nullptr || xo == nullptr || weights == nullptr || tokens <= 0 || ne <= 0 || topk <= 0) {
+        return false;
+    }
+    const unsigned threads = ne < 256 ? (unsigned) ne : 256;
+    moe_combine_kernel<<<(unsigned) tokens, threads, 0, stream>>>(out, xo, weights, (long long) ne,
+                                                                  topk);
+    return hipGetLastError() == hipSuccess;
 }
 
 bool moe_shexp_gate(const void * w, const void * x_f16, float * out, const int64_t tokens, const int64_t k,

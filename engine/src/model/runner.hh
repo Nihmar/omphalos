@@ -288,6 +288,10 @@ private:
     // the 3-D tensor, so the existing GEMV / GEMM entry points take them by
     // pointer).
     bool moe_ffn(const LayerWeights & L, const int64_t T);
+    // The prefill shape of the same (#494): one router pass for the chunk, the
+    // rows gathered per expert, one expert's tokens per GEMM, then the
+    // slot-ordered weighted sum.
+    bool moe_ffn_batched(const LayerWeights & L, const int64_t T);
 
     // One attention layer's slice of the quantized cache (indexed by attention
     // layer, kv_index_, not by model layer: 16 of the 64 layers have one).
@@ -717,7 +721,12 @@ private:
     void * moe_w_ = nullptr;     // tokens x topk float: its renormalized weights
     void * moe_down_ = nullptr;  // tokens x n_embd float: one expert's down output
     void * moe_gate_ = nullptr;  // tokens float: the shared expert's sigmoid gate
+    void * moe_xg_ = nullptr;    // tokens x n_embd f16: the gathered rows of one expert
+    void * moe_xo_ = nullptr;    // tokens x topk x n_embd f32: the experts' down outputs
+    void * moe_xgi_ = nullptr;   // tokens x topk int: the gather / store row indices
+    void * moe_slot_ = nullptr;  // tokens x topk int: the slot of each gathered row
     std::vector<int> moe_host_ids_;  // the selection, read back for the expert slices
+    std::vector<int> moe_counts_;    // per-expert rows in the batched path
     void * logits_ = nullptr;
     void * argmax_key_ = nullptr;  // 8 bytes: the greedy decode's packed argmax (#102)
     void * tmp_logits_ = nullptr;
