@@ -1,0 +1,56 @@
+# #457: the prefill GEMM's B operand split between LDS and the vector path — measured, not adopted
+
+Engine main after #456 + the variant in `bench/gemm/tile2.hip`, RX 9060 XT 16 GB,
+2026-10-14. The 2x8 tile kernel with `GB` of its 8 token tiles' B fragments read
+from the global `x` buffer (`global_load_b128`, L2-resident) instead of LDS:
+0 (the current kernel), 2 and 4. Same operands, same WMMA order - every output is
+**bit-identical** (`2x8B bit-identical` in every row below), so this is a delivery
+change only.
+
+    hipcc -O3 --offload-arch=gfx1200 -std=c++20 -I engine/src -o /tmp/tile2 bench/gemm/tile2.hip
+    /tmp/tile2 512 17408 5120   # ffn_up;  /tmp/tile2 512 5120 17408  # ffn_down
+
+## TFLOPS, 512 tokens (the 2x8 variant against the 128x256 one; B2/B4 are the splits)
+
+| type | shape | 128x256 | 2x8 (GB=0) | 2x8 B2 | 2x8 B4 |
+|---|---|---:|---:|---:|---:|
+| iq3s | up | 56.1 | **58.9** | 51.8 | 55.5 |
+| iq3s | down | 54.6 | **57.3** | 49.1 | 54.3 |
+| iq3xxs | up | 57.0 | **60.2** | 55.3 | 53.7 |
+| iq3xxs | down | 55.1 | **58.6** | 53.5 | 52.2 |
+| iq4xs | up | 60.0 | **62.6** | 61.5 | 58.5 |
+| iq4xs | down | 57.5 | **61.5** | 60.5 | 57.2 |
+| q4k | up | **59.0** | 53.6 | 53.5 | 51.8 |
+| q4k | down | **57.1** | 52.2 | 51.9 | 50.3 |
+| iq2s | up | 56.2 | **57.2** | 56.2 | 55.5 |
+| iq2s | down | 55.0 | **56.4** | 55.3 | 54.5 |
+| q2k | up | 58.3 | **62.8** | 61.1 | 56.8 |
+| q2k | down | 56.7 | **61.7** | 60.1 | 56.1 |
+| iq2xs | up | 54.4 | **60.4** | 57.3 | 57.9 |
+| iq2xs | down | 53.2 | **59.7** | 56.4 | 56.7 |
+| iq2xxs | up | 55.5 | 54.4 | **57.0** | 49.2 |
+| iq2xxs | down | 53.5 | 53.5 | **55.6** | 47.7 |
+| iq1m | up | 55.3 | **58.4** | 55.1 | 54.3 |
+| iq1m | down | 54.7 | **58.0** | 54.5 | 53.9 |
+
+(GB=4 loses in *every* cell; GB=2 wins in 2 of 18 - both on `iq2xxs`, the type the
+2x8 is weakest on - and loses in the rest, e.g. iq3s down 57.3 -> 49.1.)
+
+## Why it does not add up (the issue's own risk, confirmed)
+
+- The resource report: `gemm_t2` at **236 VGPRs** for GB=0, **249** for GB=2 (238
+  for GB=4), no spills. The kernel runs two workgroups per WGP at 236 and 249 is
+  at the limit: the extra in-flight loads buy registers, not bandwidth, and the
+  occupancy that hides the loads' latency is what pays.
+- The vector-memory path is the *same* LSU/L1 that already delivers the weight
+  bytes to every wave: the A operands are global loads by construction. Splitting
+  B onto it does not add a second path's bandwidth, it shares the one that is
+  already the kernel's bottleneck on the types the 2x8 wins (that is exactly why
+  GB=4 - half the B traffic - is uniformly worse).
+
+## Decision
+
+**Not adopted.** The delivery change is bit-identical (recorded above) and the
+bench says it loses: no engine-side switch, and #421's tile shapes remain the
+explored axis. Record: this file; the bench now carries the variant for a future
+re-look (e.g. on a GPU whose L1 is not the GEMM's bottleneck).

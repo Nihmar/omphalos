@@ -114,7 +114,10 @@ __global__ __launch_bounds__(256) void gemm_t1(const uint8_t * __restrict__ wt,
 
 // #326: 8 waves x 32 rows (256 rows) x 128 tokens, two row tiles and eight token
 // tiles per wave, so each B operand from LDS feeds two WMMAs.
-template <class TD>
+// #457: GB of the 8 token tiles' B operands come from the global x buffer (L2 /
+// L1 hits) instead of LDS, so the LDS issue path and the vector-memory path add
+// up. Same operands, same WMMA order: bit-identical.
+template <class TD, int GB = 0>
 __global__ __launch_bounds__(256) void gemm_t2(const uint8_t * __restrict__ wt,
                                               const _Float16 * __restrict__ x, float * __restrict__ y,
                                               const long long blocks, const int tokens, const long long ldy) {
@@ -168,12 +171,19 @@ __global__ __launch_bounds__(256) void gemm_t2(const uint8_t * __restrict__ wt,
                         stage(s + 1, xs[buf ^ 1]);
                     }
                 }
+                const long long s = b * 8 + sb;
                 const _Float16 * cur = xs[buf];
                 half8 bv[8];
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    bv[j] = *reinterpret_cast<const half8 *>(
-                        cur + (j * 16 + (lane & 15)) * kXLd + h * 16 + gl * 8);
+                    if (j < GB) {
+                        const long long tok = n0 + j * 16 + (lane & 15);
+                        bv[j] = *reinterpret_cast<const half8 *>(
+                            x + (tok < tokens ? tok : 0) * k + s * 32 + h * 16 + gl * 8);
+                    } else {
+                        bv[j] = *reinterpret_cast<const half8 *>(
+                            cur + (j * 16 + (lane & 15)) * kXLd + h * 16 + gl * 8);
+                    }
                 }
 #pragma unroll
                 for (int i = 0; i < 2; ++i) {
@@ -308,20 +318,28 @@ __global__ __launch_bounds__(256) void gemm_t4(const uint8_t * __restrict__ wt,
         const dim3 g4((unsigned) ((tokens + 63) / 64), (unsigned) (rows / 512));                         \
         const auto run1 = [&] { gemm_t1<TD><<<g1, 256>>>(w, x, y1, blocks, tokens, rows); };           \
         const auto run2 = [&] { gemm_t2<TD><<<g2, 256>>>(w, x, y2, blocks, tokens, rows); };           \
+        const auto run2g2 = [&] { gemm_t2<TD, 2><<<g2, 256>>>(w, x, y2g, blocks, tokens, rows); };     \
+        const auto run2g4 = [&] { gemm_t2<TD, 4><<<g2, 256>>>(w, x, y2g, blocks, tokens, rows); };     \
         const auto run4 = [&] { gemm_t4<TD><<<g4, 256>>>(w, x, y3, blocks, tokens, rows); };           \
         run1();                                                                                         \
         run2();                                                                                         \
+        run2g2();                                                                                       \
+        run2g4();                                                                                       \
         run4();                                                                                         \
         check(hipDeviceSynchronize(), #NAME);                                                           \
         std::vector<float> a1((size_t) tokens * rows), a2(a1.size()), a4(a1.size());                    \
         check(hipMemcpy(a1.data(), y1, a1.size() * 4, hipMemcpyDeviceToHost), "copy");                   \
         check(hipMemcpy(a2.data(), y2, a2.size() * 4, hipMemcpyDeviceToHost), "copy");                   \
         check(hipMemcpy(a4.data(), y3, a4.size() * 4, hipMemcpyDeviceToHost), "copy");                   \
+        std::vector<float> a2g(a1.size());                                                              \
+        check(hipMemcpy(a2g.data(), y2g, a2g.size() * 4, hipMemcpyDeviceToHost), "copy");                 \
         size_t differ = 0;                                                                              \
         size_t differ4 = 0;                                                                             \
+        size_t differg = 0;                                                                             \
         for (size_t i = 0; i < a1.size(); ++i) {                                                        \
             differ += std::memcmp(&a1[i], &a2[i], 4) != 0;                                               \
             differ4 += std::memcmp(&a1[i], &a4[i], 4) != 0;                                              \
+            differg += std::memcmp(&a1[i], &a2g[i], 4) != 0;                                             \
         }                                                                                               \
         const auto timeit = [&](const auto & fn) {                                                       \
             std::vector<float> v;                                                                        \
@@ -343,17 +361,25 @@ __global__ __launch_bounds__(256) void gemm_t4(const uint8_t * __restrict__ wt,
         for (int i = 0; i < 150; ++i) {  /* ~1 s: the clocks ramp first */                               \
             run1();                                                                                     \
             run2();                                                                                     \
+            run2g2();                                                                                   \
+            run2g4();                                                                                   \
             run4();                                                                                     \
         }                                                                                               \
         check(hipDeviceSynchronize(), "warm-up");                                                       \
         const double flops = 2.0 * rows * (double) (blocks * 256) * tokens;                             \
         const float ms1 = timeit(run1);                                                                 \
         const float ms2 = timeit(run2);                                                                 \
+        const float msg2 = timeit(run2g2);                                                              \
+        const float msg4 = timeit(run2g4);                                                              \
         const float ms4 = timeit(run4);                                                                 \
-        std::printf("%-7s  128x256 %6.1f   2x8 %6.1f (%+5.1f%%)   4x4 %6.1f (%+5.1f%%)  %s %s\n", #NAME, \
+        std::printf("%-7s  128x256 %6.1f   2x8 %6.1f (%+5.1f%%)   2x8B2 %6.1f (%+5.1f%%)   "              \
+                    "2x8B4 %6.1f (%+5.1f%%)   4x4 %6.1f (%+5.1f%%)  %s %s %s\n", #NAME,                  \
                     flops / ms1 / 1e9, flops / ms2 / 1e9, (ms1 / ms2 - 1) * 100,                      \
+                    flops / msg2 / 1e9, (ms1 / msg2 - 1) * 100,                                       \
+                    flops / msg4 / 1e9, (ms1 / msg4 - 1) * 100,                                       \
                     flops / ms4 / 1e9, (ms1 / ms4 - 1) * 100,                                        \
                     differ == 0 ? "bit-identical" : "2x8 DIFFERS",                                  \
+                    differg == 0 ? "2x8B bit-identical" : "2x8B DIFFERS",                            \
                     differ4 == 0 ? "bit-identical" : "4x4 DIFFERS");                                \
         break;                                                                                          \
     }
@@ -382,12 +408,14 @@ int main(int argc, char ** argv) {
         _Float16 * x;
         float * y1;
         float * y2;
+        float * y2g;  // #457: the global-B variant's output (the 2x8 and the 4-tile share y2/y3)
         float * y3;
         check(hipMalloc(&w, wh.size()), "malloc");
         check(hipMalloc(&x, xhv.size() * 2), "malloc");
         check(hipMalloc(&y1, (size_t) tokens * rows * 4), "malloc");
         check(hipMalloc(&y2, (size_t) tokens * rows * 4), "malloc");
         check(hipMalloc(&y3, (size_t) tokens * rows * 4), "malloc");
+        check(hipMalloc(&y2g, (size_t) tokens * rows * 4), "malloc");
         check(hipMemcpy(w, wh.data(), wh.size(), hipMemcpyHostToDevice), "copy");
         check(hipMemcpy(x, xhv.data(), xhv.size() * 2, hipMemcpyHostToDevice), "copy");
         switch (t.type) {
@@ -408,6 +436,7 @@ int main(int argc, char ** argv) {
         (void) hipFree(y1);
         (void) hipFree(y2);
         (void) hipFree(y3);
+        (void) hipFree(y2g);
     }
     return 0;
 }
