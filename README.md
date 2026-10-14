@@ -58,7 +58,7 @@ to f16 instead and loses 15 % of tg at 32k (its cells are in the same result fil
 | | omphalos | llama.cpp |
 |---|---:|---:|
 | prefill, fresh prompt, 512 / 4k / 16k / 32k tokens | **961 / 1031 / 981 / 913 t/s** | 634 / 620 / 585 / 544 t/s |
-| prefill, a 512-token chunk at depth 0 / 4k / 16k / 32k | (server appends ~715-770 t/s at 20k, #234) | 634 / 593 / 527 / 461 t/s |
+| prefill, a 512-token chunk at depth 0 / 4k / 16k / 32k | **1051 / 1013 / 905 / 793 t/s** | 634 / 593 / 527 / 461 t/s |
 | decode, tg128, at depth ~0 / 4k / 16k / 32k | **24.4 / 24.0 / 23.4 / 22.5 t/s** | 20.6 / 20.1 / 18.6 / 16.7 t/s |
 
 Speculative decoding on the #262 scenarios (prose / edit-cc / edit-py), n-gram drafts on:
