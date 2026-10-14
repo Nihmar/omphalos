@@ -1,0 +1,65 @@
+# #375: the host spin restoring ~100k-token conversations — reproduced, root-caused, fixed
+
+Engine main `fef1b2c` (after #262), RX 9060 XT 16 GB, CachyOS, desktop session
+active, 2026-10-14. The report: engine a010be4 (binary built 2026-10-06 00:05),
+`omph-server --ctx 131072` with the default `--cache-ram 2048 --kv-ram 8192`,
+driven by `loop_rate.py --pi-session <2026-10-04 pi session> --cuts ...`; request
+A (88,760 prompt tokens) answered with "142 tokens, stop: end of generation",
+request B (100,396) answered nothing for 35+ minutes (host spin ~177 %, 3 threads,
+GPU 2 %, TCP queues empty), and the run was killed.
+
+## 1. The hang, caught live
+
+`tools/check_long_restore.py --rounds 5 --kv-ram 2048` (the shape below) hung on
+the third conversation's prefill. What `/proc` showed while it was stuck:
+
+```
+tid 512124 (omph-server) state=R  stime 29263 -> 29872 in 6 s   syscall=(none) wchan=0
+tid 512125 (omph-server) state=R  stime  4002 ->  4100 in 6 s   syscall=(none) wchan=0
+tid 512126 (omph-server) state=S  (HIP's event thread, wchan=kfd_wait_on_events)
+ps: 181 % CPU, R;  GPU use 43 % -> 100 % (a stuck command);  the log frozen at
+    "prefill 32256 / 50166 tokens, 905.9 t/s"
+```
+
+The main thread burns a core **in kernel time, with no syscall and no engine code
+running** - it is spinning inside the amdgpu/KFD driver, which is why the process
+looks busy while the log says nothing. That is the report's signature exactly
+(177 % CPU, GPU idle, nothing answered).
+
+## 2. The trigger: pinned-memory churn per conversation switch
+
+The run that hangs cycles distinct conversations through the `--kv-ram` store:
+each save calls `hipHostMalloc(bytes)` for a multi-GB pinned buffer and each
+eviction/merge calls `hipHostFree` on one, and with a budget that binds (2048 MiB
+here, 8192 in the report) that alloc/free pair repeats every switch. The earlier
+replay of the report's *exact* two requests (below) never hung: it saves once and
+evicts nothing. The rounds case hung on the first switch that had to evict.
+
+## 3. The fix: reuse the pinned buffers
+
+`Generator` keeps one spare pinned buffer and hands it back out instead of
+freeing and re-allocating (`snap_host` / `snap_release`, `generator.cc/hh`): the
+peak does not grow - a save already needed that buffer transiently - and the
+eviction accounting ignores the spare (it holds no conversation). After the fix,
+the same command that hung:
+
+```
+run 1 10:19:35   reference 50166 prompt tokens; tested 50166 in 62 s, continuation 64499 (14333 new) in 23 s
+run 2 10:26:30   (same shape, second pass)
+ok: answers identical to a cold server, saved=True, restored=True
+```
+
+## 4. The report's exact pair, for the record
+
+    A 2026-10-04T11:59:19Z  87417 prompt tokens -> 142 tokens, stop, 123 s
+    B 2026-10-04T12:01:00Z  99053 prompt tokens -> 96 tokens, 25 s (14333 prefilled, rest restored)
+
+Both answered even *before* the fix (one save, no eviction), and A's behaviour is
+the report's line for line. The committed test (`tools/check_long_restore.py`) is
+the smaller version of the shape: one ~50k-token conversation, a continuation
+appending ~14k, and a cold server as the reference; `--rounds N` adds the
+evictions, and `--watchdog` fails the check instead of hanging the run.
+
+What would still settle a future recurrence: `eu-stack -p <pid>` from the shell
+that started the server (ptrace_scope is 1 here, so only an ancestor can attach),
+or `OMPH_TIMING=1` to see whether the spin is before or after the store's traffic.
