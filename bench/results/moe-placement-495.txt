@@ -75,3 +75,17 @@ KL against llama.cpp's dump: 0.004011 (the batched path was 0.004053), top-1
   MTP block and the verification add their own (small, numerous) kernels. The
   dense first model is bandwidth bound and keeps its 1.8-2.4x. For this model
   the decode's win is fewer, fatter kernels, not speculation.
+
+## Validation after all of the above
+
+Both files, against llama.cpp's CPU dump for the same 5-token prompt:
+
+| file | KL (nats) | top-1 |
+|---|---:|---:|
+| Q4_K_M | 0.004053 | 100 % |
+| Q2_K_L | 0.004377 | 100 % |
+
+The Q2_K_L exercises the per-expert fallback (its down projections are Q3_K,
+which has no tile kernel); the Q4_K_M groups all three matrices. Both give the
+greedy token the dump does, and the full-prompt greedy of each file is unchanged
+from before this round.
