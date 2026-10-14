@@ -70,7 +70,11 @@ cmake --build engine/build -j
 uv run python tools/llama_pin.py --check <llama.cpp>/build-hip/bin
 
 # build with the web UI (#378): llama.cpp's UI assets embedded at build time, so
-# omph-server serves the same page llama-server does at /
+# omph-server serves the same page llama-server does at / (the asset tree's checkout
+# HEAD is what /props reports as webui_llama_commit; #395: the walk-up finds it even
+# when OMPH_WEBUI_DIR is a build directory inside the tree - the pin v0.6.0 is
+# d8123504). Without OMPH_WEBUI_DIR the server answers /sw.js with llama.cpp's
+# self-destroying worker, so a browser that used another UI drops it (#395).
 cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release \
     -DOMPH_WEBUI_DIR=<llama.cpp>/build-hip/tools/ui/ui-gzip/_gzip   # or tools/ui/dist
 

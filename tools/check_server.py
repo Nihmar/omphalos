@@ -389,7 +389,10 @@ def run_timings_checks(url: str) -> None:
     `prompt_progress`."""
     notes = (Path(__file__).resolve().parent.parent / "PLAN.md").read_text()[20000:36000]
     chunks = stream_chunks(url, {"messages": [{"role": "user", "content": "Summarize in one sentence.\n\n" + notes}],
-                                 "max_tokens": 48, "stream": True, "timings_per_token": True,
+                                 # long enough that the decode crosses the 3-s
+                                 # progress cadence, so the --log-json check
+                                 # below has a decode event to find (#304/#395)
+                                 "max_tokens": 200, "stream": True, "timings_per_token": True,
                                  "return_progress": True})
     timed = [c["timings"] for c in chunks if "timings" in c]
     timeline = [int(t["predicted_n"]) for t in timed]
@@ -462,6 +465,25 @@ def run_webui_checks(url: str) -> None:
     check(status7 == 200 and len(slots) == 1 and slots[0].get("n_ctx", 0) > 0, f"GET /slots: {sbody[:120]!r}")
     status8, _, _ = raw_get(url, "/metrics")
     check(status8 == 501, f"llama.cpp's /metrics is a 501 here: {status8}")
+    # #395, the llama.cpp v0.6.0 alignment
+    status9, h9, b9 = raw_get(url, "/sw.js", {"Accept-Encoding": "gzip"})
+    worker = "the self-destroying fallback" if b"registration.unregister()" in b9 else "the bundle's own"
+    check(status9 == 200 and "javascript" in h9.get("Content-Type", "") and
+          h9.get("Cache-Control") == "no-cache", f"GET /sw.js: {status9} ({worker})")
+    status10, _, b10 = raw_get(url, "/models")
+    try:
+        models = json.loads(b10)
+    except json.JSONDecodeError:
+        models = {}
+    arch = (models.get("data") or [{}])[0].get("architecture") or {}
+    # a vision server adds "image" (asserted with --image below); the first entry
+    # is always text, and this server produces text
+    check(status10 == 200 and (arch.get("input_modalities") or [None])[0] == "text" and
+          arch.get("output_modalities") == ["text"], f"GET /models carries the modalities: {arch}")
+    status11, _ = raw_post(url, "/models", b"{}")
+    check(status11 == 501, f"the router's POST /models is a 501 here: {status11}")
+    status12, _ = raw_post(url, "/models/unload", b"{}")
+    check(status12 == 501, f"the router's POST /models/unload is a 501 here: {status12}")
 
 
 def run_tools_checks(url: str, enabled: str) -> None:
@@ -528,6 +550,14 @@ def run_image_checks(url: str, image: Path) -> None:
     q = [{"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": data}},
         {"type": "text", "text": "What event is this newspaper front page about? One sentence."}]}]
+    # #395: with the projector loaded the model reads images too
+    _, _, mbody = raw_get(url, "/models")
+    try:
+        arch = (json.loads(mbody).get("data") or [{}])[0].get("architecture") or {}
+    except json.JSONDecodeError:
+        arch = {}
+    check(arch.get("input_modalities") == ["text", "image"],
+          f"a vision server's /models modalities: {arch.get('input_modalities')}")
     no_think = {"chat_template_kwargs": {"enable_thinking": False}}
     r = client.chat.completions.create(model=model, messages=q, max_tokens=96, extra_body=no_think)
     text = r.choices[0].message.content or ""

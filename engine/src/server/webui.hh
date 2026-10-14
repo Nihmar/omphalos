@@ -56,4 +56,11 @@ bool etag_matches(std::string_view if_none_match, std::string_view etag);
 // contents change on every build, the immutable one for everything else.
 std::string cache_control_for(std::string_view name);
 
+// The service worker to answer /sw.js with when the bundle has none of its own
+// (llama.cpp's, #29565): it unregisters itself and drops the caches, so a
+// browser that used another UI stops showing the old page. A 404 would leave
+// the worker installed (w3c/ServiceWorker#204: a failed update keeps it), which
+// is why omph-server serves this rather than nothing (#395).
+std::string_view remove_service_worker();
+
 }  // namespace omph::server::webui

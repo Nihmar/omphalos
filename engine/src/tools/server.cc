@@ -263,6 +263,22 @@ struct Server {
         Json m = Json::object();
         m.set("id", str(model_id));
         m.set("object", str("model"));
+        // #395, llama.cpp v0.6.0's shape (GET /v1/models, GET /models): what the
+        // model reads and writes. The UI's Hub features read it; a projector
+        // makes it an image model.
+        Json in = Json::array();
+        in.push(Json::string("text"));
+#ifdef OMPH_VISION
+        if (vision != nullptr) {
+            in.push(Json::string("image"));
+        }
+#endif
+        Json out = Json::array();
+        out.push(Json::string("text"));
+        Json arch = Json::object();
+        arch.set("input_modalities", std::move(in));
+        arch.set("output_modalities", std::move(out));
+        m.set("architecture", std::move(arch));
         m.set("created", num(0));
         m.set("owned_by", str("omphalos"));
         return m;
@@ -297,6 +313,15 @@ struct Server {
                 req.header("accept-encoding") != nullptr ? *req.header("accept-encoding") : "");
             if (web.status != omph::server::webui::Resolution::Status::NotFound) {
                 serve_webui(c, web);
+                return;
+            }
+            // #395: no sw.js in the bundle (no bundle at all, or one without a
+            // worker): answer the worker's update check with llama.cpp's
+            // self-destroying one, so a browser that used another UI clears it.
+            if (path == "/sw.js") {
+                c.extra_headers.emplace_back("Cache-Control", "no-cache");
+                (void) c.respond(200, "application/javascript",
+                                 std::string(omph::server::webui::remove_service_worker()));
                 return;
             }
         }
@@ -382,6 +407,15 @@ struct Server {
                      "not_supported_error");
                 return;
             }
+        }
+        // the v0.6.0 router's model management (#395): one model here, and a
+        // GET /models is served above - only its writes are missing
+        if ((req.method == "POST" || req.method == "DELETE") &&
+            (path == "/models" || path.rfind("/models/", 0) == 0)) {
+            fail(c, 501, std::string("omph-server does not implement ") + req.method + " " + path +
+                             " (llama.cpp's router route)",
+                 "not_supported_error");
+            return;
         }
         if (path == "/models" || path == "/models/" + model_id) {
             if (req.method != "GET") {
