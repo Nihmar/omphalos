@@ -90,3 +90,29 @@ Remaining in the profile at 8k/1024: the delta-net's token-sequential path
 (14 %: the work buffer's `ffn_n_` proxy usually does not let it take the
 token-parallel form), the Q3_K down projections through the f16 staging path
 (7 %, #492 step 2), the store kernel (3 %) and the attention (1.3 %).
+
+## The delta-net's own scratch (the profile's 14 %)
+
+On an expert model the FFN scratch is the experts' width (`topk x n_ff_exp` =
+4096), and the token-parallel / WY forms of the delta rule need
+`gdn_work_floats` / `gdn_wy_floats` (12352 and ~10584 floats per token at
+Ornith's 32 v-heads): the check that reuses the FFN scratch failed, so every
+prefill chunk ran the token-sequential `delta_chunk_kernel` (~5.6 ms per layer
+per 1024-token chunk). A dedicated pair of buffers (50 + 42 MiB at chunk 1024)
+gives it the WY form; the dense model keeps the FFN-scratch reuse and is
+unchanged.
+
+| tokens | chunk | before | after | t/s |
+|---:|---:|---:|---:|---:|
+| 4096 | 512 | - | 1637.2 ms | 2502 |
+| 4096 | 1024 | 1835.0 ms | 1587.7 ms | 2580 |
+| 4096 | 2048 | - | 1187.3 ms | 3450 |
+
+Deep context (chunk 1024 unless noted):
+
+| depth | router GEMM | + delta-net scratch | llama.cpp | ratio |
+|---|---:|---:|---:|---:|
+| 128k | 93.1 s | **74.2 s** (chunk 2048: 70.9 s) | 201 s | 2.8x |
+| 160k | 127.3 s | **103.4 s** | 272 s | 2.6x |
+
+The KL against llama.cpp: 0.004377 (the WY form; 0.004359 before), top-1 100 %.
