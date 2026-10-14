@@ -176,9 +176,11 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     alloc(&gate_, T * attn_q * 4);
     alloc(&k_, T * attn_kv * 4);  // attention only: the delta-net reads qkv itself
     alloc(&v_, T * attn_kv * 4);
-    // The FFN scratch: the dense width, or the expert / shared width on an
-    // expert model (#493; there n_ff is 0).
-    ffn_n_ = h_.n_ff > 0 ? h_.n_ff : (h_.n_ff_exp > h_.n_ff_shexp ? h_.n_ff_exp : h_.n_ff_shexp);
+    // The FFN scratch: the dense width, or on an expert model (#493, where
+    // n_ff is 0) the widest of the expert / shared FFN and the delta-net's
+    // output, which the GDN writes into the same buffer (out16, ssm_inner per
+    // token: 4096 for the second model against n_ff_exp 512).
+    ffn_n_ = std::max(h_.n_ff, std::max(std::max(h_.n_ff_exp, h_.n_ff_shexp), h_.ssm_inner));
     alloc(&ffn1_, T * ffn_n_ * 4);
     alloc(&ffn2_, T * ffn_n_ * 4);
     alloc(&ffn16_, T * ffn_n_ * 2);
@@ -187,7 +189,12 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         alloc(&moe_w_, (size_t) T * h_.n_expert_used * sizeof(float));
         alloc(&moe_down_, (size_t) T * ne * 4);
         alloc(&moe_gate_, (size_t) T * sizeof(float));
+        alloc(&moe_xg_, (size_t) T * ne * 2);
+        alloc(&moe_xo_, (size_t) T * h_.n_expert_used * ne * 4);
+        alloc(&moe_xgi_, (size_t) T * h_.n_expert_used * sizeof(int));
+        alloc(&moe_slot_, (size_t) T * h_.n_expert_used * sizeof(int));
         moe_host_ids_.resize((size_t) T * h_.n_expert_used);
+        moe_counts_.resize((size_t) h_.n_expert);
     }
     last_logits_only_ = last_logits_only;
     // The head's rows go to the host in batches of kHeadRows: a whole chunk

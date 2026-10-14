@@ -240,12 +240,12 @@ bool Runner::gdn_layer(const int64_t il, const LayerWeights & L, const int64_t T
         // the token-parallel form (#96), its scratch in ffn1_, which the FFN
         // fills only later; OMPH_GDN_SERIAL=1 keeps the single launch (A/B)
         if (!env_.gdn_serial &&
-            omph::kernels::gdn_work_floats(T, n_vh, n_kh) <= T * h_.n_ff) {
+            omph::kernels::gdn_work_floats(T, n_vh, n_kh) <= T * ffn_n_) {
             step.work = static_cast<float *>(ffn1_);
             // a prefill chunk: the chunked WY form (#240), its scratch in ffn2_ (also
             // free until the FFN); verifications keep the exact per-token rule
             if (!verifying_ && !env_.gdn_exact &&
-                omph::kernels::gdn_wy_floats(T, n_vh, n_kh) <= max_tokens_ * h_.n_ff) {
+                omph::kernels::gdn_wy_floats(T, n_vh, n_kh) <= max_tokens_ * ffn_n_) {
                 step.wy = static_cast<float *>(ffn2_);
             }
         }

@@ -35,4 +35,22 @@ bool moe_acc(float * out, const float * y, const float * weights, int64_t tokens
 bool moe_shexp_gate(const void * w, const void * x_f16, float * out, int64_t tokens, int64_t k,
                     hipStream_t stream);
 
+// The prefill path (#494): the rows `ids[0..n)` of x (f16, k values each)
+// gathered back to back into dst, so one expert's tokens are one contiguous
+// GEMM input.
+bool moe_gather(const void * x_f16, int64_t k, const int * ids, int64_t n, void * dst,
+                hipStream_t stream);
+
+// ... and the other direction: the gathered row i (an expert's down output)
+// stored at slot (dst[i], slot[i]) of the per-slot buffer `xo`
+// (tokens x topk x ne). Two rows never target the same slot, so a plain store
+// keeps the result deterministic (no atomics).
+bool moe_scatter_store(float * xo, const float * y, const int * slot, const int * dst, int64_t n,
+                       int64_t ne, int topk, hipStream_t stream);
+
+// out[t][j] = sum_e weights[t * topk + e] * xo[(t * topk + e) * ne + j]: the
+// experts' weighted down outputs summed in slot order (deterministic).
+bool moe_combine(float * out, const float * xo, const float * weights, int64_t tokens, int topk,
+                 int64_t ne, hipStream_t stream);
+
 } // namespace omph::kernels

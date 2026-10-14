@@ -1550,14 +1550,22 @@ bool attention_gqa_range_impl(const float * q, const KvCache & kv, const float *
     attention_dec_kernel<Q8, NRT, G><<<dgrid, kDcThreads, 0, stream>>>(q, args, w, tokens, seq, (int) nh, \
                                                                     (int) nkv, scale, dsplits, tps,   \
                                                                     (int) split0)
+        // NRT is the row tiles the kernel holds: ceil(tokens * G / 16). G = 8
+        // (qwen35moe) needs a fourth tile at 7-8 tokens, where G = 6 stays
+        // within three (kDcMaxTokens * 8 / 16 = 4 is the largest possible).
+        if (nrt > 4) {
+            return false;  // the caller falls back to the scalar path
+        }
         if (q8) {
             if (nrt == 1) OMPH_DEC_LAUNCH(true, 1);
             else if (nrt == 2) OMPH_DEC_LAUNCH(true, 2);
-            else OMPH_DEC_LAUNCH(true, 3);
+            else if (nrt == 3) OMPH_DEC_LAUNCH(true, 3);
+            else OMPH_DEC_LAUNCH(true, 4);
         } else {
             if (nrt == 1) OMPH_DEC_LAUNCH(false, 1);
             else if (nrt == 2) OMPH_DEC_LAUNCH(false, 2);
-            else OMPH_DEC_LAUNCH(false, 3);
+            else if (nrt == 3) OMPH_DEC_LAUNCH(false, 3);
+            else OMPH_DEC_LAUNCH(false, 4);
         }
 #undef OMPH_DEC_LAUNCH
         if (!merge) {

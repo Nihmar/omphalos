@@ -104,8 +104,136 @@ bool Runner::embed(const int32_t * toks, const int64_t T, const ForwardInputs * 
 // the selection back to the host: the expert slices are picked by pointer, so
 // the dispatch needs their ids here. A device-side indexed GEMV removes the
 // round trip later (#493 step 2).
+// The prefill shape (#494): one router pass for the chunk, the rows gathered
+// per expert so each expert's tokens are one contiguous GEMM input, then the
+// slot-ordered weighted sum. The order of the sums is fixed (a store per
+// (token, slot) and one combine in slot order): the result does not depend on
+// the atomics' order.
+bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
+    const int64_t ne = h_.n_embd;
+    const int64_t ffn = h_.n_ff_exp;
+    const int64_t shexp = h_.n_ff_shexp;
+    const int topk = (int) h_.n_expert_used;
+    const int n_expert = (int) h_.n_expert;
+    auto * ids = static_cast<int *>(moe_ids_);
+    auto * weights = static_cast<float *>(moe_w_);
+
+    if (!omph::kernels::moe_route(L.ffn_gate_inp.dev, h16_, ids, weights, T, ne, n_expert, topk,
+                                  hipStreamPerThread)) {
+        return fail("moe_route failed");
+    }
+    if (hipStreamSynchronize(hipStreamPerThread) != hipSuccess ||
+        hipMemcpy(moe_host_ids_.data(), ids, (size_t) T * topk * sizeof(int),
+                  hipMemcpyDeviceToHost) != hipSuccess) {
+        return fail("moe_route readback failed");
+    }
+    // order the (token, slot) pairs by expert: a stable counting sort, and the
+    // gather / store indices it produces
+    std::fill(moe_counts_.begin(), moe_counts_.end(), 0);
+    for (int64_t i = 0; i < T * topk; ++i) {
+        ++moe_counts_[(size_t) moe_host_ids_[(size_t) i]];
+    }
+    auto * xgi = static_cast<int *>(moe_xgi_);
+    auto * slot = static_cast<int *>(moe_slot_);
+    // built on the host, uploaded once (the device buffers are not host-mapped)
+    std::vector<int> host_xgi((size_t) T * topk);
+    std::vector<int> host_slot((size_t) T * topk);
+    std::vector<int> fill(moe_counts_.size());
+    for (int e = 0, at = 0; e < n_expert; ++e) {
+        fill[(size_t) e] = at;
+        at += moe_counts_[(size_t) e];
+    }
+    for (int64_t t = 0; t < T; ++t) {
+        for (int s = 0; s < topk; ++s) {
+            const int e = moe_host_ids_[(size_t) (t * topk + s)];
+            if (e < 0 || e >= n_expert) {
+                return fail("moe_route chose an out-of-range expert");
+            }
+            const int i = fill[(size_t) e]++;
+            host_xgi[(size_t) i] = (int) t;
+            host_slot[(size_t) i] = s;
+        }
+    }
+    const size_t idx_bytes = (size_t) T * topk * sizeof(int);
+    if (hipMemcpyAsync(xgi, host_xgi.data(), idx_bytes, hipMemcpyHostToDevice, hipStreamPerThread) !=
+            hipSuccess ||
+        hipMemcpyAsync(slot, host_slot.data(), idx_bytes, hipMemcpyHostToDevice,
+                       hipStreamPerThread) != hipSuccess) {
+        return fail("moe index upload failed");
+    }
+    // the expert slices (the expert dim is the outermost in the 3-D tensor)
+    const auto slice = [this](const Mat & base, const int64_t off, const int64_t rows,
+                              const int64_t k) -> Mat {
+        Mat m = base;
+        m.dev = static_cast<const uint8_t *>(base.dev) + off;
+        m.sliced = true;
+        if (base.gemv != nullptr) {
+            slice_gemv_ = *base.gemv;
+            slice_gemv_.rows = rows;
+            slice_gemv_.k = k;
+            m.gemv = &slice_gemv_;
+        }
+        return m;
+    };
+    const int64_t gate_stride = (int64_t) L.ffn_gate_exps.t->stored / h_.n_expert;
+    const int64_t up_stride = (int64_t) L.ffn_up_exps.t->stored / h_.n_expert;
+    const int64_t down_stride = (int64_t) L.ffn_down_exps.t->stored / h_.n_expert;
+    const int64_t gate_rows = (int64_t) L.ffn_gate_exps.t->ne[1];
+    const int64_t up_rows = (int64_t) L.ffn_up_exps.t->ne[1];
+    const int64_t down_rows = (int64_t) L.ffn_down_exps.t->ne[1];
+
+    auto * xg = static_cast<__half *>(moe_xg_);
+    auto * xo = static_cast<float *>(moe_xo_);
+    for (int e = 0, at = 0; e < n_expert; ++e) {
+        const int64_t n_e = moe_counts_[(size_t) e];
+        if (n_e == 0) {
+            continue;
+        }
+        const int64_t off = at;
+        at += n_e;
+        if (!omph::kernels::moe_gather(h16_, ne, xgi + off, n_e, xg, hipStreamPerThread) ||
+            !matmul(slice(L.ffn_gate_exps, (int64_t) e * gate_stride, gate_rows, ne), xg,
+                    static_cast<float *>(ffn1_), ffn, ne, n_e) ||
+            !matmul(slice(L.ffn_up_exps, (int64_t) e * up_stride, up_rows, ne), xg,
+                    static_cast<float *>(ffn2_), ffn, ne, n_e) ||
+            !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
+                                       static_cast<const float *>(ffn2_), ffn16_, n_e * ffn,
+                                       hipStreamPerThread) ||
+            !matmul(slice(L.ffn_down_exps, (int64_t) e * down_stride, down_rows, ffn), ffn16_,
+                    static_cast<float *>(moe_down_), ne, ffn, n_e) ||
+            !omph::kernels::moe_scatter_store(xo, static_cast<const float *>(moe_down_),
+                                              slot + off, xgi + off, n_e, ne, topk,
+                                              hipStreamPerThread)) {
+            return fail("moe expert (batched) failed");
+        }
+    }
+    // the routed output: the slot-ordered weighted sum
+    if (!omph::kernels::moe_combine(static_cast<float *>(cur_), xo, weights, T, topk, ne,
+                                    hipStreamPerThread)) {
+        return fail("moe combine failed");
+    }
+    // the shared expert, all the chunk's tokens at once
+    if (!matmul(L.ffn_gate_shexp, h16_, static_cast<float *>(ffn1_), shexp, ne, T) ||
+        !matmul(L.ffn_up_shexp, h16_, static_cast<float *>(ffn2_), shexp, ne, T) ||
+        !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
+                                   static_cast<const float *>(ffn2_), ffn16_, T * shexp,
+                                   hipStreamPerThread) ||
+        !matmul(L.ffn_down_shexp, ffn16_, static_cast<float *>(moe_down_), ne, shexp, T) ||
+        !omph::kernels::moe_shexp_gate(L.ffn_gate_inp_shexp, h16_, static_cast<float *>(moe_gate_),
+                                       T, ne, hipStreamPerThread) ||
+        !omph::kernels::moe_acc(static_cast<float *>(cur_), static_cast<const float *>(moe_down_),
+                                static_cast<const float *>(moe_gate_), T, 1, 0, ne,
+                                hipStreamPerThread)) {
+        return fail("moe shared expert (batched) failed");
+    }
+    return true;
+}
+
 bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
     const int64_t ne = h_.n_embd;
+    if (T > 1) {
+        return moe_ffn_batched(L, T);
+    }
     const int64_t ffn = h_.n_ff_exp;
     const int64_t shexp = h_.n_ff_shexp;
     const int topk = (int) h_.n_expert_used;
