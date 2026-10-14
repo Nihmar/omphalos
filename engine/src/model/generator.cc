@@ -51,8 +51,11 @@ Generator::Generator(const Config & config, const omph::runtime::EnvOptions & en
         (void) disk_.open(config_.cache_dir, disk_key_, config_.cache_dir_mib);
     }
     if (config_.mtp || runner_->dflash_on()) {
-        // n-gram drafts (#199) verify up to 16 tokens
-        runner_->enable_speculation(env_.ngram ? std::max<int64_t>(config_.draft_k + 1, 16) : config_.draft_k + 1);
+        // n-gram drafts (#199) verify up to OMPH_SPEC_ROWS tokens: an edit or a
+        // quote chains to the match's end, which #415 measured always hits the
+        // budget (#454)
+        runner_->enable_speculation(env_.ngram ? std::max<int64_t>(config_.draft_k + 1, env_.spec_rows)
+                                              : config_.draft_k + 1);
     }
     for (const char * t : {"<|im_end|>", "<|endoftext|>"}) {
         const int32_t id = tokenizer_->find(t);

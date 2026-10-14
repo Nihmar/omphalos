@@ -1,0 +1,54 @@
+# #454: the verification budget beyond 16 rows — measured, not adopted
+
+Engine main after #453 + an `OMPH_SPEC_ROWS` switch (the budget, 16 by default),
+RX 9060 XT 16 GB, 2026-10-14.
+
+The issue's premise: #415 measured that on edit and repetitive text the n-gram
+chains always hit the 15-draft budget, so more rows should turn directly into
+tokens per step, and (from the arithmetic) 24-32 rows should cost little more than
+16 (26 G params x 2 x 32 = 1.7 TFLOP ~ 31 ms at 55 TFLOPS against ~36 ms of
+weight reads).
+
+## The measurement
+
+`scenario_speed.py --spec mtp --ngram 1 --kv k4q4`, the #262 scenarios, the only
+change being `OMPH_SPEC_ROWS`:
+
+| scenario | 16 rows | 32 rows | change | tokens per step | sha256 of the text |
+|---|---:|---:|---:|---|---|
+| prose | 44.3 t/s | 43.7 t/s | -1.4 % | ~6 | identical (`7582511b...`) |
+| edit-cc | **251.4 t/s** | **72.9 t/s** | **-71 %** | | identical (`7bd06d2f...`) |
+| edit-py | **220.3 t/s** | **77.9 t/s** | **-65 %** | | identical (`0a5eb535...`) |
+
+The output is **bit-identical** at both budgets (the hashes above), so the
+verification machinery is correct at 32 rows - it is simply far more expensive
+per token: edit-cc goes from 4.96 ms/token to 14.7 ms/token.
+
+## Why (and why the arithmetic's crossover does not apply)
+
+A 32-row verification costs ~90 ms/step where 16 rows cost ~30:
+
+- **The prefill GEMM is the wrong shape**: with `OMPH_GEMM_MIN=16` (the measured
+  #129/#141 crossover) a 16+ row verification takes the tile GEMM, whose
+  workgroup covers 128 tokens - at 32 rows each workgroup fills a quarter of its
+  tile and the rest is lost. Forcing the GEMV path instead (`OMPH_GEMM_MIN=64`)
+  changes nothing measurable (73.1 against 72.9 t/s): the tile GEMV only goes up
+  to **NT = 16** (#255), so 32 rows are two passes over the weights (+33 ms of
+  reads) and the two effects land on the same ~90 ms.
+- The attention's 8-row groups (#161) re-read the layer's KV once per group: 4
+  groups instead of 2 - small at an 8k context, proportional to the context
+  later.
+
+So the premise holds only if the *GEMV* path gains NT = 24/32 variants that read
+the weights **once** for the whole verification - exactly what the issue's step 1
+proposes to bench. That is a kernel project (the tile types' NT variants plus the
+bench and the validation), and this measurement says the budget change alone is a
+3.4x loss, not a 1.15x cost: the issue's gate fails before the kernels.
+
+## Decision
+
+**Not adopted; closed with the numbers.** `OMPH_SPEC_ROWS` stays as the switch (16
+the default) and the 32-row A/B is documented here for whoever picks up the NT
+kernel work: with an NT=24/32 GEMV the edit chains (always at the budget, #415)
+would gain up to ~1.6x, and the output is already proven identical at both
+budgets.
