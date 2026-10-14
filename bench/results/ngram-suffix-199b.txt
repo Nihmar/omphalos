@@ -1,0 +1,45 @@
+# The n-gram drafts' coverage: a longest match is not better than the n <= 8 hash (#199)
+
+tools/ngram_suffix_probe.py on the #199 scenarios as recorded (bench/results/ngram-199, 18
+scenarios, 86157 output tokens), 2026-10-14, engine main. The acceptance rule, the draft
+budget (15) and the MTP tokens/step are ngram_coverage.py's, so the rows are comparable to
+bench/results/ngram-coverage-199.txt.
+
+The question the brainstorm left: the hash looks up the longest n-gram in [4, 8] ending at
+the previous token and proposes the tokens after its *latest* earlier occurrence. The
+K16 columns of ngram-coverage-199.txt halved the steps of K8 - the chains are capped by the
+verification budget, not by what the text repeats - so a *longer anchor* was the one thing
+left that could help. And its "verification cost" caveat is obsolete: every weight type now
+verifies 16 tokens in one pass (#178, #244, #253, #258, #275), so a 15-token draft step costs
+what a 4-token one does.
+
+## Two experiments
+
+**(a) Longest repeated suffix (suffix automaton), first occurrence.** The longest suffix of
+the text so far that occurs at least twice, proposing from its first occurrence:
+
+    total (86157 tokens): hash 23095 steps, SAM 24575 steps (+6.4 %); tokens supplied 38 % vs 31 %
+    clear wins: none; clear losses: edit-cc, edit-py-think, edit-py, he-0, he-32, he-48,
+    he-64, he-80, he-96, pelican-t0, pelican-t1, quote
+
+edit-cc 0.30 -> 0.49x, edit-py 0.37 -> 0.50x: the long anchor drags the proposal back to a
+distant, unrelated continuation. Recency is the whole value of the lookup.
+
+**(b) Same policy (latest occurrence), longer anchors.** The one variable isolated - n up to
+8 / 12 / 16 / 24 / 32 / 64, everything else identical:
+
+    n<=8:  23095 steps, 38 % copied      n<=24: 22897 steps, 38 % copied
+    n<=16: 22945 steps, 38 % copied      n<=64: 22884 steps, 38 % copied
+
+0.9 % at most from 8x the anchor, and no scenario moves by more than 1 %. The repeat
+structure that pays is already inside 8 tokens: longer anchors only add matches that a
+shorter one would have proposed from just as well.
+
+## Reading
+
+The engine's #199 policy - the longest n in [4, 8] ending at the previous token, proposing
+from its latest occurrence - is at the ceiling of what an n-gram lookup can supply here
+(38 % of the tokens at 0.28-0.36x the MTP steps on edits and quotes). A suffix automaton
+buys nothing and costs a per-step structure to maintain; extending the hash's n_max is inert.
+Measured, not adopted: no engine change. The 15-token budget stays the lever that matters,
+and it is already the draft size.
