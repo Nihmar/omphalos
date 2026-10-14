@@ -61,9 +61,34 @@ std::vector<uint8_t> to_tiles(const long long rows, const long long blocks, cons
     return out;
 }
 
+// PLAN 16.2 [verify]: streaming (nontemporal) weight loads, measured here. The
+// builtin refuses HIP vector types and __half, so the loads go through
+// ext_vector_type / _Float16 aliases of the same width and bit_cast. Result:
+// within noise (12.768 vs 12.797 ms NT=1 at KW=8, mixed signs elsewhere),
+// bench/results/nontemporal-16-2.txt.
+typedef unsigned int nw1;
+typedef unsigned int nw4 __attribute__((ext_vector_type(4)));
+typedef _Float16 nwh;
+
+template <bool NTW>
+__device__ __forceinline__ nw4 ldw4(const void * p) {
+    return NTW ? __builtin_nontemporal_load(reinterpret_cast<const nw4 *>(p))
+               : *reinterpret_cast<const nw4 *>(p);
+}
+template <bool NTW>
+__device__ __forceinline__ nw1 ldw1(const void * p) {
+    return NTW ? __builtin_nontemporal_load(reinterpret_cast<const nw1 *>(p))
+               : *reinterpret_cast<const nw1 *>(p);
+}
+template <bool NTW>
+__device__ __forceinline__ nwh ldwh(const void * p) {
+    return NTW ? __builtin_nontemporal_load(reinterpret_cast<const nwh *>(p))
+               : *reinterpret_cast<const nwh *>(p);
+}
+
 // grid: (rows / 16 / (8 / KW)); 256 threads: (8 / KW) row tiles x KW k slices.
 // NT tokens (1..16), x [NT][k] f16, y [NT][rows]. Sums in LDS in a fixed order.
-template <int NT, int KW>
+template <int NT, int KW, bool NTW = false>
 __global__ __launch_bounds__(256) void k_wil(const uint8_t * __restrict__ wt, const __half * __restrict__ x,
                                             float * __restrict__ y, const long long rows, const long long blocks) {
     constexpr int TILES = 8 / KW;
@@ -90,12 +115,12 @@ __global__ __launch_bounds__(256) void k_wil(const uint8_t * __restrict__ wt, co
     wf8 acc = {};
     for (long long b = b0; b < b1; ++b) {
         const uint8_t * o = wt + (tile * blocks + b) * kTileBytes;
-        const uint4 q0 = *reinterpret_cast<const uint4 *>(o + lane * 32);
-        const uint4 q1 = *reinterpret_cast<const uint4 *>(o + lane * 32 + 16);
-        const uint4 s4 = *reinterpret_cast<const uint4 *>(o + 1024 + lane * 16);
-        const uint32_t qhw = *reinterpret_cast<const uint32_t *>(o + 1536 + lane * 4);
-        const uint32_t scw = *reinterpret_cast<const uint32_t *>(o + 1664 + r * 4);
-        const float dv = __half2float(*reinterpret_cast<const __half *>(o + 1728 + r * 2));
+        const uint4 q0 = __builtin_bit_cast(uint4, ldw4<NTW>(o + lane * 32));
+        const uint4 q1 = __builtin_bit_cast(uint4, ldw4<NTW>(o + lane * 32 + 16));
+        const uint4 s4 = __builtin_bit_cast(uint4, ldw4<NTW>(o + 1024 + lane * 16));
+        const uint32_t qhw = ldw1<NTW>(o + 1536 + lane * 4);
+        const uint32_t scw = ldw1<NTW>(o + 1664 + r * 4);
+        const float dv = __half2float(ldwh<NTW>(o + 1728 + r * 2));
         const uint32_t qw[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
         const uint32_t sw[4] = {s4.x, s4.y, s4.z, s4.w};
 #pragma unroll
@@ -260,13 +285,13 @@ struct TT {  // a tensor in both layouts
     uint8_t * tiles;
 };
 
-template <int NT, int KW>
+template <int NT, int KW, bool NTW = false>
 void launch_wil(const TT & t, const __half * x, float * y) {
     constexpr int TILES = 8 / KW;
-    k_wil<NT, KW><<<(unsigned) (t.t.rows / 16 / TILES), 256>>>(t.tiles, x, y, t.t.rows, t.t.k / 256);
+    k_wil<NT, KW, NTW><<<(unsigned) (t.t.rows / 16 / TILES), 256>>>(t.tiles, x, y, t.t.rows, t.t.k / 256);
 }
 
-template <int NT, int KW>
+template <int NT, int KW, bool NTW = false>
 float wil_ms(const std::vector<TT> & ts, const __half * x, float * y, int reps) {
     hipEvent_t a, b;
     (void) hipEventCreate(&a);
@@ -372,6 +397,9 @@ int main() {
                 wil_ms<4, 4>(tensors, x, y, reps));
     std::printf("  tiled KW=8    NT = 1 %.3f   NT = 4 %.3f   NT = 8 %.3f   NT = 16 %.3f\n", wil_ms<1, 8>(tensors, x, y, reps),
                 wil_ms<4, 8>(tensors, x, y, reps), wil_ms<8, 8>(tensors, x, y, reps), wil_ms<16, 8>(tensors, x, y, reps));
+    std::printf("  tiled KW=8 nt NT = 1 %.3f   NT = 4 %.3f   NT = 8 %.3f   NT = 16 %.3f\n", wil_ms<1, 8, true>(tensors, x, y, reps),
+                wil_ms<4, 8, true>(tensors, x, y, reps), wil_ms<8, 8, true>(tensors, x, y, reps),
+                wil_ms<16, 8, true>(tensors, x, y, reps));
     // prefill GEMM on the tiled layout, T = 512
     {
         const long long T = 512;

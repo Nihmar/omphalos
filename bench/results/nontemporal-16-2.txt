@@ -1,0 +1,32 @@
+# PLAN 16.2 [verify]: non-temporal weight loads on RDNA4, measured
+
+bench/gemv/iq3s_wil.hip (the IQ3_S tiled GEMV, the model's dominant type: 3474 MiB of
+11.3 GiB), RX 9060 XT 16 GB, median of 9 passes over all 144 IQ3_S tensors, 2026-10-14,
+engine main (PR #469 merged).
+
+The item: `__builtin_nontemporal_load` (streaming cache policy) on the weights, which are
+read once per token and should not evict KV/state/activations from the caches. The builtin
+does not accept HIP vector types nor __half; the probe loads through ext_vector_type(4) /
+_Float16 aliases of the same width and bit_casts, so the width stays 16 B.
+
+| KW=8, ms per pass | NT=1 | NT=4 | NT=8 | NT=16 |
+|---|---:|---:|---:|---:|
+| normal | 12.768 | 13.163 | 13.430 | 13.602 |
+| nontemporal | 12.797 | 13.118 | 13.435 | 13.612 |
+
+**No effect** (-0.3 % to +0.4 %, mixed signs, within run-to-run spread).
+
+## Why, and what it means for the item
+
+The premise does not hold on this machine. The decode's per-step stream is the whole weight
+set (~701 MiB) plus the attention's KV (1.6 KB per position *per layer*: 300 MB at 4k rows,
+9.4 GB at 128k), so the 32 MB L2 is thrashed by construction and there is no resident KV /
+state / activation working set for the weights to protect. The hint is also a no-op in the
+code the backend generates - the timing difference is smaller than the measurement noise,
+which is what a policy that only changes eviction order inside a streaming workload would
+look like.
+
+Resolved: no change (engine issue #472). Non-temporal loads are not a lever here; the L2's
+contents are not the bottleneck at any context length this engine runs - the decode is
+DRAM-bandwidth-bound, and the measured 12.8 ms per pass over 3474 MiB is 284 GB/s of a
+~318 GB/s practical ceiling.
