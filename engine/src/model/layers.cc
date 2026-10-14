@@ -197,6 +197,12 @@ bool Runner::gdn_layer(const int64_t il, const LayerWeights & L, const int64_t T
     step.conv_new = conv_new;
     step.w_beta = L.w_beta;
     step.w_alpha = L.w_alpha;
+    if (L.ssm_ab_f32) {
+        // qwen35moe stores the two projections as f32 (#493)
+        step.w_beta_f32 = reinterpret_cast<const float *>(L.w_beta);
+        step.w_alpha_f32 = reinterpret_cast<const float *>(L.w_alpha);
+        step.ab_f32 = true;
+    }
     step.k_in = ne;
     step.dt_bias = dt_bias;
     step.ssm_a = ssm_a;

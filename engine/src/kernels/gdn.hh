@@ -28,6 +28,11 @@ struct GdnStep {
     const __half * x16 = nullptr;      // (k_in) the normed layer input, token t
     const uint16_t * w_beta = nullptr;   // (heads, k_in) BF16 beta projection
     const uint16_t * w_alpha = nullptr;  // (heads, k_in) BF16 alpha projection
+    // The same two rows as f32, for the models that store them that way
+    // (qwen35moe, #493); ab_f32 picks the kernel instantiation.
+    const float * w_beta_f32 = nullptr;
+    const float * w_alpha_f32 = nullptr;
+    bool ab_f32 = false;
     long long k_in = 0;
     const float * dt_bias = nullptr;   // (heads)
     const float * ssm_a = nullptr;     // (heads)

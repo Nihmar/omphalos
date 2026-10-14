@@ -37,6 +37,20 @@ namespace {
 // launch dims against it and the model loader checks the metadata.
 constexpr int kDeltaRows = kDeltaS / 2;   // rows per thread
 
+// The beta / alpha projection weights: BF16 rows (the first model) or F32
+// (qwen35moe, #493). A template parameter, not a branch: the BF16 instantiation
+// is the code that ran before.
+template <bool ABF32>
+__device__ __forceinline__ float beta_at(const GdnStep & a, const int64_t i) {
+    return ABF32 ? a.w_beta_f32[i] : __uint_as_float((uint32_t) a.w_beta[i] << 16);
+}
+
+template <bool ABF32>
+__device__ __forceinline__ float alpha_at(const GdnStep & a, const int64_t i) {
+    return ABF32 ? a.w_alpha_f32[i] : __uint_as_float((uint32_t) a.w_alpha[i] << 16);
+}
+
+template <bool ABF32>
 __global__ __launch_bounds__(256) void delta_step_kernel(const GdnStep a) {
     __shared__ float part[2 * kDeltaS];
     __shared__ float dd[kDeltaS];
@@ -111,8 +125,8 @@ __global__ __launch_bounds__(256) void delta_step_kernel(const GdnStep a) {
     float pa = 0.0f;
     for (long long i = tid; i < a.k_in; i += 256) {
         const float xi = __half2float(a.x16[i]);
-        pb = fmaf(__uint_as_float((uint32_t) a.w_beta[h * a.k_in + i] << 16), xi, pb);
-        pa = fmaf(__uint_as_float((uint32_t) a.w_alpha[h * a.k_in + i] << 16), xi, pa);
+        pb = fmaf(beta_at<ABF32>(a, h * a.k_in + i), xi, pb);
+        pa = fmaf(alpha_at<ABF32>(a, h * a.k_in + i), xi, pa);
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -207,6 +221,7 @@ __global__ __launch_bounds__(256) void delta_step_kernel(const GdnStep a) {
 // body per token, in order, with the state kept in registers between tokens.
 // Same float operations in the same order: the result equals T launches of
 // the single-step kernel, bit for bit.
+template <bool ABF32>
 __global__ __launch_bounds__(256) void delta_chunk_kernel(GdnStep a) {
     __shared__ float part[2 * kDeltaS];
     __shared__ float dd[kDeltaS];
@@ -298,8 +313,8 @@ __global__ __launch_bounds__(256) void delta_chunk_kernel(GdnStep a) {
         float pa = 0.0f;
         for (long long i = tid; i < a.k_in; i += 256) {
             const float xi = __half2float(a.x16[i]);
-            pb = fmaf(__uint_as_float((uint32_t) a.w_beta[h * a.k_in + i] << 16), xi, pb);
-            pa = fmaf(__uint_as_float((uint32_t) a.w_alpha[h * a.k_in + i] << 16), xi, pa);
+            pb = fmaf(beta_at<ABF32>(a, h * a.k_in + i), xi, pb);
+            pa = fmaf(alpha_at<ABF32>(a, h * a.k_in + i), xi, pa);
         }
     #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
@@ -495,7 +510,7 @@ __global__ __launch_bounds__(kDeltaS) void delta_conv_kernel(const GdnStep a) {
 // of L2 traffic per 512-token chunk, #240); each dot in gdn_step's order.
 constexpr int kGateTokens = 16;
 
-template <int HB>
+template <int HB, bool ABF32>
 __global__ __launch_bounds__(256) void delta_gate_kernel(const GdnStep a) {
     __shared__ float gred[2][HB][kGateTokens][8];
     const long long h0 = (long long) blockIdx.x * HB;
@@ -525,8 +540,8 @@ __global__ __launch_bounds__(256) void delta_gate_kernel(const GdnStep a) {
         float wa[HB];
 #pragma unroll
         for (int hb = 0; hb < HB; ++hb) {
-            wb[hb] = __uint_as_float((uint32_t) a.w_beta[(h0 + hb) * k_in + i] << 16);
-            wa[hb] = __uint_as_float((uint32_t) a.w_alpha[(h0 + hb) * k_in + i] << 16);
+            wb[hb] = beta_at<ABF32>(a, (h0 + hb) * k_in + i);
+            wa[hb] = alpha_at<ABF32>(a, (h0 + hb) * k_in + i);
         }
 #pragma unroll
         for (int j = 0; j < kGateTokens; ++j) {
@@ -1144,7 +1159,11 @@ bool gdn_chunk(const GdnStep & a, const int64_t heads, hipStream_t stream) {
         return false;
     }
     if (a.work == nullptr) {
-        delta_chunk_kernel<<<(unsigned) heads, 256, 0, stream>>>(a);
+        if (a.ab_f32) {
+            delta_chunk_kernel<true><<<(unsigned) heads, 256, 0, stream>>>(a);
+        } else {
+            delta_chunk_kernel<false><<<(unsigned) heads, 256, 0, stream>>>(a);
+        }
         return hipGetLastError() == hipSuccess;
     }
     const dim3 per_token((unsigned) heads, (unsigned) a.tokens);
@@ -1157,9 +1176,15 @@ bool gdn_chunk(const GdnStep & a, const int64_t heads, hipStream_t stream) {
     // 4 heads per block read a prefill chunk's x once for them; a short call
     // (a verification) needs the workgroups more (#271: 12 of them at 8 tokens)
     if (heads % 4 == 0 && a.tokens > kGateTokens) {
-        delta_gate_kernel<4><<<dim3((unsigned) (heads / 4), gate_groups), 256, 0, stream>>>(a);
+        if (a.ab_f32) {
+            delta_gate_kernel<4, true><<<dim3((unsigned) (heads / 4), gate_groups), 256, 0, stream>>>(a);
+        } else {
+            delta_gate_kernel<4, false><<<dim3((unsigned) (heads / 4), gate_groups), 256, 0, stream>>>(a);
+        }
+    } else if (a.ab_f32) {
+        delta_gate_kernel<1, true><<<dim3((unsigned) heads, gate_groups), 256, 0, stream>>>(a);
     } else {
-        delta_gate_kernel<1><<<dim3((unsigned) heads, gate_groups), 256, 0, stream>>>(a);
+        delta_gate_kernel<1, false><<<dim3((unsigned) heads, gate_groups), 256, 0, stream>>>(a);
     }
     float * vo = a.work + a.tokens * a.channels;
     const float * gates = vo + a.tokens * heads * kDeltaS;
@@ -1189,7 +1214,11 @@ bool gdn_step(const GdnStep & a, const int64_t heads, hipStream_t stream) {
         a.channels != a.q_dims + a.kv_dims + heads * kDeltaS) {
         return false;  // written for s = 128 and the q | k | v channel layout
     }
-    delta_step_kernel<<<(unsigned) heads, 256, 0, stream>>>(a);
+    if (a.ab_f32) {
+        delta_step_kernel<true><<<(unsigned) heads, 256, 0, stream>>>(a);
+    } else {
+        delta_step_kernel<false><<<(unsigned) heads, 256, 0, stream>>>(a);
+    }
     return hipGetLastError() == hipSuccess;
 }
 

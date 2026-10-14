@@ -389,13 +389,12 @@ __device__ inline float half_xor(const float x) {
 // decode step, 4 for a prefill chunk). Rows past the last token are computed on
 // zero queries and not stored. Writes one partial (m, l, acc) per (token, head,
 // split) to `work`.
-template <bool Q8, int TQ>
+template <bool Q8, int TQ, int G = kGqaGroup>
 __global__ __launch_bounds__(kGqaHd) void attention_gqa_kernel(
     const float * __restrict__ q, const KvArgs kv, float * __restrict__ work,
     const long long tokens, const long long seq, const int nh, const int nkv,
     const float scale, const int splits, const long long blocks_per_split, const bool per_query,
     const int split0) {
-    constexpr int G = kGqaGroup;
     constexpr int kRows = TQ * G;
     // Q rows in 16-dimension chunks padded to 20 floats: 16-byte aligned, so a
     // chunk is four ds_read_b128, and the 16 lanes of a key (different chunks)
@@ -701,8 +700,8 @@ __device__ inline void fa_stage_v(const KvArgs & kv, _Float16 * vb, const long l
 
 // grid: (ceil(tokens / 32), nkv); kFaThreads threads. Scores are in log2 units (q is
 // prescaled by scale * log2(e)): with one split the merge only divides by l.
-template <bool Q8, int ABL, int RT = kFaRowTiles>
-__global__ __launch_bounds__(32 * (kGqaGroup * RT + kFaProd)) void attention_wmma_kernel(
+template <bool Q8, int ABL, int RT = kFaRowTiles, int G = kGqaGroup>
+__global__ __launch_bounds__(32 * (G * RT + kFaProd)) void attention_wmma_kernel(
     const float * __restrict__ q, const KvArgs kv, float * __restrict__ work,
     const long long tokens, const long long seq, const int nh, const int nkv,
     const float scale) {
@@ -712,10 +711,10 @@ __global__ __launch_bounds__(32 * (kGqaGroup * RT + kFaProd)) void attention_wmm
     const int tid = (int) threadIdx.x;
     const int lane = tid & 31;
     const int wv = tid >> 5;
-    const int g = wv % kGqaGroup;   // query head within the KV group
-    const int rt = wv / kGqaGroup;  // row tile
+    const int g = wv % G;   // query head within the KV group
+    const int rt = wv / G;  // row tile
     const int kvh = (int) blockIdx.y;
-    const int h = kvh * kGqaGroup + g;
+    const int h = kvh * G + g;
     const long long wg0 = (long long) blockIdx.x * (kFaTokens * RT);
     const long long t0 = wg0 + rt * kFaTokens;
     // this wave's rows (none for a row tile past the end: it only stages)
@@ -724,8 +723,8 @@ __global__ __launch_bounds__(32 * (kGqaGroup * RT + kFaProd)) void attention_wmm
     // Two staging waves dequantize the next tile while the others compute (#191):
     // per tile, V(t + 1) during the scores of t, K(t + 1) during its softmax and
     // P V (K single-buffered, V double-buffered), one barrier after each phase.
-    const bool prod = wv >= (kGqaGroup * RT);
-    const int ptid = tid - (kGqaGroup * RT) * 32;
+    const bool prod = wv >= (G * RT);
+    const int ptid = tid - (G * RT) * 32;
 
     // keys up to the workgroup's last query: tiles past a row tile's own last
     // query are masked out entirely (corr 1, P 0: its rows are unchanged)
@@ -1013,7 +1012,7 @@ __device__ inline wmma_half8 dec_load_k8(const KvArgs & kv, const long long p, c
 }
 
 // grid: (1, nkv, splits); 128 threads. Scores in log2 units, as everywhere.
-template <bool Q8, int NRT>
+template <bool Q8, int NRT, int G = kGqaGroup>
 __global__ __launch_bounds__(kDcThreads) void attention_dec_kernel(
     const float * __restrict__ q, const KvArgs kv, float * __restrict__ work,
     const long long tokens, const long long seq, const int nh, const int nkv, const float scale,
@@ -1030,7 +1029,7 @@ __global__ __launch_bounds__(kDcThreads) void attention_dec_kernel(
     const int kvh = (int) blockIdx.y;
     const int split = split0 + (int) blockIdx.z;  // global index of this split (#409)
     const int nt = (int) tokens;
-    const int rows = nt * kGqaGroup;
+    const int rows = nt * G;
     const long long qpos0 = seq - tokens;  // cache position of the first query
     const int db = w * kDcDims;            // this wave's dimensions
 
@@ -1040,8 +1039,8 @@ __global__ __launch_bounds__(kDcThreads) void attention_dec_kernel(
     for (int rt = 0; rt < NRT; ++rt) {
         const int r = rt * 16 + (lane & 15);
         const bool in = r < rows;
-        const int t = in ? r / kGqaGroup : 0;
-        const int h = kvh * kGqaGroup + (in ? r % kGqaGroup : 0);
+        const int t = in ? r / G : 0;
+        const int h = kvh * G + (in ? r % G : 0);
         const float * qr = q + ((long long) t * nh + h) * kGqaHd + db + (lane >> 4) * 8;
         const float f = in ? scale * 1.44269504088896341f : 0.0f;
 #pragma unroll
@@ -1142,7 +1141,7 @@ __global__ __launch_bounds__(kDcThreads) void attention_dec_kernel(
                 for (int vv = 0; vv < 2; ++vv) {
                     const int row = (lane >> 4) * 8 + 2 * w + vv;
                     const int r = rt * 16 + row;
-                    const int t = r / kGqaGroup;
+                    const int t = r / G;
                     float pv = 0.0f;
                     float cr = 1.0f;
                     if (r < rows && (only < 0 || t == only)) {  // uniform in the 16 lanes of a half
@@ -1200,8 +1199,8 @@ __global__ __launch_bounds__(kDcThreads) void attention_dec_kernel(
         for (int v = 0; v < 8; ++v) {
             const int r = rt * 16 + (lane >> 4) * 8 + v;
             if (r < rows) {
-                const int t = r / kGqaGroup;
-                const int h = kvh * kGqaGroup + r % kGqaGroup;
+                const int t = r / G;
+                const int h = kvh * G + r % G;
                 float * dst = work + (((long long) t * nh + h) * splits + split) * (kGqaHd + 2);
 #pragma unroll
                 for (int j = 0; j < kDcDims / 16; ++j) {
@@ -1397,37 +1396,37 @@ long long g_fa_rt1_tokens = 64;
 
 // OMPH_TEST_FA_ABL: the prefill kernel's phases ablated, compile-time so the
 // default instantiation (ABL 0) is the kernel as it was (#191, #422).
-template <bool Q8, int RT>
+template <bool Q8, int RT, int G = kGqaGroup>
 hipError_t fa_launch_rt(const dim3 & fgrid, hipStream_t stream, const float * q, const KvArgs & args,
                         float * w, const long long tokens, const long long seq, const int nh,
                         const int nkv, const float scale) {
-    constexpr unsigned threads = 32 * (kGqaGroup * RT + kFaProd);
+    constexpr unsigned threads = 32 * (G * RT + kFaProd);
     switch (g_fa_abl) {
-        case 1: attention_wmma_kernel<Q8, 1, RT><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
-        case 2: attention_wmma_kernel<Q8, 2, RT><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
-        case 4: attention_wmma_kernel<Q8, 4, RT><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
-        case 8: attention_wmma_kernel<Q8, 8, RT><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
-        case 16: attention_wmma_kernel<Q8, 16, RT><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
-        case 32: attention_wmma_kernel<Q8, 32, RT><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
-        case 64: attention_wmma_kernel<Q8, 64, RT><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
-        case 128: attention_wmma_kernel<Q8, 128, RT><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
-        case 65: attention_wmma_kernel<Q8, 65, RT><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
-        case 63: attention_wmma_kernel<Q8, 63, RT><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
-        default: attention_wmma_kernel<Q8, 0, RT><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
+        case 1: attention_wmma_kernel<Q8, 1, RT, G><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
+        case 2: attention_wmma_kernel<Q8, 2, RT, G><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
+        case 4: attention_wmma_kernel<Q8, 4, RT, G><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
+        case 8: attention_wmma_kernel<Q8, 8, RT, G><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
+        case 16: attention_wmma_kernel<Q8, 16, RT, G><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
+        case 32: attention_wmma_kernel<Q8, 32, RT, G><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
+        case 64: attention_wmma_kernel<Q8, 64, RT, G><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
+        case 128: attention_wmma_kernel<Q8, 128, RT, G><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
+        case 65: attention_wmma_kernel<Q8, 65, RT, G><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
+        case 63: attention_wmma_kernel<Q8, 63, RT, G><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
+        default: attention_wmma_kernel<Q8, 0, RT, G><<<fgrid, threads, 0, stream>>>(q, args, w, tokens, seq, nh, nkv, scale); break;
     }
     return hipGetLastError();
 }
 
-template <bool Q8>
+template <bool Q8, int G = kGqaGroup>
 hipError_t fa_launch(hipStream_t stream, const float * q, const KvArgs & args, float * w,
                      const long long tokens, const long long seq, const int nh, const int nkv,
                      const float scale) {
     if (g_fa_rt1_tokens > 0 && tokens <= g_fa_rt1_tokens) {
         const dim3 fgrid((unsigned) ((tokens + kFaTokens - 1) / kFaTokens), (unsigned) nkv);
-        return fa_launch_rt<Q8, 1>(fgrid, stream, q, args, w, tokens, seq, nh, nkv, scale);
+        return fa_launch_rt<Q8, 1, G>(fgrid, stream, q, args, w, tokens, seq, nh, nkv, scale);
     }
     const dim3 fgrid((unsigned) ((tokens + kFaWgTokens - 1) / kFaWgTokens), (unsigned) nkv);
-    return fa_launch_rt<Q8, kFaRowTiles>(fgrid, stream, q, args, w, tokens, seq, nh, nkv, scale);
+    return fa_launch_rt<Q8, kFaRowTiles, G>(fgrid, stream, q, args, w, tokens, seq, nh, nkv, scale);
 }
 
 } // namespace
@@ -1452,16 +1451,21 @@ bool attention_gqa_merge(const float * work, const float * gate, float * out, vo
     return hipGetLastError() == hipSuccess;
 }
 
-bool attention_gqa_range(const float * q, const KvCache & kv, const float * gate, float * out,
-                         const int64_t tokens, const int64_t seq, const int64_t nh,
-                         const int64_t nkv, const int64_t hd, const float scale,
-                         const bool v_rotated, void * work, const size_t work_bytes,
-                         hipStream_t stream, void * out_f16, const bool allow_wmma,
-                         const int64_t key_chunk, const bool dec_wmma, const int64_t split0,
-                         const int64_t nsplits, const bool merge) {
+// The two GQA groups the kernels are instantiated for (#493): 6 (Qwen3.8-27B)
+// and 8 (qwen35moe). The template keeps the per-group geometry - the flash
+// kernels' waves, the decode kernel's row mapping - compile-time, so the first
+// model's code is what it was.
+template <int G>
+bool attention_gqa_range_impl(const float * q, const KvCache & kv, const float * gate, float * out,
+                              const int64_t tokens, const int64_t seq, const int64_t nh,
+                              const int64_t nkv, const int64_t hd, const float scale,
+                              const bool v_rotated, void * work, const size_t work_bytes,
+                              hipStream_t stream, void * out_f16, const bool allow_wmma,
+                              const int64_t key_chunk, const bool dec_wmma, const int64_t split0,
+                              const int64_t nsplits, const bool merge) {
     const bool q8 = kv.k_q8 != nullptr;
     if (q == nullptr || (out == nullptr && out_f16 == nullptr) || work == nullptr || tokens <= 0 || seq < tokens ||
-        nh <= 0 || nkv <= 0 || nh / nkv != kGqaGroup || nh % nkv != 0 || hd != kGqaHd || split0 < 0 ||
+        nh <= 0 || nkv <= 0 || nh / nkv != G || nh % nkv != 0 || hd != kGqaHd || split0 < 0 ||
         nsplits < 0) {
         return false;
     }
@@ -1518,8 +1522,8 @@ bool attention_gqa_range(const float * q, const KvCache & kv, const float * gate
             return false;
         }
         const hipError_t e =
-            q8 ? fa_launch<true>(stream, q, args, w, tokens, seq, (int) nh, (int) nkv, scale)
-               : fa_launch<false>(stream, q, args, w, tokens, seq, (int) nh, (int) nkv, scale);
+            q8 ? fa_launch<true, G>(stream, q, args, w, tokens, seq, (int) nh, (int) nkv, scale)
+               : fa_launch<false, G>(stream, q, args, w, tokens, seq, (int) nh, (int) nkv, scale);
         if (e != hipSuccess) {
             return false;
         }
@@ -1541,9 +1545,9 @@ bool attention_gqa_range(const float * q, const KvCache & kv, const float * gate
             return false;
         }
         const dim3 dgrid(1u, (unsigned) nkv, (unsigned) ns);
-        const int nrt = (int) ((tokens * kGqaGroup + 15) / 16);
+        const int nrt = (int) ((tokens * G + 15) / 16);
 #define OMPH_DEC_LAUNCH(Q8, NRT)                                                                       \
-    attention_dec_kernel<Q8, NRT><<<dgrid, kDcThreads, 0, stream>>>(q, args, w, tokens, seq, (int) nh, \
+    attention_dec_kernel<Q8, NRT, G><<<dgrid, kDcThreads, 0, stream>>>(q, args, w, tokens, seq, (int) nh, \
                                                                     (int) nkv, scale, dsplits, tps,   \
                                                                     (int) split0)
         if (q8) {
@@ -1566,7 +1570,7 @@ bool attention_gqa_range(const float * q, const KvCache & kv, const float * gate
     const int tq = gqa_tq(tokens);
     const dim3 grid((unsigned) ((tokens + tq - 1) / tq), (unsigned) nkv, (unsigned) ns);
 #define OMPH_GQA_LAUNCH(Q8, TQ)                                                                              \
-    attention_gqa_kernel<Q8, TQ><<<grid, kGqaHd, 0, stream>>>(q, args, w, tokens, seq, (int) nh, (int) nkv, \
+    attention_gqa_kernel<Q8, TQ, G><<<grid, kGqaHd, 0, stream>>>(q, args, w, tokens, seq, (int) nh, (int) nkv, \
                                                               scale, splits, bps, per_query, (int) split0)
     if (q8) {
         if (tq == 4) {
@@ -1592,6 +1596,30 @@ bool attention_gqa_range(const float * q, const KvCache & kv, const float * gate
     attention_gqa_merge_kernel<<<dim3((unsigned) tokens, (unsigned) nh), kGqaHd, 0, stream>>>(
         w, gate, out, static_cast<__half *>(out_f16), (int) nh, splits, v_rotated);
     return hipGetLastError() == hipSuccess;
+}
+
+bool attention_gqa_range(const float * q, const KvCache & kv, const float * gate, float * out,
+                         const int64_t tokens, const int64_t seq, const int64_t nh,
+                         const int64_t nkv, const int64_t hd, const float scale,
+                         const bool v_rotated, void * work, const size_t work_bytes,
+                         hipStream_t stream, void * out_f16, const bool allow_wmma,
+                         const int64_t key_chunk, const bool dec_wmma, const int64_t split0,
+                         const int64_t nsplits, const bool merge) {
+    if (nh <= 0 || nkv <= 0 || nh % nkv != 0) {
+        return false;
+    }
+    const int64_t g = nh / nkv;
+    if (g == kGqaGroup) {
+        return attention_gqa_range_impl<kGqaGroup>(q, kv, gate, out, tokens, seq, nh, nkv, hd, scale,
+                                                   v_rotated, work, work_bytes, stream, out_f16, allow_wmma,
+                                                   key_chunk, dec_wmma, split0, nsplits, merge);
+    }
+    if (g == kGqaGroupMoe) {
+        return attention_gqa_range_impl<kGqaGroupMoe>(q, kv, gate, out, tokens, seq, nh, nkv, hd, scale,
+                                                      v_rotated, work, work_bytes, stream, out_f16, allow_wmma,
+                                                      key_chunk, dec_wmma, split0, nsplits, merge);
+    }
+    return false;
 }
 
 bool attention_gqa(const float * q, const KvCache & kv, const float * gate, float * out,
