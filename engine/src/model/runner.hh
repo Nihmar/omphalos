@@ -460,6 +460,8 @@ private:
     // Italian at ~16 % (where a prefix draft misses too often to pay off).
     static constexpr double kDraftOovMax = 0.05;
     double draft_oov_ = 0.0;
+    int64_t dfl_head_steps_ = 0;      // #453: draft steps and how many scored the whole head
+    int64_t dfl_head_fallback_ = 0;
     void observe_draft(const int32_t * toks, int64_t n);
     int64_t last_pos0_ = 0;
     // The MTP block over T positions: embeddings of `toks`, h rows `h_in`,

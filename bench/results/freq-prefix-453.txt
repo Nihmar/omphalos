@@ -1,0 +1,73 @@
+# #453: a frequency-ordered head prefix for the draft vocabulary — measured, not adopted
+
+Engine main after #452 + the probe, RX 9060 XT 16 GB, 2026-10-14. The issue's two
+step-1 measurements, no format change: (a) how often the draft head falls back to
+the whole 682 MiB, (b) what a frequency-ordered (lossless re-layout) prefix of
+16k/32k/64k/98304 rows would recall, with the frequency taken from one workload
+and evaluated on another.
+
+## (a) The fallback, on three workloads (`--dflash`, 256 tokens each, greedy)
+
+`OMPH_DFLASH_DEBUG=1` now prints, per verified block, the prefix size, the OOV EMA
+of the output tokens and the share of draft steps that scored the whole head:
+
+| workload | OOV EMA (final) | full-head steps | note |
+|---|---:|---:|---|
+| Italian chat (568-token transcript) | 0.0215 | **90 / 108 (83 %)** | the EMA starts at **0.25** and takes ~90 steps to fall |
+| English chat (486-token) | 0.0003 | 0 / 106 | 0-2 % as the code comment said |
+| code (2.9k file) | 0.0092 | 0 / 71 | |
+
+Italian is the case #203 flagged as the slowest MTP scenario, and its output
+tokens are **9 % outside the 98304-id prefix** overall (25 % over the first
+steps), so the fallback is not a bug: the prefix simply does not cover the
+language. (The EMA's weight 64 also keeps the fallback on for ~90 steps after the
+OOV drops - a separate, cheaper nit, but the startup OOV is genuinely above the
+5 % threshold, so the fallback is correct where it starts.)
+
+## (b) The recall, offline (`tools/freq_prefix_probe.py`)
+
+The head dequantized with gguf-py, 512 probe vectors = the layer-63 hidden states
+of a 512-token Italian prompt (`--trace-dir`, RMS-normalized with `output_norm`),
+the true top-16 per position over the whole head, then the prefix sets:
+
+| prefix | order | recall@16 | top-1 agreement |
+|---:|---|---:|---:|
+| 16384 | id order | 8.94 | 0.648 |
+| 16384 | frequency, Italian | 9.36 | 0.691 |
+| 32768 | id order | 10.54 | 0.736 |
+| 32768 | frequency, Italian | 10.73 | 0.762 |
+| 32768 | frequency, code / English | 10.56 | 0.736 |
+| 65536 | id order | 12.02 | 0.801 |
+| 65536 | frequency, Italian | 12.19 | 0.826 |
+| 98304 | id order | 12.97 | 0.856 |
+| 98304 | frequency, Italian | 13.13 | 0.879 |
+| 98304 | frequency, code / English | 12.98 | 0.856 |
+
+Three readings:
+
+1. **The size-shrinking hope is dead**: a frequency-ordered 32768-row prefix
+   recalls 10.73 of 16 (67 %) against the current 98304 id-ordered prefix's 12.97
+   (81 %). "The same top-16 recall with ~32k rows" does not exist; 42 % of the
+   true candidates at these positions are simply not among the most frequent
+   tokens of the workload.
+2. At the *same* size the Italian frequency order is worth **+2.7 % relative on
+   top-1** (0.856 -> 0.879) - real, but small, and it does not transfer: a
+   permutation built from code or English is indistinguishable from the id order
+   on Italian (0.856), so the permutation would be workload-specific while the
+   `.omph` is not.
+3. The OOV of an Italian generation under each prefix: id order 98304 -> **9.0 %**,
+   frequency-ordered 98304 (Italian corpus) -> **6.6 %**, (English/docs corpus)
+   -> 8.2 %. The permuted prefix would *still* sit above the 5 % fallback
+   threshold, so it does not even buy the thing the issue was after.
+
+## Decision
+
+**Not adopted.** A format bump plus the id <-> row tables in the argmax, the
+sampler, the n-gram and DFlash2 candidate paths and the target's head, for a
+workload-specific +2.7 % of top-1 and a fallback that keeps firing. The measured
+answer to "how do you draft Italian well" is the existing knob: `OMPH_DRAFT_VOCAB`
+(the head's cost is ~0.3 ms per 32k rows per step, the fallback ~2 ms when it
+fires), and the probe stays for any future re-layout idea:
+
+    uv run python tools/freq_prefix_probe.py --states <trace>/l_out-63.f32 \
+        --freq <gen-out> [--gen <gen-out>] --sizes 32768,98304
