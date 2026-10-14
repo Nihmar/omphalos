@@ -38,5 +38,26 @@ A truncated-SVD sketch would do better than a random projection at the same
 rank, but the order of magnitude (a >50 % loss of candidates at rank 512) does
 not suggest it changes the conclusion.
 
+## The two-stage variant (a shortlist + an exact re-rank), measured
+
+If a cheap sketch cannot *rank* the top-16, it might still *shortlist* them: the
+sketch's top-M candidates, then the *exact* head logits for those M rows only
+(12 MB at M = 4096 against the 283 MB prefix). Same probe setup, 128 real hidden
+states, the exact re-rank inside the sketch's top-4096, compared with the exact
+top-16 over the *whole* vocabulary:
+
+| head | recall@16 vs the true top-16 | contains the whole top-16 |
+|---|---:|---:|
+| the engine's today: the first 98304 rows | **100.0 %** | **100.0 %** |
+| rank-256 sketch -> top-4096 -> exact re-rank | 38.9 % | 0.0 % |
+| rank-512 sketch -> top-4096 -> exact re-rank | 55.6 % | 0.8 % |
+
+A rank-256/512 Johnson-Lindenstrauss projection's score error (||x|| ||h|| /
+sqrt(rank)) is large against the *gaps between the top tokens*, so the shortlist
+misses part of the true top-16 in ~99 % of the cases; the exact second stage
+cannot recover what the first did not select. (The same probe also shows the
+98304-row prefix the engine already uses keeps the whole true top-16 on all 128
+probes, so the prefix costs nothing in candidate quality.)
+
 Decision: **no sketched draft head.** The candidates stay with the real head,
 already reduced to the first 98304 rows (#217, #245).
