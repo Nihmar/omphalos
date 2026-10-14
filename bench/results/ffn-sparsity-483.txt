@@ -1,0 +1,27 @@
+# The FFN activation's block sparsity at the down projection's input (#483) — measured, not adopted
+
+Engine main 2026-10-14 + an `OMPH_TEST_FFNDUMP=<file>` diagnostic (dump of `up_swiglu`'s `out16`,
+the down projection's input; reverted). One 512-token prefill chunk, layer 0's FFN:
+512 x 17408 values, max |x| 4.21, mean |x| 0.0024.
+
+| block | threshold | blocks below | activation energy dropped | exact zeros |
+|---:|---:|---:|---:|---:|
+| 32 | < 1e-3 | **0.0 %** | 0.0 % | 0.01 % of values |
+| 32 | < 1e-2 | 44.6 % | 3.0 % | |
+| 32 | < 3e-2 | 90.5 % | 17.1 % | |
+| 256 | < 1e-3 | **0.0 %** | 0.0 % | |
+| 256 | < 1e-2 | 6.3 % | 0.25 % | |
+| 256 | < 3e-2 | 56.4 % | 7.9 % | |
+| 256 | < 0.1 | 92.6 % | 25.8 % | |
+
+Energy concentration (256-blocks): 43 of 68 carry 90 %, 64.4 carry 99 %.
+
+SwiGLU's output is never exactly zero: a bit-exact skip has nothing to skip. A tolerance-based
+skip costs relative output noise ~sqrt(dropped energy share) on the down projection: 6.3 % of
+the 256-blocks (0.25 % of the energy) for ~5 % noise, or 56 % (7.9 %) for ~28 % noise. The down
+projections are 64 x 5120 x 17408 = 21 % of the per-token weight bytes, so the 6.3 % skip is
+~1.3 % of a decode step — for a several-percent error on every layer's FFN output, on the path
+that has been bit-exact by design (KV and the WY prefill are the only accepted approximations,
+both with measured KL budgets).
+
+Decision: measured, not adopted.
