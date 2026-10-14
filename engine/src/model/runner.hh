@@ -582,6 +582,15 @@ private:
     void * kv_wstg_vq_ = nullptr;
     void * kv_wstg_vs_ = nullptr;
     int64_t kv_wstg_rows_ = 0;
+    // #409 step 4: what the staged attention actually copies, and what the last
+    // OMPH_TIMING print has already reported. The per-step delta is the traffic
+    // a streaming decode pays (`kv stream:` next to `step gpu`).
+    int64_t kv_stage_rows_ = 0;
+    int64_t kv_stage_bytes_ = 0;
+    int64_t kv_stage_groups_ = 0;
+    int64_t kv_stage_rows_shown_ = 0;
+    int64_t kv_stage_bytes_shown_ = 0;
+    int64_t kv_stage_groups_shown_ = 0;
     // The store's per-layer pointers for a layer (the device's quant_kv for the
     // resident part, over the whole context for the store).
     struct HostKv {

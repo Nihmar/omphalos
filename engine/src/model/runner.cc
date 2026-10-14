@@ -446,6 +446,18 @@ void Runner::step_event(hipEvent_t a, hipEvent_t b) {
     float ms = 0.0f;
     (void) hipEventElapsedTime(&ms, a, b);
     std::fprintf(stderr, "step gpu %.2f ms\n", ms);
+    if (kv_stream_) {
+        // #409 step 4: the rows the staged attention copied for this step - the
+        // one number that says whether the residency budget is biting.
+        const int64_t rows = kv_stage_rows_ - kv_stage_rows_shown_;
+        const int64_t bytes = kv_stage_bytes_ - kv_stage_bytes_shown_;
+        const int64_t groups = kv_stage_groups_ - kv_stage_groups_shown_;
+        kv_stage_rows_shown_ = kv_stage_rows_;
+        kv_stage_bytes_shown_ = kv_stage_bytes_;
+        kv_stage_groups_shown_ = kv_stage_groups_;
+        std::fprintf(stderr, "kv stream: staged %lld rows / %.1f MiB in %lld group calls\n",
+                     (long long) rows, (double) bytes / 1048576.0, (long long) groups);
+    }
     (void) hipEventDestroy(a);
     (void) hipEventDestroy(b);
 }

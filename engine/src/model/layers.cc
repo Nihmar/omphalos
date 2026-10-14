@@ -450,6 +450,9 @@ bool Runner::attn_splits_staged(const omph::kernels::KvCache & kv, const int64_t
                                           host ? hipMemcpyHostToDevice : hipMemcpyDeviceToDevice,
                                           nullptr) == hipSuccess;
                 };
+                // #409 step 4: the telemetry OMPH_TIMING reports per step.
+                kv_stage_rows_ += (int64_t) rows;
+                kv_stage_bytes_ += (int64_t) rows * (int64_t) (k_row + sc_row + v_row + sc_row);
                 return mv(kv_g_k_, sk, k_row) && mv(kv_g_ks_, sks, sc_row) && mv(kv_g_vq_, svq, v_row) &&
                        mv(kv_g_vs_, svs, sc_row);
             };
@@ -467,6 +470,7 @@ bool Runner::attn_splits_staged(const omph::kernels::KvCache & kv, const int64_t
                 return fail("KV group staging failed");
             }
             staged.kbase = r0;
+            ++kv_stage_groups_;
             if (!call(staged, split0, ns, false)) {
                 return false;
             }
