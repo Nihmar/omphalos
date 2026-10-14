@@ -98,10 +98,24 @@ void test_etag() {
           "the gzip check comes first");
 }
 
+// The fallback service worker (#395): served for /sw.js when the bundle has
+// none, it must unregister itself and drop the caches, or a browser that used
+// another UI keeps showing it.
+void test_sw_fallback() {
+    const std::string_view js = omph::server::webui::remove_service_worker();
+    CHECK(js.find("registration.unregister()") != std::string_view::npos, "unregisters itself");
+    CHECK(js.find("caches.delete") != std::string_view::npos, "drops the caches");
+    CHECK(js.find("skipWaiting") != std::string_view::npos, "takes over the old worker");
+    CHECK(resolve("/sw.js").status == Resolution::Status::NotFound ||
+              resolve("/sw.js").asset != nullptr,
+          "/sw.js is an asset when the bundle has one, else the fallback answers");
+}
+
 }  // namespace
 
 int main() {
     test_table();
+    test_sw_fallback();
     test_index();
     test_hashed_assets();
     test_cache_policy();

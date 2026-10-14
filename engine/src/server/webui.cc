@@ -88,4 +88,16 @@ Resolution resolve(const std::string_view path, const std::string_view if_none_m
     return res;
 }
 
+std::string_view remove_service_worker() {
+    // llama.cpp's tools/server/server-http.cpp, byte for byte (#29565).
+    return R"JS(
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil((async () => {
+    await self.registration.unregister();
+    for (const key of await caches.keys()) await caches.delete(key);
+    for (const c of await self.clients.matchAll({ type: 'window' })) c.navigate(c.url);
+})()));
+)JS";
+}
+
 }  // namespace omph::server::webui

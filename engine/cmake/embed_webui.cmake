@@ -78,11 +78,21 @@ list(LENGTH assets N_ASSETS)
 # not check it, the server's build does).
 set(WEBUI_COMMIT "")
 if(EXISTS "${WEBUI_DIR}")
-    execute_process(COMMAND git -C "${WEBUI_DIR}" rev-parse HEAD
-                    OUTPUT_VARIABLE WEBUI_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE
-                    RESULT_VARIABLE WEBUI_COMMIT_RC ERROR_QUIET)
-    if(NOT WEBUI_COMMIT_RC EQUAL 0)
-        set(WEBUI_COMMIT "")
+    # The assets usually sit inside the llama.cpp checkout (its tools/ui build
+    # dir), so walk up to the tree that owns them and take *its* HEAD (#395):
+    # a build dir is not a repository itself, and the empty answer would hide
+    # the pin behind nothing.
+    set(_webui_git "${WEBUI_DIR}")
+    while(NOT EXISTS "${_webui_git}/.git" AND NOT _webui_git STREQUAL "/")
+        get_filename_component(_webui_git "${_webui_git}" DIRECTORY)
+    endwhile()
+    if(EXISTS "${_webui_git}/.git")
+        execute_process(COMMAND git -C "${_webui_git}" rev-parse HEAD
+                        OUTPUT_VARIABLE WEBUI_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE
+                        RESULT_VARIABLE WEBUI_COMMIT_RC ERROR_QUIET)
+        if(NOT WEBUI_COMMIT_RC EQUAL 0)
+            set(WEBUI_COMMIT "")
+        endif()
     endif()
 endif()
 
