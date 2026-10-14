@@ -1,0 +1,35 @@
+# The verification row budget against the context cost (#478) — measured, not adopted
+
+Engine main 2026-10-14 (after #477), RX 9060 XT 16 GB, CachyOS, desktop active.
+`omph-generate --chat --ctx N --max 300` on a verbatim-copy prompt (a long filler + a
+passage to repeat), MTP loaded, n-gram on, greedy. The n-gram path bypasses the keep rule,
+so `OMPH_SPEC_ROWS` is the only knob there.
+
+## A. Copy workload: the budget is worth running to the cap at 63k
+
+| budget (rows) | 31k ms/token (t/s) | 63k ms/token (t/s) |
+|---:|---:|---:|
+| 8  | 7.42 (134.8) | 8.22 (121.6) |
+| 12 | 5.34 (187.4) | 6.16 (162.3) |
+| 16 | **5.05 (198.0)** | **5.93 (168.7)** |
+
+Acceptance is context-independent (275/337 at both lengths): the same content. Break-even
+for a marginal row is `p > row_cost / ms_per_token`; at 63k, 16 rows, that is 3.6/5.93 = 0.61,
+and the copy chain is above it. 16 rows stays the best budget at both lengths.
+
+## B. DFlash2 on a 63k code prompt, 128 tokens
+
+| OMPH_DFLASH_KEEP | block (rows) | ms/token | drafts accepted |
+|---:|---:|---:|---:|
+| 0.12 (default) | 9 | 18.30 | 100 / 262 |
+| 0.6 | 1 | 18.54 | 89 / 175 |
+
+The per-position keep EMAs (OMPH_DFLASH_DEBUG=1) fall to 0.04 past position 9, and poor
+acceptance raises the token value (18.3 ms/token, 4x the oracle's 4.78), which lowers the
+break-even threshold to ~0.12 — exactly the default. The keep rule self-calibrates; a fixed
+`P_min(seq)` would cut rows that pay for themselves.
+
+Oracle reference (correct drafts, 100% acceptance; `--draft-oracle --draft-k 7|15` at 32k/63k):
+one verification row costs 1.41 ms at 32k and 2.15 ms at 63k.
+
+Decision: measured, not adopted — the lever is the row *cost* (#479), not the row choice.
