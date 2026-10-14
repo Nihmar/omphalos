@@ -18,12 +18,14 @@
 
 namespace omph::kernels {
 
-// The routed gate for `tokens` hidden states (f16, k values each):
-// logits = x . router (F32 [k, n_expert], ne[0] = k), softmax over all of them,
-// the top `topk` ids written to `ids` (row-major, tokens x topk) and their
-// renormalized probabilities to `weights`. Ties keep the lower id.
-bool moe_route(const void * router, const void * x_f16, int * ids, float * weights, int64_t tokens,
-               int64_t k, int64_t n_expert, int topk, hipStream_t stream);
+// The routed gate's selection: the softmax over a token's router logits (the
+// [tokens, n_expert] f32 rows of the router GEMM), the top-k ids and their
+// renormalized probabilities. Ties keep the lower id. The logits themselves are
+// a plain f16 GEMM (the router weights are converted to f16 once at load):
+// the per-expert scalar dot this replaced was 57 % of the second model's
+// prefill (#494).
+bool moe_topk(const void * logits, int * ids, float * weights, int64_t tokens, int64_t n_expert,
+              int topk, hipStream_t stream);
 
 // out[t][j] += weights[t * stride + slot] * y[t][j]: one expert's down output,
 // weighted by its router probability, accumulated into the block's output.

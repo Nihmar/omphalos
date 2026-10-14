@@ -9,38 +9,27 @@
 namespace omph::kernels {
 namespace {
 
-// One block per token, one thread per expert: the logits are the block's
-// threads, the softmax a block reduction, the top-k a small scan in thread 0
+// One block per token, one thread per expert: the softmax over the token's
+// router logits (already computed by the f16 GEMM), then the top-k in thread 0
 // (a serial scan of the shared probabilities, ties keeping the lower id).
-//
-// The router row of expert e starts at `router[e * k]` (F32, ne[0] = k); x is
-// f16. expf (not __expf): the reference's soft_max is the f32 one.
-constexpr int kRouteThreads = 256;
+constexpr int kTopkThreads = 256;
 
-__global__ void moe_route_kernel(const float * __restrict__ router, const __half * __restrict__ x,
-                                 int * __restrict__ ids, float * __restrict__ weights,
-                                 const long long k, const int n_expert, const int topk) {
-    extern __shared__ float sh[];  // n_expert probabilities
+__global__ void moe_topk_kernel(const float * __restrict__ logits, int * __restrict__ ids,
+                                float * __restrict__ weights, const int n_expert, const int topk) {
+    extern __shared__ float sh[];  // n_expert logits, then probabilities
     const int t = blockIdx.x;
     const int e = threadIdx.x;
-    const __half * xr = x + (size_t) t * (size_t) k;
-
-    float logit = 0.0f;
     if (e < n_expert) {
-        const float * r = router + (size_t) e * (size_t) k;
-        for (long long j = 0; j < k; ++j) {
-            logit += __half2float(xr[j]) * r[j];
-        }
-        sh[e] = logit;
+        sh[e] = logits[(size_t) t * (size_t) n_expert + e];
     }
     __syncthreads();
 
-    // softmax over all the experts
+    // softmax over all the experts (expf: the reference's soft_max is the f32 one)
     float m = -INFINITY;
-    for (int i = e; i < n_expert; i += kRouteThreads) {
+    for (int i = e; i < n_expert; i += kTopkThreads) {
         m = fmaxf(m, sh[i]);
     }
-    for (int o = kRouteThreads / 2; o > 0; o >>= 1) {
+    for (int o = kTopkThreads / 2; o > 0; o >>= 1) {
         m = fmaxf(m, __shfl_xor(m, o));
     }
     __shared__ float s_max;
@@ -49,12 +38,12 @@ __global__ void moe_route_kernel(const float * __restrict__ router, const __half
     }
     __syncthreads();
     float sum = 0.0f;
-    for (int i = e; i < n_expert; i += kRouteThreads) {
+    for (int i = e; i < n_expert; i += kTopkThreads) {
         const float p = expf(sh[i] - s_max);
         sh[i] = p;
         sum += p;
     }
-    for (int o = kRouteThreads / 2; o > 0; o >>= 1) {
+    for (int o = kTopkThreads / 2; o > 0; o >>= 1) {
         sum += __shfl_xor(sum, o);
     }
     __shared__ float s_sum;
@@ -90,7 +79,10 @@ __global__ void moe_route_kernel(const float * __restrict__ router, const __half
     }
 }
 
-// out[t][j] += w[t][slot] * y[t][j], one thread per output element.
+// one block per gathered row: store it at its (token, slot) in the per-slot
+// buffer (a plain store: every (token, slot) pair appears once)
+// out[t][j] += w[t][slot] * y[t][j], one thread per output element (the decode
+// path's per-expert accumulate and the shared expert's weighted sum).
 __global__ void moe_acc_kernel(float * __restrict__ out, const float * __restrict__ y,
                                const float * __restrict__ weights, const long long n, const int stride,
                                const int slot) {
@@ -100,6 +92,17 @@ __global__ void moe_acc_kernel(float * __restrict__ out, const float * __restric
     const float * yrow = y + (size_t) t * (size_t) n;
     for (long long j = threadIdx.x; j < n; j += blockDim.x) {
         orow[j] += w * yrow[j];
+    }
+}
+
+// one block per row: copy k f16 values (the gather of an expert's rows)
+__global__ void moe_gather_kernel(const __half * __restrict__ x, const long long k,
+                                  const int * __restrict__ ids, __half * __restrict__ dst) {
+    const long long i = blockIdx.x;
+    const __half * s = x + (size_t) ids[i] * (size_t) k;
+    __half * d = dst + (size_t) i * (size_t) k;
+    for (long long j = threadIdx.x; j < k; j += blockDim.x) {
+        d[j] = s[j];
     }
 }
 
@@ -119,19 +122,6 @@ __global__ void moe_shexp_gate_kernel(const float * __restrict__ w, const __half
     out[t] = 1.0f / (1.0f + expf(-acc));
 }
 
-// one block per row: copy k f16 values
-__global__ void moe_gather_kernel(const __half * __restrict__ x, const long long k,
-                                  const int * __restrict__ ids, __half * __restrict__ dst) {
-    const long long i = blockIdx.x;
-    const __half * s = x + (size_t) ids[i] * (size_t) k;
-    __half * d = dst + (size_t) i * (size_t) k;
-    for (long long j = threadIdx.x; j < k; j += blockDim.x) {
-        d[j] = s[j];
-    }
-}
-
-// one block per gathered row: store it at its (token, slot) in the per-slot
-// buffer (a plain store: every (token, slot) pair appears once)
 __global__ void moe_scatter_store_kernel(float * __restrict__ xo, const float * __restrict__ y,
                                          const int * __restrict__ slot, const int * __restrict__ dst,
                                          const long long ne, const int topk) {
@@ -163,17 +153,16 @@ __global__ void moe_combine_kernel(float * __restrict__ out, const float * __res
 
 } // namespace
 
-bool moe_route(const void * router, const void * x_f16, int * ids, float * weights, const int64_t tokens,
-               const int64_t k, const int64_t n_expert, const int topk, hipStream_t stream) {
-    if (router == nullptr || x_f16 == nullptr || ids == nullptr || weights == nullptr || tokens <= 0 ||
-        k <= 0 || n_expert <= 0 || n_expert > kRouteThreads || topk <= 0 || topk > n_expert) {
+bool moe_topk(const void * logits, int * ids, float * weights, const int64_t tokens,
+              const int64_t n_expert, const int topk, hipStream_t stream) {
+    if (logits == nullptr || ids == nullptr || weights == nullptr || tokens <= 0 || n_expert <= 0 ||
+        n_expert > kTopkThreads || topk <= 0 || topk > n_expert) {
         return false;
     }
     const size_t sh_bytes = (size_t) n_expert * sizeof(float);
-    moe_route_kernel<<<(unsigned) tokens, kRouteThreads, sh_bytes, stream>>>(
-        static_cast<const float *>(router), static_cast<const __half *>(x_f16), ids, weights,
-        (long long) k, (int) n_expert, topk);
-    return true;
+    moe_topk_kernel<<<(unsigned) tokens, kTopkThreads, sh_bytes, stream>>>(
+        static_cast<const float *>(logits), ids, weights, (int) n_expert, topk);
+    return hipGetLastError() == hipSuccess;
 }
 
 bool moe_acc(float * out, const float * y, const float * weights, const int64_t tokens, const int64_t stride,
@@ -185,7 +174,7 @@ bool moe_acc(float * out, const float * y, const float * weights, const int64_t 
     const unsigned threads = n < 256 ? (unsigned) n : 256;
     moe_acc_kernel<<<(unsigned) tokens, threads, 0, stream>>>(out, y, weights, (long long) n, (int) stride,
                                                               slot);
-    return true;
+    return hipGetLastError() == hipSuccess;
 }
 
 bool moe_gather(const void * x_f16, const int64_t k, const int * ids, const int64_t n, void * dst,

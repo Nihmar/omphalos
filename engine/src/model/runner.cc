@@ -135,6 +135,9 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     }
 
     resolve_layers();
+    if (h_.moe()) {
+        moe_router_f16();
+    }
     if (dft_file_ != nullptr) {
         dflash_load();
     }
@@ -200,6 +203,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         alloc(&moe_slot_, (size_t) T * h_.n_expert_used * sizeof(int));
         alloc(&moe_off_, ((size_t) h_.n_expert + 1) * sizeof(int));
         alloc(&moe_cnt_, (size_t) h_.n_expert * sizeof(int));
+        alloc(&moe_logits_, (size_t) T * h_.n_expert * 4);
         moe_host_ids_.resize((size_t) T * h_.n_expert_used);
         moe_counts_.resize((size_t) h_.n_expert);
     }
@@ -1263,6 +1267,27 @@ void Runner::resolve_layers() {
     }
     embd_type_ = te->type;
     embd_row_bytes_ = (int64_t) (te->nbytes / te->ne[1]);
+}
+
+// One f16 copy of every layer's router (#494): the gate is a small f32 GEMM
+// per layer per chunk, and the per-expert scalar dot it replaced was 57 % of
+// the second model's prefill. A one-off at load, ~1 MiB per layer.
+void Runner::moe_router_f16() {
+    for (int64_t il = 0; il < h_.n_layer; ++il) {
+        LayerWeights & L = layers_[(size_t) il];
+        if (L.ffn_gate_inp.t == nullptr || L.ffn_gate_inp.dev == nullptr) {
+            continue;
+        }
+        const int64_t n = numel(*L.ffn_gate_inp.t);
+        L.gate_inp16 = mem_.device((size_t) n * 2);
+        if (!omph::kernels::cast_f32_to_f16(static_cast<const float *>(L.ffn_gate_inp.dev),
+                                            L.gate_inp16, n, nullptr)) {
+            throw std::runtime_error("cannot convert the router to f16");
+        }
+    }
+    if (hipDeviceSynchronize() != hipSuccess) {
+        throw std::runtime_error("the router conversion failed");
+    }
 }
 
 // --- speculative decoding (#122) ---
