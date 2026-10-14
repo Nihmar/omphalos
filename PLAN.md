@@ -910,7 +910,7 @@ Small gains, a few percent each at most, but they add up. Rough expected impact 
 
 - Struct-of-arrays, 128-bit aligned loads, fully coalesced (§8.3) [several %].
 - Several independent 128-bit loads in flight per lane (unrolling / software pipelining) [latency hiding].
-- **Non-temporal loads for weights** (`__builtin_nontemporal_load`, streaming cache policy): weights are read once per token and should not evict KV/state/activations from caches **[verify]** effect on RDNA4 [small].
+- **Non-temporal loads for weights** (`__builtin_nontemporal_load`, streaming cache policy): weights are read once per token and should not evict KV/state/activations from caches. **[resolved, #472: no effect on RDNA4]** - 12.768 vs 12.797 ms per pass over all 144 IQ3_S tensors (NT=1, KW=8; mixed signs elsewhere, within noise), `bench/results/nontemporal-16-2.txt`. The premise does not hold here: the per-step stream (701 MiB of weights plus the attention's KV, 300 MB at 4k rows) thrashes the 32 MB L2 by construction, so there is no resident working set for the policy to protect.
 - Keep activations in FP16/int8, accumulate in FP32.
 - Codebook tables in LDS, loaded once per workgroup.
 - Put all tiny per-token state (norm weights, gates, biases) contiguous so they come in few cache lines.
