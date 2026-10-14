@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 namespace {
@@ -63,6 +64,37 @@ __global__ __launch_bounds__(256) void rd_queue(const uint4 * __restrict__ pool,
             acc.z ^= v.z;
             acc.w ^= v.w;
         }
+    }
+    if (acc.x == 0x12345678u && acc.y == 7u) {
+        out[0] = acc;
+    }
+}
+
+// #456: the decode step's small kernels (delta_step, norms, attention prep /
+// merge: ~165 launches, ~2.5 ms per step) leave the DRAM idle. A light
+// side-stream kernel could read the *next* GEMV's head into the 32 MB MALL
+// (Infinity Cache) during them, so that GEMV starts on hits instead of a cold
+// ramp. The dummy below is one such gap (a dependent FMA chain, no memory), and
+// rd_prefetch reads a head of `bytes` with cacheable loads (a non-temporal load
+// would bypass the MALL and prefetch nothing).
+__global__ __launch_bounds__(256) void lat_dummy(float * out, const int iters) {
+    float x = (float) threadIdx.x * 1e-6f + (float) blockIdx.x * 1e-5f;
+    for (int i = 0; i < iters; ++i) {
+        x = fmaf(x, 1.000001f, 1e-7f);
+    }
+    if (x == 12345.678f) {
+        out[0] = x;
+    }
+}
+
+__global__ __launch_bounds__(256) void rd_prefetch(const uint4 * __restrict__ p, const long long n, uint4 * out) {
+    uint4 acc = make_uint4(0, 0, 0, 0);
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long) gridDim.x * blockDim.x) {
+        const uint4 v = p[i];
+        acc.x ^= v.x;
+        acc.y ^= v.y;
+        acc.z ^= v.z;
+        acc.w ^= v.w;
     }
     if (acc.x == 0x12345678u && acc.y == 7u) {
         out[0] = acc;
@@ -191,5 +223,56 @@ int main() {
     row("C: 8 launches", chain_k(8));
     row("C: 32 launches", chain_k(32));
     std::printf("prize A - B: %.2f ms (%.0f%% of A)\n", ms_a - ms_b, 100.0 * (ms_a - ms_b) / ms_a);
+
+    // ---- #456: a latency-bound gap between segments, with and without a
+    // side-stream prefetch of the next segment's head.
+    hipStream_t side = nullptr;
+    (void) hipStreamCreateWithFlags(&side, hipStreamNonBlocking);
+    float * fout = nullptr;
+    (void) hipMalloc(&fout, 64);
+    // ~15 us of dependent FMA (the small kernels' measured cost, #203)
+    const int iters = 350;  // calibrated for ~15 us: the small kernels' measured cost (#203)
+    hipEvent_t ev_pre = nullptr;
+    (void) hipEventCreateWithFlags(&ev_pre, hipEventDisableTiming);
+    const std::vector<size_t> prefetch_mib = {0, 2, 4, 8, 16, 24};
+    // a gap without the prefetch: the chain with the dummy everywhere (the head
+    // row's cost includes the dummy; the deltas between rows are the effect)
+    std::vector<double> base(seg_mib.size(), 0.0);
+    const auto chain_gap = [&](const int p_mib) {
+        const size_t bytes = (size_t) p_mib * 1048576;
+        return time_ms([&] {
+            for (size_t s = 0; s + 1 < seg_mib.size(); ++s) {
+                rd<<<grid, 256>>>(pool + seg_off[s], seg_n[s], out);
+                if (bytes > 0) {
+                    const long long nn = (long long) std::min<size_t>(bytes, (size_t) seg_n[s + 1] * 16) / 16;
+                    rd_prefetch<<<grid, 256, 0, side>>>(pool + seg_off[s + 1], nn, out);
+                    (void) hipEventRecord(ev_pre, side);
+                }
+                lat_dummy<<<grid, 256>>>(fout, iters);
+                if (bytes > 0) {
+                    // a device-side wait, not a host sync (256 host syncs cost
+                    // more than the whole chain)
+                    (void) hipStreamWaitEvent(nullptr, ev_pre, 0);
+                }
+            }
+        });
+    };
+    std::printf("\n#456: the chain with a %.0f us latency gap per segment (FMA dummy), prefetch of the next head:\n",
+                (double) iters * 0.0002);
+    for (const size_t mib : prefetch_mib) {
+        const double ms = chain_gap((int) mib);
+        std::printf("%-22s %8.2f ms  %6.1f GB/s  (%.1f us per segment)\n",
+                    mib == 0 ? "no prefetch" : (std::string("prefetch ") + std::to_string(mib) + " MiB").c_str(),
+                    ms, gb / (ms * 1e-3), ms * 1000.0 / (double) seg_mib.size());
+    }
+    // the dummy alone, for the gap's own cost
+    const double ms_dummy = time_ms([&] {
+        for (size_t s = 0; s + 1 < seg_mib.size(); ++s) {
+            lat_dummy<<<grid, 256>>>(fout, iters);
+        }
+    });
+    std::printf("the gap alone: %.2f ms for %zu gaps (%.1f us each)\n", ms_dummy, seg_mib.size() - 1,
+                ms_dummy * 1000.0 / (double) (seg_mib.size() - 1));
+    (void) hipStreamDestroy(side);
     return 0;
 }
