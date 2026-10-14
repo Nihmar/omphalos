@@ -616,6 +616,7 @@ GenerateResult Generator::generate_inner(const std::vector<int32_t> & prompt_ids
     save_snapshot(prompt, ex.images, res);
     const int64_t from = resume(prompt, ex.images, res);
     runner_->mtp_prompt((int64_t) prompt.size());
+    runner_->dflash_prompt((int64_t) prompt.size());  // #449: only the rows the ring can hold
     if (from < 0) {
         drop_checkpoints(true);
         res.stop = GenerateResult::Stop::Error;

@@ -39,6 +39,7 @@ EnvOptions EnvOptions::from_env() {
     }
     o.kv_stream = flag("OMPH_KV_STREAM");
     o.kv_stream_check = flag("OMPH_KV_STREAM_CHECK");
+    o.dflash_full_inject = flag("OMPH_DFLASH_FULL_INJECT");
     if (const char * m = std::getenv("OMPH_KV_STREAM_MIB")) {
         o.kv_stream_mib = std::atoll(m);
     }

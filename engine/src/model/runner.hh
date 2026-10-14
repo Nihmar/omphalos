@@ -115,6 +115,10 @@ public:
     // window only; after a restore to position pos, the window holds nothing
     // past it (and starts over when pos is before it).
     void mtp_prompt(const int64_t n) { mtp_fill_from_ = mtp_window_ > 0 ? std::max(n - mtp_window_, kMtpSink) : 0; }
+    // #449: the drafter's ring keeps dfl_swa_ rows, so a prompt's injection only
+    // has to cover the rows from here on (the MTP block's window does the same,
+    // #171). Set once per request, before its prefill chunks.
+    void dflash_prompt(const int64_t n) { dfl_fill_from_ = dfl_swa_ > 0 ? std::max<int64_t>(n - dfl_swa_, 0) : 0; }
     void mtp_rewind(int64_t pos);
 
     const HParams & hparams() const { return h_; }
@@ -504,8 +508,9 @@ private:
     int32_t dfl_mask_ = 0;
     int64_t dfl_ne_ = 0;       // drafter width (5120)
     int64_t dfl_ff_ = 0;       // its FFN (17408)
-    int64_t dfl_swa_ = 0;
-    int64_t dfl_swa_eff_ = 0;           // the attention window actually read (#417 follow-up)      // sliding window (2048) = ring slots
+    int64_t dfl_swa_ = 0;               // sliding window (2048) = ring slots
+    int64_t dfl_swa_eff_ = 0;           // the attention window actually read (#417 follow-up)
+    int64_t dfl_fill_from_ = 0;         // #449: the first prompt row the ring can still hold
     size_t dfl_ring_bytes_ = 0;  // each of dfl_ring_k_ / dfl_ring_v_
     int64_t dfl_group_ = 0;    // conv group size (16)
     float dfl_eps_ = 0.0f;
