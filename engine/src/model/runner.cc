@@ -144,7 +144,20 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 std::memcpy(embd_host_, file_.tensor_data(t), (size_t) t.nbytes);
                 continue;
             }
-            if (t.layout != omph::gguf::kLayoutGguf) {
+            if (t.layout == omph::gguf::kLayoutGguf && (t.type == 2 || t.type == 8)) {
+                // Q4_0 / Q8_0 keep the GGUF blocks and their GEMV reads them as
+                // they are (#492)
+                GemvEntry e;
+                e.bytes = (size_t) t.nbytes;
+                e.rows = omph::format::quant_rows(t.type, (int64_t) t.ne[0], t.nbytes);
+                e.k = (int64_t) t.ne[0];
+                e.type = t.type;
+                e.gguf = true;
+                if (e.rows <= 0) {
+                    throw std::runtime_error(name + ": cannot count the rows of " + name);
+                }
+                gems_[name] = e;
+            } else if (t.layout != omph::gguf::kLayoutGguf) {
                 // the engine's layout of the type (format/repack.hh): IQ3_S tiles, else the repack
                 const int64_t k = (int64_t) t.ne[0];
                 // the same row count omph-convert computed (#346: ne[1] alone
@@ -1054,7 +1067,8 @@ const void * Runner::q8_input(const void * x16, const int64_t k, const int64_t T
 
 // Device pointer to the original GGUF bytes of a tensor that was not repacked.
 const void * Runner::raw_bytes(const std::string & name) {
-    if (gems_.find(name) != gems_.end()) {
+    const auto g = gems_.find(name);
+    if (g != gems_.end() && !g->second.gguf) {  // the legacy types keep them (#492)
         throw std::runtime_error("raw bytes of the repacked " + name + " are not kept");
     }
     return static_cast<const uint8_t *>(weight_ptr_.at(name));
@@ -1065,6 +1079,8 @@ const void * Runner::raw_bytes(const std::string & name) {
 // bulk of the model).
 bool Runner::has_gemv_type(const uint32_t type) {
     switch (type) {
+        case 2:
+        case 8:
         case 10:
         case 12:
         case 14:
@@ -1097,7 +1113,7 @@ void * Runner::stage_slice(const Mat & m, const int64_t row0, const int64_t nrow
     void * dst = stage_scratch((size_t) n * 2);
     timer_stage_.start();
     bool ok = false;
-    if (m.gemv != nullptr) {
+    if (m.gemv != nullptr && !m.gemv->gguf) {
         // the slice's own rows/k describe its layout (the tile / repack
         // offsets are a function of the tile and block index alone)
         ok = omph::kernels::dequant_repacked(m.gemv->type, m.dev, dst, m.gemv->rows, m.gemv->k,
@@ -1203,7 +1219,7 @@ void * Runner::stage_w(const std::string & name, const int64_t row0, int64_t nro
     // run on its tile bytes decoded garbage (#341). The GGUF path is only for
     // a tensor without a repacked layout.
     const auto g = gems_.find(name);
-    const bool ok = g != gems_.end()
+    const bool ok = g != gems_.end() && !g->second.gguf
                         ? omph::kernels::dequant_repacked(g->second.type,
                                                           static_cast<const uint8_t *>(weight_ptr_.at(name)),
                                                           dst, g->second.rows, g->second.k, nullptr,

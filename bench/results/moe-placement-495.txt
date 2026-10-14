@@ -32,3 +32,27 @@ Loading is I/O-bound (20 GiB read + 15 GiB uploaded + 7 GiB registered) and, on
 a machine whose RAM is already full, the file's pages and the pinned experts
 compete: the first load after a cold cache takes minutes. After it, the runs
 start in ~2 s.
+
+## The decode's selection stays on the device (#493), and Q8_0 / Q4_0 get a GEMV
+
+Two changes to the decode path:
+
+1. `gemv_moe`: one launch per matrix kind for every selected expert (`grid.z` is
+   the slot, `ids[slot]` picks the expert, the tile layout makes each expert a
+   contiguous run of tiles). The gate / up read the one token, the down reads
+   the slot's own row, and `moe_combine` sums the slots - so the router's
+   selection never leaves the device. The per-layer readback and the 24 GEMVs a
+   layer used to run are gone; the per-expert path stays as the fallback for
+   types without a tile body (this file's Q3_K down projections).
+2. Q8_0 and Q4_0 (the legacy 32-wide types: `ssm_out`, the shared experts,
+   `attn_k` / `attn_v`) have a fused GEMV that reads their GGUF blocks as they
+   are, like IQ1_M's - the staged f16 path was 43 % of the decode.
+
+| | before | after |
+|---|---:|---:|
+| decode (Q4_K_M, 7.12 GiB host) | 33.2 ms/step (30.1 t/s) | **26.7 ms/step (37.5 t/s)** |
+| prefill 4096 (chunk 1024) | 1552.3 ms | 1587.3 ms |
+| prefill 128k (chunk 1024) | 77.6 s | (unchanged path) |
+
+KL against llama.cpp's dump: 0.004011 (the batched path was 0.004053), top-1
+100 %. llama.cpp's decode on the same file: 23 ms/step (43 t/s, -ncmoe 16).

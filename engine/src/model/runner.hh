@@ -52,6 +52,9 @@ class Runner {
         int64_t rows = 0;
         int64_t k = 0;
         uint32_t type = 0;
+        // The bytes are the GGUF blocks, not one of repack.hh's layouts (#492:
+        // the legacy 32-wide types have a GEMV that reads them as they are)
+        bool gguf = false;
     };
 
     // A weight matrix resolved once at load (#100): the hot path looks nothing
@@ -293,6 +296,8 @@ private:
     // rows gathered per expert, one expert's tokens per GEMM, then the
     // slot-ordered weighted sum.
     bool moe_ffn_batched(const LayerWeights & L, const int64_t T);
+    // The shared expert of a MoE layer, one pass for the whole chunk (#493).
+    bool moe_shared(const LayerWeights & L, const int64_t T);
     // The router's f16 weights, converted once at load (#494): the logits are
     // a plain f16 GEMM instead of a per-expert scalar f32 dot.
     void moe_router_f16();

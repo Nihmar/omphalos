@@ -27,6 +27,8 @@ namespace omph::model {
 bool Runner::gemv_one(const int type, const void * w, const void * x, float * y,
                      const int64_t n_out, const int64_t k, hipStream_t st) {
     switch (type) {
+        case 2: return omph::kernels::gemv_q4_0(w, x, y, n_out, k, st);
+        case 8: return omph::kernels::gemv_q8_0(w, x, y, n_out, k, st);
         case 10: return omph::kernels::gemv_q2k(w, x, y, n_out, k, st);
         case 12: return omph::kernels::gemv_q4k(w, x, y, n_out, k, st);
         case 14: return omph::kernels::gemv_q6k(w, x, y, n_out, k, st);
