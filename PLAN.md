@@ -733,7 +733,7 @@ Details:
   Speculative decoding: prose −3.4 %, code −6.7 %, English chat −6.4 %, Italian chat at parity; output unchanged (`bench/results/draft-vocab-217.txt`).
 - **Truncated-vocab draft head (the original idea):** score only the top ~32k most frequent tokens = first rows of the frequency-sorted `lm_head` (§8.3). Build the frequency table from a corpus representative of the real workload (for code-heavy use, a code corpus including the languages you actually use), tokenized with the model's tokenizer (`uv run` + `tokenizers`).
 - **Adaptive k:** track acceptance over the last few steps and pick k ∈ {1, 2, 3, 4} dynamically.
-- Tree drafting (several candidates per position) is attractive for memory-bound verification, but the DeltaNet recurrence needs a separate state per branch → not worth it initially.
+- Tree drafting (several candidates per position) is attractive for memory-bound verification, but the DeltaNet recurrence needs a separate state per branch → not worth it initially. **Measured (#452):** the selector's second candidate at the chain's first rejected position is what the target picks **1 time in 171 rejections** (greedy, prose/code/chat, `bench/results/dflash-tree-452.txt`), so the per-branch machinery has no prize to pay for it.
 
 ### 12.6 Verification and acceptance rule
 

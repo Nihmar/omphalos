@@ -1377,6 +1377,20 @@ bool Runner::commit(const int64_t accepted, const int64_t drafts_accepted) {
         }
     }
     dflash_observe(kept_drafts);
+    if (std::getenv("OMPH_DFLASH_PROBE") != nullptr) {
+        // #452: one line per verified block - the chain, what a tree would have
+        // tried next to it, and the token the target actually produced at the
+        // first rejected position (the correction, last_toks_[kept_drafts]).
+        std::fprintf(stderr, "dfl_probe,%lld,%lld,%lld,%lld,%lld,%d,",
+                     (long long) dfl_steps_, (long long) verify_pos0_, (long long) kept_drafts,
+                     (long long) drafts_accepted, (long long) accepted,
+                     kept_drafts < (int64_t) last_toks_.size() ? last_toks_[(size_t) kept_drafts] : -1);
+        for (size_t i = 0; i < dfl_probe_second_.size(); ++i) {
+            std::fprintf(stderr, "%s%zu:%d:%.4f", i ? " " : "", i, dfl_probe_second_[i],
+                         i < dfl_probe_margin_.size() ? dfl_probe_margin_[i] : 0.0f);
+        }
+        std::fprintf(stderr, "\n");
+    }
     return dflash_tags_invalidate(verify_pos0_, T) && (!mtp_ || mtp_fill(accepted)) &&
            dflash_inject(verify_pos0_, accepted);
 }
