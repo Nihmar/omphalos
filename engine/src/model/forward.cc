@@ -119,9 +119,11 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
     auto * ids = static_cast<int *>(moe_ids_);
     auto * weights = static_cast<float *>(moe_w_);
 
-    if (!omph::kernels::moe_route(L.ffn_gate_inp.dev, h16_, ids, weights, T, ne, n_expert, topk,
-                                  hipStreamPerThread)) {
-        return fail("moe_route failed");
+    // the router: one f16 GEMM for the whole chunk (#494), then the top-k
+    if (!omph::kernels::gemm_f16(L.gate_inp16, h16_, static_cast<float *>(moe_logits_),
+                                 (int64_t) n_expert, ne, T, (int64_t) n_expert, hipStreamPerThread) ||
+        !omph::kernels::moe_topk(moe_logits_, ids, weights, T, n_expert, topk, hipStreamPerThread)) {
+        return fail("moe route failed");
     }
     if (hipStreamSynchronize(hipStreamPerThread) != hipSuccess ||
         hipMemcpy(moe_host_ids_.data(), ids, (size_t) T * topk * sizeof(int),
@@ -302,9 +304,11 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
     if (hipMemsetAsync(cur_, 0, (size_t) T * ne * 4, gemv_stream_) != hipSuccess) {
         return fail("moe memset failed");
     }
-    if (!omph::kernels::moe_route(L.ffn_gate_inp.dev, h16_, ids, weights, T, ne, h_.n_expert, topk,
-                                  hipStreamPerThread)) {
-        return fail("moe_route failed");
+    if (!omph::kernels::gemm_f16(L.gate_inp16, h16_, static_cast<float *>(moe_logits_),
+                                 h_.n_expert, ne, T, h_.n_expert, hipStreamPerThread) ||
+        !omph::kernels::moe_topk(moe_logits_, ids, weights, T, h_.n_expert, topk,
+                                 hipStreamPerThread)) {
+        return fail("moe route failed");
     }
     if (hipStreamSynchronize(hipStreamPerThread) != hipSuccess ||
         hipMemcpy(moe_host_ids_.data(), ids, (size_t) T * topk * sizeof(int),

@@ -58,3 +58,35 @@ The launch count per layer went from ~256 x 5 to ~6; the achieved weight
 bandwidth from ~14 GB/s to ~31 GB/s (the whole expert set per layer, 464 MiB,
 over ~15 ms). llama.cpp's own numbers on this machine: 959 t/s at 512 tokens
 (Q4_K_M, 25 layers' experts on GPU) and 651 t/s at 128k depth.
+
+## The router as a GEMM, and the deep-context target (#494, #490)
+
+`rocprofv3` said the router was 57 % of the prefill: `moe_route` computed the
+256 expert logits per token with a per-thread *scalar* f32 dot (16.7 ms per
+layer for a 1024-token chunk, ~32 GFLOP/s). The router weights are converted to
+f16 once at load (1 MiB per layer, 40 MiB) and the logits are a plain f16 GEMM
+(the engine's WMMA `gemm_f16`); `moe_topk` then does the softmax and the top-k on
+the logits. The end-to-end KL *improved* slightly (0.004501 -> 0.004359: the
+f16 GEMM's accumulation is better than the scalar dot's against the f16 x).
+
+| tokens | before | after | t/s |
+|---:|---:|---:|---:|
+| 512 (chunk 512) | 811.7 ms | 341.1 ms | **1501** |
+| 4096 (chunk 1024) | 4463.3 ms | 1835.0 ms | **2232** |
+
+The #490 target at the depths the maintainer asked for (Q2_K_L, VRAM-resident):
+
+| depth | omphalos | llama.cpp | ratio |
+|---|---:|---:|---:|
+| 128k | **93.1 s** (1408 t/s) | 201 s (651 t/s) | 2.16x |
+| 160k | **127.3 s** (1287 t/s) | 272 s (603 t/s) | 2.14x |
+
+Both are inside the acceptance bar (128k in <= 2 min, 160k in <= 3 min) with the
+Q2_K_L; the same file llama.cpp ran for those anchors is the Q4_K_M, so the fair
+A/B is still #495's placement. Chunk invariance still holds (KL 0.000000 with
+`--chunk 512` against `--chunk 256`).
+
+Remaining in the profile at 8k/1024: the delta-net's token-sequential path
+(14 %: the work buffer's `ffn_n_` proxy usually does not let it take the
+token-parallel form), the Q3_K down projections through the f16 staging path
+(7 %, #492 step 2), the store kernel (3 %) and the attention (1.3 %).

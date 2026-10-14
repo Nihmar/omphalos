@@ -85,6 +85,7 @@ class Runner {
         Mat ffn_up, ffn_gate, ffn_down;
         // MoE FFN (qwen35moe, h_.moe(); the weights load here, the kernels are #493)
         Mat ffn_gate_inp;  // the router, F32 [n_embd, n_expert]
+        void * gate_inp16 = nullptr;  // the same weights as f16 (#494)
         Mat ffn_gate_exps, ffn_up_exps, ffn_down_exps;  // [k, n_ff_exp, n_expert]
         const float * ffn_gate_inp_shexp = nullptr;     // [n_embd]
         Mat ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp;
@@ -292,6 +293,9 @@ private:
     // rows gathered per expert, one expert's tokens per GEMM, then the
     // slot-ordered weighted sum.
     bool moe_ffn_batched(const LayerWeights & L, const int64_t T);
+    // The router's f16 weights, converted once at load (#494): the logits are
+    // a plain f16 GEMM instead of a per-expert scalar f32 dot.
+    void moe_router_f16();
 
     // One attention layer's slice of the quantized cache (indexed by attention
     // layer, kv_index_, not by model layer: 16 of the 64 layers have one).
@@ -729,6 +733,7 @@ private:
     void * moe_cnt_ = nullptr;   // n_expert int: the rows per expert
     std::vector<int> moe_host_ids_;  // the selection, read back for the expert slices
     std::vector<int> moe_counts_;    // per-expert rows in the batched path
+    void * moe_logits_ = nullptr;    // tokens x n_expert f32: the router's logits
     void * logits_ = nullptr;
     void * argmax_key_ = nullptr;  // 8 bytes: the greedy decode's packed argmax (#102)
     void * tmp_logits_ = nullptr;
