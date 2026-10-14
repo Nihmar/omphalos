@@ -412,6 +412,8 @@ bool Runner::dflash_draft(const int32_t token, const int64_t pos, const int64_t 
         }
         // the selector's greedy path from the anchor (llama.cpp: predecessor 0 at position 1)
         out.clear();
+        dfl_probe_second_.clear();
+        dfl_probe_margin_.clear();
         int64_t pred = 0;
         for (int64_t i = 0; i < P; ++i) {
             const float * sc = scores.data() + (i * kTopK + pred) * kTopK;
@@ -421,6 +423,15 @@ bool Runner::dflash_draft(const int32_t token, const int64_t pos, const int64_t 
                     best = j;
                 }
             }
+            // #452: what a tree would try next to the chain's pick
+            int64_t second = best == 0 ? 1 : 0;
+            for (int64_t j = 0; j < kTopK; ++j) {
+                if (j != best && sc[j] > sc[second]) {
+                    second = j;
+                }
+            }
+            dfl_probe_second_.push_back(ids[(size_t) (i * kTopK + second)]);
+            dfl_probe_margin_.push_back(sc[best] - sc[second]);
             if (env_.dflash_pmin > 0.0f) {  // softmax of the scores at the best: 1 / sum exp(s - s_best)
                 float sum = 0.0f;
                 for (int64_t j = 0; j < kTopK; ++j) {

@@ -1,0 +1,46 @@
+# #452: a DFlash2 draft tree — the number that closes it
+
+Engine main after #450 + the probe, RX 9060 XT 16 GB, 2026-10-14. Greedy
+(`temperature 0`), the drafter's own selector, `--generate 256`:
+
+- prose: the first 512 tokens of the local corpus, `bench/prompts/continue-code.txt`
+  (a 2.9k-token code file) and a 486-token chat transcript;
+- `OMPH_DFLASH_PROBE=1` prints, per verified block whose chain was rejected, the
+  selector's second-best successor next to the chain's pick at the first rejected
+  position, its margin (the two lattice scores' difference), and the token the
+  target actually produced there (the correction). No sampling: under sampling the
+  second candidate is not what a tree would compare against, that case is #451's.
+
+## P(the target picked the second candidate | the chain's first was rejected)
+
+| prompt | rejections | #2 taken | P(#2) | margin at the rejection (median / p90) |
+|---|---:|---:|---:|---|
+| prose (corpus, 512) | 53 | 0 | **0.000** | 0.75 / 2.34 |
+| code (`continue-code.txt`) | 53 | 1 | **0.019** | 1.10 / 3.06 |
+| chat (486-token transcript) | 65 | 0 | **0.000** | 0.53 / 2.44 |
+| **all** | **171** | **1** | **0.006** | |
+
+A tree's sibling rows would have produced the right token **once in 171
+rejections**: the first alternative is almost never the one the target took. The
+margins at the rejections are small but not degenerate (0.5-1.5 in the selector's
+score space, p90 2.3-3.1), so a margin-driven shape would *include* exactly these
+positions - it would spend its extra verification rows on the cases that pay 0.6 %.
+
+Where the rejections sit (prose, the chain's per-position reached/kept from
+`OMPH_DFLASH_DEBUG`): positions 1-4 hold 40 of the 53 (reaching 53/64, 42/64,
+32/64, 18/49 of the steps), 5-11 the rest (15/42 down to 0/15). The chain's reach
+collapsing after the fourth position is #416/#433's measurement again: a tree
+would have to branch *early*, where the chain is still usually right.
+
+## Decision
+
+**Closed with the number**, as the issue's step 1 allows: PLAN.md §12.5's "tree
+drafting not worth it initially" now has a measurement behind it, and the state
+machinery a tree needs (per-branch snapshots, ancestor-masked attention, KV
+compaction) is not worth building for 0.6 %. The probe stays as the instrument if
+a future change (a different drafter, a sampled chain, #451) makes the question
+interesting again:
+
+    OMPH_DFLASH_PROBE=1 omph-run <model> <ids> x.f32 --last-logits --gemv --dflash <drafter> \
+        --generate 256 --gen-out g.txt 2> probe.log
+    uv run python tools/dflash_tree_probe.py probe.log

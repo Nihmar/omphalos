@@ -536,6 +536,11 @@ private:
     std::vector<int64_t> dfl_kept_;
     int64_t dfl_drafted_ = 0;      // drafts of the last dflash_draft
     int64_t dfl_steps_ = 0;
+    // #452's offline probe (OMPH_DFLASH_PROBE=1): the selector's top-2 successor
+    // per position of the last block, its margin, and the draft chain - printed
+    // next to what the verification then accepted.
+    std::vector<int32_t> dfl_probe_second_;
+    std::vector<float> dfl_probe_margin_;
     void dflash_observe(int64_t kept_drafts);
     std::vector<__half *> state_cur_;  // recurrent layers: the state the next step reads (f16, #273)
     std::vector<__half *> state_alt_;  // speculation: the buffer a verification writes
