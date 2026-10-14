@@ -38,6 +38,18 @@ Generator::Generator(const Config & config, const omph::runtime::EnvOptions & en
     if (runner_->dflash_on()) {
         config_.draft_k = runner_->dflash_block() - 1;
     }
+    // #437: mirror the saved conversations to disk. The key is the .omph's
+    // source digest: a reconverted or re-quantized model never reuses a file.
+    if (!config_.cache_dir.empty()) {
+        disk_key_ = "nomodel0";
+        if (const omph::gguf::Value * v = file_->find("omph.source_sha256")) {
+            std::string_view sha;
+            if (v->as_str(sha) && sha.size() >= 8) {
+                disk_key_.assign(sha.substr(0, 8));
+            }
+        }
+        (void) disk_.open(config_.cache_dir, disk_key_, config_.cache_dir_mib);
+    }
     if (config_.mtp || runner_->dflash_on()) {
         // n-gram drafts (#199) verify up to 16 tokens
         runner_->enable_speculation(env_.ngram ? std::max<int64_t>(config_.draft_k + 1, 16) : config_.draft_k + 1);
@@ -305,14 +317,40 @@ void Generator::save_snapshot(const std::vector<int32_t> & prompt, const std::ve
         snapshots_.erase(snapshots_.begin() + (std::ptrdiff_t) merged[q]);
     }
     while (!snapshots_.empty() && snapshot_total_ + bytes > budget) {  // the least recently used go
-        auto lru = std::min_element(snapshots_.begin(), snapshots_.end(),
-                                    [](const Snapshot & a, const Snapshot & b) { return a.used < b.used; });
+        auto lru = snapshots_.end();
+        for (auto it = snapshots_.begin(); it != snapshots_.end(); ++it) {
+            if (it->disk != nullptr && !it->disk->load()) {
+                continue;  // the disk writer reads its pinned buffer (#437)
+            }
+            if (lru == snapshots_.end() || it->used < lru->used) {
+                lru = it;
+            }
+        }
+        if (lru == snapshots_.end()) {
+            break;  // every snapshot is being written: over budget until the writer catches up
+        }
         (void) hipHostFree(lru->host);
         snapshot_total_ -= lru->bytes;
         snapshots_.erase(lru);
     }
     snapshots_.push_back(std::move(snap));
     snapshot_total_ += bytes;
+    // #437: mirror it to disk (the writer thread; it reads the pinned buffer, so
+    // the eviction skips the snapshot until the write is done)
+    if (disk_.enabled()) {
+        Snapshot & fresh = snapshots_.back();
+        DiskCache::Entry de;
+        de.n = (int64_t) fresh.tokens.size();
+        de.tokens = fresh.tokens;
+        de.images = fresh.images;
+        de.kv_bytes = (int64_t) fresh.kv;
+        de.cp_bytes = runner_->checkpoint_bytes();
+        de.points = fresh.points;
+        de.file = disk_file_name(disk_key_, de.n, de.tokens);
+        de.blob_hash = 0;  // filled by the writer (DiskCache::save hashes it there)
+        fresh.disk = std::make_unique<std::atomic<bool>>(false);
+        disk_.save(de, fresh.host, (int64_t) fresh.bytes, fresh.disk.get());
+    }
     res.saved = true;
     res.checkpoint_ms += omph::runtime::now_ms() - t0;
 }
@@ -359,6 +397,50 @@ int64_t Generator::resume(const std::vector<int32_t> & prompt, const std::vector
                 snap = &s;
                 at = q;
                 reach = p;
+            }
+        }
+    }
+    // #437: no in-RAM conversation matches; a file may. The lookup uses the
+    // same prefix rule as the in-RAM store (the entry carries the tokens), so a
+    // request that matches an inner checkpoint restores that point.
+    if (snap == nullptr && disk_.enabled()) {
+        const double t0 = omph::runtime::now_ms();
+        const auto fits = [&](const DiskCache::Entry & e, const int64_t p) {
+            return p > reach && p < (int64_t) prompt.size() &&
+                   prefix_equal(e.tokens, e.images, prompt, images, (size_t) p);
+        };
+        if (const DiskCache::Entry * e = disk_.match(fits)) {
+            std::vector<uint8_t> blob;
+            if (disk_.load(*e, blob) && !blob.empty() &&
+                blob.size() <= (size_t) config_.kv_ram_mib << 20) {
+                void * host = nullptr;
+                if (hipHostMalloc(&host, blob.size()) == hipSuccess) {
+                    std::memcpy(host, blob.data(), blob.size());
+                    Snapshot s;
+                    s.tokens = e->tokens;
+                    s.images = e->images;
+                    s.host = host;
+                    s.bytes = blob.size();
+                    s.kv = (size_t) e->kv_bytes;
+                    s.points = e->points;
+                    s.used = ++clock_;
+                    snapshots_.push_back(std::move(s));
+                    snapshot_total_ += blob.size();
+                    Snapshot & fresh = snapshots_.back();
+                    for (size_t q = 0; q < fresh.points.size(); ++q) {
+                        const int64_t p = fresh.points[q];
+                        if (p > reach && p < (int64_t) prompt.size() &&
+                            prefix_equal(fresh.tokens, fresh.images, prompt, images, (size_t) p)) {
+                            snap = &fresh;
+                            at = q;
+                            reach = p;
+                        }
+                    }
+                    res.disk_ms += omph::runtime::now_ms() - t0;
+                    res.restored_disk = snap != nullptr;
+                } else {
+                    (void) hipGetLastError();
+                }
             }
         }
     }

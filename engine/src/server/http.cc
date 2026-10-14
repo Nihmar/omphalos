@@ -286,6 +286,12 @@ Listener::~Listener() {
     if (fd_ >= 0) ::close(fd_);
 }
 
+void Listener::stop() {
+    if (fd_ >= 0) {
+        (void) ::shutdown(fd_, SHUT_RDWR);
+    }
+}
+
 int Listener::accept_one() {
     while (true) {
         // the accepted fd must not survive into a tool's child either (#389)

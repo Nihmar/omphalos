@@ -14,6 +14,7 @@
 
 #include "format/gguf.hh"
 #include "model/runner.hh"
+#include "model/diskcache.hh"
 #include "model/sampler.hh"
 #include "runtime/options.hh"
 #include "text/tokenizer.hh"
@@ -62,8 +63,10 @@ struct GenerateResult {
     int64_t prompt_tokens = 0;    // with each image's tokens
     int64_t cached_tokens = 0;    // of the prompt, already in the caches
     bool restored = false;        // ... from a checkpoint (#158) or a saved conversation (#179)
+    bool restored_disk = false;   // ... from the on-disk conversation (#437)
     bool saved = false;           // the previous conversation went to host RAM (#179)
     double checkpoint_ms = 0.0;   // saving / restoring checkpoints and conversations (in prefill_ms)
+    double disk_ms = 0.0;         // reading a saved conversation back (#437)
     double prefill_ms = 0.0;
     double decode_ms = 0.0;
     int64_t drafted = 0;
@@ -83,6 +86,8 @@ public:
                                  // instead of the MTP block's, which is then not loaded
         int64_t cache_mib = 2048;  // host RAM for sequence checkpoints (#158); 0: none
         int64_t kv_ram_mib = 8192;  // host RAM for whole conversations (#179); 0: none
+        std::string cache_dir;      // the saved conversations mirrored to disk (#437); empty: off
+        int64_t cache_dir_mib = 8192;  // the disk budget, least recently used first
     };
     Generator(const Config & config, const omph::runtime::EnvOptions & env);
     ~Generator();
@@ -166,6 +171,9 @@ private:
         std::vector<int64_t> points;    // ascending
         uint64_t used = 0;
         std::vector<std::string> images;  // the sequence's image occurrences, in order (#363)
+        // #437: the disk write of this snapshot is pending while the flag is
+        // false; the eviction skips it (the writer reads the pinned buffer).
+        std::unique_ptr<std::atomic<bool>> disk;
     };
     void save_snapshot(const std::vector<int32_t> & prompt, const std::vector<std::string> & images,
                        GenerateResult & res);
@@ -184,6 +192,8 @@ private:
     std::vector<Checkpoint> checkpoints_;
     std::vector<void *> spare_;  // host buffers of evicted checkpoints
     std::vector<Snapshot> snapshots_;
+    DiskCache disk_;              // #437
+    std::string disk_key_;        // the model's digest, for the file names
     size_t snapshot_total_ = 0;
     size_t max_checkpoints_ = 0;
     size_t n_buffers_ = 0;

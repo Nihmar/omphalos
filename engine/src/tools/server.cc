@@ -10,6 +10,10 @@
 //   --kv-ram MIB      pinned host RAM for whole conversations (default 8192, 0: none, #179):
 //                     a prompt that leaves the cached conversation saves it first, one that
 //                     continues a saved conversation restores it instead of prefilling
+//   --cache-dir DIR   mirror the saved conversations to DIR (default off, #437): a
+//                     restart resumes a long context with a read (a 100k
+//                     conversation is ~3 GB) instead of a prefill
+//   --cache-dir-mib N the disk budget (default 8192), least recently used first
 //   --cache-ram MIB   pinned host RAM for sequence checkpoints (default 2048, 0: none): a
 //                     retried answer or a history without the reasoning resumes from one
 //   --mmproj FILE     the vision encoder: images as base64 data: URLs in image_url
@@ -64,6 +68,7 @@
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
+#include <csignal>
 #include <cstdio>
 #include <cerrno>
 #include <cstdlib>
@@ -813,6 +818,7 @@ struct Server {
             e.set("saved", Json::boolean(res.saved));
             e.set("prefill_ms", num(res.prefill_ms));
             e.set("checkpoint_ms", num(res.checkpoint_ms));
+            e.set("disk_ms", num(res.disk_ms));
             e.set("completion_tokens", Json::integer((int64_t) res.tokens.size()));
             e.set("decode_ms", num(res.decode_ms));
             e.set("drafts", Json::integer(res.drafted));
@@ -828,7 +834,8 @@ struct Server {
                          "(%.1f t/s, drafts accepted %lld / %lld); stop: %s%s\n",
                          req.method.c_str(), req.path.c_str(), sampling_label(job).c_str(), (size_t) prompt_len,
                          (long long) res.cached_tokens,
-                         res.restored ? ", restored" : "", res.saved ? ", previous conversation saved" : "",
+                         res.restored ? (res.restored_disk ? ", restored from disk" : ", restored") : "",
+                         res.saved ? ", previous conversation saved" : "",
                          res.prefill_ms,
                          res.checkpoint_ms,
                          res.prefill_ms > 0
@@ -853,6 +860,20 @@ std::string default_id(const std::string & path) {
         }
     }
     return name;
+}
+
+} // namespace
+
+namespace {
+
+volatile std::sig_atomic_t g_stop = 0;
+omph::server::Listener * g_listener = nullptr;
+
+void on_stop_signal(int) {
+    g_stop = 1;
+    if (g_listener != nullptr) {
+        g_listener->stop();  // only shutdown(2): async-signal-safe
+    }
 }
 
 } // namespace
@@ -885,6 +906,8 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--dflash")) cfg.dflash = val();
         else if (!std::strcmp(argv[i], "--cache-ram")) cfg.cache_mib = omph::cli::integer(val(), "--cache-ram");
         else if (!std::strcmp(argv[i], "--kv-ram")) cfg.kv_ram_mib = omph::cli::integer(val(), "--kv-ram");
+        else if (!std::strcmp(argv[i], "--cache-dir")) cfg.cache_dir = val();
+        else if (!std::strcmp(argv[i], "--cache-dir-mib")) cfg.cache_dir_mib = omph::cli::integer(val(), "--cache-dir-mib");
         else if (!std::strcmp(argv[i], "--alias")) alias = val();
         else if (!std::strcmp(argv[i], "--mmproj")) mmproj = val();
         else if (!std::strcmp(argv[i], "--api-key")) api_key = val();
@@ -958,8 +981,18 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "omph-server: %s on http://%s:%d (context %lld)\n", server.model_id.c_str(),
                          host.c_str(), port, (long long) gen.context());
         }
-        while (true) {
+        // #437: a SIGINT/SIGTERM stops the accept loop instead of the process,
+        // so the Generator's destructor runs and the cache writes are flushed.
+        g_listener = &listener;
+        struct sigaction sa {};
+        sa.sa_handler = &on_stop_signal;
+        (void) sigaction(SIGINT, &sa, nullptr);
+        (void) sigaction(SIGTERM, &sa, nullptr);
+        while (!g_stop) {
             const int fd = listener.accept_one();
+            if (g_stop) {
+                break;
+            }
             if (fd < 0) {
                 std::perror("accept");
                 continue;
