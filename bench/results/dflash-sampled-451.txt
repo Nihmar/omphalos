@@ -1,0 +1,46 @@
+# #451: sampled DFlash2 drafts (min(1, p/q)) — measured, not adopted
+
+Engine main after #454 + the change, RX 9060 XT 16 GB, 2026-10-14. T 0.6, the #262
+scenarios through `scenario_speed.py --temp 0.6` (top-k 20, top-p 0.95, seed 262),
+`--spec dflash --ngram 1`.
+
+The proposal q is the lattice's transition row over the top-16 (the selector's
+scores, the request's temperature/top-k/min-p/top-p applied exactly as the
+target's sampler applies them), sampled as a Markov chain; the acceptance is
+#394's rule (`draft_q` per position, `min(1, p/q)`, the residual on rejection).
+`OMPH_SPEC_POINTMASS=1` selects the point-mass rule (the drafter's argmax kept
+with p(x)), which is what ships.
+
+| scenario | rule | t/s | tokens | drafts accepted |
+|---|---|---:|---:|---|
+| prose | point mass | 38.5 | 978 | 488 / 1901 (25.7 %) |
+| prose | sampled q | **43.3** | 1103 | **615 / 2003 (30.7 %)** |
+| edit-cc | point mass | 210.6 | 2014 | 1863 / 2250 (82.8 %) |
+| edit-cc | sampled q | 212.9 | 2014 | 1865 / 2220 (84.0 %) |
+| edit-py | point mass | **231.3** | 4044 | 3777 / 3990 (94.7 %) |
+| edit-py | sampled q | 110.8 | 5865 | 4977 / 8307 (59.9 %) |
+
+## Reading
+
+- Where the drafter is the only source of drafts (prose), the sampled q does what
+  #394 measured for the MTP head: **+5 acceptance points** (25.7 -> 30.7 %) and
+  +12.5 % t/s. #394's own prose numbers were 33.9 -> 41.2 %; same direction.
+- The edit scenarios produce **different texts** under the two rules (sampling
+  cannot be compared token for token) and edit-py's sampled run drafted twice as
+  many rows for a lower rate - a different, harder text, not a like-for-like
+  loss. The one thing that is comparable there, edit-cc (identical token counts,
+  different bytes), is +1.2 acceptance points.
+- The code's own note before this measurement ("DFlash2 drafts are a greedy path,
+  measured: rejection sampling does not help it, upstream and here, #245/#394")
+  stands: with the agentic workloads dominated by n-gram chains the sampled
+  lattice changes the text for no measured gain, and the deterministic greedy
+  path keeps the runs reproducible token for token (the #262 identity checks).
+
+## Decision
+
+**Not adopted; the change is reverted** and the point-mass rule stays
+(`OMPH_SPEC_POINTMASS` unchanged). The record here is the fresh number the issue
+asked for: the rule is exact by construction (any q is corrected by min(1, p/q)),
+it helps where the drafter stands alone, and it is not worth the loss of
+token-for-token comparability in the agentic case. `OMPH_DFLASH_PROBE`'s sibling
+question (a tree) is closed the same way in `bench/results/dflash-tree-452.txt`.
