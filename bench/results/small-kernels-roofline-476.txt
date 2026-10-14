@@ -1,0 +1,50 @@
+# The prefill's small kernels against their roofline (#476)
+
+From the 32k profile (bench/results/prefill-32k-profile-474.txt): 5.7 % of the prefill
+(2.0 s of 35.3 s) is six small kernels outside the GEMM and the attention. Each is
+bandwidth-bound in intent; this checks whether they actually reach the card's ~318 GB/s
+practical DRAM ceiling, and whether the one fusion idea left (folding a norm into a
+neighbouring epilogue) can remove bytes.
+
+Per launch: the profile's launch counts (64 chunks x 64 layers, or the 16 attention layers
+for the attention kernels), 512 tokens per prefill chunk.
+
+| kernel | ms | launches | per launch | bytes per launch | GB/s | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `add_rms_norm_f16_kernel` | 842 | 8192 | 102.8 us | 26.2 MB | 255 | at the wall |
+| `GdnStep` (conv) + `GdnStep` (gate) | 711 + 329 | 6144 + 3072 | 116 + 107 us | ~26 MB | ~230 | at the wall |
+| `attn_prep_kernel` | 332 | 1024 | 324 us | ~27.6 MB | ~85 | **latency-bound, ~3.7x headroom** |
+| `attention_gqa_merge_kernel` | 189 | 1024 | 184 us | ~9.5 MB | ~52 | **latency-bound, ~6x headroom** |
+
+Bytes are counted from the code: the norm reads two f32 streams and writes one f16 (512 x
+5120 x 10 B); `attn_prep` reads the q/gate/k/v rows (32 + 32 + 4 + 4 heads x 128 f32 = 36 KB
+per token) and writes q back plus the quantized k/v; the merge reads the split partials
+(512 x 24 heads x 130 f32) and writes the f16 output.
+
+## The fusion idea does not pay
+
+`add_rms_norm_f16_kernel` is already at the irreducible byte count for its types: two f32
+inputs and one f16 output are 10 B per element, and it runs at 80 % of the ceiling. Neither
+fusion can reduce that:
+
+- **Into the producing GEMM's epilogue**: the RMSNorm reduction spans the full 5120-wide row,
+  while a GEMM workgroup holds 128 weight rows x 256 tokens, so the row's norm is spread
+  across 40 workgroups. Folding it there means a two-pass reduction and writing the f32 sum
+  for the second pass: 4 + 4 + 4 + 2 B, *more* than today.
+- **Into the consuming GEMM's prologue**: the consumer reads the f16 activation (2 B) and its
+  tiles are re-read from L2 by ~136 workgroups per call. Fusing the norm there re-reads the
+  two f32 streams from DRAM per tile and repeats the reduction per workgroup (~136x the
+  reduction work): 8 B per element per re-read instead of 2 B.
+
+Only narrowing the residual stream to f16 would cut those bytes (-40 %, ~340 ms), and that is
+a numerics decision for the maintainer, not a kernel one.
+
+## What is actually left
+
+`attn_prep_kernel` is one workgroup per (token, head) - 20480 workgroups of 256 threads for
+512 tokens, 128 elements each - with ~10 barriers, an LDS-based RoPE and a Hadamard walk in
+series per 128 elements: it moves 27.6 MB in 324 us. The merge is the same story, 9.5 MB in
+184 us. Both would want several heads (or rows) per workgroup, which is a moderate rewrite of
+two kernels for **~0.4 s, 1.1 % of the prefill** - and the prefill is this engine's third
+priority, behind VRAM and decode, where these two kernels are ~0.07 % of the step. Not taken;
+kept here with the numbers so the option is on record rather than in someone's head.
