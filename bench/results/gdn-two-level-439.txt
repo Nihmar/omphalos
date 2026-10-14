@@ -1,0 +1,77 @@
+# #439: the delta-net prefill, two-level WY split - measured and not adopted
+
+Tree: main after #435/#436/#437 (1d0bd1c-ish) + the branch perf/439-gdn-two-level.
+GPU: RX 9060 XT (gfx1200), ROCm, `OMPH_TIMING=1`, 4096-token prompt (docs+PLAN
+repeated, `omph-tokenize`), `omph-run <omph> /tmp/tok_full.txt out.f32 --last-logits --gemv`,
+median of 3 unprofiled runs for the wall, `rocprofv3 --kernel-trace` for the kernels.
+
+## What #240's phase B is (the hypothesis the split tested)
+
+`delta_wy_b_kernel`: one block per value head (48), 256 threads, 8 WMMA waves (16
+value columns each), walking a 512-token prefill chunk's eight 64-token WY chunks
+*serially* - the entry state chain h' = gamma_C h + K'^T T beta (V - gamma K h).
+The split (issue #439) keeps that walk alone in level 1 (also storing each chunk's
+entry state and D) and moves the part the entry state alone determines,
+o = gamma_t q_t h_c + P D, into level 2 for every (head, chunk) *in parallel*
+(384 blocks instead of 48), with the gated RMSNorm folded in so `delta_post_kernel`
+(107 us/launch) also disappears.
+
+## Result: it loses
+
+| kernel | launches | ms | per launch | VGPR / scratch |
+|---|---:|---:|---:|---|
+| `delta_wy_a_kernel` (unchanged) | 384 | 47.3 | 123 us | 96 / 0 |
+| `delta_wy_b_kernel` (#240, serial) | 384 | 67.5 | 176 us | 224 / 0 |
+| `delta_post_kernel` (#240, after it) | 384 | 41.0 | 107 us | 24 / 0 |
+| **#240 total (wy_b + post)** | 768 | **108.5** | 283 us | |
+| `delta_wy_s_kernel` (level 1, split) | 384 | 64.9 | 169 us | 200 / 0 |
+| `delta_wy_o_kernel` (level 2, o + norm) | 384 | 76.2 | 198 us | 120 / 0 |
+| **split total** | 768 | **141.1** | 367 us | |
+
+Prefill wall 4096 tokens: 3948 ms (#240) against 3928 ms (split) - the +33 ms of
+kernel time hides in the run-to-run spread; it is not a win either way.
+
+Iterations kept for the record: (a) level 2 recomputing D (V, K, T, b in the o
+pass, no D store) was the first cut - 227.9 ms with 256 VGPRs and 636 B/lane of
+spill; (b) normalising per row tile instead of holding all four tiles' o values
+helped (197.2 ms, 368 B spill) but not enough; (c) storing D in level 1 and
+leaving level 2 nothing but q h, P D and the norm is the version measured above
+(119 VGPRs, no spill, occupancy 12 waves/SIMD).
+
+## Why (the useful part)
+
+1. **The serial chain is not the WMMA work.** Removing phase B's two biggest
+   phases (q h and P D: ~42 of its ~94 WMMAs per lane per chunk, the rest being
+   K h, R, D = T R and the h' update) shortened a launch from 176 to 169 us - 4 %.
+   The walk's cost is in K h -> R -> D -> h' itself: the loads of K, V and T, the
+   96 `expf` per lane, and the dependency chain through them.
+2. **The split is a bandwidth loss.** The entry state is 128x128 f16 (32 KB per
+   head per chunk) and must be written by level 1 and read again by level 2, and
+   level 2 re-reads h, q, P, D and z rather than holding them in registers:
+   ~91 MB per (layer, 512-token chunk) against ~60 MB for #240's two kernels.
+   The time follows the bytes (141/108.5 = 1.30 against 91/60 = 1.52).
+3. The bucket is at its memory floors anyway (right dims: n_vh 48, n_kh 16,
+   channels 10240, 512-token prefill chunk). Measured against the bytes each kernel
+   must move at 318.3 GB/s:
+
+   | kernel | bytes/launch | floor | measured | note |
+   |---|---:|---:|---:|---|
+   | `delta_conv_kernel` | 42 MB | 132 us | 107 us | qkv f16 in, cv f32 out: at the wall |
+   | `delta_gate_kernel<4>` | 36 MB | 113 us | 130 us | x read once per 4 heads + the weights once per 16-token group (0.98 MB x 32): 13 % off |
+   | `delta_wy_a_kernel` | ~33 MB | 104 us | 123 us | every value head reads its key head's K and Q (48 blocks x 64 KB, each key head 3x) |
+   | `delta_wy_b_kernel` | ~28 MB | 87 us | 176 us | the serial chain |
+   | `delta_post_kernel` | 31.5 MB | 99 us | 107 us | vo + z in, out16 out: at the wall |
+
+   `delta_wy_a_kernel` was measured with its forward substitution disabled (a
+   diagnostic build): 36.2 ms against 47.3 at 4k, i.e. the inverse - 64 active
+   threads, ~2048 sequential FMAs each - is 23 % of the kernel and not its limit.
+   The same build's resource report: `delta_wy_a_kernel` 95 VGPRs, 17.9 KB LDS,
+   14 waves/SIMD (LDS-bound at 7 blocks per CU, one wave of the 384);
+   `delta_wy_b_kernel` 223 VGPRs, 6 waves/SIMD, no spill.
+
+So the delta-net prefill is bytes, not chain: 1985 ms at 32k against a ~1550 ms
+floor, and the two candidates that looked like headroom (phase B's serial outputs,
+`delta_post_kernel`'s blocking) both measured as losses. The re-blocking of
+`delta_post_kernel` from one (head, token) block each to four rows per block, with
+the per-row arithmetic left bit-identical (the verification path and the decode
+path must agree, #161), measured 47.4 ms against 41.0 at 4k and was dropped too.
