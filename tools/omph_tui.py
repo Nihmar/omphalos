@@ -95,8 +95,18 @@ class FormPane(VerticalScroll):
         super().__init__(id=f"form-{group}")
         self.group = group
         self.widgets: dict[str, object] = {}
+        self.picker: Select | None = None
+        self.picker_models: list[str] = []
 
     def compose(self) -> ComposeResult:
+        if self.group == "model":
+            # the models in models/ (#532): picking one switches the form to it,
+            # with its family's drafter and encoder; not a form value itself
+            self.picker_models = profiles.available_models()
+            options = [(Path(m).stem, m) for m in self.picker_models]
+            self.picker = Select(options, prompt="pick a model in models/", allow_blank=True, id="model-pick")
+            yield Horizontal(Static("[b]switch model[/b]  [dim](m / F6)[/dim]", classes="field-label"),
+                             self.picker, classes="field")
         for o in schema.group_options(self.group):
             if o.key == schema.POSITIONAL:
                 widget = Input(placeholder="/path/to/model.omph", id=f"in-{o.key}", value=str(o.default))
@@ -137,6 +147,12 @@ class FormPane(VerticalScroll):
         return out
 
     def set_values(self, values: dict) -> None:
+        if self.picker is not None:
+            # show the active model when it is one of the list (no switch: the
+            # handler ignores a pick of the model the form already has)
+            model = str(values.get("model") or "")
+            if model in self.picker_models:
+                self.picker.value = model
         for key, widget in self.widgets.items():
             if key not in values:
                 continue
@@ -821,7 +837,9 @@ class OmphTui(App):
             uptime = f" · up {secs // 3600:02d}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
         model = Path(str(self.values.get("model") or "")).name or "no model"
         if self.narrow:
-            text = (f"{state} {self.values.get('host')}:{self.values.get('port')} · "
+            # the family, not the file name: a phone's 58 columns (#532)
+            family = profiles.family(self.values.get("model")) if self.values.get("model") else "no model"
+            text = (f"{state} [b]{family}[/b] {self.values.get('host')}:{self.values.get('port')} · "
                     f"ctx {self.values.get('ctx')}{uptime}")
         else:
             text = (f"{state} [b]{escape(model)}[/b] · {self.values.get('host')}:{self.values.get('port')} · "
@@ -868,6 +886,17 @@ class OmphTui(App):
                 self.exit()
 
         self.push_screen(ConfirmQuit(), answer)
+
+    @on(Select.Changed, "#model-pick")
+    def model_picked(self, event: Select.Changed) -> None:
+        """The model picker (#532): the chosen file, its family's drafter and
+        encoder, the rest of the form kept."""
+        path = event.value
+        if path is Select.BLANK or not path or path == self.collect().get("model"):
+            return
+        self.apply(profiles.switch_model(self.collect(), profiles.family(path), str(path)))
+        self.notify(f"model: {Path(str(path)).name}")
+        self.logview.write("[dim]model switched; F9 shows the command[/dim]")
 
     def action_switch_model(self) -> None:
         """F6: the form on the other model (#527) - its files, every other
@@ -1025,7 +1054,8 @@ class OmphTui(App):
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default=None,
-                    help="the .omph to serve (default: the profile's, else the repo's Qwen3.8 file)")
+                    help="the .omph to serve, or a model name (qwen3.8, ornith) for its file in models/ "
+                         "(default: the profile's, else the repo's Qwen3.8 file)")
     ap.add_argument("--dflash", default=None,
                     help="the DFlash2 drafter .omph to fill in (default: the repo's when the file exists; "
                          "empty starts on the MTP head)")
@@ -1043,7 +1073,7 @@ def main() -> None:
     args = ap.parse_args()
 
     values = profiles.load().get(args.profile, schema.defaults())
-    model = args.model or values.get("model") or str(DEFAULT_MODEL)
+    model = profiles.resolve_model_arg(args.model) if args.model else values.get("model") or str(DEFAULT_MODEL)
     # --dflash / --mmproj win, then the profile's own file, then its model family's when present
     files = profiles.default_files(profiles.family(model))
     dflash = resolve_file(args.dflash, values.get("dflash"), files["dflash"])

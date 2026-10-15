@@ -59,14 +59,33 @@ def with_files(values: dict) -> dict:
     return out
 
 
-def switch_model(values: dict, name: str) -> dict:
-    """The same form on another model: its files, every other choice kept,
-    except what the target cannot run (Qwen Sharp is Qwen3.8's template,
-    refused for the Qwen3.5 one, #497)."""
+def switch_model(values: dict, name: str, model: str | None = None) -> dict:
+    """The same form on another model (a family's own file, or `model`): that
+    family's drafter and encoder, every other choice kept, except what the
+    target cannot run (Qwen Sharp is Qwen3.8's template, refused for the
+    Qwen3.5 one, #497)."""
     out = {**values, **default_files(name)}
+    if model:
+        out["model"] = model
     if name == "ornith" and out.get("chat_template") == "sharp":
         out["chat_template"] = "original"
     return out
+
+
+def available_models(models_dir: Path | None = None) -> list[str]:
+    """The .omph files in models/ a server can load (#532): the DFlash2 drafters,
+    which are .omph files too, left out."""
+    d = models_dir or REPO_MODELS
+    if not d.is_dir():
+        return []
+    return sorted(str(p) for p in d.glob("*.omph") if "dflash" not in p.name.lower())
+
+
+def resolve_model_arg(arg: str) -> str:
+    """--model FILE, or a family name (qwen3.8, ornith) for its file in models/."""
+    if arg in MODELS:
+        return str(MODELS[arg]["model"])
+    return arg
 
 PRESETS: dict[str, dict] = {
     "default": {**schema.defaults(), "ctx": 8192},
