@@ -243,7 +243,7 @@ bool Runner::dflash_inject(const int64_t pos0, const int64_t T) {
     if (!matmul(dfl_fc_, feat, static_cast<float *>(cur_) + row0 * dfl_ne_,
                 dfl_ne_, dfl_fc_.gemv->k, n) ||
         !omph::kernels::add_rms_norm_f16(static_cast<const float *>(cur_) + row0 * dfl_ne_, nullptr, nullptr,
-                                         dfl_enc_norm_, h16_ + row0 * dfl_ne_, n, dfl_ne_, dfl_eps_, nullptr)) {
+                                         dfl_enc_norm_, static_cast<__half *>(h16_) + row0 * dfl_ne_, n, dfl_ne_, dfl_eps_, nullptr)) {
         return fail("drafter: fc failed");
     }
     (void) ne;
