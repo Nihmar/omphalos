@@ -1586,6 +1586,7 @@ void Runner::moe_tables() {
             c.slot_of.assign((size_t) n, -1);
             c.hidx.assign((size_t) n, -1);
             c.last.assign((size_t) n, 0);
+            c.missed.assign((size_t) n, 0);
             c.count.assign((size_t) n, 0);
             for (int64_t e = 0; e < n; ++e) {
                 const int64_t p = pos[(size_t) e];

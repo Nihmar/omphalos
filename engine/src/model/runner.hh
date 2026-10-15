@@ -329,6 +329,7 @@ private:
     // selections (T <= kMoeLogTokens) back after its layers.
     static constexpr int64_t kMoeCacheSlots = 32;
     static constexpr int64_t kMoeLogTokens = 16;
+    static constexpr int64_t kMoeAdmitSteps = 8;
     void moe_tables();
     void moe_load_counts(const std::string & path);
     const std::vector<int> & moe_order(int blk);
@@ -795,6 +796,7 @@ private:
         std::vector<int64_t> count;    // per expert: this run's logged picks
         int blk = -1;
         std::vector<int64_t> last;     // per expert: the last step that chose it
+        std::vector<int64_t> missed;   // per expert: the last step it was read from host
     };
     std::vector<MoeTab> moe_tabs_;  // only for a cached model; the MTP layer is not logged
     int64_t moe_log_tabs_ = 0;      // the logged tables (the stack's layers)

@@ -142,6 +142,17 @@ bool Runner::moe_cache_begin() {
                 continue;
             }
             ++moe_misses_;
+            // admitted on its second miss within kMoeAdmitSteps steps (#522): a
+            // fill costs the PCIe read the miss already paid, so an expert seen
+            // once is not worth it. Measured (400 tokens, step gpu): no
+            // admission 12.17 / 11.47 / 11.58 ms (code / ita / tech), 4 steps
+            // 11.50 / 11.07 / 11.29, 8 11.52 / 11.05, 16 11.62 / 11.10 / 11.27,
+            // never 13.22 / 11.18 / 13.18
+            const int64_t prev = c.missed[(size_t) e];
+            c.missed[(size_t) e] = moe_clock_;
+            if (prev == 0 || moe_clock_ - prev > kMoeAdmitSteps) {
+                continue;
+            }
             // the least recently used slot whose expert this step did not choose
             int victim = -1;
             for (int64_t s = moe_fixed_; s < moe_cap_; ++s) {
