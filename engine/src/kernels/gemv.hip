@@ -2632,6 +2632,11 @@ bool gemv_multi(const uint32_t type, const void * packed, const void * x_f16, fl
         return false;
     }
     switch (type) {
+        case 8:
+        case 2:
+        case 13:
+            // the GGUF-block types (#492): their NT kernels (#496)
+            return gemv_legacy_n(type, packed, x_f16, y, rows, k, nt, stream);
         case 21:
             return launch_tiles_n<qd::TileIq3s>(nt, packed, x_f16, y, rows, k, stream);
         case 18:
@@ -2984,47 +2989,45 @@ bool dequant_repacked(const uint32_t type, const void * packed, void * dst_f16,
 
 namespace {
 
-template <class TD, bool PerSlotX>
+template <class TD>
 __global__ __launch_bounds__(256, 8) void gemv_moe_tile_kernel(
     const uint8_t * const * __restrict__ exps, const int * __restrict__ ids,
     const __half * __restrict__ x, float * __restrict__ y, const long long rows,
-    const long long blocks) {
+    const long long blocks, const int slots_per_x) {
     __shared__ __attribute__((aligned(16))) uint8_t lds[TD::kLds + 8704];
     const long long slot = blockIdx.z;
     const uint8_t * w = exps[ids[slot]];
-    const __half * xs = PerSlotX ? x + slot * (blocks * 256) : x;
+    const __half * xs = x + (slot / slots_per_x) * (blocks * 256);
     tiles_body<TD, 1>(w, xs, y + slot * rows, rows, blocks, (long long) blockIdx.x, lds);
 }
 
-template <class TD, bool PerSlotX>
+template <class TD>
 bool launch_moe_tile(const uint8_t * const * exps, const int * ids, const __half * x,
-                     float * y, const int64_t rows, const int64_t k, const int topk, hipStream_t stream) {
-    if (rows % 16 != 0 || k % 256 != 0 || topk <= 0 || topk > 64) {
+                     float * y, const int64_t rows, const int64_t k, const int slots, const int slots_per_x,
+                     hipStream_t stream) {
+    if (rows % 16 != 0 || k % 256 != 0 || slots <= 0 || slots > kMoeMaxSlots || slots_per_x <= 0) {
         return false;
     }
     const unsigned grid = (unsigned) ((rows / 16 + kTileTiles - 1) / kTileTiles);
-    gemv_moe_tile_kernel<TD, PerSlotX><<<dim3(grid, 1, (unsigned) topk), 256, 0, stream>>>(
-        exps, ids, x, y, rows, k / 256);
+    gemv_moe_tile_kernel<TD><<<dim3(grid, 1, (unsigned) slots), 256, 0, stream>>>(
+        exps, ids, x, y, rows, k / 256, slots_per_x);
     return hipGetLastError() == hipSuccess;
 }
 
 } // namespace
 
 bool gemv_moe(const uint32_t type, const void * const * exps, const void * ids,
-              const void * x_f16, float * y, const int64_t rows, const int64_t k, const int64_t topk,
-              const bool per_slot_x, hipStream_t stream) {
+              const void * x_f16, float * y, const int64_t rows, const int64_t k, const int64_t slots,
+              const int64_t slots_per_x, hipStream_t stream) {
     if (exps == nullptr || ids == nullptr || x_f16 == nullptr || y == nullptr ||
-        rows <= 0 || k <= 0 || topk <= 0 || topk > 64) {
+        rows <= 0 || k <= 0 || slots <= 0 || slots > kMoeMaxSlots || slots_per_x <= 0) {
         return false;
     }
     const auto * wt = reinterpret_cast<const uint8_t * const *>(exps);
     const auto * id = static_cast<const int *>(ids);
     const auto * x = static_cast<const __half *>(x_f16);
     const auto run = [&](const auto td) {
-        return per_slot_x ? launch_moe_tile<decltype(td), true>(wt, id, x, y, rows, k,
-                                                                (int) topk, stream)
-                          : launch_moe_tile<decltype(td), false>(wt, id, x, y, rows, k,
-                                                                 (int) topk, stream);
+        return launch_moe_tile<decltype(td)>(wt, id, x, y, rows, k, (int) slots, (int) slots_per_x, stream);
     };
     switch (type) {
         case 21: return run(qd::TileIq3s{});
@@ -3050,68 +3053,89 @@ bool gemv_moe(const uint32_t type, const void * const * exps, const void * ids,
 constexpr long long kLegacyRows = 4;
 constexpr long long kLegacyChunkSub = 256;
 
-template <bool Q8>
+// NT tokens per weight read (#496: a verification): token t's x at x + t * k
+// and its y at y + t * rows. Each token's sums run in the one-token kernel's
+// order (a lane takes the sub-blocks s = lane mod 32 in increasing order for
+// any chunk that is a multiple of 32), so every token's result is its
+// one-token result bit for bit.
+template <bool Q8, int NT>
 __global__ void gemv_legacy32_kernel(const uint8_t * __restrict__ blocks,
                                      const __half * __restrict__ x, float * __restrict__ y,
                                      const long long rows, const long long n_sub,
                                      const long long chunk_sub) {
-    extern __shared__ __half xs[];  // the x chunk
+    extern __shared__ __half xs[];  // the x chunk of each token
     const int warp = (int) threadIdx.x / 32;
     const int lane = (int) threadIdx.x % 32;
     const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kLegacyRows;
     const long long rlast = rows - 1;
     const long long blk_bytes = Q8 ? 34 : 18;
-    float acc[kLegacyRows] = {};
+    const long long k = n_sub * 32;
+    float acc[NT][kLegacyRows] = {};
     for (long long base = 0; base < n_sub; base += chunk_sub) {
         const long long len = n_sub - base < chunk_sub ? n_sub - base : chunk_sub;
-        for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
-            xs[i] = x[base * 32 + i];
+        for (int t = 0; t < NT; ++t) {
+            for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
+                xs[t * chunk_sub * 32 + i] = x[t * k + base * 32 + i];
+            }
         }
         __syncthreads();
         if (row0 < rows) {
             for (long long s = base + lane; s < base + len; s += 32) {
-                const __half * xv = xs + (s - base) * 32;
 #pragma unroll
                 for (int r = 0; r < kLegacyRows; ++r) {
                     const long long row = row0 + r <= rlast ? row0 + r : rlast;
                     const uint8_t * b = blocks + (row * n_sub + s) * blk_bytes;
                     const float d = __half2float(*reinterpret_cast<const __half *>(b));
-                    float part = 0.0f;
-                    if (Q8) {
-                        const auto * q = reinterpret_cast<const int8_t *>(b + 2);
 #pragma unroll
-                        for (int j = 0; j < 32; ++j) {
-                            part = fmaf((float) q[j], __half2float(xv[j]), part);
-                        }
-                    } else {
-                        // the block's first 16 weights are the low nibbles
+                    for (int t = 0; t < NT; ++t) {
+                        const __half * xv = xs + t * chunk_sub * 32 + (s - base) * 32;
+                        float part = 0.0f;
+                        if (Q8) {
+                            const auto * q = reinterpret_cast<const int8_t *>(b + 2);
 #pragma unroll
-                        for (int j = 0; j < 16; ++j) {
-                            const int q = b[2 + j];
-                            part = fmaf((float) ((q & 15) - 8), __half2float(xv[j]), part);
-                            part = fmaf((float) ((q >> 4) - 8), __half2float(xv[16 + j]), part);
+                            for (int j = 0; j < 32; ++j) {
+                                part = fmaf((float) q[j], __half2float(xv[j]), part);
+                            }
+                        } else {
+                            // the block's first 16 weights are the low nibbles
+#pragma unroll
+                            for (int j = 0; j < 16; ++j) {
+                                const int q = b[2 + j];
+                                part = fmaf((float) ((q & 15) - 8), __half2float(xv[j]), part);
+                                part = fmaf((float) ((q >> 4) - 8), __half2float(xv[16 + j]), part);
+                            }
                         }
+                        acc[t][r] = fmaf(d, part, acc[t][r]);
                     }
-                    acc[r] = fmaf(d, part, acc[r]);
                 }
             }
         }
         __syncthreads();
     }
 #pragma unroll
-    for (int r = 0; r < kLegacyRows; ++r) {
-        float v = acc[r];
+    for (int t = 0; t < NT; ++t) {
 #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            v += __shfl_down(v, off);
-        }
-        if (lane == 0 && row0 + r < rows) {
-            y[row0 + r] = v;
+        for (int r = 0; r < kLegacyRows; ++r) {
+            float v = acc[t][r];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                v += __shfl_down(v, off);
+            }
+            if (lane == 0 && row0 + r < rows) {
+                y[t * rows + row0 + r] = v;
+            }
         }
     }
 }
 
-template <bool Q8>
+// the x chunk of NT tokens: a multiple of 32 sub-blocks (the order above),
+// smaller with more tokens so their chunks stay at 16 KB of LDS
+inline int64_t legacy_chunk(const int64_t n_sub, const int nt) {
+    const int64_t cap = nt == 1 ? kLegacyChunkSub : nt == 2 ? 128 : 64;
+    return n_sub < cap ? n_sub : cap;
+}
+
+template <bool Q8, int NT>
 bool gemv_legacy32(const void * blocks, const void * x_f16, float * y, const int64_t rows,
                    const int64_t k, hipStream_t stream) {
     if (blocks == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
@@ -3119,22 +3143,41 @@ bool gemv_legacy32(const void * blocks, const void * x_f16, float * y, const int
         return false;
     }
     const int64_t n_sub = k / 32;
-    const int64_t chunk = n_sub < kLegacyChunkSub ? n_sub : kLegacyChunkSub;
-    const size_t smem = (size_t) chunk * 64;
+    const int64_t chunk = legacy_chunk(n_sub, NT);
+    const size_t smem = (size_t) NT * chunk * 64;
     const dim3 grid((unsigned) ((rows + 8 * kLegacyRows - 1) / (8 * kLegacyRows)));
-    gemv_legacy32_kernel<Q8><<<grid, 256, smem, stream>>>(
+    gemv_legacy32_kernel<Q8, NT><<<grid, 256, smem, stream>>>(
         static_cast<const uint8_t *>(blocks), static_cast<const __half *>(x_f16), y, rows, n_sub, chunk);
     return hipGetLastError() == hipSuccess;
 }
 
 bool gemv_q8_0(const void * blocks, const void * x_f16, float * y, const int64_t rows, const int64_t k,
                hipStream_t stream) {
-    return gemv_legacy32<true>(blocks, x_f16, y, rows, k, stream);
+    return gemv_legacy32<true, 1>(blocks, x_f16, y, rows, k, stream);
 }
 
 bool gemv_q4_0(const void * blocks, const void * x_f16, float * y, const int64_t rows, const int64_t k,
                hipStream_t stream) {
-    return gemv_legacy32<false>(blocks, x_f16, y, rows, k, stream);
+    return gemv_legacy32<false, 1>(blocks, x_f16, y, rows, k, stream);
+}
+
+bool gemv_legacy_n(const uint32_t type, const void * blocks, const void * x_f16, float * y,
+                   const int64_t rows, const int64_t k, const int nt, hipStream_t stream) {
+    const auto run = [&](const auto q8) {
+        constexpr bool Q8 = decltype(q8)::value;
+        switch (nt) {
+            case 2: return gemv_legacy32<Q8, 2>(blocks, x_f16, y, rows, k, stream);
+            case 3: return gemv_legacy32<Q8, 3>(blocks, x_f16, y, rows, k, stream);
+            case 4: return gemv_legacy32<Q8, 4>(blocks, x_f16, y, rows, k, stream);
+            default: return false;
+        }
+    };
+    switch (type) {
+        case 8: return run(std::true_type{});
+        case 2: return run(std::false_type{});
+        case 13: return gemv_q5k_n(blocks, x_f16, y, rows, k, nt, stream);
+        default: return false;
+    }
 }
 
 
@@ -3143,32 +3186,40 @@ bool gemv_q4_0(const void * blocks, const void * x_f16, float * y, const int64_t
 // 176-byte blocks (d, dmin, 12 scale bytes, 32 qh bytes, 128 qs bytes) read
 // from the GGUF layout (#492, like the legacy 32-wide ones): the fifth bit of
 // each weight comes from qh and the 6-bit scales from get_scale_min_k4.
+template <int NT>
 __global__ void gemv_q5k_kernel(const uint8_t * __restrict__ blocks,
                                 const __half * __restrict__ x, float * __restrict__ y,
                                 const long long rows, const long long n_sub,
                                 const long long chunk_sub) {
-    extern __shared__ __half xs[];
+    extern __shared__ __half xs[];  // the x chunk of each token (as the legacy kernel)
+    const long long k = n_sub * 32;
     const int warp = (int) threadIdx.x / 32;
     const int lane = (int) threadIdx.x % 32;
     const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kLegacyRows;
     const long long rlast = rows - 1;
     const long long nblk = n_sub / 8;  // 256-weight blocks per row
-    float acc[kLegacyRows] = {};
+    float acc[NT][kLegacyRows] = {};
     for (long long base = 0; base < n_sub; base += chunk_sub) {
         const long long len = n_sub - base < chunk_sub ? n_sub - base : chunk_sub;
-        for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
-            xs[i] = x[base * 32 + i];
+        for (int t = 0; t < NT; ++t) {
+            for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
+                xs[t * chunk_sub * 32 + i] = x[t * k + base * 32 + i];
+            }
         }
         __syncthreads();
         if (row0 < rows) {
             for (long long s = base + lane; s < base + len; s += 32) {
                 const long long blk = s / 8;   // the 256-weight block
                 const int ib = (int) (s % 8);  // the sub-block in it
-                const __half * xv = xs + (s - base) * 32;
-                float xsum = 0.0f;
+                float xsum[NT];
 #pragma unroll
-                for (int j = 0; j < 32; ++j) {
-                    xsum += __half2float(xv[j]);
+                for (int t = 0; t < NT; ++t) {
+                    const __half * xv = xs + t * chunk_sub * 32 + (s - base) * 32;
+                    xsum[t] = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < 32; ++j) {
+                        xsum[t] += __half2float(xv[j]);
+                    }
                 }
                 // the sub-block's 64-weight group and nibble half
                 const int grp = ib / 2;
@@ -3186,28 +3237,35 @@ __global__ void gemv_q5k_kernel(const uint8_t * __restrict__ blocks,
                     const float ml = dmin * (float) mn;
                     const uint8_t * qs = b + 48 + grp * 32;
                     const int bit = 2 * grp + (high ? 1 : 0);
-                    float part = 0.0f;
 #pragma unroll
-                    for (int j = 0; j < 32; ++j) {
-                        const int q = (high ? (qs[j] >> 4) : (qs[j] & 15)) +
-                                      (((b[16 + j] >> bit) & 1) ? 16 : 0);
-                        part = fmaf((float) q, __half2float(xv[j]), part);
+                    for (int t = 0; t < NT; ++t) {
+                        const __half * xv = xs + t * chunk_sub * 32 + (s - base) * 32;
+                        float part = 0.0f;
+#pragma unroll
+                        for (int j = 0; j < 32; ++j) {
+                            const int q = (high ? (qs[j] >> 4) : (qs[j] & 15)) +
+                                          (((b[16 + j] >> bit) & 1) ? 16 : 0);
+                            part = fmaf((float) q, __half2float(xv[j]), part);
+                        }
+                        acc[t][r] = fmaf(dl, part, fmaf(-ml, xsum[t], acc[t][r]));
                     }
-                    acc[r] = fmaf(dl, part, fmaf(-ml, xsum, acc[r]));
                 }
             }
         }
         __syncthreads();
     }
 #pragma unroll
-    for (int r = 0; r < kLegacyRows; ++r) {
-        float v = acc[r];
+    for (int t = 0; t < NT; ++t) {
 #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            v += __shfl_down(v, off);
-        }
-        if (lane == 0 && row0 + r < rows) {
-            y[row0 + r] = v;
+        for (int r = 0; r < kLegacyRows; ++r) {
+            float v = acc[t][r];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                v += __shfl_down(v, off);
+            }
+            if (lane == 0 && row0 + r < rows) {
+                y[t * rows + row0 + r] = v;
+            }
         }
     }
 }
@@ -3218,13 +3276,27 @@ bool gemv_q5k(const void * blocks, const void * x_f16, float * y, const int64_t 
         k % 256 != 0) {
         return false;
     }
+    return gemv_q5k_n(blocks, x_f16, y, rows, k, 1, stream);
+}
+
+bool gemv_q5k_n(const void * blocks, const void * x_f16, float * y, const int64_t rows,
+                const int64_t k, const int nt, hipStream_t stream) {
+    if (blocks == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
+        k % 256 != 0 || nt < 1 || nt > 4) {
+        return false;
+    }
     const int64_t n_sub = k / 32;
-    const int64_t chunk = n_sub < kLegacyChunkSub ? n_sub : kLegacyChunkSub;
-    const size_t smem = (size_t) chunk * 64;
+    const int64_t chunk = legacy_chunk(n_sub, nt);
+    const size_t smem = (size_t) nt * chunk * 64;
     const dim3 grid((unsigned) ((rows + 8 * kLegacyRows - 1) / (8 * kLegacyRows)));
-    gemv_q5k_kernel<<<grid, 256, smem, stream>>>(static_cast<const uint8_t *>(blocks),
-                                                 static_cast<const __half *>(x_f16), y, rows, n_sub,
-                                                 chunk);
+    const auto * b = static_cast<const uint8_t *>(blocks);
+    const auto * x = static_cast<const __half *>(x_f16);
+    switch (nt) {
+        case 1: gemv_q5k_kernel<1><<<grid, 256, smem, stream>>>(b, x, y, rows, n_sub, chunk); break;
+        case 2: gemv_q5k_kernel<2><<<grid, 256, smem, stream>>>(b, x, y, rows, n_sub, chunk); break;
+        case 3: gemv_q5k_kernel<3><<<grid, 256, smem, stream>>>(b, x, y, rows, n_sub, chunk); break;
+        default: gemv_q5k_kernel<4><<<grid, 256, smem, stream>>>(b, x, y, rows, n_sub, chunk); break;
+    }
     return hipGetLastError() == hipSuccess;
 }
 

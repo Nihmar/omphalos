@@ -165,12 +165,16 @@ bool Runner::mtp_block(const int32_t * toks, const float * h_in, const int64_t p
     const int64_t dv = draft_vocab_rows();  // OMPH_DRAFT_VOCAB in head tiles (#340)
     const int64_t nv = (logits == nullptr || prefix_logits) && dv > 0 && dv < h_.n_vocab && use_gemv_ &&
                                draft_oov_ < kDraftOovMax &&
-                               hg != nullptr && hg->type == 12 && hg->rows == h_.n_vocab
+                               hg != nullptr && has_gemv_type(hg->type) && hg->rows == h_.n_vocab
                            ? dv
                            : h_.n_vocab;
+    // another type's prefix (the second model's Q6_K head, #496): the first nv
+    // rows are the first nv / 16 tiles (or GGUF rows), a matrix of their own
     if (nv < h_.n_vocab
-            ? !omph::kernels::gemv_q4k_prefix(head_.dev, h16_, static_cast<float *>(logits_), h_.n_vocab, nv, ne,
-                                              gemv_stream_)
+            ? !(hg->type == 12 ? omph::kernels::gemv_q4k_prefix(head_.dev, h16_, static_cast<float *>(logits_),
+                                                                h_.n_vocab, nv, ne, gemv_stream_)
+                               : gemv_one(hg->type, head_.dev, h16_, static_cast<float *>(logits_), nv, ne,
+                                          gemv_stream_))
             : !matmul(head_, h16_, static_cast<float *>(logits_), h_.n_vocab, ne, 1)) {
         return fail("mtp: head failed");
     }
