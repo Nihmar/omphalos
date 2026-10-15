@@ -20,6 +20,33 @@ drops an earlier turn's reasoning unless it is set, so the follow-up re-prefille
 (0 of 66 cached); with it, 242 of 259 cached. Clients that want the cache across
 turns on this model send chat_template_kwargs.preserve_thinking = true.
 
+## check_warm_server.py on the MoE: the prefill split moves a token
+
+The first run (`--text` wikitext-2 test rebuilt as text) failed 4 checks, all
+in the no-checkpoints variant (`--cache-ram 0`), all on the 2k prompt and its
+second turn, in both orders; default, no-mtp, the canary and the cross-order
+checks all passed. It is not state leaking between requests: two *fresh*
+servers answer the 2k prompt differently,
+
+    default         "... a Korean War engagement from September 1–15, 1950,"
+    --cache-ram 0   "... a Korean War engagement from September 1-15, 1950,"
+
+The checkpoints split the prompt's prefill at other positions, so its tail runs
+through other kernels (the T <= 16 GEMV path and the short-chunk attention
+instead of the GEMM and the flash attention); the rounding differs, and on the
+MoE model the routing turns that into another expert somewhere and, here, an
+en dash into a hyphen (the same effect as #516's KL). The dense model's
+answers do not move with the split; a MoE model's can - llama.cpp's do with
+its batch size too.
+
+The check now judges a variant's answer that differs from the default fresh one
+against a fresh server *of the same variant*: a leak fails, a split does not.
+Rerun on the MoE: 115 checks, 0 failures; the four no-checkpoints answers that
+differ from the default's (2k and 2k-turn2, both orders) are identical to a
+fresh no-checkpoints server's; default, no-mtp and k8 match their references,
+the two orders match each other in every variant, and the canary leaked
+nowhere.
+
 ## Qwen3.8-27B: unchanged
 
 | | main 9af4056 (before the MoE decode work) | this branch |
