@@ -2984,47 +2984,45 @@ bool dequant_repacked(const uint32_t type, const void * packed, void * dst_f16,
 
 namespace {
 
-template <class TD, bool PerSlotX>
+template <class TD>
 __global__ __launch_bounds__(256, 8) void gemv_moe_tile_kernel(
     const uint8_t * const * __restrict__ exps, const int * __restrict__ ids,
     const __half * __restrict__ x, float * __restrict__ y, const long long rows,
-    const long long blocks) {
+    const long long blocks, const int slots_per_x) {
     __shared__ __attribute__((aligned(16))) uint8_t lds[TD::kLds + 8704];
     const long long slot = blockIdx.z;
     const uint8_t * w = exps[ids[slot]];
-    const __half * xs = PerSlotX ? x + slot * (blocks * 256) : x;
+    const __half * xs = x + (slot / slots_per_x) * (blocks * 256);
     tiles_body<TD, 1>(w, xs, y + slot * rows, rows, blocks, (long long) blockIdx.x, lds);
 }
 
-template <class TD, bool PerSlotX>
+template <class TD>
 bool launch_moe_tile(const uint8_t * const * exps, const int * ids, const __half * x,
-                     float * y, const int64_t rows, const int64_t k, const int topk, hipStream_t stream) {
-    if (rows % 16 != 0 || k % 256 != 0 || topk <= 0 || topk > 64) {
+                     float * y, const int64_t rows, const int64_t k, const int slots, const int slots_per_x,
+                     hipStream_t stream) {
+    if (rows % 16 != 0 || k % 256 != 0 || slots <= 0 || slots > kMoeMaxSlots || slots_per_x <= 0) {
         return false;
     }
     const unsigned grid = (unsigned) ((rows / 16 + kTileTiles - 1) / kTileTiles);
-    gemv_moe_tile_kernel<TD, PerSlotX><<<dim3(grid, 1, (unsigned) topk), 256, 0, stream>>>(
-        exps, ids, x, y, rows, k / 256);
+    gemv_moe_tile_kernel<TD><<<dim3(grid, 1, (unsigned) slots), 256, 0, stream>>>(
+        exps, ids, x, y, rows, k / 256, slots_per_x);
     return hipGetLastError() == hipSuccess;
 }
 
 } // namespace
 
 bool gemv_moe(const uint32_t type, const void * const * exps, const void * ids,
-              const void * x_f16, float * y, const int64_t rows, const int64_t k, const int64_t topk,
-              const bool per_slot_x, hipStream_t stream) {
+              const void * x_f16, float * y, const int64_t rows, const int64_t k, const int64_t slots,
+              const int64_t slots_per_x, hipStream_t stream) {
     if (exps == nullptr || ids == nullptr || x_f16 == nullptr || y == nullptr ||
-        rows <= 0 || k <= 0 || topk <= 0 || topk > 64) {
+        rows <= 0 || k <= 0 || slots <= 0 || slots > kMoeMaxSlots || slots_per_x <= 0) {
         return false;
     }
     const auto * wt = reinterpret_cast<const uint8_t * const *>(exps);
     const auto * id = static_cast<const int *>(ids);
     const auto * x = static_cast<const __half *>(x_f16);
     const auto run = [&](const auto td) {
-        return per_slot_x ? launch_moe_tile<decltype(td), true>(wt, id, x, y, rows, k,
-                                                                (int) topk, stream)
-                          : launch_moe_tile<decltype(td), false>(wt, id, x, y, rows, k,
-                                                                 (int) topk, stream);
+        return launch_moe_tile<decltype(td)>(wt, id, x, y, rows, k, (int) slots, (int) slots_per_x, stream);
     };
     switch (type) {
         case 21: return run(qd::TileIq3s{});

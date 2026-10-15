@@ -91,12 +91,15 @@ bool gemv_iq2_s(const void * packed, const void * x_f16, float * y, int64_t rows
 // One launch for every selected expert of a 3-D tensor's slice (#497): the
 // device ids pick the expert per slot (no host round trip), `exps[expert]` its
 // slice (a device array of pointers into VRAM or pinned host memory, #512),
-// and the slot's rows of output go to y + slot * rows. `per_slot_x` selects
-// the down projections, whose input rows are per slot. False for a type
-// without a tile body.
+// and the slot's rows of output go to y + slot * rows. Slot s reads the x row
+// s / slots_per_x: topk for the gate / up of T tokens (slot t * topk + j reads
+// token t), 1 for the down projections (a row per slot). A slot's work does not
+// depend on the slot count, so T tokens give each token's decode result bit for
+// bit (#496). False for a type without a tile body.
+constexpr int64_t kMoeMaxSlots = 128;
 bool gemv_moe(uint32_t type, const void * const * exps, const void * ids,
-              const void * x_f16, float * y, int64_t rows, int64_t k, int64_t topk,
-              bool per_slot_x, hipStream_t stream);
+              const void * x_f16, float * y, int64_t rows, int64_t k, int64_t slots,
+              int64_t slots_per_x, hipStream_t stream);
 
 bool gemv_bf16(const void * w, const void * x_f16, float * y, int64_t rows, int64_t k,
                hipStream_t stream);

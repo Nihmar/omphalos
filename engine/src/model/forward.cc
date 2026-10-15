@@ -417,7 +417,10 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
 
 bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
     const int64_t ne = h_.n_embd;
-    if (T > 1) {
+    // A verification (or a short --gemv run) takes the decode's shape over
+    // T x topk slots: every token's result is its decode result bit for bit,
+    // so speculation cannot change the text (#496); a chunk is batched.
+    if (T > 1 && !(T <= kMoeRouterGemvMax && gemv_path(T))) {
         return moe_ffn_batched(L, T);
     }
     const int64_t ffn = h_.n_ff_exp;
@@ -430,9 +433,11 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
         return fail("moe route failed");
     }
     // The device-side shape (#497): the selection never leaves the device, and
-    // each matrix kind is one launch over every selected expert. It needs all
-    // three to be tile-layout types; the per-expert path below falls back.
+    // each matrix kind is one launch over every selected expert of every token.
+    // It needs all three to be tile-layout types; the per-expert path below
+    // falls back.
     {
+        const int64_t slots = T * topk;
         const int64_t gate_rows = (int64_t) L.ffn_gate_exps.t->ne[1];
         const int64_t up_rows = (int64_t) L.ffn_up_exps.t->ne[1];
         const int64_t down_rows = (int64_t) L.ffn_down_exps.t->ne[1];
@@ -440,16 +445,16 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
         auto * ffn2 = static_cast<float *>(ffn2_);
         auto * down_out = static_cast<float *>(moe_down_);
         if (omph::kernels::gemv_moe(L.ffn_gate_exps.t->type, L.ffn_gate_exps.experts, ids,
-                                    h16_, ffn1, gate_rows, ne, topk, false, hipStreamPerThread) &&
+                                    h16_, ffn1, gate_rows, ne, slots, topk, hipStreamPerThread) &&
             omph::kernels::gemv_moe(L.ffn_up_exps.t->type, L.ffn_up_exps.experts, ids, h16_,
-                                    ffn2, up_rows, ne, topk, false, hipStreamPerThread) &&
+                                    ffn2, up_rows, ne, slots, topk, hipStreamPerThread) &&
             omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
-                                      static_cast<const float *>(ffn2_), ffn16_, topk * h_.n_ff_exp,
+                                      static_cast<const float *>(ffn2_), ffn16_, slots * h_.n_ff_exp,
                                       hipStreamPerThread) &&
             omph::kernels::gemv_moe(L.ffn_down_exps.t->type, L.ffn_down_exps.experts, ids,
-                                    ffn16_, down_out, down_rows, h_.n_ff_exp, topk, true,
+                                    ffn16_, down_out, down_rows, h_.n_ff_exp, slots, 1,
                                     hipStreamPerThread) &&
-            omph::kernels::moe_combine(static_cast<float *>(cur_), down_out, weights, 1, topk, ne,
+            omph::kernels::moe_combine(static_cast<float *>(cur_), down_out, weights, T, topk, ne,
                                        hipStreamPerThread)) {
             return moe_shared(L, T);
         }
@@ -817,10 +822,22 @@ bool Runner::lm_head(const int64_t T, std::vector<float> & logits, int32_t * gre
     // A verification (#122, #126): every row's greedy token on the device, 8
     // bytes per row back instead of 1 MB of logits.
     if (verifying_ && verify_argmax_ != nullptr && use_gemv_ && T <= kVerifyRowsMax &&
-        head_.gemv != nullptr && head_.gemv->type == 12) {
-        // 5..16 tokens: one read of the 682 MB head (#244); fewer: four at a time
-        const bool one = T > 4 && omph::kernels::gemv_tokens(12, head_.dev, h16_, static_cast<float *>(logits_),
-                                                             h_.n_vocab, ne, (int) T, nullptr);
+        head_.gemv != nullptr && has_gemv_type(head_.gemv->type)) {
+        const uint32_t ht = head_.gemv->type;
+        // 5..16 tokens: one read of the 682 MB head (#244); fewer: four at a time.
+        // Another tile type (the second model's Q6_K head, #496): its 1..16-token
+        // tile GEMV, else one launch per row - either way each row is the
+        // decode's GEMV result, never the chunked f16 path (~10 ms a verification)
+        bool one = (ht != 12 || T > 4) && omph::kernels::gemv_tokens(ht, head_.dev, h16_,
+                                                                     static_cast<float *>(logits_),
+                                                                     h_.n_vocab, ne, (int) T, nullptr);
+        for (int64_t t = 0; t < T && !one && ht != 12; ++t) {
+            if (!gemv_one(ht, head_.dev, static_cast<const uint8_t *>(h16_) + t * ne * 2,
+                          static_cast<float *>(logits_) + t * h_.n_vocab, h_.n_vocab, ne, nullptr)) {
+                return fail("lm_head (verify) failed");
+            }
+        }
+        one = one || ht != 12;
         for (int64_t t0 = 0; t0 < T && !one;) {
             const int64_t n = std::min<int64_t>(4, T - t0);
             const uint8_t * x = static_cast<const uint8_t *>(h16_) + t0 * ne * 2;
