@@ -990,6 +990,8 @@ int main(int argc, char ** argv) {
         omph::server::Listener listener(host, port);  // fail before the minute of loading
         const double t_load = omph::runtime::now_ms();
         omph::model::Generator gen(cfg, omph::runtime::EnvOptions::from_env());
+        // "original" is the file's own template: Qwen3.8's or Qwen3.5's (#497)
+        defaults.chat_template = omph::text::resolve_chat_template(defaults.chat_template, gen.chat_template());
         Server server{gen, alias.empty() ? default_id(cfg.model) : alias, cfg.model, host, port, api_key, cors,
                       defaults, enabled_tools};
         server.log_json = log_json;

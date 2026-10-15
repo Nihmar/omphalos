@@ -16,7 +16,15 @@ namespace omph::text {
 class Tokenizer;
 
 // The built-in chat templates: the GGUF's own, or the vendored Qwen Sharp.
-enum class ChatTemplate { Original, Sharp };
+// Original is Qwen3.8's template; a file whose template is the Qwen3.5 / 3.6
+// one (Ornith, #497: no reasoning effort) renders as Qwen35 -
+// resolve_chat_template picks it from the file's tokenizer.chat_template.
+enum class ChatTemplate { Original, Sharp, Qwen35 };
+
+// The requested template for this file (its tokenizer.chat_template): Original
+// becomes Qwen35 when the file's template has no reasoning_effort (the Qwen3.8
+// template's marker); Sharp, written for Qwen3.8's format, throws there.
+ChatTemplate resolve_chat_template(ChatTemplate tpl, const std::string & file_template);
 
 // A --chat-template value: "original" or "sharp" (anything else throws).
 ChatTemplate chat_template_from_string(const std::string & name);

@@ -94,7 +94,11 @@ struct Renderer {
     int video_count = 0;
     std::vector<Segment> segs;
 
-    explicit Renderer(const Json & request) : req(request) {}
+    // the Qwen3.5 / 3.6 template (Ornith's, #497): no reasoning effort, the
+    // system message as it is, the old reasoning kept only on request, the
+    // reasoning of an assistant text with </think> split off
+    bool qwen35 = false;
+    explicit Renderer(const Json & request, const bool q35 = false) : req(request), qwen35(q35) {}
 
     // Appends a piece of the prompt: the template's own text (`special`), or a
     // string the request supplied (not special, #292). Adjacent pieces with
@@ -179,7 +183,7 @@ struct Renderer {
         add_vision_id = truthy(req.get("add_vision_id"));
         const Json * enable_thinking = req.find("enable_thinking");
         std::string reasoning;
-        if (enable_thinking == nullptr || (enable_thinking->is_bool() && enable_thinking->as_bool())) {
+        if (!qwen35 && (enable_thinking == nullptr || (enable_thinking->is_bool() && enable_thinking->as_bool()))) {
             const Json * effort = req.find("reasoning_effort");
             const std::string e = effort == nullptr ? "xhigh" : print(*effort);
             if (e != "xhigh" && e != "medium" && e != "low") {
@@ -229,6 +233,11 @@ struct Renderer {
                 }
             }
             add("<|im_end|>\n");
+        } else if (role_of(msgs[0]) == "system" && qwen35) {
+            // the Qwen3.5 template writes the system turn even when it is empty
+            add("<|im_start|>system\n");
+            add_trimmed(content_segments(msgs[0], false));
+            add("<|im_end|>\n");
         } else if (role_of(msgs[0]) == "system") {
             const std::vector<Segment> c = content_segments(msgs[0], false);
             if (!trim(join(c)).empty()) {
@@ -258,7 +267,9 @@ struct Renderer {
             raise("No user query found in messages.");
         }
         const Json * preserve = req.find("preserve_thinking");
-        const bool keep_thinking = preserve == nullptr || (preserve->is_bool() && preserve->as_bool());
+        // Qwen3.8: kept unless false; Qwen3.5: only when set to true
+        const bool keep_thinking = qwen35 ? preserve != nullptr && preserve->is_bool() && preserve->as_bool()
+                                          : preserve == nullptr || (preserve->is_bool() && preserve->as_bool());
         for (size_t k = 0; k < msgs.size(); ++k) {
             const Json & m = msgs[k];
             const std::string role = role_of(m);
@@ -272,14 +283,39 @@ struct Renderer {
                 add("<|im_end|>\n");
             } else if (role == "assistant") {
                 const Json & rc = m.get("reasoning_content");
-                const std::string reasoning_content = trim(rc.is_string() ? rc.as_string() : std::string());
+                std::string reasoning_content = rc.is_string() ? rc.as_string() : std::string();
+                // the Qwen3.5 template: an assistant text with </think> and no
+                // reasoning_content carries its reasoning (split as the template
+                // splits it); what is left of the text is the request's string
+                std::vector<Segment> body = content;
+                std::string body_text = text;
+                if (qwen35 && !rc.is_string() && text.find("</think>") != std::string::npos) {
+                    const size_t close = text.find("</think>");
+                    std::string before = text.substr(0, close);
+                    while (!before.empty() && before.back() == '\n') before.pop_back();
+                    const size_t open = before.rfind("<think>");
+                    reasoning_content = open == std::string::npos ? before : before.substr(open + 7);
+                    reasoning_content.erase(0, reasoning_content.find_first_not_of('\n') == std::string::npos
+                                                   ? reasoning_content.size()
+                                                   : reasoning_content.find_first_not_of('\n'));
+                    body_text = text.substr(text.rfind("</think>") + 8);
+                    body_text.erase(0, body_text.find_first_not_of('\n') == std::string::npos
+                                           ? body_text.size()
+                                           : body_text.find_first_not_of('\n'));
+                    body = {Segment{body_text, false}};
+                }
+                reasoning_content = trim(reasoning_content);
                 add("<|im_start|>" + role + "\n");
                 if (keep_thinking || k > last_query) {
                     add("<think>\n");
                     add(reasoning_content, false);
                     add("\n</think>\n\n");
                 }
-                add_trimmed(content);
+                if (body_text == text) {
+                    add_trimmed(body);
+                } else {
+                    add(body_text, false);
+                }
                 const Json & calls = m.get("tool_calls");
                 if (calls.is_array() && calls.size() > 0) {
                     bool first = true;
@@ -291,7 +327,7 @@ struct Renderer {
                         // content came first, and "\n<tool_call>" for the rest
                         // (it used to put a blank line before every later call)
                         if (first) {
-                            add(text.empty() ? "<tool_call>\n<function=" : "\n\n<tool_call>\n<function=");
+                            add(trim(body_text).empty() ? "<tool_call>\n<function=" : "\n\n<tool_call>\n<function=");
                         } else {
                             add("\n<tool_call>\n<function=");
                         }
@@ -299,7 +335,9 @@ struct Renderer {
                         add(">\n");
                         first = false;
                         const Json * args = call.find("arguments");
-                        if (args != nullptr && !(args->is_string() && args->as_string().empty())) {
+                        // Qwen3.8 skips empty arguments; the Qwen3.5 template reads
+                        // any it is given (an empty string is not a mapping)
+                        if (args != nullptr && (qwen35 || !(args->is_string() && args->as_string().empty()))) {
                             // an OpenAI-style string of JSON arguments is parsed first
                             const Json parsed = args->is_string() ? Json::parse(args->as_string()) : *args;
                             if (!parsed.is_object()) raise("tool call arguments are not a mapping");
@@ -346,15 +384,22 @@ struct Renderer {
 std::string join_segments(const std::vector<Segment> & segments) { return join(segments); }
 
 std::string render_chat(const Json & request, const ChatTemplate tpl) {
-    if (tpl == ChatTemplate::Sharp) return join(render_chat_segments_sharp(request));
-    Renderer r{request};
-    return join(r.run());
+    return join(render_chat_segments(request, tpl));
 }
 
 std::vector<Segment> render_chat_segments(const Json & request, const ChatTemplate tpl) {
     if (tpl == ChatTemplate::Sharp) return render_chat_segments_sharp(request);
-    Renderer r{request};
+    Renderer r{request, tpl == ChatTemplate::Qwen35};
     return r.run();
+}
+
+ChatTemplate resolve_chat_template(const ChatTemplate tpl, const std::string & file_template) {
+    const bool qwen35 = !file_template.empty() && file_template.find("reasoning_effort") == std::string::npos;
+    if (tpl == ChatTemplate::Sharp && qwen35) {
+        throw std::runtime_error("the Qwen Sharp chat template is written for Qwen3.8's chat format; this model's "
+                                 "template is the Qwen3.5 one (use --chat-template original)");
+    }
+    return tpl == ChatTemplate::Original && qwen35 ? ChatTemplate::Qwen35 : tpl;
 }
 
 ChatTemplate chat_template_from_string(const std::string & name) {
@@ -364,6 +409,7 @@ ChatTemplate chat_template_from_string(const std::string & name) {
 }
 
 const char * chat_template_name(const ChatTemplate tpl) {
+    // Qwen35 is the file's own template too
     return tpl == ChatTemplate::Sharp ? "sharp" : "original";
 }
 

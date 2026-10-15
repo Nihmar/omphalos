@@ -114,6 +114,7 @@ int main(int argc, char ** argv) {
         const std::string in((std::istreambuf_iterator<char>(std::cin)), std::istreambuf_iterator<char>());
         omph::model::Generator gen(cfg, omph::runtime::EnvOptions::from_env());
         const omph::text::Tokenizer & tok = gen.tokenizer();
+        tpl = omph::text::resolve_chat_template(tpl, gen.chat_template());
         const auto read_file = [](const std::string & path) {
             FILE * f = std::fopen(path.c_str(), "rb");
             if (f == nullptr) throw std::runtime_error("cannot open " + path);

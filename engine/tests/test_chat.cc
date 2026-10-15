@@ -191,5 +191,32 @@ int main() {
     if (omph_test::failures == 0) {
         std::printf("test_chat: all checks passed\n");
     }
+    // the Qwen3.5 template (Ornith, #497): an empty system turn is written, no
+    // reasoning-effort prompt, and an earlier assistant turn's </think> text
+    // loses its reasoning (preserve_thinking unset)
+    {
+        using omph::text::ChatTemplate;
+        const Json q35 = Json::parse(R"({"messages":[{"role":"system","content":""},)"
+                                     R"({"role":"user","content":"q1"},)"
+                                     R"({"role":"assistant","content":"<think>\nr1\n</think>\n\na1"},)"
+                                     R"({"role":"user","content":"q2"}],"add_generation_prompt":true})");
+        CHECK(omph::text::render_chat(q35, ChatTemplate::Qwen35) ==
+                  "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\na1"
+                  "<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>\n",
+              "qwen35: empty system, no effort, the old reasoning split off and dropped");
+        const std::string q38_file = "... reasoning_effort|default('xhigh') ...";
+        const std::string q35_file = "{%- if messages[0].role == 'system' %} ...";
+        CHECK(omph::text::resolve_chat_template(ChatTemplate::Original, q38_file) == ChatTemplate::Original,
+              "a Qwen3.8 template stays Original");
+        CHECK(omph::text::resolve_chat_template(ChatTemplate::Original, q35_file) == ChatTemplate::Qwen35,
+              "a template without reasoning_effort renders as Qwen35");
+        bool refused = false;
+        try {
+            (void) omph::text::resolve_chat_template(ChatTemplate::Sharp, q35_file);
+        } catch (const std::runtime_error &) {
+            refused = true;
+        }
+        CHECK(refused, "sharp is refused for a Qwen3.5 template");
+    }
     return omph_test::failures;
 }
