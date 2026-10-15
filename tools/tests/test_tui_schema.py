@@ -149,3 +149,17 @@ def test_profiles_round_trip(tmp_path, monkeypatch) -> None:
     assert loaded["mine"]["ctx"] == 4096 and loaded["mine"]["temperature"] == 0.7
     assert "nope" not in loaded["mine"]
     assert profiles.delete("mine") and "mine" not in profiles.load()
+
+
+def test_the_model_families_and_the_moe_presets() -> None:
+    """#527: the family by the file name, the switch, and the MoE presets'
+    command (its model, K4/V4, a 1024 chunk for the coding agent, no drafter)."""
+    assert profiles.family("models/Ornith-1.5-35B-A3B-Q4_K_M.omph") == "ornith"
+    assert profiles.family("models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph") == "qwen3.8"
+    assert profiles.family("") == "qwen3.8"
+    moved = profiles.switch_model({**schema.defaults(), "chat_template": "sharp", "ctx": 4096}, "ornith")
+    assert moved["chat_template"] == "original" and moved["ctx"] == 4096 and moved["dflash"] == ""
+    env, argv = schema.build_command(profiles.PRESETS["moe-coding-agent"], "omph-server")
+    assert "Ornith-1.5-35B-A3B-Q4_K_M.omph" in argv[1]
+    assert env.get("OMPH_KV_K4") == "1" and argv[argv.index("--chunk") + 1] == "1024"
+    assert "--dflash" not in argv and "--mmproj" not in argv

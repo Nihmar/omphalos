@@ -160,6 +160,39 @@ def test_profiles_screen_loads_a_preset(tmp_path) -> None:
             await pilot.press("enter")
             await pilot.pause(0.2)
             assert app.values["kv_k4_layers"] == "none" and app.values["ctx"] == 131072
+            # a preset names no model: the form keeps its own (#527)
+            assert app.values["model"] == "models/x.omph"
+
+    asyncio.run(run())
+
+
+def test_the_model_key_switches_the_family_and_keeps_the_rest(tmp_path, monkeypatch) -> None:
+    """m / F6 (#527): the other model's files, the user's other choices kept,
+    and what the target cannot run fixed (Qwen Sharp on the Qwen3.5 template)."""
+    fixture(tmp_path)
+    dense = tmp_path / "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph"
+    moe = tmp_path / "Ornith-1.5-35B-A3B-Q4_K_M.omph"
+    drafter = tmp_path / "Qwen3.8-27B-DFlash2-Q4_K_M.omph"
+    for f in (dense, moe, drafter):
+        f.write_text("x")
+    monkeypatch.setitem(profiles.MODELS, "qwen3.8", {"model": dense, "dflash": drafter, "mmproj": None})
+    monkeypatch.setitem(profiles.MODELS, "ornith", {"model": moe, "dflash": None, "mmproj": None})
+
+    async def run() -> None:
+        app = omph_tui.OmphTui({**schema.defaults(), "model": str(dense), "dflash": str(drafter), "ctx": 65536,
+                                "chat_template": "sharp", "port": 7070},
+                               binary="engine/build/omph-server", demo_file=str(tmp_path / "server.log"),
+                               demo_delay=0.0, poll=0.02)
+        async with app.run_test(size=(140, 46)) as pilot:
+            await pilot.pause(0.2)
+            await pilot.press("m")
+            await pilot.pause(0.2)
+            assert app.values["model"] == str(moe) and app.values["dflash"] == ""
+            assert app.values["chat_template"] == "original", "sharp is Qwen3.8's"
+            assert app.values["ctx"] == 65536 and app.values["port"] == 7070, "the other choices kept"
+            await pilot.press("f6")
+            await pilot.pause(0.2)
+            assert app.values["model"] == str(dense) and app.values["dflash"] == str(drafter)
 
     asyncio.run(run())
 
@@ -298,15 +331,31 @@ def test_preflight_catches_the_wrong_model_file(tmp_path) -> None:
     assert 14.0 < est < 15.6, f"11.3 GiB of weights + 3.3 GiB of KV at 128k, got {est:.2f}"
 
 
-def test_the_dflash_and_mmproj_defaults_are_the_repos_when_they_exist(tmp_path) -> None:
+def test_the_moe_model_fits_by_design_in_the_preflight(tmp_path, monkeypatch) -> None:
+    """A MoE file larger than the free VRAM is not an error (#527): the engine
+    pins the experts that do not fit; the check says how much."""
+    moe = tmp_path / "Ornith-1.5-35B-A3B-Q4_K_M.omph"
+    with open(moe, "wb") as f:
+        f.truncate(20 * 1024 ** 3)  # sparse: 20 GiB of weights, no disk used
+    monkeypatch.setattr(srv, "vram", lambda: (1 * 1024 ** 3, 16 * 1024 ** 3))
+    checks = srv.preflight({**schema.defaults(), "model": str(moe), "ctx": 32768})
+    vram = next(c for c in checks if c[1] == "vram")
+    assert vram[0] == "ok" and "pinned" in vram[2], vram
+    est = srv.vram_estimate({**schema.defaults(), "model": str(moe), "ctx": 131072})
+    assert est < 20 + 1.5, f"the MoE KV is ~8.5 KiB per token, not the dense 26: {est:.2f}"
+
+
+def test_the_dflash_and_mmproj_defaults_are_the_repos_when_they_exist(tmp_path, monkeypatch) -> None:
     """The form pre-fills the model path; it should pre-fill the DFlash2 drafter
     and the vision encoder the same way, but only when the file is there (they
-    are optional)."""
-    missing = tmp_path / "nope.omph"
-    assert omph_tui.default_file(missing) == ""
+    are optional), and only for the model family that has them (#527)."""
     present = tmp_path / "d.omph"
     present.write_text("x")
-    assert omph_tui.default_file(present) == str(present)
+    monkeypatch.setitem(profiles.MODELS, "qwen3.8", {"model": tmp_path / "m.omph", "dflash": present,
+                                                     "mmproj": tmp_path / "nope.gguf"})
+    files = profiles.default_files("qwen3.8")
+    assert files["dflash"] == str(present) and files["mmproj"] == "" and files["model"] == ""
+    assert profiles.default_files("ornith")["dflash"] == "", "Ornith has no drafter"
     # precedence: --dflash, then the profile's drafter, then the repo's
     assert omph_tui.resolve_file("/cli.omph", "/profile.omph", "/repo.omph") == "/cli.omph"
     assert omph_tui.resolve_file(None, "/profile.omph", "/repo.omph") == "/profile.omph"

@@ -27,7 +27,11 @@ import time
 from collections.abc import Iterable
 from pathlib import Path
 
-KIB_PER_TOKEN = 26 * 1024        # the default K/Q8 + V/Q4 cache, #58's 0.87 GB at 32k
+from . import profiles
+
+KIB_PER_TOKEN = 26 * 1024       # the default K/Q8 + V/Q4 cache, #58's 0.87 GB at 32k
+MOE_KIB_PER_TOKEN = 8.5          # the MoE model's (10 attention layers, 2 KV heads; K8/V4, #516)
+MOE_MARGIN_GIB = 0.75            # what the engine's auto expert budget leaves free (#495)
 MTP_MIB = 352                     # the MTP block's weights
 DFLASH_MIB = 1100                 # the DFlash2 drafter's weights (Q4_K_M)
 
@@ -96,7 +100,8 @@ def vram_estimate(values: dict) -> float:
     path = Path(model)
     weights = path.stat().st_size / 1024 ** 3 if model and path.is_file() else 11.3
     ctx = int(values.get("ctx") or 8192)
-    kv = ctx * KIB_PER_TOKEN / 1024 ** 3
+    kib = MOE_KIB_PER_TOKEN if profiles.family(model) == "ornith" else KIB_PER_TOKEN / 1024
+    kv = ctx * kib / 1024 ** 2
     extra = 0.0
     if not values.get("no_mtp"):
         extra += MTP_MIB / 1024
@@ -133,7 +138,15 @@ def preflight(values: dict, exclude_pids: Iterable[int] = ()) -> list[tuple[str,
                   else ("ok", "servers", "no other omph-server"))
     est = vram_estimate(values)
     used, total = vram()
-    if total:
+    if total and profiles.family(model) == "ornith":
+        # the MoE model fits by design: the engine fills the free VRAM and pins
+        # the experts that do not fit in host RAM (#495, #512)
+        free = (total - (used or 0)) / 1024 ** 3
+        pinned = max(0.0, est + MOE_MARGIN_GIB - free)
+        level = "warn" if pinned > 10 else "ok"
+        detail = f"MoE: fills {free:.1f} GiB free, ~{pinned:.1f} GiB of experts pinned in host RAM"
+        checks.append((level, "vram", detail))
+    elif total:
         free = (total - (used or 0)) / 1024 ** 3
         level = "err" if est > free else ("warn" if est > free - 0.5 else "ok")
         checks.append((level, "vram", f"est. {est:.1f} GiB, {free:.1f} GiB free of {total / 1024 ** 3:.1f}"))

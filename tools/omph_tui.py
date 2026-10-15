@@ -64,20 +64,11 @@ from tui import profiles, schema
 
 HERE = Path(__file__).resolve().parent
 # The repo's own files, for the form's defaults: the .omph omph-convert writes,
-# the DFlash2 drafter and the vision encoder next to it (README's "everything
-# on" / coding-agent recipes; the encoder runs on the CPU, no VRAM, #385). Both
-# are optional, so a checkout without one leaves its field empty rather than
-# failing the preflight.
-DEFAULT_MODEL = HERE.parent / "models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph"
-DEFAULT_DFLASH = HERE.parent / "models/Qwen3.8-27B-DFlash2-Q4_K_M.omph"
-DEFAULT_MMPROJ = HERE.parent / "models/mmproj-Qwen3.8-27B-BF16.gguf"
-
-
-def default_file(path: Path) -> str:
-    """An optional file (drafter, encoder) to pre-fill the form with, or ""
-    when it is not there (the model field is always filled; these only when
-    they can run)."""
-    return str(path) if path.is_file() else ""
+# and for Qwen3.8 the DFlash2 drafter and the vision encoder next to it
+# (README's "everything on" / coding-agent recipes; the encoder runs on the
+# CPU, no VRAM, #385). The optional ones are left empty when they are not
+# there, and per model family (#527: Ornith has neither).
+DEFAULT_MODEL = profiles.MODELS["qwen3.8"]["model"]
 
 
 def resolve_file(cli: str | None, profile_value: object, repo_default: str) -> str:
@@ -313,6 +304,7 @@ class HelpScreen(ModalScreen):
     KEYS = (("s / F2", "start the server with the form's options"),
             ("x / F3", "stop it (and its process group)"),
             ("r / F5", "restart"),
+            ("m / F6", "switch the model (Qwen3.8 <-> Ornith): its files, the rest kept"),
             ("p / F7", "profiles: load, save, delete"),
             ("c / F9", "the command that will run, with the pre-flight checks"),
             ("y / F10", "copy that command"),
@@ -492,6 +484,7 @@ class OmphTui(App):
         Binding("f2", "start", "start"),
         Binding("f3", "stop", "stop"),
         Binding("f5", "restart", "restart"),
+        Binding("f6", "switch_model", "model"),
         Binding("f7", "profiles", "profiles"),
         Binding("f8", "export", "export CSV"),
         Binding("f9", "command", "command"),
@@ -500,6 +493,7 @@ class OmphTui(App):
         Binding("x", "stop", "stop", show=False),
         Binding("r", "restart", "restart", show=False),
         Binding("p", "profiles", "profiles", show=False),
+        Binding("m", "switch_model", "model", show=False),
         Binding("c", "command", "command", show=False),
         Binding("y", "copy", "copy", show=False),
         Binding("h", "help", "help", show=False),
@@ -610,7 +604,10 @@ class OmphTui(App):
         return values
 
     def apply(self, values: dict) -> None:
-        self.values = {**schema.defaults(), **values}
+        # a profile without a model keeps the form's (the presets name none but
+        # the MoE ones); its empty file fields take that model family's files
+        values = {**values, "model": values.get("model") or self.values.get("model", "")}
+        self.values = profiles.with_files({**schema.defaults(), **values})
         for pane in self.forms.values():
             pane.set_values(self.values)
         self.refresh_chips()
@@ -872,6 +869,19 @@ class OmphTui(App):
 
         self.push_screen(ConfirmQuit(), answer)
 
+    def action_switch_model(self) -> None:
+        """F6: the form on the other model (#527) - its files, every other
+        choice kept but what it cannot run; F9 shows the command."""
+        current = self.collect()
+        to = "qwen3.8" if profiles.family(current.get("model")) == "ornith" else "ornith"
+        values = profiles.switch_model(current, to)
+        if not values.get("model"):
+            self.notify(f"no {to} model in models/: set the model field", severity="warning")
+            return
+        self.apply(values)
+        self.notify(f"model: {Path(values['model']).name}")
+        self.logview.write(f"[dim]model switched to {to}; F9 shows the command[/dim]")
+
     def action_profiles(self) -> None:
         def loaded(values) -> None:
             if isinstance(values, dict):
@@ -1014,7 +1024,8 @@ class OmphTui(App):
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", default=str(DEFAULT_MODEL), help="the .omph to serve")
+    ap.add_argument("--model", default=None,
+                    help="the .omph to serve (default: the profile's, else the repo's Qwen3.8 file)")
     ap.add_argument("--dflash", default=None,
                     help="the DFlash2 drafter .omph to fill in (default: the repo's when the file exists; "
                          "empty starts on the MTP head)")
@@ -1032,10 +1043,12 @@ def main() -> None:
     args = ap.parse_args()
 
     values = profiles.load().get(args.profile, schema.defaults())
-    # --dflash / --mmproj win, then the profile's own file, then the repo's when present
-    dflash = resolve_file(args.dflash, values.get("dflash"), default_file(DEFAULT_DFLASH))
-    mmproj = resolve_file(args.mmproj, values.get("mmproj"), default_file(DEFAULT_MMPROJ))
-    values = {**values, "model": args.model, "dflash": dflash, "mmproj": mmproj}
+    model = args.model or values.get("model") or str(DEFAULT_MODEL)
+    # --dflash / --mmproj win, then the profile's own file, then its model family's when present
+    files = profiles.default_files(profiles.family(model))
+    dflash = resolve_file(args.dflash, values.get("dflash"), files["dflash"])
+    mmproj = resolve_file(args.mmproj, values.get("mmproj"), files["mmproj"])
+    values = {**values, "model": model, "dflash": dflash, "mmproj": mmproj}
     app = OmphTui(values, binary=args.binary, exec_command=args.exec_command, demo_file=args.demo,
                   poll=args.poll, demo_delay=args.demo_delay)
 
