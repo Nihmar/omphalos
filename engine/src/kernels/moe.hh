@@ -39,6 +39,13 @@ bool moe_topk(const void * logits, int * ids, float * weights, int64_t tokens, i
 bool moe_router(const void * w_f16, const void * x_f16, float * logits, int64_t tokens,
                 int64_t n_expert, int64_t k, hipStream_t stream);
 
+// rows x n 32-bit words from src (pitch spitch words) to dst (pitch dpitch),
+// either side in VRAM or in pinned host memory: the expert cache's table
+// upload and selection log (#513) as kernels on the compute stream, so they do
+// not queue on a DMA engine behind the cache's fills.
+bool moe_copy_words(void * dst, int64_t dpitch, const void * src, int64_t spitch, int64_t n, int64_t rows,
+                    hipStream_t stream);
+
 // out[t][j] += weights[t * stride + slot] * y[t][j]: one expert's down output,
 // weighted by its router probability, accumulated into the block's output.
 bool moe_acc(float * out, const float * y, const float * weights, int64_t tokens, int64_t stride,
