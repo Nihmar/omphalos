@@ -18,6 +18,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -75,6 +78,9 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
             bool host = false;
             size_t src = 0;  // the bytes of the tensor it holds (len 0: all of them)
             size_t len = 0;
+            // or these experts' slices of pe bytes each, back to back (#512)
+            std::vector<int> experts;
+            size_t pe = 0;
         };
         std::vector<Place> places;
         std::vector<std::pair<const omph::gguf::File *, const omph::gguf::TensorInfo *>> all;
@@ -142,6 +148,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 }
                 moe_cap_ = std::clamp<int64_t>((expert_bytes - host_budget) / per_set, 0, h_.n_expert);
                 moe_fixed_ = std::max<int64_t>(0, moe_cap_ - kMoeCacheSlots);
+                moe_load_counts(path + ".experts");
             }
         }
         const bool cached = moe_cap_ < h_.n_expert;
@@ -193,14 +200,20 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 gems_[name] = e;
             }
             if (cached && f == &file_ && is_expert(name)) {
-                // experts 0..CAP-1 in the device pool, R..n-1 in pinned memory
+                // the layer's order (the most chosen first, #512): its first
+                // CAP in the device pool, from the fixed count on in pinned memory
+                const std::vector<int> & order = moe_order(std::stoi(name.substr(4)));
                 const size_t pe = (size_t) (t.stored / (uint64_t) h_.n_expert);
-                const size_t dev_len = (size_t) moe_cap_ * pe;
-                const size_t host_len = (size_t) (h_.n_expert - moe_fixed_) * pe;
-                places.push_back(Place{f, &t, name, dev_total, false, 0, dev_len});
-                places.push_back(Place{f, &t, name, host_total, true, (size_t) moe_fixed_ * pe, host_len});
-                dev_total += aligned(dev_len);
-                host_total += aligned(host_len);
+                Place dev{f, &t, name, dev_total, false};
+                dev.experts.assign(order.begin(), order.begin() + moe_cap_);
+                dev.pe = pe;
+                Place host{f, &t, name, host_total, true};
+                host.experts.assign(order.begin() + moe_fixed_, order.end());
+                host.pe = pe;
+                dev_total += aligned(dev.experts.size() * pe);
+                host_total += aligned(host.experts.size() * pe);
+                places.push_back(std::move(dev));
+                places.push_back(std::move(host));
                 continue;
             }
             const bool host = !cached && f == &file_ && is_expert(name) && host_used < host_budget;
@@ -251,14 +264,31 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 throw std::runtime_error("cannot allocate the upload buffers");
             }
         }
+        // bytes [from, from + n) of what a place holds, into dst
+        const auto read = [](const Place & p, uint8_t * dst, size_t from, size_t n) {
+            const uint8_t * src = p.f->tensor_data(*p.t);
+            if (p.experts.empty()) {
+                std::memcpy(dst, src + p.src + from, n);
+                return;
+            }
+            while (n > 0) {
+                const size_t o = from % p.pe;
+                const size_t m = std::min(n, p.pe - o);
+                std::memcpy(dst, src + (size_t) p.experts[from / p.pe] * p.pe + o, m);
+                dst += m;
+                from += m;
+                n -= m;
+            }
+        };
         int turn = 0;
         for (const Place & p : places) {
             uint8_t * base = p.host ? static_cast<uint8_t *>(host_weights_)
                                     : static_cast<uint8_t *>(dev_weights_);
-            const size_t len = p.len > 0 ? p.len : (size_t) p.t->stored;
-            const uint8_t * src = p.f->tensor_data(*p.t) + p.src;
+            const size_t len = !p.experts.empty() ? p.experts.size() * p.pe
+                               : p.len > 0      ? p.len
+                                                : (size_t) p.t->stored;
             if (p.host) {
-                std::memcpy(base + p.off, src, len);
+                read(p, base + p.off, 0, len);
             } else {
                 for (size_t at = 0; at < len; at += kBounce, turn ^= 1) {
                     const size_t n = std::min(kBounce, len - at);
@@ -266,7 +296,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                         release();
                         throw std::runtime_error("cannot upload " + p.name);
                     }
-                    std::memcpy(bounce[turn], src + at, n);
+                    read(p, static_cast<uint8_t *>(bounce[turn]), at, n);
                     if (hipMemcpyAsync(base + p.off + at, bounce[turn], n, hipMemcpyHostToDevice,
                                        hipStreamPerThread) != hipSuccess ||
                         hipEventRecord(done[turn], hipStreamPerThread) != hipSuccess) {
@@ -1523,6 +1553,14 @@ void Runner::moe_tables() {
     for (size_t i = 0; i < ls.size(); ++i) {
         LayerWeights & L = *ls[i];
         L.moe_tab = (int) i;
+        // where each expert went at load: position p < CAP is pool slot p,
+        // p >= fixed is pinned index p - fixed
+        const int blk = std::stoi(L.ffn_gate_exps.name.substr(4));
+        const std::vector<int> & order = moe_order(blk);
+        std::vector<int> pos((size_t) n);
+        for (int64_t p = 0; p < n; ++p) {
+            pos[(size_t) order[(size_t) p]] = (int) p;
+        }
         Mat * kinds[3] = {&L.ffn_gate_exps, &L.ffn_up_exps, &L.ffn_down_exps};
         for (int k = 0; k < 3; ++k) {
             Mat & m = *kinds[k];
@@ -1535,7 +1573,8 @@ void Runner::moe_tables() {
             }
             const void ** row = moe_eptr_host_.data() + (i * 3 + (size_t) k) * (size_t) n;
             for (int64_t e = 0; e < n; ++e) {
-                row[e] = cached && e >= moe_cap_ ? host + (size_t) (e - moe_fixed_) * pe : dev + (size_t) e * pe;
+                const int64_t p = pos[(size_t) e];
+                row[e] = cached && p >= moe_cap_ ? host + (size_t) (p - moe_fixed_) * pe : dev + (size_t) p * pe;
             }
             m.experts = static_cast<const void * const *>(moe_eptr_) + (i * 3 + (size_t) k) * (size_t) n;
             if (cached) {
@@ -1546,12 +1585,16 @@ void Runner::moe_tables() {
         }
         if (cached) {
             MoeTab & c = moe_tabs_[i];
-            c.owner.resize((size_t) moe_cap_);
+            c.blk = blk;
+            c.owner.assign(order.begin(), order.begin() + moe_cap_);
             c.slot_of.assign((size_t) n, -1);
+            c.hidx.assign((size_t) n, -1);
             c.last.assign((size_t) n, 0);
-            for (int64_t e = 0; e < moe_cap_; ++e) {
-                c.owner[(size_t) e] = (int) e;
-                c.slot_of[(size_t) e] = (int) e;
+            c.count.assign((size_t) n, 0);
+            for (int64_t e = 0; e < n; ++e) {
+                const int64_t p = pos[(size_t) e];
+                c.slot_of[(size_t) e] = p < moe_cap_ ? (int) p : -1;
+                c.hidx[(size_t) e] = p >= moe_fixed_ ? (int) (p - moe_fixed_) : -1;
             }
         }
     }
@@ -1571,6 +1614,90 @@ void Runner::moe_tables() {
             throw std::runtime_error("cannot create the expert cache's stream");
         }
     }
+}
+
+// The expert counts file (#512): one line per MoE layer, "blk c0 c1 ...", the
+// decode's picks of every expert. At load it orders each layer's experts, the
+// most chosen first, so the fixed set is the measured hot one (by id without
+// it); omph-run --moe-counts adds a run's picks to it.
+void Runner::moe_load_counts(const std::string & path) {
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line)) {
+        std::istringstream ls(line);
+        int blk = -1;
+        std::vector<int64_t> c((size_t) h_.n_expert, 0);
+        ls >> blk;
+        for (int64_t e = 0; e < h_.n_expert && ls; ++e) {
+            ls >> c[(size_t) e];
+        }
+        if (blk < 0 || !ls) {
+            throw std::runtime_error(path + ": a malformed line (expected a layer and " +
+                                     std::to_string(h_.n_expert) + " counts)");
+        }
+        std::vector<int> order((size_t) h_.n_expert);
+        for (int64_t e = 0; e < h_.n_expert; ++e) {
+            order[(size_t) e] = (int) e;
+        }
+        // the most chosen first; a tie keeps the lower id
+        std::stable_sort(order.begin(), order.end(),
+                         [&](const int a, const int b) { return c[(size_t) a] > c[(size_t) b]; });
+        moe_orders_[blk] = std::move(order);
+    }
+    if (env_.timing && !moe_orders_.empty()) {
+        std::fprintf(stderr, "expert cache: the fixed set of %zu layers from %s\n", moe_orders_.size(),
+                     path.c_str());
+    }
+}
+
+const std::vector<int> & Runner::moe_order(const int blk) {
+    const auto it = moe_orders_.find(blk);
+    if (it != moe_orders_.end()) {
+        return it->second;
+    }
+    if (moe_identity_.empty()) {
+        moe_identity_.resize((size_t) h_.n_expert);
+        for (int64_t e = 0; e < h_.n_expert; ++e) {
+            moe_identity_[(size_t) e] = (int) e;
+        }
+    }
+    return moe_identity_;
+}
+
+bool Runner::moe_save_counts(const std::string & path) const {
+    std::map<int, std::vector<int64_t>> sum;
+    {
+        std::ifstream in(path);
+        std::string line;
+        while (std::getline(in, line)) {
+            std::istringstream ls(line);
+            int blk = -1;
+            std::vector<int64_t> c((size_t) h_.n_expert, 0);
+            ls >> blk;
+            for (int64_t e = 0; e < h_.n_expert && ls; ++e) {
+                ls >> c[(size_t) e];
+            }
+            if (blk >= 0 && ls) {
+                sum[blk] = std::move(c);
+            }
+        }
+    }
+    for (const MoeTab & t : moe_tabs_) {
+        std::vector<int64_t> & c = sum[t.blk];
+        c.resize((size_t) h_.n_expert, 0);
+        for (int64_t e = 0; e < h_.n_expert; ++e) {
+            c[(size_t) e] += t.count[(size_t) e];
+        }
+    }
+    std::ofstream out(path);
+    for (const auto & [blk, c] : sum) {
+        out << blk;
+        for (const int64_t v : c) {
+            out << ' ' << v;
+        }
+        out << '\n';
+    }
+    return (bool) out;
 }
 
 // --- speculative decoding (#122) ---

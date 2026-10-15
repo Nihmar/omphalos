@@ -233,6 +233,7 @@ chunks of 512.
 | `--draft-oracle FILE` | off | take the drafts from a token file (a plain greedy run's `--gen-out`) |
 | `--draft-k K` | `3` | drafts per step with `--draft-oracle` |
 | `--draft-corrupt N` | `0` | corrupt every N-th draft: exercises the verification and the rollback (#122); the output must still equal the plain greedy run |
+| `--moe-counts FILE` | off | a MoE model with the expert cache (#512): add the decode's expert picks to FILE (one line per layer, `blk c0 c1 ...`). Named `<model.omph>.experts`, it orders each layer's experts at the next load, so the experts that stay in VRAM for good are the measured hot ones (by id without it) |
 
 ## omph-gguf-info
 

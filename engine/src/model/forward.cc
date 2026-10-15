@@ -150,6 +150,7 @@ bool Runner::moe_cache_begin() {
             const int * ids = moe_log_ + (size_t) tab * (size_t) (kMoeLogTokens * h_.n_expert_used);
             for (int64_t i = 0; i < picks; ++i) {
                 c.last[(size_t) ids[i]] = moe_clock_;
+                ++c.count[(size_t) ids[i]];
             }
             for (int64_t i = 0; i < picks; ++i) {
                 const int e = ids[i];
@@ -179,7 +180,7 @@ bool Runner::moe_cache_begin() {
                 c.slot_of[(size_t) old] = -1;
                 for (int k = 0; k < 3; ++k) {
                     moe_eptr_host_[((size_t) tab * 3 + (size_t) k) * (size_t) n + (size_t) old] =
-                        c.host[k] + (size_t) (old - moe_fixed_) * c.pe[k];
+                        c.host[k] + (size_t) c.hidx[(size_t) old] * c.pe[k];
                 }
                 c.owner[(size_t) victim] = e;
                 c.last[(size_t) e] = moe_clock_;  // a second pick of e in this step is not a new fill
@@ -215,7 +216,7 @@ bool Runner::moe_cache_begin() {
             const MoeTab & c = moe_tabs_[(size_t) f.tab];
             for (int k = 0; k < 3; ++k) {
                 if (hipMemcpyAsync(const_cast<uint8_t *>(c.dev[k]) + (size_t) f.slot * c.pe[k],
-                                   c.host[k] + (size_t) (f.expert - moe_fixed_) * c.pe[k], c.pe[k],
+                                   c.host[k] + (size_t) c.hidx[(size_t) f.expert] * c.pe[k], c.pe[k],
                                    hipMemcpyHostToDevice, moe_copy_) != hipSuccess) {
                     return fail("expert fill failed");
                 }
