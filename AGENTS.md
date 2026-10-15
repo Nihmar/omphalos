@@ -98,6 +98,15 @@ engine/build/omph-convert <model.gguf> [<model.omph>]
 # set is the measured hot one when <model.omph>.experts exists: add a run's picks to it with
 engine/build/omph-run <model.omph> <tokens.txt> /tmp/x.f32 --last-logits --gemv --generate 400 \
     --gen-out /tmp/g.txt --moe-counts <model.omph>.experts   # a few varied prompts; then reload
+# the MoE model's checks (#497): its chat template is the Qwen3.5 one ("original" follows the
+# file; sharp is refused), per-layer outputs against a golden dump of the same file
+# (tools/native/dump_tensors on the pin's CPU build), the tokenizer and the template vs llama.cpp
+cd tools
+uv run python check_gpu_run.py ../models/Ornith-1.5-35B-A3B-Q4_K_M.gguf --dump <dump-dir> --layers
+uv run python check_chat_template.py ../models/Ornith-1.5-35B-A3B-Q4_K_M.gguf <llama.cpp>/bin/llama-tokenize
+uv run python check_tokenizer.py ../models/Ornith-1.5-35B-A3B-Q4_K_M.gguf <llama.cpp>/bin/llama-tokenize --fuzz 200
+uv run python check_server.py --model ../models/Ornith-1.5-35B-A3B-Q4_K_M.gguf
+cd ..
 
 # tokenizer (#148): text on stdin -> ids, or --decode ids -> text (reads a .gguf or an .omph)
 engine/build/omph-tokenize <model.gguf> [--no-parse-special] [--chat-template original|sharp] < prompt.txt > tokens.txt

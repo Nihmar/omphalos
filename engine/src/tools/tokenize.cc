@@ -54,12 +54,18 @@ int main(int argc, char ** argv) {
     }
     try {
         const std::string in((std::istreambuf_iterator<char>(std::cin)), std::istreambuf_iterator<char>());
+        const omph::gguf::File file(argv[1]);
+        // "original" is the file's own template: Qwen3.8's or Qwen3.5's (#497)
+        {
+            const omph::gguf::Value * v = file.find("tokenizer.chat_template");
+            std::string_view s;
+            tpl = omph::text::resolve_chat_template(tpl, v != nullptr && v->as_str(s) ? std::string(s) : std::string());
+        }
         if (chat == 1) {
             const std::string prompt = omph::text::render_chat(omph::text::Json::parse(in), tpl);
             std::fwrite(prompt.data(), 1, prompt.size(), stdout);
             return 0;
         }
-        const omph::gguf::File file(argv[1]);
         const omph::text::Tokenizer tok(file);
         // a chat prompt is rendered as segments: its structure parsed for
         // special tokens, the request's own text not (#292)

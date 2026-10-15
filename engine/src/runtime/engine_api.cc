@@ -143,7 +143,9 @@ int64_t omph_chat_render(omph_engine * e, const char * request_json, char * out,
                          size_t * needed) {
     if (e == nullptr || request_json == nullptr) return fail(e, OMPH_E_ARG, "bad argument");
     try {
-        const std::string s = omph::text::render_chat(omph::text::Json::parse(request_json));
+        const std::string s = omph::text::render_chat(
+            omph::text::Json::parse(request_json),
+            omph::text::resolve_chat_template(omph::text::ChatTemplate::Original, e->gen->chat_template()));
         return copy_out(e, s.data(), s.size(), out, cap, needed);
     } catch (const std::exception & ex) {
         return fail(e, OMPH_E_TEMPLATE, ex.what());
@@ -159,7 +161,10 @@ int64_t omph_chat_tokenize(omph_engine * e, const char * request_json, int32_t *
         // in the structure (#292): the C ABI's safe path, the one omph-server
         // and omph-generate use
         const std::vector<int32_t> v = omph::text::tokenize_chat(
-            omph::text::render_chat_segments(omph::text::Json::parse(request_json)), e->gen->tokenizer());
+            omph::text::render_chat_segments(
+                omph::text::Json::parse(request_json),
+                omph::text::resolve_chat_template(omph::text::ChatTemplate::Original, e->gen->chat_template())),
+            e->gen->tokenizer());
         return copy_out(e, v.data(), v.size(), ids, cap, needed);
     } catch (const std::exception & ex) {
         return fail(e, OMPH_E_TEMPLATE, ex.what());

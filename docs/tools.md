@@ -71,7 +71,7 @@ omph-tokenize <model.gguf> [--no-parse-special] [--chat-template original|sharp]
 | `--chat` | a JSON chat request on stdin (`text/chat.hh`, the same object `omph-generate --chat` takes) -> the rendered prompt |
 | `--chat-ids` | the same, tokenized: the template's structure is parsed for special tokens, the request's own text is not (#292) |
 | `--no-parse-special` | control tokens written in the *text* stay text (only meaningful outside the chat modes) |
-| `--chat-template NAME` | `original` (the GGUF's own template, the default) or `sharp` (the vendored Qwen Sharp template, #392) |
+| `--chat-template NAME` | `original` (the GGUF's own template, the default) or `sharp` (the vendored Qwen Sharp template, #392). `original` follows the file: the Qwen3.8 template, or the Qwen3.5 one for a file whose template has no reasoning effort (Ornith, #497); `sharp` is refused for the latter. The same rule holds in omph-generate, omph-server and the C ABI |
 
 The `--chat` rendering is byte-identical to its Jinja source as jinja2
 renders it (`tools/check_chat_template.py`, `--template sharp` for the vendored
