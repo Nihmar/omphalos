@@ -622,9 +622,7 @@ constexpr int kFaRowTiles = 2;
 constexpr int kFaWgTokens = kFaTokens * kFaRowTiles;
 constexpr int kFaKeys = 32;              // keys per tile (16: slower, 64: over the LDS)
 constexpr int kFaSt = kFaKeys / 16;      // 16-key WMMA tiles per key tile
-constexpr int kFaWaves = kGqaGroup * kFaRowTiles;  // the computing waves
 constexpr int kFaProd = 8;                          // the staging waves (#191)
-constexpr int kFaThreads = 32 * (kFaWaves + kFaProd);
 constexpr int kFaProdThreads = 32 * kFaProd;
 // The staged tiles (#191). K: key rows padded by 16 bytes (a WMMA operand's 16
 // lanes on 16 different banks with immediate offsets; an XOR swizzle needed a
@@ -698,14 +696,13 @@ __device__ inline void fa_stage_v(const KvArgs & kv, _Float16 * vb, const long l
     }
 }
 
-// grid: (ceil(tokens / 32), nkv); kFaThreads threads. Scores are in log2 units (q is
+// grid: (ceil(tokens / 32), nkv); 32 * (G * RT + kFaProd) threads. Scores are in log2 units (q is
 // prescaled by scale * log2(e)): with one split the merge only divides by l.
 template <bool Q8, int ABL, int RT = kFaRowTiles, int G = kGqaGroup>
 __global__ __launch_bounds__(32 * (G * RT + kFaProd)) void attention_wmma_kernel(
     const float * __restrict__ q, const KvArgs kv, float * __restrict__ work,
     const long long tokens, const long long seq, const int nh, const int nkv,
     const float scale) {
-    constexpr int abl = ABL;
     __shared__ __attribute__((aligned(16))) _Float16 ks[kFaKeys * kFaKLd];
     __shared__ __attribute__((aligned(16))) _Float16 vt[2][kGqaHd * kFaKeys];
     const int tid = (int) threadIdx.x;

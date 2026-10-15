@@ -204,10 +204,10 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 // CAP in the device pool, from the fixed count on in pinned memory
                 const std::vector<int> & order = moe_order(std::stoi(name.substr(4)));
                 const size_t pe = (size_t) (t.stored / (uint64_t) h_.n_expert);
-                Place dev{f, &t, name, dev_total, false};
+                Place dev{f, &t, name, dev_total, false, 0, 0, {}, 0};
                 dev.experts.assign(order.begin(), order.begin() + moe_cap_);
                 dev.pe = pe;
-                Place host{f, &t, name, host_total, true};
+                Place host{f, &t, name, host_total, true, 0, 0, {}, 0};
                 host.experts.assign(order.begin() + moe_fixed_, order.end());
                 host.pe = pe;
                 dev_total += aligned(dev.experts.size() * pe);
@@ -218,7 +218,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
             }
             const bool host = !cached && f == &file_ && is_expert(name) && host_used < host_budget;
             const size_t bytes = aligned(t.stored);
-            Place pl{f, &t, name, host ? host_total : dev_total, host};
+            Place pl{f, &t, name, host ? host_total : dev_total, host, 0, 0, {}, 0};
             if (host) {
                 host_total += bytes;
                 host_used += (int64_t) bytes;
@@ -591,7 +591,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         if (work * 4 > T * ffn_n_ * 4) {
             alloc(&gdn_work_, (size_t) work * 4);
         }
-        if (wy * 4 > (size_t) T * ffn_n_ * 4) {
+        if ((size_t) wy * 4 > (size_t) T * ffn_n_ * 4) {
             alloc(&gdn_wy_, (size_t) wy * 4);
         }
     }
