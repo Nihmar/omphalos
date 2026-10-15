@@ -9,7 +9,7 @@ import queue
 import time
 from pathlib import Path
 
-from textual.widgets import Button, DataTable, TabbedContent
+from textual.widgets import Button, DataTable, Select, TabbedContent
 
 import omph_tui
 from tui import log, profiles, schema
@@ -329,6 +329,40 @@ def test_preflight_catches_the_wrong_model_file(tmp_path) -> None:
     assert any(level == "err" and label == "model" for level, label, _ in missing)
     est = srv.vram_estimate({**schema.defaults(), "ctx": 131072})
     assert 14.0 < est < 15.6, f"11.3 GiB of weights + 3.3 GiB of KV at 128k, got {est:.2f}"
+
+
+def test_the_model_picker_lists_models_and_switches(tmp_path, monkeypatch) -> None:
+    """#532: the Model tab's picker lists models/'s .omph files (not the
+    DFlash2 drafters), shows the active one, and a pick switches the form."""
+    fixture(tmp_path)
+    d = tmp_path / "models"
+    d.mkdir()
+    dense = d / "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph"
+    moe = d / "Ornith-1.5-35B-A3B-Q4_K_M.omph"
+    drafter = d / "Qwen3.8-27B-DFlash2-Q4_K_M.omph"
+    for f in (dense, moe, drafter):
+        f.write_text("x")
+    monkeypatch.setattr(profiles, "REPO_MODELS", d)
+    monkeypatch.setitem(profiles.MODELS, "qwen3.8", {"model": dense, "dflash": drafter, "mmproj": None})
+    monkeypatch.setitem(profiles.MODELS, "ornith", {"model": moe, "dflash": None, "mmproj": None})
+    assert profiles.available_models() == sorted([str(moe), str(dense)]), "the drafter is not a model"
+    assert profiles.resolve_model_arg("ornith") == str(moe)
+    assert profiles.resolve_model_arg("/x/y.omph") == "/x/y.omph"
+
+    async def run() -> None:
+        app = omph_tui.OmphTui({**schema.defaults(), "model": str(dense), "dflash": str(drafter), "ctx": 65536},
+                               binary="engine/build/omph-server", demo_file=str(tmp_path / "server.log"),
+                               demo_delay=0.0, poll=0.02)
+        async with app.run_test(size=(140, 46)) as pilot:
+            await pilot.pause(0.2)
+            picker = app.query_one("#model-pick", Select)
+            assert picker.value == str(dense), "the active model is shown"
+            picker.value = str(moe)
+            await pilot.pause(0.2)
+            assert app.values["model"] == str(moe) and app.values["dflash"] == ""
+            assert app.values["ctx"] == 65536, "the rest of the form kept"
+
+    asyncio.run(run())
 
 
 def test_the_moe_model_fits_by_design_in_the_preflight(tmp_path, monkeypatch) -> None:
