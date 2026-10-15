@@ -144,10 +144,10 @@ server's own log, so it also shows the requests another client (pi, curl) sent.
 
 | option | default | effect |
 |---|---|---|
-| `--model FILE` | `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph` | the `.omph` to serve |
-| `--dflash FILE` | `models/Qwen3.8-27B-DFlash2-Q4_K_M.omph` when it exists | the DFlash2 drafter `.omph` the form starts on (`--dflash ""` for the MTP head) |
-| `--mmproj FILE` | `models/mmproj-Qwen3.8-27B-BF16.gguf` when it exists | the vision encoder the form starts on, run on the CPU (`--mmproj ""` for no vision; #385) |
-| `--profile NAME` | `coding-agent` | the profile to start the form from (see `tools/tui/profiles.py`: `default`, `coding-agent`, `long-context`, `fast`, `vision`) |
+| `--model FILE` | the profile's, else `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph` | the `.omph` to serve |
+| `--dflash FILE` | the model family's: `models/Qwen3.8-27B-DFlash2-Q4_K_M.omph` when it exists, none for Ornith | the DFlash2 drafter `.omph` the form starts on (`--dflash ""` for the MTP head) |
+| `--mmproj FILE` | the model family's: `models/mmproj-Qwen3.8-27B-BF16.gguf` when it exists, none for Ornith | the vision encoder the form starts on, run on the CPU (`--mmproj ""` for no vision; #385) |
+| `--profile NAME` | `coding-agent` | the profile to start the form from (see `tools/tui/profiles.py`: `default`, `coding-agent`, `long-context`, `fast`, `vision`, and the MoE model's `moe-chat`, `moe-coding-agent`, #527) |
 | `--binary PATH` | `engine/build/omph-server` | the server to run |
 | `--exec CMD` | off | run this command instead of the server: a fake server for development |
 | `--demo FILE` | off | replay a saved log instead of running anything |
@@ -163,6 +163,7 @@ button (the title bar, the modals):
 | `s` / `F2` | start the server with the form's options |
 | `x` / `F3` | stop it (and its process group) |
 | `r` / `F5` | restart |
+| `m` / `F6` | switch the model (Qwen3.8 <-> Ornith, #527): its files from `models/`, every other choice kept (Qwen Sharp falls back to `original` on Ornith) |
 | `p` / `F7` | profiles: load a row, `s` saves the current form, `d` deletes |
 | `c` / `F9` | the command that will run, the `OMPH_*` line and the pre-flight checks (model, port, other servers, VRAM estimate) |
 | `y` / `F10` | copy that command to the clipboard |
