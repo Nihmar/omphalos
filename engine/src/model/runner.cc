@@ -1478,8 +1478,10 @@ void Runner::resolve_layers() {
 // per layer per chunk, and the per-expert scalar dot it replaced was 57 % of
 // the second model's prefill. A one-off at load, ~1 MiB per layer.
 void Runner::moe_router_f16() {
-    for (int64_t il = 0; il < h_.n_layer; ++il) {
-        LayerWeights & L = layers_[(size_t) il];
+    // the stack's layers and the MTP block (#496: without its copy every
+    // draft failed in the router)
+    for (int64_t il = 0; il <= h_.n_layer; ++il) {
+        LayerWeights & L = il < h_.n_layer ? layers_[(size_t) il] : mtp_L_;
         if (L.ffn_gate_inp.t == nullptr || L.ffn_gate_inp.dev == nullptr) {
             continue;
         }
