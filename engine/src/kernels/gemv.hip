@@ -969,24 +969,28 @@ constexpr int kTileKW = 4;                  // waves per tile: the k split (fixe
 constexpr int kTileTiles = 8 / kTileKW;     // tiles per 8-wave workgroup
 constexpr int kTileMaxTokens = 16;
 
-template <class TD, int NT>
+// KW: the waves that split a tile's k (the fixed kTileKW everywhere but the
+// MoE down projections, #522: their k = 512 is 2 blocks, so 4 waves left 2
+// idle; 2 waves sum the same 2 partials in the same order, plus no zeros)
+template <class TD, int NT, int KW = kTileKW>
 __device__ __forceinline__ void tiles_body(const uint8_t * __restrict__ wt, const __half * __restrict__ x,
                                            float * __restrict__ y, const long long rows, const long long blocks,
                                            const long long blk, uint8_t * __restrict__ lds) {
+    constexpr int kTiles = 8 / KW;
     float (*red)[16][17] = reinterpret_cast<float (*)[16][17]>(lds + TD::kLds);
     const int tid = (int) threadIdx.x;
     TD::init(lds);
     __syncthreads();
     const int lane = tid & 31;
     const int wv = tid >> 5;
-    const int tl = wv / kTileKW;
-    const int kp = wv % kTileKW;
+    const int tl = wv / KW;
+    const int kp = wv % KW;
     const int h = lane >> 4;
     const int t = lane & 15;  // B column: the token
-    const long long tile = (long long) blk * kTileTiles + tl;
+    const long long tile = (long long) blk * kTiles + tl;
     const bool valid = tile < rows / 16;
     const long long k = blocks * 256;
-    const long long per = (blocks + kTileKW - 1) / kTileKW;
+    const long long per = (blocks + KW - 1) / KW;
     const long long b0 = kp * per;
     const long long b1 = valid ? (b0 + per < blocks ? b0 + per : blocks) : b0;
     tile_f8 acc = {};
@@ -1013,16 +1017,16 @@ __device__ __forceinline__ void tiles_body(const uint8_t * __restrict__ wt, cons
     }
     __syncthreads();
     // (tiles x 16 rows x NT tokens) sums: more than the 256 threads past 8 tokens
-    for (int idx = tid; idx < kTileTiles * 16 * NT; idx += blockDim.x) {
+    for (int idx = tid; idx < kTiles * 16 * NT; idx += blockDim.x) {
         const int tt2 = idx / (16 * NT);
         const int m = (idx / NT) % 16;
         const int tt = idx % NT;
-        float sum = red[tt2 * kTileKW][m][tt];
+        float sum = red[tt2 * KW][m][tt];
 #pragma unroll
-        for (int i = 1; i < kTileKW; ++i) {
-            sum += red[tt2 * kTileKW + i][m][tt];
+        for (int i = 1; i < KW; ++i) {
+            sum += red[tt2 * KW + i][m][tt];
         }
-        const long long row = ((long long) blk * kTileTiles + tt2) * 16 + m;
+        const long long row = ((long long) blk * kTiles + tt2) * 16 + m;
         if (row < rows) {
             y[tt * rows + row] = sum;
         }
@@ -2989,7 +2993,7 @@ bool dequant_repacked(const uint32_t type, const void * packed, void * dst_f16,
 
 namespace {
 
-template <class TD>
+template <class TD, int KW>
 __global__ __launch_bounds__(256, 8) void gemv_moe_tile_kernel(
     const uint8_t * const * __restrict__ exps, const int * __restrict__ ids,
     const __half * __restrict__ x, float * __restrict__ y, const long long rows,
@@ -2998,7 +3002,7 @@ __global__ __launch_bounds__(256, 8) void gemv_moe_tile_kernel(
     const long long slot = blockIdx.z;
     const uint8_t * w = exps[ids[slot]];
     const __half * xs = x + (slot / slots_per_x) * (blocks * 256);
-    tiles_body<TD, 1>(w, xs, y + slot * rows, rows, blocks, (long long) blockIdx.x, lds);
+    tiles_body<TD, 1, KW>(w, xs, y + slot * rows, rows, blocks, (long long) blockIdx.x, lds);
 }
 
 template <class TD>
@@ -3008,13 +3012,129 @@ bool launch_moe_tile(const uint8_t * const * exps, const int * ids, const __half
     if (rows % 16 != 0 || k % 256 != 0 || slots <= 0 || slots > kMoeMaxSlots || slots_per_x <= 0) {
         return false;
     }
-    const unsigned grid = (unsigned) ((rows / 16 + kTileTiles - 1) / kTileTiles);
-    gemv_moe_tile_kernel<TD><<<dim3(grid, 1, (unsigned) slots), 256, 0, stream>>>(
-        exps, ids, x, y, rows, k / 256, slots_per_x);
+    // k of 2 blocks or fewer (the down projections, #522): 2 waves per tile
+    if (k / 256 <= 2) {
+        const unsigned grid = (unsigned) ((rows / 16 + 3) / 4);
+        gemv_moe_tile_kernel<TD, 2><<<dim3(grid, 1, (unsigned) slots), 256, 0, stream>>>(
+            exps, ids, x, y, rows, k / 256, slots_per_x);
+    } else {
+        const unsigned grid = (unsigned) ((rows / 16 + kTileTiles - 1) / kTileTiles);
+        gemv_moe_tile_kernel<TD, kTileKW><<<dim3(grid, 1, (unsigned) slots), 256, 0, stream>>>(
+            exps, ids, x, y, rows, k / 256, slots_per_x);
+    }
+    return hipGetLastError() == hipSuccess;
+}
+
+// The experts' gate and up projections and their SwiGLU in one launch (#522):
+// a workgroup's two tiles are the gate and the up of the same 16 rows of one
+// slot (4 waves each: tiles_body's k split and summation order, so the sums
+// are bit for bit those of two gemv_moe calls), and the epilogue writes
+// f16(silu(g) * u) as swiglu_f16 does.
+template <class TD>
+__global__ __launch_bounds__(256, 8) void gemv_moe_gu_kernel(
+    const uint8_t * const * __restrict__ gate, const uint8_t * const * __restrict__ up,
+    const int * __restrict__ ids, const __half * __restrict__ x, __half * __restrict__ out,
+    const long long rows, const long long blocks, const int slots_per_x) {
+    __shared__ __attribute__((aligned(16))) uint8_t lds[TD::kLds + 8704];
+    float (*red)[16][17] = reinterpret_cast<float (*)[16][17]>(lds + TD::kLds);
+    const long long slot = blockIdx.z;
+    const int e = ids[slot];
+    const __half * xs = x + (slot / slots_per_x) * (blocks * 256);
+    const int tid = (int) threadIdx.x;
+    TD::init(lds);
+    __syncthreads();
+    const int lane = tid & 31;
+    const int wv = tid >> 5;
+    const int tl = wv / kTileKW;  // 0: the gate, 1: the up
+    const int kp = wv % kTileKW;
+    const int h = lane >> 4;
+    const int t = lane & 15;
+    const long long tile = blockIdx.x;
+    const bool valid = tile < rows / 16;
+    const uint8_t * wt = tl == 0 ? gate[e] : up[e];
+    const long long per = (blocks + kTileKW - 1) / kTileKW;
+    const long long b0 = kp * per;
+    const long long b1 = valid ? (b0 + per < blocks ? b0 + per : blocks) : b0;
+    tile_f8 acc = {};
+    for (long long b = b0; b < b1; ++b) {
+        const typename TD::Blk kb = TD::load(wt + (tile * blocks + b) * TD::kBytes, lane);
+#pragma unroll
+        for (int sb = 0; sb < 8; ++sb) {
+            const long long s = b * 8 + sb;
+#pragma unroll
+            for (int gl = 0; gl < 2; ++gl) {
+                const tile_h8 a = TD::frag(lds, kb, sb, gl, h);
+                tile_h8 bv = {};
+                if (t < 1) {
+                    bv = *reinterpret_cast<const tile_h8 *>(xs + s * 32 + h * 16 + gl * 8);
+                }
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bv, acc);
+            }
+        }
+    }
+#pragma unroll
+    for (int v = 0; v < 8; ++v) {
+        red[wv][h * 8 + v][t] = acc[v];
+    }
+    __syncthreads();
+    if (tid < 16) {
+        const int m = tid;
+        float g = red[0][m][0];
+        float u = red[kTileKW][m][0];
+#pragma unroll
+        for (int i = 1; i < kTileKW; ++i) {
+            g += red[i][m][0];
+            u += red[kTileKW + i][m][0];
+        }
+        const long long row = tile * 16 + m;
+        if (row < rows) {
+            out[slot * rows + row] = __float2half((g / (1.0f + expf(-g))) * u);
+        }
+    }
+}
+
+template <class TD>
+bool launch_moe_gu(const uint8_t * const * gate, const uint8_t * const * up, const int * ids, const __half * x,
+                   __half * out, const int64_t rows, const int64_t k, const int slots, const int slots_per_x,
+                   hipStream_t stream) {
+    if (rows % 16 != 0 || k % 256 != 0 || slots <= 0 || slots > kMoeMaxSlots || slots_per_x <= 0) {
+        return false;
+    }
+    gemv_moe_gu_kernel<TD><<<dim3((unsigned) (rows / 16), 1, (unsigned) slots), 256, 0, stream>>>(
+        gate, up, ids, x, out, rows, k / 256, slots_per_x);
     return hipGetLastError() == hipSuccess;
 }
 
 } // namespace
+
+bool gemv_moe_gu(const uint32_t type, const void * const * gate, const void * const * up, const void * ids,
+                 const void * x_f16, void * out_f16, const int64_t rows, const int64_t k, const int64_t slots,
+                 const int64_t slots_per_x, hipStream_t stream) {
+    if (gate == nullptr || up == nullptr || ids == nullptr || x_f16 == nullptr || out_f16 == nullptr ||
+        rows <= 0 || k <= 0 || slots <= 0 || slots > kMoeMaxSlots || slots_per_x <= 0) {
+        return false;
+    }
+    const auto * g = reinterpret_cast<const uint8_t * const *>(gate);
+    const auto * u = reinterpret_cast<const uint8_t * const *>(up);
+    const auto * id = static_cast<const int *>(ids);
+    const auto * x = static_cast<const __half *>(x_f16);
+    auto * o = static_cast<__half *>(out_f16);
+    const auto run = [&](const auto td) {
+        return launch_moe_gu<decltype(td)>(g, u, id, x, o, rows, k, (int) slots, (int) slots_per_x, stream);
+    };
+    switch (type) {
+        case 21: return run(qd::TileIq3s{});
+        case 18: return run(qd::TileIq3xxs{});
+        case 12: return run(qd::TileQ4k{});
+        case 23: return run(qd::TileIq4xs{});
+        case 17: return run(qd::TileIq2xs{});
+        case 16: return run(qd::TileIq2xxs{});
+        case 22: return run(qd::TileIq2s{});
+        case 10: return run(qd::TileQ2k{});
+        case 14: return run(qd::TileQ6k{});
+        default: return false;
+    }
+}
 
 bool gemv_moe(const uint32_t type, const void * const * exps, const void * ids,
               const void * x_f16, float * y, const int64_t rows, const int64_t k, const int64_t slots,
@@ -3148,6 +3268,96 @@ bool gemv_legacy32(const void * blocks, const void * x_f16, float * y, const int
     const dim3 grid((unsigned) ((rows + 8 * kLegacyRows - 1) / (8 * kLegacyRows)));
     gemv_legacy32_kernel<Q8, NT><<<grid, 256, smem, stream>>>(
         static_cast<const uint8_t *>(blocks), static_cast<const __half *>(x_f16), y, rows, n_sub, chunk);
+    return hipGetLastError() == hipSuccess;
+}
+
+// Two Q8_0 / Q4_0 matrices of the same shape on one x and their SwiGLU (#522:
+// the MoE shared expert's gate and up): a warp's rows of both, each summed in
+// gemv_legacy32_kernel's order, then f16(silu(g) * u) as swiglu_f16 writes it.
+template <bool Q8>
+__global__ void gemv_legacy32_gu_kernel(const uint8_t * __restrict__ gate, const uint8_t * __restrict__ up,
+                                        const __half * __restrict__ x, __half * __restrict__ out,
+                                        const long long rows, const long long n_sub, const long long chunk_sub) {
+    extern __shared__ __half xs[];
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kLegacyRows;
+    const long long rlast = rows - 1;
+    const long long blk_bytes = Q8 ? 34 : 18;
+    float acc[2][kLegacyRows] = {};
+    for (long long base = 0; base < n_sub; base += chunk_sub) {
+        const long long len = n_sub - base < chunk_sub ? n_sub - base : chunk_sub;
+        for (long long i = threadIdx.x; i < len * 32; i += blockDim.x) {
+            xs[i] = x[base * 32 + i];
+        }
+        __syncthreads();
+        if (row0 < rows) {
+            for (long long s = base + lane; s < base + len; s += 32) {
+                const __half * xv = xs + (s - base) * 32;
+#pragma unroll
+                for (int m = 0; m < 2; ++m) {
+                    const uint8_t * blocks = m == 0 ? gate : up;
+#pragma unroll
+                    for (int r = 0; r < kLegacyRows; ++r) {
+                        const long long row = row0 + r <= rlast ? row0 + r : rlast;
+                        const uint8_t * b = blocks + (row * n_sub + s) * blk_bytes;
+                        const float d = __half2float(*reinterpret_cast<const __half *>(b));
+                        float part = 0.0f;
+                        if (Q8) {
+                            const auto * q = reinterpret_cast<const int8_t *>(b + 2);
+#pragma unroll
+                            for (int j = 0; j < 32; ++j) {
+                                part = fmaf((float) q[j], __half2float(xv[j]), part);
+                            }
+                        } else {
+#pragma unroll
+                            for (int j = 0; j < 16; ++j) {
+                                const int q = b[2 + j];
+                                part = fmaf((float) ((q & 15) - 8), __half2float(xv[j]), part);
+                                part = fmaf((float) ((q >> 4) - 8), __half2float(xv[16 + j]), part);
+                            }
+                        }
+                        acc[m][r] = fmaf(d, part, acc[m][r]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < kLegacyRows; ++r) {
+        float g = acc[0][r];
+        float u = acc[1][r];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            g += __shfl_down(g, off);
+            u += __shfl_down(u, off);
+        }
+        if (lane == 0 && row0 + r < rows) {
+            out[row0 + r] = __float2half((g / (1.0f + expf(-g))) * u);
+        }
+    }
+}
+
+bool gemv_legacy_gu(const uint32_t type, const void * gate, const void * up, const void * x_f16, void * out_f16,
+                    const int64_t rows, const int64_t k, hipStream_t stream) {
+    if (gate == nullptr || up == nullptr || x_f16 == nullptr || out_f16 == nullptr || rows <= 0 || k <= 0 ||
+        k % 256 != 0 || (type != 8 && type != 2)) {
+        return false;
+    }
+    const int64_t n_sub = k / 32;
+    const int64_t chunk = legacy_chunk(n_sub, 1);
+    const size_t smem = (size_t) chunk * 64;
+    const dim3 grid((unsigned) ((rows + 8 * kLegacyRows - 1) / (8 * kLegacyRows)));
+    const auto * g = static_cast<const uint8_t *>(gate);
+    const auto * u = static_cast<const uint8_t *>(up);
+    const auto * x = static_cast<const __half *>(x_f16);
+    auto * o = static_cast<__half *>(out_f16);
+    if (type == 8) {
+        gemv_legacy32_gu_kernel<true><<<grid, 256, smem, stream>>>(g, u, x, o, rows, n_sub, chunk);
+    } else {
+        gemv_legacy32_gu_kernel<false><<<grid, 256, smem, stream>>>(g, u, x, o, rows, n_sub, chunk);
+    }
     return hipGetLastError() == hipSuccess;
 }
 

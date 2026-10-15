@@ -398,13 +398,20 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
         auto * ffn1 = static_cast<float *>(ffn1_);
         auto * ffn2 = static_cast<float *>(ffn2_);
         auto * down_out = static_cast<float *>(moe_down_);
-        if (omph::kernels::gemv_moe(L.ffn_gate_exps.t->type, L.ffn_gate_exps.experts, ids,
-                                    h16_, ffn1, gate_rows, ne, slots, topk, hipStreamPerThread) &&
-            omph::kernels::gemv_moe(L.ffn_up_exps.t->type, L.ffn_up_exps.experts, ids, h16_,
-                                    ffn2, up_rows, ne, slots, topk, hipStreamPerThread) &&
-            omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
-                                      static_cast<const float *>(ffn2_), ffn16_, slots * h_.n_ff_exp,
-                                      hipStreamPerThread) &&
+        // gate, up and SwiGLU in one launch when both are of one tile type
+        // (#522), else the two GEMVs and swiglu_f16 - the same values
+        const bool gu = L.ffn_gate_exps.t->type == L.ffn_up_exps.t->type && gate_rows == up_rows &&
+                        omph::kernels::gemv_moe_gu(L.ffn_gate_exps.t->type, L.ffn_gate_exps.experts,
+                                                   L.ffn_up_exps.experts, ids, h16_, ffn16_, gate_rows, ne,
+                                                   slots, topk, hipStreamPerThread);
+        if ((gu ||
+             (omph::kernels::gemv_moe(L.ffn_gate_exps.t->type, L.ffn_gate_exps.experts, ids,
+                                      h16_, ffn1, gate_rows, ne, slots, topk, hipStreamPerThread) &&
+              omph::kernels::gemv_moe(L.ffn_up_exps.t->type, L.ffn_up_exps.experts, ids, h16_,
+                                      ffn2, up_rows, ne, slots, topk, hipStreamPerThread) &&
+              omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
+                                        static_cast<const float *>(ffn2_), ffn16_, slots * h_.n_ff_exp,
+                                        hipStreamPerThread))) &&
             omph::kernels::gemv_moe(L.ffn_down_exps.t->type, L.ffn_down_exps.experts, ids,
                                     ffn16_, down_out, down_rows, h_.n_ff_exp, slots, 1,
                                     hipStreamPerThread)) {
@@ -499,11 +506,19 @@ bool Runner::moe_finish(const LayerWeights & L, const int64_t T, const float * x
 bool Runner::moe_shared(const LayerWeights & L, const int64_t T, float * y) {
     const int64_t ne = h_.n_embd;
     const int64_t shexp = h_.n_ff_shexp;
-    if (!matmul(L.ffn_gate_shexp, h16_, static_cast<float *>(ffn1_), shexp, ne, T) ||
-        !matmul(L.ffn_up_shexp, h16_, static_cast<float *>(ffn2_), shexp, ne, T) ||
-        !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
-                                   static_cast<const float *>(ffn2_), ffn16_, T * shexp,
-                                   hipStreamPerThread) ||
+    // one token of a GGUF-block gate / up pair: one launch with the SwiGLU (#522)
+    const Mat & g = L.ffn_gate_shexp;
+    const Mat & u = L.ffn_up_shexp;
+    const bool gu = T == 1 && use_gemv_ && g.gemv != nullptr && u.gemv != nullptr && g.gemv->gguf &&
+                    u.gemv->gguf && g.gemv->type == u.gemv->type && g.gemv->rows == shexp &&
+                    u.gemv->rows == shexp && g.gemv->k == ne && u.gemv->k == ne &&
+                    omph::kernels::gemv_legacy_gu(g.gemv->type, g.dev, u.dev, h16_, ffn16_, shexp, ne,
+                                                  gemv_stream_);
+    if ((!gu && (!matmul(g, h16_, static_cast<float *>(ffn1_), shexp, ne, T) ||
+                 !matmul(u, h16_, static_cast<float *>(ffn2_), shexp, ne, T) ||
+                 !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
+                                            static_cast<const float *>(ffn2_), ffn16_, T * shexp,
+                                            hipStreamPerThread))) ||
         !matmul(L.ffn_down_shexp, ffn16_, y, ne, shexp, T)) {
         return fail("moe shared expert failed");
     }

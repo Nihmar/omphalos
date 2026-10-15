@@ -85,6 +85,10 @@ bool gemv_q5k(const void * blocks, const void * x_f16, float * y, int64_t rows, 
 // result its one-token kernel's bit for bit. gemv_multi takes them at 2..4.
 bool gemv_q5k_n(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k, int nt,
                 hipStream_t stream);
+// Q8_0 / Q4_0 gate and up of one shape on one token and their SwiGLU into f16
+// (#522: the MoE shared expert), each sum bit for bit gemv_q8_0's / gemv_q4_0's.
+bool gemv_legacy_gu(uint32_t type, const void * gate, const void * up, const void * x_f16, void * out_f16,
+                    int64_t rows, int64_t k, hipStream_t stream);
 bool gemv_legacy_n(uint32_t type, const void * blocks, const void * x_f16, float * y, int64_t rows,
                    int64_t k, int nt, hipStream_t stream);
 
@@ -104,6 +108,13 @@ bool gemv_iq2_s(const void * packed, const void * x_f16, float * y, int64_t rows
 // depend on the slot count, so T tokens give each token's decode result bit for
 // bit (#496). False for a type without a tile body.
 constexpr int64_t kMoeMaxSlots = 128;
+// The gate and up projections of the same slots and their SwiGLU in one
+// launch (#522): out_f16[slot * rows + r] = f16(silu(gate . x) * (up . x)), the
+// sums bit for bit those of two gemv_moe calls and the SwiGLU swiglu_f16's.
+// Both tensors of one tile type; false otherwise (the caller falls back).
+bool gemv_moe_gu(uint32_t type, const void * const * gate, const void * const * up, const void * ids,
+                 const void * x_f16, void * out_f16, int64_t rows, int64_t k, int64_t slots,
+                 int64_t slots_per_x, hipStream_t stream);
 bool gemv_moe(uint32_t type, const void * const * exps, const void * ids,
               const void * x_f16, float * y, int64_t rows, int64_t k, int64_t slots,
               int64_t slots_per_x, hipStream_t stream);
