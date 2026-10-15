@@ -390,7 +390,6 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         alloc(&moe_w_, (size_t) T * h_.n_expert_used * sizeof(float));
         // the batched path keeps one down output per gathered row (#494)
         alloc(&moe_down_, (size_t) T * h_.n_expert_used * ne * 4);
-        alloc(&moe_gate_, (size_t) T * sizeof(float));
         alloc(&moe_xg_, (size_t) T * h_.n_expert_used * ne * 2);
         alloc(&moe_xo_, (size_t) T * h_.n_expert_used * ne * 4);
         alloc(&moe_xgi_, (size_t) T * h_.n_expert_used * sizeof(int));
@@ -1587,6 +1586,7 @@ void Runner::moe_tables() {
             c.slot_of.assign((size_t) n, -1);
             c.hidx.assign((size_t) n, -1);
             c.last.assign((size_t) n, 0);
+            c.missed.assign((size_t) n, 0);
             c.count.assign((size_t) n, 0);
             for (int64_t e = 0; e < n; ++e) {
                 const int64_t p = pos[(size_t) e];
@@ -1598,6 +1598,26 @@ void Runner::moe_tables() {
     if (hipMemcpy(moe_eptr_, moe_eptr_host_.data(), moe_eptr_host_.size() * sizeof(void *),
                   hipMemcpyHostToDevice) != hipSuccess) {
         throw std::runtime_error("cannot upload the expert tables");
+    }
+    // the tile-type shared experts' {gate, up} pairs and a zero id (#522):
+    // their gate + up + SwiGLU run as a one-slot gemv_moe_gu
+    std::vector<const void *> sh(ls.size() * 2 + 1, nullptr);
+    moe_shexp_ptr_ = mem_.device(sh.size() * sizeof(void *), "cannot allocate the shared expert pairs");
+    for (size_t i = 0; i < ls.size(); ++i) {
+        LayerWeights & L = *ls[i];
+        const Mat & g = L.ffn_gate_shexp;
+        const Mat & u = L.ffn_up_shexp;
+        if (g.gemv != nullptr && u.gemv != nullptr && !g.gemv->gguf && !u.gemv->gguf &&
+            g.gemv->type == u.gemv->type && g.gemv->rows == u.gemv->rows && g.gemv->k == u.gemv->k) {
+            sh[i * 2] = g.dev;
+            sh[i * 2 + 1] = u.dev;
+            L.shexp_gu = static_cast<const void * const *>(moe_shexp_ptr_) + i * 2;
+        }
+    }
+    // the last entry, read as an int, is the one-slot call's expert id: 0
+    moe_zero_id_ = static_cast<const void * const *>(moe_shexp_ptr_) + ls.size() * 2;
+    if (hipMemcpy(moe_shexp_ptr_, sh.data(), sh.size() * sizeof(void *), hipMemcpyHostToDevice) != hipSuccess) {
+        throw std::runtime_error("cannot upload the shared expert pairs");
     }
     if (cached) {
         moe_eptr_pin_ = mem_.host(moe_eptr_host_.size() * sizeof(void *), "cannot allocate the expert table staging");

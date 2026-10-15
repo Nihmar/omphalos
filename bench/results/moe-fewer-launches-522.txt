@@ -1,0 +1,46 @@
+# MoE decode: fewer launches per step and the cache's admission (#522)
+
+Model: Ornith-1.5-35B-A3B-Q4_K_M.omph, calibrated expert set, auto host budget.
+Prompts and method as moe-cache-order-513.txt (400 tokens, median of 5; plain:
+the mean of "step wall", plus the step gpu median; MTP K=1: ms per generated
+token). Every output identical to the pre-cache greedy reference.
+
+## Before (main a9f348a, moe-cache-order-513.txt) and after
+
+| prompt | plain before | **plain after** | K=1 before | **K=1 after** |
+|---|---:|---:|---:|---:|
+| code | 13.17 | **11.69** (-11 %) | 10.45 | **9.36** (-10 %) |
+| ita | 12.44 | **11.17** (-10 %) | 10.90 | **9.84** (-10 %) |
+| tech | 12.63 | **11.41** (-10 %) | 10.76 | **9.79** (-9 %) |
+
+code plain 11.69 runs 11.69 11.69 11.69 11.70 11.69  gpu-median 11.54 miss% 5.05 identical
+code K=1 9.36 runs 9.37 9.37 9.36 9.36 9.36  miss% 5.60 identical
+ita plain 11.17 runs 11.17 11.17 11.17 11.17 11.18  gpu-median 11.06 miss% 2.85 identical
+ita K=1 9.84 runs 9.84 9.81 9.84 9.84 9.84  miss% 2.93 identical
+tech plain 11.41 runs 11.41 11.41 11.41 11.40 11.40  gpu-median 11.28 miss% 3.94 identical
+tech K=1 9.79 runs 9.79 9.79 9.79 9.79 9.79  miss% 3.86 identical
+
+KL against llama.cpp's CPU dump (forced decode, last row): 0.004104, top-1
+100 % (unchanged).
+
+## The steps (ita, 200 tokens, step gpu median)
+
+| change | step |
+|---|---:|
+| main | 12.39 ms |
+| moe_finish: the routed sum + the shared gate + its accumulate in one kernel (-80 launches) | 12.11 |
+| gemv_moe_gu: the experts' gate + up + SwiGLU in one launch; the down projections on 2 waves per tile (-80) | 11.76 |
+| gemv_legacy_gu: the Q8_0 shared experts' gate + up + SwiGLU (-44) | 11.60 |
+| the Q6_K shared experts as a one-slot gemv_moe_gu (-36) | 11.47 |
+| fills only on a second miss within 8 steps (400 tokens: code/ita/tech 12.17/11.47/11.58 -> 11.52/11.05/~11.3) | |
+
+Launches per step: 786 -> ~550. One launch removed is worth ~3.5 us here.
+
+## Measured and not kept
+
+- the router and the top-k in one kernel (the last block to finish selects):
+  11.60 -> 11.56 ms, not worth an atomic counter and the fences
+- an ablation that skipped the small kernels suggested ~11 us per launch: it
+  left cur_ unwritten, the router saw garbage and chose only VRAM experts, so
+  the PCIe reads vanished too; on this model an ablation that breaks the
+  results also changes the routing

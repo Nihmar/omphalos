@@ -142,6 +142,17 @@ bool Runner::moe_cache_begin() {
                 continue;
             }
             ++moe_misses_;
+            // admitted on its second miss within kMoeAdmitSteps steps (#522): a
+            // fill costs the PCIe read the miss already paid, so an expert seen
+            // once is not worth it. Measured (400 tokens, step gpu): no
+            // admission 12.17 / 11.47 / 11.58 ms (code / ita / tech), 4 steps
+            // 11.50 / 11.07 / 11.29, 8 11.52 / 11.05, 16 11.62 / 11.10 / 11.27,
+            // never 13.22 / 11.18 / 13.18
+            const int64_t prev = c.missed[(size_t) e];
+            c.missed[(size_t) e] = moe_clock_;
+            if (prev == 0 || moe_clock_ - prev > kMoeAdmitSteps) {
+                continue;
+            }
             // the least recently used slot whose expert this step did not choose
             int victim = -1;
             for (int64_t s = moe_fixed_; s < moe_cap_; ++s) {
@@ -231,7 +242,6 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
     const int topk = (int) h_.n_expert_used;
     const int n_expert = (int) h_.n_expert;
     auto * ids = moe_ids(L);
-    auto * weights = static_cast<float *>(moe_w_);
 
     if (!moe_route(L, T)) {
         return fail("moe route failed");
@@ -365,12 +375,10 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
                                           hipStreamPerThread)) {
         return fail("moe store (batched) failed");
     }
-    // the routed output: the slot-ordered weighted sum
-    if (!omph::kernels::moe_combine(static_cast<float *>(cur_), xo, weights, T, topk, ne,
-                                    hipStreamPerThread)) {
-        return fail("moe combine failed");
-    }
-    return moe_shared(L, T);
+    // the shared expert into moe_down_ (the routed rows are in xo now), then the
+    // slot-ordered weighted sum plus the gated shared output
+    return moe_shared(L, T, static_cast<float *>(moe_down_)) &&
+           moe_finish(L, T, xo, static_cast<float *>(moe_down_));
 }
 
 bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
@@ -401,19 +409,26 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
         auto * ffn1 = static_cast<float *>(ffn1_);
         auto * ffn2 = static_cast<float *>(ffn2_);
         auto * down_out = static_cast<float *>(moe_down_);
-        if (omph::kernels::gemv_moe(L.ffn_gate_exps.t->type, L.ffn_gate_exps.experts, ids,
-                                    h16_, ffn1, gate_rows, ne, slots, topk, hipStreamPerThread) &&
-            omph::kernels::gemv_moe(L.ffn_up_exps.t->type, L.ffn_up_exps.experts, ids, h16_,
-                                    ffn2, up_rows, ne, slots, topk, hipStreamPerThread) &&
-            omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
-                                      static_cast<const float *>(ffn2_), ffn16_, slots * h_.n_ff_exp,
-                                      hipStreamPerThread) &&
+        // gate, up and SwiGLU in one launch when both are of one tile type
+        // (#522), else the two GEMVs and swiglu_f16 - the same values
+        const bool gu = L.ffn_gate_exps.t->type == L.ffn_up_exps.t->type && gate_rows == up_rows &&
+                        omph::kernels::gemv_moe_gu(L.ffn_gate_exps.t->type, L.ffn_gate_exps.experts,
+                                                   L.ffn_up_exps.experts, ids, h16_, ffn16_, gate_rows, ne,
+                                                   slots, topk, hipStreamPerThread);
+        if ((gu ||
+             (omph::kernels::gemv_moe(L.ffn_gate_exps.t->type, L.ffn_gate_exps.experts, ids,
+                                      h16_, ffn1, gate_rows, ne, slots, topk, hipStreamPerThread) &&
+              omph::kernels::gemv_moe(L.ffn_up_exps.t->type, L.ffn_up_exps.experts, ids, h16_,
+                                      ffn2, up_rows, ne, slots, topk, hipStreamPerThread) &&
+              omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
+                                        static_cast<const float *>(ffn2_), ffn16_, slots * h_.n_ff_exp,
+                                        hipStreamPerThread))) &&
             omph::kernels::gemv_moe(L.ffn_down_exps.t->type, L.ffn_down_exps.experts, ids,
                                     ffn16_, down_out, down_rows, h_.n_ff_exp, slots, 1,
-                                    hipStreamPerThread) &&
-            omph::kernels::moe_combine(static_cast<float *>(cur_), down_out, weights, T, topk, ne,
-                                       hipStreamPerThread)) {
-            return moe_shared(L, T);
+                                    hipStreamPerThread)) {
+            // the routed rows stay in moe_down_: the shared expert goes to moe_xo_
+            return moe_shared(L, T, static_cast<float *>(moe_xo_)) &&
+                   moe_finish(L, T, down_out, static_cast<float *>(moe_xo_));
         }
         (void) hipGetLastError();
     }
@@ -480,27 +495,46 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
             }
         }
     }
-    return moe_shared(L, T);
+    // cur_ holds the routed sum already
+    return moe_shared(L, T, static_cast<float *>(moe_down_)) &&
+           moe_finish(L, T, nullptr, static_cast<float *>(moe_down_));
 }
 
-// The shared expert of a MoE layer (#493): SwiGLU 2048 -> 512 -> 2048, its
-// output scaled by sigmoid(x . ffn_gate_inp_shexp) and accumulated into cur_.
-// One pass for the whole chunk: the shared expert does not depend on the
-// routing.
-bool Runner::moe_shared(const LayerWeights & L, const int64_t T) {
+// The end of a MoE layer (#522): cur_ = the slot-ordered weighted sum of the
+// routed rows xo (or cur_ itself when xo is null) + sigmoid(x . gate) * ysh.
+bool Runner::moe_finish(const LayerWeights & L, const int64_t T, const float * xo, const float * ysh) {
+    if (!omph::kernels::moe_finish(static_cast<float *>(cur_), xo, static_cast<const float *>(moe_w_),
+                                   (int) h_.n_expert_used, ysh, L.ffn_gate_inp_shexp, h16_, T, h_.n_embd,
+                                   hipStreamPerThread)) {
+        return fail("moe finish failed");
+    }
+    return true;
+}
+
+// The shared expert of a MoE layer (#493): SwiGLU 2048 -> 512 -> 2048 into y;
+// moe_finish gates it with sigmoid(x . ffn_gate_inp_shexp) and adds it. One
+// pass for the whole chunk: the shared expert does not depend on the routing.
+bool Runner::moe_shared(const LayerWeights & L, const int64_t T, float * y) {
     const int64_t ne = h_.n_embd;
     const int64_t shexp = h_.n_ff_shexp;
-    if (!matmul(L.ffn_gate_shexp, h16_, static_cast<float *>(ffn1_), shexp, ne, T) ||
-        !matmul(L.ffn_up_shexp, h16_, static_cast<float *>(ffn2_), shexp, ne, T) ||
-        !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
-                                   static_cast<const float *>(ffn2_), ffn16_, T * shexp,
-                                   hipStreamPerThread) ||
-        !matmul(L.ffn_down_shexp, ffn16_, static_cast<float *>(moe_down_), ne, shexp, T) ||
-        !omph::kernels::moe_shexp_gate(L.ffn_gate_inp_shexp, h16_, static_cast<float *>(moe_gate_),
-                                       T, ne, hipStreamPerThread) ||
-        !omph::kernels::moe_acc(static_cast<float *>(cur_), static_cast<const float *>(moe_down_),
-                                static_cast<const float *>(moe_gate_), T, 1, 0, ne,
-                                hipStreamPerThread)) {
+    // one token of a GGUF-block gate / up pair: one launch with the SwiGLU (#522)
+    const Mat & g = L.ffn_gate_shexp;
+    const Mat & u = L.ffn_up_shexp;
+    const bool fits = T == 1 && use_gemv_ && g.gemv != nullptr && u.gemv != nullptr &&
+                      g.gemv->type == u.gemv->type && g.gemv->rows == shexp && u.gemv->rows == shexp &&
+                      g.gemv->k == ne && u.gemv->k == ne;
+    // ... or of a tile type: a one-slot gemv_moe_gu over its {gate, up} pair
+    const bool gu = fits && (g.gemv->gguf ? omph::kernels::gemv_legacy_gu(g.gemv->type, g.dev, u.dev, h16_, ffn16_,
+                                                                          shexp, ne, gemv_stream_)
+                             : L.shexp_gu != nullptr &&
+                                   omph::kernels::gemv_moe_gu(g.gemv->type, L.shexp_gu, L.shexp_gu + 1, moe_zero_id_,
+                                                              h16_, ffn16_, shexp, ne, 1, 1, hipStreamPerThread));
+    if ((!gu && (!matmul(g, h16_, static_cast<float *>(ffn1_), shexp, ne, T) ||
+                 !matmul(u, h16_, static_cast<float *>(ffn2_), shexp, ne, T) ||
+                 !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
+                                            static_cast<const float *>(ffn2_), ffn16_, T * shexp,
+                                            hipStreamPerThread))) ||
+        !matmul(L.ffn_down_shexp, ffn16_, y, ne, shexp, T)) {
         return fail("moe shared expert failed");
     }
     return true;
