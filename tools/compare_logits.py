@@ -3,6 +3,7 @@
 
 usage: uv run python compare_logits.py <ref.f32> <test.f32> [--vocab N | --model M.gguf]
                                        [--skip N] [--max-kl KL] [--min-top1 FRAC]
+                                       [--tokens IDS]
 
 Both files are (tokens, vocab) f32, as written by omph-run. The vocabulary size
 comes from --vocab, or from the model's token_embd with --model, or defaults
@@ -12,6 +13,13 @@ comparing long-context behaviour). `--max-kl` / `--min-top1` turn the report
 into a check: the exit code is 1 when the mean KL is above, or the top-1
 agreement below, the given bound; a non-finite value in either dump always
 fails (it used to print "KL mean nan" and exit 0, #348).
+
+`--tokens` (the prompt's ids, the file omph-run read; the dumps its last rows,
+--logits-tail) adds each side's NLL of the true next tokens and their paired
+difference with its standard error (#516): on the MoE model a numerically
+different but exact path moves the KL as much as a quantized KV does (the
+routing amplifies it), so whether a configuration predicts the text worse is
+the question the KL cannot answer there.
 """
 
 import argparse
@@ -39,6 +47,8 @@ def main() -> int:
                     help="exit 1 when the mean KL exceeds this")
     ap.add_argument("--min-top1", type=float, default=None,
                     help="exit 1 when the top-1 agreement (0..1) is below this")
+    ap.add_argument("--tokens", default=None,
+                    help="the prompt's token ids: also the NLL of the true next tokens (rows = the last positions)")
     args = ap.parse_args()
 
     vocab = args.vocab
@@ -67,6 +77,16 @@ def main() -> int:
     if not 0 <= args.skip < len(ref):
         print(f"--skip {args.skip} leaves no positions of {len(ref)}", file=sys.stderr)
         return 1
+    # the true next token of each row (the dumps are the prompt's last rows);
+    # the last row predicts past the prompt and has none
+    nxt = None
+    if args.tokens is not None:
+        ids = np.loadtxt(args.tokens, dtype=np.int64).ravel()
+        first = len(ids) - len(ref)
+        if first < 0:
+            print(f"{args.tokens}: {len(ids)} ids for {len(ref)} rows", file=sys.stderr)
+            return 1
+        nxt = np.append(ids[first + 1 :], -1)[args.skip :]
     ref = ref[args.skip :]
     test = test[args.skip :]
     # A NaN anywhere poisons every row it is in: the max, the softmax and the
@@ -78,16 +98,25 @@ def main() -> int:
             return 1
 
     kl = np.empty(len(ref))
+    nll = np.full((len(ref), 2), np.nan)
     for i in range(len(ref)):  # row by row: a (512, 248320) f64 block is 1 GB
         lp = log_softmax(ref[i])
         lq = log_softmax(test[i])
         kl[i] = float((np.exp(lp) * (lp - lq)).sum())
+        if nxt is not None and nxt[i] >= 0:
+            nll[i] = (-lp[nxt[i]], -lq[nxt[i]])
     top1 = float((ref.argmax(axis=-1) == test.argmax(axis=-1)).mean())
 
     print(f"positions {len(ref)}")
     print(f"KL mean {kl.mean():.6f}  median {np.median(kl):.6f}  "
           f"p99 {np.percentile(kl, 99):.6f}  max {kl.max():.6f} nats")
     print(f"top-1 agreement {top1 * 100:.2f} %")
+    if nxt is not None:
+        nll = nll[~np.isnan(nll[:, 0])]
+        d = nll[:, 1] - nll[:, 0]
+        print(f"NLL ref {nll[:, 0].mean():.5f}  test {nll[:, 1].mean():.5f}  "
+              f"(ppl {np.exp(nll[:, 0].mean()):.4f} / {np.exp(nll[:, 1].mean()):.4f}); "
+              f"test - ref {d.mean():+.5f} +- {d.std(ddof=1) / np.sqrt(len(d)):.5f} (1 s.e., {len(d)} tokens)")
     failed = []
     if args.max_kl is not None and kl.mean() > args.max_kl:
         failed.append(f"KL mean {kl.mean():.6f} > --max-kl {args.max_kl}")

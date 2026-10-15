@@ -131,7 +131,38 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                         "cannot read the free VRAM for the expert placement: set OMPH_MOE_HOST_MIB");
                 }
                 const int64_t margin = 768 << 20;
-                host_budget = std::max<int64_t>(0, total_bytes + margin - (int64_t) free_vram);
+                // The context-sized allocations that follow the weights: the
+                // quantized KV of every attention layer (each in its own K
+                // format), the MTP block's cache and the attention's work
+                // buffer, at the configured context (#516: a 160k --ctx ran
+                // out of VRAM at load, the margin alone covers ~8k rows)
+                int64_t ctx_bytes = 0;
+                {
+                    const int64_t kvcap = kv_capacity > 0 ? kv_capacity : T;
+                    const int64_t attn_kv = h_.n_head_kv * h_.head_dim;
+                    const int64_t sc_row = h_.n_head_kv * (h_.head_dim / 32) * 2;
+                    int64_t n_kv = 0;
+                    for (int64_t il = 0; il < h_.n_layer; ++il) {
+                        if (file_.tensor("blk." + std::to_string(il) + ".attn_q.weight") == nullptr) {
+                            continue;
+                        }
+                        const bool k4 = env_.kv_k4 || (n_kv < 64 && ((env_.kv_k4_layers >> n_kv) & 1));
+                        if (env_.kv_f32) {
+                            ctx_bytes += kvcap * attn_kv * 8;
+                        } else if (!env_.kv_host) {
+                            ctx_bytes += kvcap * (attn_kv / (k4 ? 2 : 1) + sc_row + attn_kv / 2 + sc_row);
+                        }
+                        ++n_kv;
+                    }
+                    if (mtp) {
+                        const bool win = env_.mtp_window > 0 && kMtpSink + 2 * env_.mtp_window < kvcap;
+                        const int64_t mtp_cap = win ? kMtpSink + 2 * std::max<int64_t>(env_.mtp_window, T) : kvcap;
+                        ctx_bytes += mtp_cap * (attn_kv + sc_row + attn_kv / 2 + sc_row);
+                    }
+                    ctx_bytes += (int64_t) omph::kernels::attention_gqa_work_bytes(
+                        T, h_.n_head, h_.n_head_kv, h_.head_dim, kvcap, omph::kernels::attention_key_chunk(kvcap));
+                }
+                host_budget = std::max<int64_t>(0, total_bytes + margin + ctx_bytes - (int64_t) free_vram);
             }
             host_budget = std::min(host_budget, expert_bytes);
             // The expert cache (#512): every MoE layer keeps the same number of

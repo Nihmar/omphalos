@@ -84,6 +84,7 @@ def main() -> None:
     ap.add_argument("--dflash", default=str(ROOT / "models/Qwen3.8-27B-DFlash2-Q4_K_M.omph"))
     ap.add_argument("--tokens", type=int, default=0, help="prompt tokens (0: ctx - 1024)")
     ap.add_argument("--generate", type=int, default=256)
+    ap.add_argument("--chunk", type=int, default=0, help="omph-server --chunk (0: its default)")
     ap.add_argument("--out", default=str(DEFAULT_OUT))
     ap.add_argument("--note", default="")
     args = ap.parse_args()
@@ -120,6 +121,8 @@ def main() -> None:
         cmd += ["--dflash", args.dflash]
     elif args.spec == "none":
         cmd += ["--no-mtp"]
+    if args.chunk > 0:
+        cmd += ["--chunk", str(args.chunk)]
     log = open(f"/tmp/check_max_context-{args.ctx}.log", "w")  # noqa: SIM115
     peak = PeakVram()
     proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)

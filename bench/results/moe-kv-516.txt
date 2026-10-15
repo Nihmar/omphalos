@@ -1,0 +1,118 @@
+# The KV cache on the MoE model: K4/V4, the per-layer choice, llama.cpp (#516)
+
+Model: Ornith-1.5-35B-A3B-Q4_K_M (.omph with the calibrated expert set; engine
+main edbc09a + #522). Prompts: 16384 tokens of wikitext-2 test (wiki16k) and of
+wikitext-2 train (wtrain16k, used for no choice). 10 attention layers (model
+layers 3, 7, ..., 39), V Q4 in every quantized configuration, the FP16 window
+of 512 (the default) on.
+
+## 1. The dense model's method does not work here
+
+#175 chose the K4 layers by KL(exact f32 KV || test) over the last 512 positions
+of 16k. On the MoE the KL of a quantized KV is ~10x the dense model's, and it
+does not rank the layers:
+
+| configuration (wiki16k, against the f32 host KV) | KL mean | top-1 |
+|---|---:|---:|
+| K8/V4 everywhere | 0.008518 | 96.48 % |
+| K4/V4 everywhere | 0.012976 | 96.88 % |
+| default (K4 on 2, 4, 5, 6, 7, 9) | 0.010646 | 96.68 % |
+| K4 on layer 0 only | 0.007914 | 96.88 % |
+| K4 on layer 1 only | 0.008279 | 97.07 % |
+
+One layer in K4 measured *below* K8 everywhere, so the sweep was stopped after
+two layers. The engine is deterministic (K8 repeated: the same 0.008518), and
+the exact f32 KV in VRAM against the exact f32 KV in host RAM is bit-identical
+(KL 0, with a fixed expert placement). The routing turns a tiny difference
+into a different expert at some position, and that position's logits move a
+lot: the KL is a measure of how many such flips happen, not of the KV's error.
+(One earlier exact-vs-exact control under the auto expert budget, with VRAM at
+its limit, measured KL 0.010068 and was not reproduced: the same configuration
+now stops with "out of VRAM", and the expert placement alone was checked not to
+change the numbers - 171 vs 143 experts per layer in VRAM, logits
+bit-identical.)
+
+## 2. What the text says: the NLL of the true tokens
+
+tools/compare_logits.py --tokens: each configuration's NLL of the true next
+token over the last 511 positions, and its paired difference against the exact
+f32 KV in VRAM (same positions), +- 1 standard error. OMPH_MOE_HOST_MIB=6144 for
+every run (the auto margin does not hold the f32 reference KV).
+
+| configuration | wiki16k: KL | top-1 | NLL - exact | wtrain16k: KL | top-1 | NLL - exact |
+|---|---:|---:|---:|---:|---:|---:|
+| exact f32 KV in host RAM (control) | 0 | 100 % | 0 | 0 | 100 % | 0 |
+| K8/V4 everywhere | 0.008518 | 96.48 % | +0.0070 +- 0.0066 | 0.008405 | 96.48 % | -0.0126 +- 0.0064 |
+| default (K4 on 2,4,5,6,7,9) | 0.010646 | 96.68 % | +0.0081 +- 0.0067 | 0.008777 | 97.27 % | -0.0166 +- 0.0089 |
+| K4/V4 everywhere | 0.012976 | 96.88 % | +0.0031 +- 0.0080 | 0.018931 | 96.48 % | -0.0190 +- 0.0111 |
+
+(exact NLL: 1.56980 / 1.18981 nats per token). No quantized configuration
+predicts the text measurably worse than the exact KV, on either text; the
+differences go both ways by up to ~2 standard errors (wtrain16k: every
+quantized cache "better" than the exact one), which is the size of the
+fluctuation, not an effect. 511 positions per text resolve ~0.015 nats; a
+smaller loss is not excluded.
+
+## 3. llama.cpp on the same tokens (the pin, -ncmoe 16, -fa on)
+
+llama-perplexity -c 16384 --chunks 1 on wiki16k's tokens (rebuilt as text from
+wiki32k's ids, the first 16384 round-trip identical); it scores the chunk's
+second half (8192 positions), each quantized KV against its own f16 KV:
+
+| llama.cpp K / V | KLD vs its f16 | same top | PPL ratio |
+|---|---:|---:|---:|
+| q8_0 / q8_0 | 0.013469 | 95.53 % | 1.0010 +- 0.0022 |
+| q8_0 / q4_0 | 0.016878 | 95.35 % | 1.0013 +- 0.0025 |
+| q4_0 / q4_0 | 0.019760 | 94.70 % | 1.0064 +- 0.0028 |
+
+(f16 PPL 4.0005.) The same picture on llama.cpp's side: an 8-bit KV already
+moves the top token at ~4.5 % of the positions (routing flips), and only
+q4_0/q4_0 shows a PPL loss its 8192 positions can resolve (+0.64 %, 2.3 s.e.).
+Against that, omphalos' K8/V4 is 0.0085 and K4/V4 0.013-0.019 KL with 96.5-96.9 %
+top-1, at the prompt's last 512 positions (the deepest, where a quantized KV
+errs most) - at or below llama.cpp's q4_0/q4_0 on every count, with the
+caveat that the positions differ.
+
+## 4. The long context: 160k reserved (tools/check_max_context.py, omph-server)
+
+The auto expert budget used to keep a fixed 768 MiB after the weights: a
+160k --ctx stopped at load with "out of VRAM". It now subtracts the KV at the
+configured context, the MTP cache and the attention's work buffer (this
+branch's fix); a short context is unchanged (omph-run: 186 experts per layer,
+7.24 GiB pinned, 11.08 ms/step).
+
+--ctx 163840, MTP (K = 1), greedy, wikitext-2 test rebuilt as text; VRAM is the
+device total with the desktop; GTT unchanged means the driver evicted nothing:
+
+| KV | prompt | chunk | prefill | decode at depth | VRAM peak | GTT |
+|---|---:|---:|---:|---:|---:|---|
+| K8/V4 | 98304 | 512 | 90.3 s (1089 t/s) | 15.6 ms/token | 15814 MiB | 187 -> 187 |
+| K4/V4 | 98304 | 512 | 88.9 s (1105 t/s) | **14.1 ms/token** | 15778 MiB | 187 -> 187 |
+| K4/V4 | 131072 | 512 | 127.4 s (1029 t/s) | 10.6 ms/token | 15786 MiB | 178 -> 178 |
+| K4/V4 | 131072 | **1024** | **97.1 s (1350 t/s)** | 12.2 ms/token | 16010 MiB | 178 -> 178 |
+| K4/V4 | 131072 | 2048 | 124.2 s (1055 t/s) | 14.6 ms/token | 16303 MiB | 178 -> **14348** |
+
+(The 131072-token prompt is wiki100k then wiki32k, so its tail repeats text the
+prompt holds: the 128k decode rows have the n-gram drafts' help and are not
+comparable with the 98k ones.) At 160k reserved with K4/V4, 168 of 256 experts
+per layer are in VRAM and 8.71 GiB of experts are pinned (7.24 GiB at a short
+context: more than #512's ~7.8 GB once the KV takes VRAM).
+
+- K4/V4 is also the faster cache at depth: 14.1 against 15.6 ms/token at 98k
+  (less KV to read, more VRAM for the experts).
+- The 128k prefill meets #494's 2-minute bar with --chunk 1024 (97.1 s); the
+  default 512 takes 127.4 s. A 2048 chunk overflows the card (the budget does
+  not scale the activations with the chunk: #525) and the driver evicts 14 GB
+  to GTT.
+
+## Conclusion
+
+- On this model the per-layer K4 choice of #175 cannot be measured with the
+  KL (the routing's flips swamp it), and the NLL shows no cost for any of the
+  configurations at the resolution 1022 positions give.
+- K4/V4 everywhere - the maintainer's configuration - costs nothing measurable
+  and saves 2 x 128 B per token per attention layer (n_head_kv = 2): 2.5 KB per
+  token over the 10 layers, ~0.33 GB at 128k, i.e. more expert slots (#525),
+  and decodes 10 % faster at a 98k depth.
+- The engine's default stays the dense model's mixed set: whether the MoE
+  should default to K4/V4 is the maintainer's call (it is what they run).
