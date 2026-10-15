@@ -1,0 +1,42 @@
+# MoE decode: the router, top-k, shared gate and combine kernels (#509)
+
+Model: Ornith-1.5-35B-A3B-Q4_K_M.omph, auto host budget (14.55 GiB device,
+5.09 GiB host-mapped: the experts of layers 0-10). Prompt: 34 tokens (a short
+story request), `OMPH_TIMING=1 omph-run ... --last-logits --gemv --generate 65`,
+step gpu / step wall, median of 5 runs. Engine: main 387d60b vs a6ed5f9.
+
+| | step gpu | step wall | t/s |
+|---|---:|---:|---:|
+| main (387d60b) | 23.50 ms | 23.52 ms | 42.5 |
+| #509 (a6ed5f9) | **16.93 ms** | **16.95 ms** | **59.0** |
+| llama.cpp, same file (-ncmoe 16, moe-placement-495.txt) | 23 ms | | 43 |
+
+runs (gpu): main 23.53 23.50 23.59 23.41 23.49; #509 16.96 16.92 16.93 16.94 16.91
+
+## Where the time went (rocprofv3 kernel trace, per step, main)
+
+808 launches, 22.7 ms of kernel time in a 25.5 ms step (under the profiler):
+not launch-bound. Per layer with the experts in VRAM:
+
+| kernel | main | #509 |
+|---|---:|---:|
+| router logits (`gemm_f16` -> `moe_router`) | 30 us | 8.5 us |
+| `moe_topk` | 69 us | 6.7 us |
+| `moe_shexp_gate` | 73 us | 3.4 us |
+| `moe_combine` | 11 us | 2.5 us |
+| experts gate + up + down (VRAM) | 66-71 us | same |
+| experts gate + up + down (host-mapped, PCIe) | ~600 us | same |
+
+After #509 the step is 15.9 ms of kernels: ~6.4 ms are the 11 host-mapped
+layers' experts (163 MB per token over PCIe at ~27 GB/s), ~1.3 ms the Q6_K
+lm_head (at DRAM bandwidth), the dense GEMVs at 230-275 GB/s.
+
+## Validation
+
+| | KL vs llama.cpp's CPU dump | top-1 |
+|---|---:|---:|
+| Q4_K_M, prefill (5 tokens, last row) | 0.004076 | 100 % |
+| Q4_K_M, forced decode (1 + 4 steps, last row) | 0.004104 | 100 % |
+| Q2_K_L, forced decode (the per-expert fallback) | 0.004337 | 100 % |
+
+(before: 0.004053 / 0.004377). 65 greedy tokens identical to main.
