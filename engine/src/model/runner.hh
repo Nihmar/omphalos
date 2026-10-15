@@ -331,8 +331,10 @@ private:
     const std::vector<int> & moe_order(int blk);
     bool moe_cache_begin();
     bool moe_cache_log(const int64_t T);
-    // The shared expert of a MoE layer, one pass for the whole chunk (#493).
-    bool moe_shared(const LayerWeights & L, const int64_t T);
+    // The shared expert of a MoE layer into y, one pass for the whole chunk
+    // (#493); moe_finish adds the routed sum and the gated shared output (#522).
+    bool moe_shared(const LayerWeights & L, const int64_t T, float * y);
+    bool moe_finish(const LayerWeights & L, const int64_t T, const float * xo, const float * ysh);
     // The router's f16 weights, converted once at load (#494): the logits are
     // a plain f16 GEMM instead of a per-expert scalar f32 dot.
     void moe_router_f16();
@@ -800,7 +802,6 @@ private:
     int64_t moe_selects_ = 0;
     void * moe_w_ = nullptr;     // tokens x topk float: its renormalized weights
     void * moe_down_ = nullptr;  // tokens x n_embd float: one expert's down output
-    void * moe_gate_ = nullptr;  // tokens float: the shared expert's sigmoid gate
     void * moe_xg_ = nullptr;    // tokens x n_embd f16: the gathered rows of one expert
     void * moe_xo_ = nullptr;    // tokens x topk x n_embd f32: the experts' down outputs
     void * moe_xgi_ = nullptr;   // tokens x topk int: the gather / store row indices

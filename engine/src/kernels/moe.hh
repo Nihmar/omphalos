@@ -51,11 +51,6 @@ bool moe_copy_words(void * dst, int64_t dpitch, const void * src, int64_t spitch
 bool moe_acc(float * out, const float * y, const float * weights, int64_t tokens, int64_t stride,
              int slot, int64_t n, hipStream_t stream);
 
-// The shared expert's gate per token: out[t] = sigmoid(x_t . w), w a F32 row of
-// k values (ffn_gate_inp_shexp).
-bool moe_shexp_gate(const void * w, const void * x_f16, float * out, int64_t tokens, int64_t k,
-                    hipStream_t stream);
-
 // The prefill path (#494): the rows `ids[0..n)` of x (f16, k values each)
 // gathered back to back into dst, so one expert's tokens are one contiguous
 // GEMM input.
@@ -69,9 +64,12 @@ bool moe_gather(const void * x_f16, int64_t k, const int * ids, int64_t n, void 
 bool moe_scatter_store(float * xo, const float * y, const int * slot, const int * dst, int64_t n,
                        int64_t ne, int topk, hipStream_t stream);
 
-// out[t][j] = sum_e weights[t * topk + e] * xo[(t * topk + e) * ne + j]: the
-// experts' weighted down outputs summed in slot order (deterministic).
-bool moe_combine(float * out, const float * xo, const float * weights, int64_t tokens, int topk,
-                 int64_t ne, hipStream_t stream);
+// The end of a MoE layer (#522): out[t][j] = sum_e weights[t * topk + e] *
+// xo[(t * topk + e) * ne + j] in slot order (or out as it is when xo is null)
+// + sigmoid(x_t . wg) * ysh[t * ne + j]; wg the shared expert's F32 gate row
+// (ffn_gate_inp_shexp), x the layer's f16 FFN input. One launch for the
+// routed sum, the shared gate and the shared expert's accumulate.
+bool moe_finish(float * out, const float * xo, const float * weights, int topk, const float * ysh,
+                const void * wg, const void * x_f16, int64_t tokens, int64_t ne, hipStream_t stream);
 
 } // namespace omph::kernels

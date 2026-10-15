@@ -231,34 +231,6 @@ __global__ void moe_gather_kernel(const __half * __restrict__ x, const long long
     }
 }
 
-// out[t] = sigmoid(dot(x_t, w)), one block per token, w a F32 row of k values
-// (one thread per token was 73 us a layer, #509)
-constexpr int kGateThreads = 256;
-
-__global__ void __launch_bounds__(kGateThreads)
-moe_shexp_gate_kernel(const float * __restrict__ w, const __half * __restrict__ x,
-                      float * __restrict__ out, const long long k) {
-    __shared__ float s_sum[kGateThreads / kWave];
-    const long long t = blockIdx.x;
-    const __half * xr = x + (size_t) t * (size_t) k;
-    float acc = 0.0f;
-    for (long long j = threadIdx.x; j < k; j += kGateThreads) {
-        acc += __half2float(xr[j]) * w[j];
-    }
-    acc = wave_sum(acc);
-    if (threadIdx.x % kWave == 0) {
-        s_sum[threadIdx.x / kWave] = acc;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float d = 0.0f;
-        for (int i = 0; i < kGateThreads / kWave; ++i) {
-            d += s_sum[i];
-        }
-        out[t] = 1.0f / (1.0f + expf(-d));
-    }
-}
-
 __global__ void moe_scatter_store_kernel(float * __restrict__ xo, const float * __restrict__ y,
                                          const int * __restrict__ slot, const int * __restrict__ dst,
                                          const long long ne, const int topk) {
@@ -271,23 +243,50 @@ __global__ void moe_scatter_store_kernel(float * __restrict__ xo, const float * 
     }
 }
 
-// the slot-ordered weighted sum, one thread per output (a 2-D grid: one block
-// per token was 11 us a layer for one token, #509)
-__global__ void moe_combine_kernel(float * __restrict__ out, const float * __restrict__ xo,
-                                   const float * __restrict__ weights, const long long ne,
-                                   const int topk) {
+// The end of a MoE layer (#522): out[t][j] = sum_e w[t][e] * xo[t][e][j] (slot
+// order; or out[t][j] as it is when xo is null: the per-expert fallback
+// accumulated it) + sigmoid(x_t . wg) * ysh[t][j]. Each block computes the
+// shared gate's dot itself (a fixed order: 8 waves, then their sums in order),
+// one launch instead of three.
+constexpr int kFinishThreads = 256;
+
+__global__ void __launch_bounds__(kFinishThreads)
+moe_finish_kernel(float * __restrict__ out, const float * __restrict__ xo, const float * __restrict__ weights,
+                  const int topk, const float * __restrict__ ysh, const float * __restrict__ wg,
+                  const __half * __restrict__ x, const long long ne) {
+    __shared__ float s_sum[kFinishThreads / kWave];
     const long long t = blockIdx.y;
-    const long long j = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    const __half * xr = x + (size_t) t * (size_t) ne;
+    float d = 0.0f;
+    for (long long j = threadIdx.x; j < ne; j += kFinishThreads) {
+        d += __half2float(xr[j]) * wg[j];
+    }
+    d = wave_sum(d);
+    if (threadIdx.x % kWave == 0) {
+        s_sum[threadIdx.x / kWave] = d;
+    }
+    __syncthreads();
+    d = 0.0f;
+    for (int i = 0; i < kFinishThreads / kWave; ++i) {
+        d += s_sum[i];
+    }
+    const float g = 1.0f / (1.0f + expf(-d));
+    const long long j = (long long) blockIdx.x * kFinishThreads + threadIdx.x;
     if (j >= ne) {
         return;
     }
-    const float * wrow = weights + (size_t) t * (size_t) topk;
-    const float * xrow = xo + (size_t) t * (size_t) topk * (size_t) ne;
-    float acc = 0.0f;
-    for (int e = 0; e < topk; ++e) {
-        acc += wrow[e] * xrow[(size_t) e * (size_t) ne + j];
+    float acc;
+    if (xo != nullptr) {
+        const float * wrow = weights + (size_t) t * (size_t) topk;
+        const float * xrow = xo + (size_t) t * (size_t) topk * (size_t) ne;
+        acc = 0.0f;
+        for (int e = 0; e < topk; ++e) {
+            acc += wrow[e] * xrow[(size_t) e * (size_t) ne + j];
+        }
+    } else {
+        acc = out[(size_t) t * (size_t) ne + j];
     }
-    out[(size_t) t * (size_t) ne + j] = acc;
+    out[(size_t) t * (size_t) ne + j] = acc + g * ysh[(size_t) t * (size_t) ne + j];
 }
 
 } // namespace
@@ -378,24 +377,18 @@ bool moe_scatter_store(float * xo, const float * y, const int * slot, const int 
     return hipGetLastError() == hipSuccess;
 }
 
-bool moe_combine(float * out, const float * xo, const float * weights, const int64_t tokens,
-                 const int topk, const int64_t ne, hipStream_t stream) {
-    if (out == nullptr || xo == nullptr || weights == nullptr || tokens <= 0 || ne <= 0 || topk <= 0) {
+bool moe_finish(float * out, const float * xo, const float * weights, const int topk, const float * ysh,
+                const void * wg, const void * x_f16, const int64_t tokens, const int64_t ne, hipStream_t stream) {
+    if (out == nullptr || ysh == nullptr || wg == nullptr || x_f16 == nullptr || tokens <= 0 || ne <= 0 ||
+        (xo != nullptr && (weights == nullptr || topk <= 0))) {
         return false;
     }
-    const dim3 grid((unsigned) ((ne + 255) / 256), (unsigned) tokens);
-    moe_combine_kernel<<<grid, 256, 0, stream>>>(out, xo, weights, (long long) ne, topk);
+    const dim3 grid((unsigned) ((ne + kFinishThreads - 1) / kFinishThreads), (unsigned) tokens);
+    moe_finish_kernel<<<grid, kFinishThreads, 0, stream>>>(out, xo, weights, topk, ysh,
+                                                           static_cast<const float *>(wg),
+                                                           static_cast<const __half *>(x_f16), (long long) ne);
     return hipGetLastError() == hipSuccess;
 }
 
-bool moe_shexp_gate(const void * w, const void * x_f16, float * out, const int64_t tokens, const int64_t k,
-                    hipStream_t stream) {
-    if (w == nullptr || x_f16 == nullptr || out == nullptr || tokens <= 0 || k <= 0) {
-        return false;
-    }
-    moe_shexp_gate_kernel<<<(unsigned) tokens, kGateThreads, 0, stream>>>(
-        static_cast<const float *>(w), static_cast<const __half *>(x_f16), out, (long long) k);
-    return hipGetLastError() == hipSuccess;
-}
 
 } // namespace omph::kernels

@@ -390,7 +390,6 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         alloc(&moe_w_, (size_t) T * h_.n_expert_used * sizeof(float));
         // the batched path keeps one down output per gathered row (#494)
         alloc(&moe_down_, (size_t) T * h_.n_expert_used * ne * 4);
-        alloc(&moe_gate_, (size_t) T * sizeof(float));
         alloc(&moe_xg_, (size_t) T * h_.n_expert_used * ne * 2);
         alloc(&moe_xo_, (size_t) T * h_.n_expert_used * ne * 4);
         alloc(&moe_xgi_, (size_t) T * h_.n_expert_used * sizeof(int));
