@@ -509,11 +509,15 @@ bool Runner::moe_shared(const LayerWeights & L, const int64_t T, float * y) {
     // one token of a GGUF-block gate / up pair: one launch with the SwiGLU (#522)
     const Mat & g = L.ffn_gate_shexp;
     const Mat & u = L.ffn_up_shexp;
-    const bool gu = T == 1 && use_gemv_ && g.gemv != nullptr && u.gemv != nullptr && g.gemv->gguf &&
-                    u.gemv->gguf && g.gemv->type == u.gemv->type && g.gemv->rows == shexp &&
-                    u.gemv->rows == shexp && g.gemv->k == ne && u.gemv->k == ne &&
-                    omph::kernels::gemv_legacy_gu(g.gemv->type, g.dev, u.dev, h16_, ffn16_, shexp, ne,
-                                                  gemv_stream_);
+    const bool fits = T == 1 && use_gemv_ && g.gemv != nullptr && u.gemv != nullptr &&
+                      g.gemv->type == u.gemv->type && g.gemv->rows == shexp && u.gemv->rows == shexp &&
+                      g.gemv->k == ne && u.gemv->k == ne;
+    // ... or of a tile type: a one-slot gemv_moe_gu over its {gate, up} pair
+    const bool gu = fits && (g.gemv->gguf ? omph::kernels::gemv_legacy_gu(g.gemv->type, g.dev, u.dev, h16_, ffn16_,
+                                                                          shexp, ne, gemv_stream_)
+                             : L.shexp_gu != nullptr &&
+                                   omph::kernels::gemv_moe_gu(g.gemv->type, L.shexp_gu, L.shexp_gu + 1, moe_zero_id_,
+                                                              h16_, ffn16_, shexp, ne, 1, 1, hipStreamPerThread));
     if ((!gu && (!matmul(g, h16_, static_cast<float *>(ffn1_), shexp, ne, T) ||
                  !matmul(u, h16_, static_cast<float *>(ffn2_), shexp, ne, T) ||
                  !omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),

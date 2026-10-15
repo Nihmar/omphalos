@@ -94,6 +94,9 @@ class Runner {
         void * gate_inp16 = nullptr;  // the same weights as f16 (#494)
         Mat ffn_gate_exps, ffn_up_exps, ffn_down_exps;  // [k, n_ff_exp, n_expert]
         int moe_tab = -1;  // its row of the expert tables and of moe_ids_ (#512)
+        // a tile-type shared expert's {gate, up} as a one-expert table for
+        // gemv_moe_gu (#522); null for the GGUF-block types
+        const void * const * shexp_gu = nullptr;
         const float * ffn_gate_inp_shexp = nullptr;     // [n_embd]
         Mat ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp;
     };
@@ -778,6 +781,8 @@ private:
     std::unordered_map<int, std::vector<int>> moe_orders_;  // per layer: the experts, hottest first
     std::vector<int> moe_identity_;
     void * moe_eptr_ = nullptr;                 // device: tables x 3 kinds x n_expert pointers
+    void * moe_shexp_ptr_ = nullptr;            // device: per table {gate, up} of the shared expert, + one 0 id
+    const void * moe_zero_id_ = nullptr;        // that 0 id
     std::vector<const void *> moe_eptr_host_;   // the same, as last uploaded
     void * moe_eptr_pin_ = nullptr;             // pinned staging of its upload
     struct MoeTab {
