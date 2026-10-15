@@ -110,6 +110,23 @@ bool Runner::embed(const int32_t * toks, const int64_t T, const ForwardInputs * 
 // slot-ordered weighted sum. The order of the sums is fixed (a store per
 // (token, slot) and one combine in slot order): the result does not depend on
 // the atomics' order.
+// The routed gate's selection into moe_ids_ / moe_w_: the logits from a GEMV
+// for a step or a verification (one token's logits do not depend on T, #509)
+// and from the f16 GEMM for a prefill chunk (#494), then the top-k.
+bool Runner::moe_route(const LayerWeights & L, const int64_t T) {
+    const int64_t ne = h_.n_embd;
+    const int64_t n_expert = h_.n_expert;
+    auto * logits = static_cast<float *>(moe_logits_);
+    const bool ok = T <= kMoeRouterGemvMax
+                        ? omph::kernels::moe_router(L.gate_inp16, h16_, logits, T, n_expert, ne,
+                                                    hipStreamPerThread)
+                        : omph::kernels::gemm_f16(L.gate_inp16, h16_, logits, n_expert, ne, T, n_expert,
+                                                  hipStreamPerThread);
+    return ok && omph::kernels::moe_topk(moe_logits_, static_cast<int *>(moe_ids_),
+                                         static_cast<float *>(moe_w_), T, n_expert,
+                                         (int) h_.n_expert_used, hipStreamPerThread);
+}
+
 bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
     const int64_t ne = h_.n_embd;
     const int64_t ffn = h_.n_ff_exp;
@@ -119,10 +136,7 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
     auto * ids = static_cast<int *>(moe_ids_);
     auto * weights = static_cast<float *>(moe_w_);
 
-    // the router: one f16 GEMM for the whole chunk (#494), then the top-k
-    if (!omph::kernels::gemm_f16(L.gate_inp16, h16_, static_cast<float *>(moe_logits_),
-                                 (int64_t) n_expert, ne, T, (int64_t) n_expert, hipStreamPerThread) ||
-        !omph::kernels::moe_topk(moe_logits_, ids, weights, T, n_expert, topk, hipStreamPerThread)) {
+    if (!moe_route(L, T)) {
         return fail("moe route failed");
     }
     // The routing table, the gather / store indices and the per-expert offsets
@@ -276,14 +290,7 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
     auto * ids = static_cast<int *>(moe_ids_);
     auto * weights = static_cast<float *>(moe_w_);
 
-    // cur_ accumulates the experts' weighted down outputs
-    if (hipMemsetAsync(cur_, 0, (size_t) T * ne * 4, gemv_stream_) != hipSuccess) {
-        return fail("moe memset failed");
-    }
-    if (!omph::kernels::gemm_f16(L.gate_inp16, h16_, static_cast<float *>(moe_logits_),
-                                 h_.n_expert, ne, T, h_.n_expert, hipStreamPerThread) ||
-        !omph::kernels::moe_topk(moe_logits_, ids, weights, T, h_.n_expert, topk,
-                                 hipStreamPerThread)) {
+    if (!moe_route(L, T)) {
         return fail("moe route failed");
     }
     // The device-side shape (#497): the selection never leaves the device, and
@@ -314,6 +321,11 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
             return moe_shared(L, T);
         }
         (void) hipGetLastError();
+    }
+    // the per-expert fallback accumulates the experts' weighted down outputs
+    // into cur_ (the device-side shape's combine stores them)
+    if (hipMemsetAsync(cur_, 0, (size_t) T * ne * 4, gemv_stream_) != hipSuccess) {
+        return fail("moe memset failed");
     }
     if (hipStreamSynchronize(hipStreamPerThread) != hipSuccess ||
         hipMemcpy(moe_host_ids_.data(), ids, (size_t) T * topk * sizeof(int),
