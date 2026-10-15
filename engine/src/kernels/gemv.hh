@@ -69,6 +69,13 @@ bool gemv_iq2_xxs(const void * packed, const void * x_f16, float * y, int64_t ro
 // Same contract for a tensor in the repacked IQ2_S layout (10-bit grid indices
 // into a 1024-entry grid, sign masks, 4-bit scales).
 // IQ1_M on the GGUF blocks as they are (identity "repack").
+// The legacy 32-wide types from their GGUF blocks (#492): Q8_0's d f16 plus 32
+// int8, Q4_0's d f16 plus 16 nibble bytes (the low ones first).
+bool gemv_q8_0(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k,
+               hipStream_t stream);
+bool gemv_q4_0(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k,
+               hipStream_t stream);
+
 bool gemv_iq1_m(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k,
                 hipStream_t stream);
 
@@ -76,6 +83,14 @@ bool gemv_iq2_s(const void * packed, const void * x_f16, float * y, int64_t rows
                 hipStream_t stream);
 
 // BF16 weights (type 30), single token: a plain dot product, no codebook.
+// One launch for every selected expert of a 3-D tensor's slice (#497): the
+// device ids pick the expert per slot (no host round trip) and the slot's rows
+// of output go to y + slot * rows. `per_slot_x` selects the down projections,
+// whose input rows are per slot. False for a type without a tile body.
+bool gemv_moe(uint32_t type, const void * exps, int64_t per_expert, const void * ids,
+              const void * x_f16, float * y, int64_t rows, int64_t k, int64_t topk,
+              bool per_slot_x, hipStream_t stream);
+
 bool gemv_bf16(const void * w, const void * x_f16, float * y, int64_t rows, int64_t k,
                hipStream_t stream);
 
