@@ -1,0 +1,36 @@
+# n-gram (prompt lookup) drafts on the MoE model (#513)
+
+Model: Ornith-1.5-35B-A3B-Q4_K_M (omphalos: the .omph with the calibrated expert
+set, main a9f348a; llama.cpp: the pin v0.6.0 @ d8123504, build-hip-pin,
+-ncmoe 16 - the file does not fit 16 GB). KV Q4/Q4 on both sides (omphalos
+OMPH_KV_K4=1, llama.cpp -ctk q4_0 -ctv q4_0). tools/scenario_speed.py, greedy,
+the prompt sent as the same token ids to both engines; one server per
+(spec, n-gram) cell. omphalos' MTP drafts 1 token per step (its MoE default,
+#496), llama.cpp's 3 (the tool's setting, its default). The plain n-gram=1
+cells are a repeat of plain (the n-gram drafts need a drafter on both
+engines): their spread is the run-to-run noise.
+
+Every omphalos cell produced plain greedy's text (text_sha256 equal per
+scenario). llama.cpp's greedy text differs from omphalos' (other numerics) and
+stops much earlier on the edit scenarios (127-1126 tokens against 2083 / 4190),
+so its rates are over shorter texts with fewer copies to look up.
+
+| scenario | engine | plain | MTP | MTP + n-gram | tokens (plain / MTP+n-gram) | accepted (MTP+n-gram) |
+|---|---|---:|---:|---:|---|---|
+| edit-cc | omphalos | 54.5 (55.1) | 66.8 | **96.0** | 2083 / 2083 | 1918 / 2320 |
+| edit-cc | llama.cpp | 41.4 (41.3) | 39.0 | **39.0** | 341 / 168 | 79 / 264 |
+| edit-py | omphalos | 56.6 (57.3) | 69.7 | **96.6** | 4190 / 4190 | 3773 / 4361 |
+| edit-py | llama.cpp | 40.7 (37.9) | 40.4 | **40.8** | 127 / 1126 | 712 / 2088 |
+| prose | omphalos | 81.5 (82.1) | 87.4 | **85.2** | 974 / 974 | 313 / 730 |
+| prose | llama.cpp | 43.6 (43.0) | 31.2 | **31.1** | 1053 / 990 | 316 / 2019 |
+
+omphalos, MTP + n-gram against plain: edit-cc +76 %, edit-py +71 %, prose +5 %
+(against MTP alone: +44 %, +39 %, -2.5 %: on prose ~70 n-gram drafts are
+proposed and none kept). Against llama.cpp's best cell per scenario: edit-cc
+96.0 vs 41.4 t/s (2.3x), edit-py 96.6 vs 40.8 (2.4x), prose 85.2/87.4 vs 43.6
+(2.0x).
+
+Raw rows: moe-ngram-513-baseline.jsonl (omphalos), moe-ngram-513-llama.jsonl.
+
+llama.cpp's own text also changes between its cells (edit-cc: 341 tokens plain,
+168 with MTP): its speculation is not identical to its greedy decoding here.

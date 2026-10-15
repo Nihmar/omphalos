@@ -53,6 +53,8 @@ def main() -> None:
     ap.add_argument("--kv", default="k4q4", choices=["k8", "k8q4", "k4q4"])
     ap.add_argument("--engine", default="omphalos", choices=["omphalos", "llama"])
     ap.add_argument("--llama-server", default="", help="llama-server for --engine llama")
+    ap.add_argument("--llama-args", default="",
+                    help="extra llama-server arguments, e.g. '-ncmoe 16' for a MoE model that does not fit (#513)")
     ap.add_argument("--temp", type=float, default=0.0, help="0: greedy (the identity witness)")
     ap.add_argument("--seed", type=int, default=262, help="sent with temp > 0 (reproducible sampling)")
     ap.add_argument("--ctx", type=int, default=32768)
@@ -88,6 +90,7 @@ def main() -> None:
                        "-c", str(args.ctx), "-np", "1", "--host", "127.0.0.1", "--port", str(port)] + kv_llama
                 if types:
                     cmd += ["--spec-type", ",".join(types)]
+                cmd += args.llama_args.split()
                 if spec == "mtp":
                     cmd += ["--spec-draft-n-max", "3"]
                 elif spec == "dflash":
