@@ -105,6 +105,12 @@ public:
     const uint8_t * tensor_data(const TensorInfo & t) const {
         return base_ + data_offset_ + t.offset;
     }
+    // Drops the process's mapping of the tensor data (#512): a reader that
+    // copied the weights out at load leaves the pages to the page cache, where
+    // they are reclaimable, instead of mapped (~20 GiB for the second model,
+    // which pushed the kernel into swapping the pinned experts' neighbours).
+    // A later tensor_data() read faults the pages back in from the file.
+    void release_data() const;
 
 private:
     const uint8_t * base_ = nullptr;
