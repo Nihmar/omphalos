@@ -403,8 +403,10 @@ uv run python omph_tui.py --profile long-context
 - **The model, the DFlash2 drafter and the vision encoder** default to the
   repository's own `models/` files of the model's family (Ornith has no drafter
   and no encoder), so the form starts on the same "everything on" setup as the
-  recipes above; `m` / `F6` switches between the two models, keeping the rest
-  of the form (#527); `--dflash ""` clears the drafter and starts
+  recipes above. To change model, pick it in the `switch model` list at the top
+  of the `Model` tab (every `.omph` in `models/`), press `m` / `F6` to toggle
+  between the two, or start with `--model ornith` / `--model qwen3.8`: its
+  drafter and encoder come with it and the rest of the form stays (#527, #532); `--dflash ""` clears the drafter and starts
   on the MTP head, `--mmproj ""` starts without vision (the encoder runs on the
   CPU: no VRAM), and the fields can be edited or emptied in the `Drafting` and
   `Vision` tabs.

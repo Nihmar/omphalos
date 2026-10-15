@@ -144,7 +144,7 @@ server's own log, so it also shows the requests another client (pi, curl) sent.
 
 | option | default | effect |
 |---|---|---|
-| `--model FILE` | the profile's, else `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph` | the `.omph` to serve |
+| `--model FILE` | the profile's, else `models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph` | the `.omph` to serve, or a model name - `qwen3.8`, `ornith` - for its file in `models/` (#532) |
 | `--dflash FILE` | the model family's: `models/Qwen3.8-27B-DFlash2-Q4_K_M.omph` when it exists, none for Ornith | the DFlash2 drafter `.omph` the form starts on (`--dflash ""` for the MTP head) |
 | `--mmproj FILE` | the model family's: `models/mmproj-Qwen3.8-27B-BF16.gguf` when it exists, none for Ornith | the vision encoder the form starts on, run on the CPU (`--mmproj ""` for no vision; #385) |
 | `--profile NAME` | `coding-agent` | the profile to start the form from (see `tools/tui/profiles.py`: `default`, `coding-agent`, `long-context`, `fast`, `vision`, and the MoE model's `moe-chat`, `moe-coding-agent`, #527) |
@@ -163,7 +163,7 @@ button (the title bar, the modals):
 | `s` / `F2` | start the server with the form's options |
 | `x` / `F3` | stop it (and its process group) |
 | `r` / `F5` | restart |
-| `m` / `F6` | switch the model (Qwen3.8 <-> Ornith, #527): its files from `models/`, every other choice kept (Qwen Sharp falls back to `original` on Ornith) |
+| `m` / `F6` | switch the model (Qwen3.8 <-> Ornith, #527): its files from `models/`, every other choice kept (Qwen Sharp falls back to `original` on Ornith); the `Model` tab's `switch model` list picks any `.omph` in `models/` the same way (#532) |
 | `p` / `F7` | profiles: load a row, `s` saves the current form, `d` deletes |
 | `c` / `F9` | the command that will run, the `OMPH_*` line and the pre-flight checks (model, port, other servers, VRAM estimate) |
 | `y` / `F10` | copy that command to the clipboard |
