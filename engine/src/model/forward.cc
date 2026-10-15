@@ -228,7 +228,6 @@ bool Runner::moe_route(const LayerWeights & L, const int64_t T) {
 bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
     const int64_t ne = h_.n_embd;
     const int64_t ffn = h_.n_ff_exp;
-    const int64_t shexp = h_.n_ff_shexp;
     const int topk = (int) h_.n_expert_used;
     const int n_expert = (int) h_.n_expert;
     auto * ids = moe_ids(L);
@@ -383,7 +382,6 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
         return moe_ffn_batched(L, T);
     }
     const int64_t ffn = h_.n_ff_exp;
-    const int64_t shexp = h_.n_ff_shexp;
     const int topk = (int) h_.n_expert_used;
     auto * ids = moe_ids(L);
     auto * weights = static_cast<float *>(moe_w_);

@@ -335,7 +335,7 @@ void Generator::save_snapshot(const std::vector<int32_t> & prompt, const std::ve
     if (host == nullptr) {
         return;  // no pinned memory: the conversation will be prefilled again
     }
-    Snapshot snap{seq_, host, bytes, kv, {}, ++clock_, seq_images_};
+    Snapshot snap{seq_, host, bytes, kv, {}, ++clock_, seq_images_, nullptr};
     bool ok = runner_->kv_prefix_save(host, n);
     for (size_t q = 0; q < pts.size() && ok; ++q) {
         void * dst = static_cast<uint8_t *>(host) + kv + q * cp;
