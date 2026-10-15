@@ -319,11 +319,11 @@ private:
         return static_cast<int *>(moe_ids_) + (size_t) L.moe_tab * (size_t) moe_ids_stride_;
     }
     // The expert cache (#512). moe_tables() builds the pointer tables at load;
-    // moe_cache_begin() runs before a forward's kernels: it applies the fills
-    // that are done, turns the last logged selection into LRU decisions
-    // (victims back to their pinned copies, the table uploaded in stream
-    // order) and starts the new fills on the copy stream; moe_cache_log()
-    // copies a step's selections (T <= kMoeLogTokens) back after its layers.
+    // moe_cache_begin() runs before a forward's kernels: it turns the last
+    // logged selection into LRU decisions (victims back to their pinned
+    // copies, the new experts copied into their slots, then the table - all
+    // in the compute stream's order, #513); moe_cache_log() copies a step's
+    // selections (T <= kMoeLogTokens) back after its layers.
     static constexpr int64_t kMoeCacheSlots = 32;
     static constexpr int64_t kMoeLogTokens = 16;
     void moe_tables();
@@ -794,14 +794,7 @@ private:
     int * moe_log_ = nullptr;       // pinned: moe_log_tabs_ x kMoeLogTokens x topk
     int64_t moe_log_T_ = 0;         // the tokens of the logged step, 0: none pending
     int64_t moe_clock_ = 0;
-    struct MoeFill {
-        int tab, slot, expert;
-    };
-    std::vector<MoeFill> moe_fills_;  // in flight on moe_copy_
-    hipStream_t moe_copy_ = nullptr;
     hipEvent_t moe_ev_log_ = nullptr;
-    hipEvent_t moe_ev_tbl_ = nullptr;
-    hipEvent_t moe_ev_fill_ = nullptr;
     hipEvent_t moe_ev_up_ = nullptr;  // the last table upload read moe_eptr_pin_
     int64_t moe_misses_ = 0;   // OMPH_TIMING: selections read from host / all
     int64_t moe_selects_ = 0;

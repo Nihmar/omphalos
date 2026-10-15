@@ -657,17 +657,14 @@ Runner::~Runner() {
         (void) hipEventDestroy(ev_fork_);
         (void) hipEventDestroy(ev_join_);
     }
-    if (moe_copy_ != nullptr) {
+    if (moe_ev_log_ != nullptr) {
         if (env_.timing && moe_selects_ > 0) {
             std::fprintf(stderr, "expert cache: %lld of %lld logged selections read from host (%.2f %%)\n",
                          (long long) moe_misses_, (long long) moe_selects_,
                          100.0 * (double) moe_misses_ / (double) moe_selects_);
         }
-        (void) hipStreamSynchronize(moe_copy_);
-        (void) hipStreamDestroy(moe_copy_);
+        (void) hipDeviceSynchronize();
         (void) hipEventDestroy(moe_ev_log_);
-        (void) hipEventDestroy(moe_ev_tbl_);
-        (void) hipEventDestroy(moe_ev_fill_);
         (void) hipEventDestroy(moe_ev_up_);
     }
 }
@@ -1606,12 +1603,9 @@ void Runner::moe_tables() {
         moe_eptr_pin_ = mem_.host(moe_eptr_host_.size() * sizeof(void *), "cannot allocate the expert table staging");
         moe_log_ = static_cast<int *>(mem_.host((size_t) moe_log_tabs_ * kMoeLogTokens * h_.n_expert_used * sizeof(int),
                                                 "cannot allocate the expert log"));
-        if (hipStreamCreateWithFlags(&moe_copy_, hipStreamNonBlocking) != hipSuccess ||
-            hipEventCreateWithFlags(&moe_ev_log_, hipEventDisableTiming) != hipSuccess ||
-            hipEventCreateWithFlags(&moe_ev_tbl_, hipEventDisableTiming) != hipSuccess ||
-            hipEventCreateWithFlags(&moe_ev_fill_, hipEventDisableTiming) != hipSuccess ||
+        if (hipEventCreateWithFlags(&moe_ev_log_, hipEventDisableTiming) != hipSuccess ||
             hipEventCreateWithFlags(&moe_ev_up_, hipEventDisableTiming) != hipSuccess) {
-            throw std::runtime_error("cannot create the expert cache's stream");
+            throw std::runtime_error("cannot create the expert cache's events");
         }
     }
 }

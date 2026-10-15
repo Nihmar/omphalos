@@ -210,6 +210,16 @@ __global__ void moe_order_kernel(const int * __restrict__ ids, const int n_pairs
     }
 }
 
+// rows of 32-bit words, one thread per word (blockIdx.y the row)
+__global__ void moe_copy_words_kernel(uint32_t * __restrict__ dst, const long long dpitch,
+                                      const uint32_t * __restrict__ src, const long long spitch,
+                                      const long long n) {
+    const long long j = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < n) {
+        dst[(long long) blockIdx.y * dpitch + j] = src[(long long) blockIdx.y * spitch + j];
+    }
+}
+
 // one block per row: copy k f16 values (the gather of an expert's rows)
 __global__ void moe_gather_kernel(const __half * __restrict__ x, const long long k,
                                   const int * __restrict__ ids, __half * __restrict__ dst) {
@@ -303,6 +313,18 @@ bool moe_router(const void * w_f16, const void * x_f16, float * logits, const in
     moe_router_kernel<<<grid, kRouterWaves * kWave, 0, stream>>>(
         static_cast<const __half *>(w_f16), static_cast<const __half *>(x_f16), logits,
         (int) n_expert, (int) k);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool moe_copy_words(void * dst, const int64_t dpitch, const void * src, const int64_t spitch, const int64_t n,
+                    const int64_t rows, hipStream_t stream) {
+    if (dst == nullptr || src == nullptr || n <= 0 || rows <= 0 || (rows > 1 && (dpitch < n || spitch < n))) {
+        return false;
+    }
+    const dim3 grid((unsigned) ((n + 255) / 256), (unsigned) rows);
+    moe_copy_words_kernel<<<grid, 256, 0, stream>>>(static_cast<uint32_t *>(dst), (long long) dpitch,
+                                                    static_cast<const uint32_t *>(src), (long long) spitch,
+                                                    (long long) n);
     return hipGetLastError() == hipSuccess;
 }
 

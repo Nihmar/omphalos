@@ -110,122 +110,83 @@ bool Runner::embed(const int32_t * toks, const int64_t T, const ForwardInputs * 
 // slot-ordered weighted sum. The order of the sums is fixed (a store per
 // (token, slot) and one combine in slot order): the result does not depend on
 // the atomics' order.
-// The expert cache (#512), before a forward's kernels. Every step costs the
-// host a few microseconds; the device sees at most one table upload. In order:
-//  1. the fills that are done: their experts now read their slots;
-//  2. the selections the last logged step made (if its copy is done and no
-//     fill is in flight): each touches its expert, each host-read expert of a
-//     layer takes the least recently used slot whose expert this step did not
-//     choose - the victim points back at its pinned copy at once, the new
-//     expert only once its fill is done (a later call);
-//  3. the table goes up in the compute stream's order, before the kernels
-//     that read it, and the fills wait for it on the copy stream: a kernel
-//     never reads a slot being written (the victims' last readers came before
-//     the upload in stream order).
+// The expert cache (#512), before a forward's kernels: the selections the
+// last logged step made (once their copy is done) touch their experts, and
+// each host-read expert of a layer takes the least recently used slot whose
+// expert that step did not choose. All on the compute stream, in order: the
+// fills (a copy kernel from the pinned copy), then the table (#513). The
+// victims' last readers are earlier kernels of the same stream, the new
+// experts' first readers later ones, and every write goes through the GPU's
+// L2. An asynchronous version - fills on a copy stream, the table by DMA -
+// changed the text of one n-gram run in a few (a kernel read a slot while its
+// fill wrote it) and, with the fills on a DMA engine, decoded half the runs at
+// 22 ms/step instead of 12.
 bool Runner::moe_cache_begin() {
-    if (moe_tabs_.empty()) {
+    if (moe_tabs_.empty() || moe_log_T_ == 0 || hipEventQuery(moe_ev_log_) != hipSuccess) {
         return true;
     }
+    const int64_t n = h_.n_expert;
+    const int64_t picks = moe_log_T_ * h_.n_expert_used;
+    ++moe_clock_;
     bool changed = false;
-    if (!moe_fills_.empty() && hipEventQuery(moe_ev_fill_) == hipSuccess) {
-        const int64_t n = h_.n_expert;
-        for (const MoeFill & f : moe_fills_) {
-            MoeTab & c = moe_tabs_[(size_t) f.tab];
-            c.slot_of[(size_t) f.expert] = f.slot;
+    for (int64_t tab = 0; tab < moe_log_tabs_; ++tab) {
+        MoeTab & c = moe_tabs_[(size_t) tab];
+        const int * ids = moe_log_ + (size_t) tab * (size_t) (kMoeLogTokens * h_.n_expert_used);
+        for (int64_t i = 0; i < picks; ++i) {
+            c.last[(size_t) ids[i]] = moe_clock_;
+            ++c.count[(size_t) ids[i]];
+        }
+        for (int64_t i = 0; i < picks; ++i) {
+            const int e = ids[i];
+            if (c.slot_of[(size_t) e] >= 0) {
+                continue;
+            }
+            ++moe_misses_;
+            // the least recently used slot whose expert this step did not choose
+            int victim = -1;
+            for (int64_t s = moe_fixed_; s < moe_cap_; ++s) {
+                const int o = c.owner[(size_t) s];
+                if (c.last[(size_t) o] < moe_clock_ &&
+                    (victim < 0 || c.last[(size_t) o] < c.last[(size_t) c.owner[(size_t) victim]])) {
+                    victim = (int) s;
+                }
+            }
+            if (victim < 0) {
+                continue;
+            }
+            const int old = c.owner[(size_t) victim];
+            c.slot_of[(size_t) old] = -1;
+            c.owner[(size_t) victim] = e;
+            c.slot_of[(size_t) e] = victim;
             for (int k = 0; k < 3; ++k) {
-                moe_eptr_host_[((size_t) f.tab * 3 + (size_t) k) * (size_t) n + (size_t) f.expert] =
-                    c.dev[k] + (size_t) f.slot * c.pe[k];
-            }
-        }
-        moe_fills_.clear();
-        changed = true;
-    }
-    std::vector<MoeFill> todo;
-    if (moe_log_T_ > 0 && moe_fills_.empty() && hipEventQuery(moe_ev_log_) == hipSuccess) {
-        const int64_t n = h_.n_expert;
-        const int64_t picks = moe_log_T_ * h_.n_expert_used;
-        ++moe_clock_;
-        for (int64_t tab = 0; tab < moe_log_tabs_; ++tab) {
-            MoeTab & c = moe_tabs_[(size_t) tab];
-            const int * ids = moe_log_ + (size_t) tab * (size_t) (kMoeLogTokens * h_.n_expert_used);
-            for (int64_t i = 0; i < picks; ++i) {
-                c.last[(size_t) ids[i]] = moe_clock_;
-                ++c.count[(size_t) ids[i]];
-            }
-            for (int64_t i = 0; i < picks; ++i) {
-                const int e = ids[i];
-                const int at = c.slot_of[(size_t) e];
-                if (at >= 0) {
-                    continue;
-                }
-                ++moe_misses_;
-                if (at == -2) {
-                    continue;  // read from host this step, its fill was started by another pick
-                }
-                // the least recently used slot whose expert this step did not
-                // choose (an expert already being filled holds its slot's
-                // owner, chosen now: it is skipped the same way)
-                int victim = -1;
-                for (int64_t s = moe_fixed_; s < moe_cap_; ++s) {
-                    const int o = c.owner[(size_t) s];
-                    if (c.last[(size_t) o] < moe_clock_ &&
-                        (victim < 0 || c.last[(size_t) o] < c.last[(size_t) c.owner[(size_t) victim]])) {
-                        victim = (int) s;
-                    }
-                }
-                if (victim < 0) {
-                    continue;
-                }
-                const int old = c.owner[(size_t) victim];
-                c.slot_of[(size_t) old] = -1;
-                for (int k = 0; k < 3; ++k) {
-                    moe_eptr_host_[((size_t) tab * 3 + (size_t) k) * (size_t) n + (size_t) old] =
-                        c.host[k] + (size_t) c.hidx[(size_t) old] * c.pe[k];
-                }
-                c.owner[(size_t) victim] = e;
-                c.last[(size_t) e] = moe_clock_;  // a second pick of e in this step is not a new fill
-                c.slot_of[(size_t) e] = -2;       // filling: read from host until it is done
-                todo.push_back(MoeFill{(int) tab, victim, e});
-                changed = true;
-            }
-            moe_selects_ += picks;
-        }
-        moe_log_T_ = 0;
-    }
-    // through a pinned buffer: a pageable source is pinned by the runtime
-    // during the copy, which under host memory pressure stalled the compute
-    // stream for seconds (#512)
-    if (changed) {
-        const size_t bytes = moe_eptr_host_.size() * sizeof(void *);
-        if (hipEventSynchronize(moe_ev_up_) != hipSuccess) {
-            return fail("expert table upload wait failed");
-        }
-        std::memcpy(moe_eptr_pin_, moe_eptr_host_.data(), bytes);
-        if (hipMemcpyAsync(moe_eptr_, moe_eptr_pin_, bytes, hipMemcpyHostToDevice, hipStreamPerThread) !=
-                hipSuccess ||
-            hipEventRecord(moe_ev_up_, hipStreamPerThread) != hipSuccess) {
-            return fail("expert table upload failed");
-        }
-    }
-    if (!todo.empty()) {
-        if (hipEventRecord(moe_ev_tbl_, hipStreamPerThread) != hipSuccess ||
-            hipStreamWaitEvent(moe_copy_, moe_ev_tbl_, 0) != hipSuccess) {
-            return fail("expert fill ordering failed");
-        }
-        for (const MoeFill & f : todo) {
-            const MoeTab & c = moe_tabs_[(size_t) f.tab];
-            for (int k = 0; k < 3; ++k) {
-                if (hipMemcpyAsync(const_cast<uint8_t *>(c.dev[k]) + (size_t) f.slot * c.pe[k],
-                                   c.host[k] + (size_t) c.hidx[(size_t) f.expert] * c.pe[k], c.pe[k],
-                                   hipMemcpyHostToDevice, moe_copy_) != hipSuccess) {
+                const void ** row = moe_eptr_host_.data() + ((size_t) tab * 3 + (size_t) k) * (size_t) n;
+                uint8_t * slot = const_cast<uint8_t *>(c.dev[k]) + (size_t) victim * c.pe[k];
+                row[old] = c.host[k] + (size_t) c.hidx[(size_t) old] * c.pe[k];
+                row[e] = slot;
+                if (!omph::kernels::moe_copy_words(slot, 0, c.host[k] + (size_t) c.hidx[(size_t) e] * c.pe[k], 0,
+                                                   (int64_t) (c.pe[k] / 4), 1, hipStreamPerThread)) {
                     return fail("expert fill failed");
                 }
             }
+            changed = true;
         }
-        if (hipEventRecord(moe_ev_fill_, moe_copy_) != hipSuccess) {
-            return fail("expert fill event failed");
+        moe_selects_ += picks;
+    }
+    moe_log_T_ = 0;
+    // through a pinned buffer (a pageable source is pinned by the runtime
+    // during the copy, which under host memory pressure stalled the compute
+    // stream for seconds, #512), read by a kernel
+    if (changed) {
+        const size_t words = moe_eptr_host_.size() * sizeof(void *) / 4;
+        if (hipEventSynchronize(moe_ev_up_) != hipSuccess) {
+            return fail("expert table upload wait failed");
         }
-        moe_fills_ = std::move(todo);
+        std::memcpy(moe_eptr_pin_, moe_eptr_host_.data(), words * 4);
+        if (!omph::kernels::moe_copy_words(moe_eptr_, (int64_t) words, moe_eptr_pin_, (int64_t) words,
+                                           (int64_t) words, 1, hipStreamPerThread) ||
+            hipEventRecord(moe_ev_up_, hipStreamPerThread) != hipSuccess) {
+            return fail("expert table upload failed");
+        }
     }
     return true;
 }
@@ -238,10 +199,8 @@ bool Runner::moe_cache_log(const int64_t T) {
     if (moe_tabs_.empty() || T > kMoeLogTokens || moe_log_T_ > 0) {
         return true;
     }
-    const size_t row = (size_t) (T * h_.n_expert_used) * sizeof(int);
-    if (hipMemcpy2DAsync(moe_log_, (size_t) (kMoeLogTokens * h_.n_expert_used) * sizeof(int), moe_ids_,
-                         (size_t) moe_ids_stride_ * sizeof(int), row, (size_t) moe_log_tabs_,
-                         hipMemcpyDeviceToHost, hipStreamPerThread) != hipSuccess ||
+    if (!omph::kernels::moe_copy_words(moe_log_, kMoeLogTokens * h_.n_expert_used, moe_ids_, moe_ids_stride_,
+                                       T * h_.n_expert_used, moe_log_tabs_, hipStreamPerThread) ||
         hipEventRecord(moe_ev_log_, hipStreamPerThread) != hipSuccess) {
         return fail("expert log copy failed");
     }
