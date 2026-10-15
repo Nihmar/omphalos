@@ -37,6 +37,18 @@ __device__ inline uint32_t iq3xxs_group_signs(const uint32_t a, const int l) {
     return (even << 12) | (odd << 29) | (par << 28);
 }
 
+// Q4_K / Q5_K: the GGUF 6-bit scale and min of sub-block j (0..7) from the
+// block's 12-byte scale area (ggml's get_scale_min_k4).
+__device__ inline void scale_min_k4(const int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (uint8_t) ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+        m = (uint8_t) ((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+    }
+}
+
 // Q4_K: d * scale and dmin * min of sub-block j (0..7) from a block's 16-byte
 // meta record: the GGUF 12-byte 6-bit scale/min area (ggml's
 // get_scale_min_k4), then d and dmin (#94).

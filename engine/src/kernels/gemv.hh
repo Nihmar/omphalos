@@ -76,6 +76,11 @@ bool gemv_q8_0(const void * blocks, const void * x_f16, float * y, int64_t rows,
 bool gemv_q4_0(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k,
                hipStream_t stream);
 
+// Q5_K from its GGUF blocks (#492): d, dmin, the 6-bit scales and the fifth
+// bit of each weight (qh).
+bool gemv_q5k(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k,
+              hipStream_t stream);
+
 bool gemv_iq1_m(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k,
                 hipStream_t stream);
 

@@ -56,3 +56,36 @@ Two changes to the decode path:
 
 KL against llama.cpp's dump: 0.004011 (the batched path was 0.004053), top-1
 100 %. llama.cpp's decode on the same file: 23 ms/step (43 t/s, -ncmoe 16).
+
+## The routing table on the device, and the MTP's negative result
+
+- `moe_order` builds the per-expert counts, their prefix sum and the gather /
+  store indices on the device (a 256-bin histogram, a scan in one thread, shared
+  atomics - the order inside an expert cannot change a result, the outputs are
+  summed back per (token, slot) in slot order). A batched step - a prefill chunk
+  or a verification - has no host round trip left; the grid's row bound is the
+  largest count, read back once per layer for a chunk (T > 64) and the token
+  count for a step.
+- Q5_K (`attn_output`) gets the GGUF-block GEMV too: decode 26.7 -> 26.1 ms.
+- **The MTP loses on this model**: 200 generated tokens, plain 7.45 s against
+  9.7-14.2 s with `--draft-mtp 3`, output bit-identical. The decode of the
+  second model is *launch-latency* bound, not bandwidth bound (the selected
+  experts are 566 MB per token against ~400 GB/s, ~2 ms, inside a 26 ms step),
+  so sharing one weight read over 1 + K verified tokens does not pay, while the
+  MTP block and the verification add their own (small, numerous) kernels. The
+  dense first model is bandwidth bound and keeps its 1.8-2.4x. For this model
+  the decode's win is fewer, fatter kernels, not speculation.
+
+## Validation after all of the above
+
+Both files, against llama.cpp's CPU dump for the same 5-token prompt:
+
+| file | KL (nats) | top-1 |
+|---|---:|---:|
+| Q4_K_M | 0.004053 | 100 % |
+| Q2_K_L | 0.004377 | 100 % |
+
+The Q2_K_L exercises the per-expert fallback (its down projections are Q3_K,
+which has no tile kernel); the Q4_K_M groups all three matrices. Both give the
+greedy token the dump does, and the full-prompt greedy of each file is unchanged
+from before this round.

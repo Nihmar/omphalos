@@ -744,6 +744,7 @@ private:
     std::vector<int> moe_host_ids_;  // the selection, read back for the expert slices
     std::vector<int> moe_counts_;    // per-expert rows in the batched path
     void * moe_logits_ = nullptr;    // tokens x n_expert f32: the router's logits
+    void * moe_cnt_max_ = nullptr;   // int: the largest per-expert count of a chunk
     // The delta-net's own scratch (#494): on an expert model the FFN scratch is
     // the experts' width, too small for the token-parallel / WY forms
     void * gdn_work_ = nullptr;

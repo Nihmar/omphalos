@@ -6,6 +6,7 @@
 #include "kernels/dequant.hh"
 
 #include "kernels/iq_tables.hh"
+#include "kernels/quant_decode.hh"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -102,17 +103,6 @@ __global__ void dequant_q2_k_kernel(const uint8_t * __restrict__ src, T * __rest
 
 // -------------------------------------------------------------------- Q4_K
 
-__device__ __forceinline__ void scale_min_k4(const int j, const uint8_t * q, uint8_t & d,
-                                             uint8_t & m) {
-    if (j < 4) {
-        d = q[j] & 63;
-        m = q[j + 4] & 63;
-    } else {
-        d = (uint8_t) ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
-        m = (uint8_t) ((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
-    }
-}
-
 template <typename T>
 __global__ void dequant_q4_k_kernel(const uint8_t * __restrict__ src, T * __restrict__ dst,
                                     const long long n) {
@@ -131,7 +121,7 @@ __global__ void dequant_q4_k_kernel(const uint8_t * __restrict__ src, T * __rest
     const float dmin = f16_at(blk + 2);
     uint8_t s = 0;
     uint8_t m = 0;
-    scale_min_k4(2 * j + high, blk + 4, s, m);
+    qd::scale_min_k4(2 * j + high, blk + 4, s, m);
     const uint8_t q = blk[16 + j * 32 + l];
 
     const float dl = d * (float) s;
@@ -256,7 +246,7 @@ __global__ void dequant_q5_k_kernel(const uint8_t * __restrict__ src, T * __rest
     const float dmin = f16_at(blk + 2);
     uint8_t s = 0;
     uint8_t m = 0;
-    scale_min_k4(2 * j + high, blk + 4, s, m);
+    qd::scale_min_k4(2 * j + high, blk + 4, s, m);
     const uint8_t q = blk[48 + j * 32 + l];
     const bool up = (blk[16 + l] & (uint8_t) (1u << (2 * j + high))) != 0;
 
