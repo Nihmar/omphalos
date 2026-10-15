@@ -1,0 +1,43 @@
+# The expert cache's updates in the compute stream's order (#512, #513)
+
+Model: Ornith-1.5-35B-A3B-Q4_K_M.omph, calibrated expert set, auto host budget.
+
+## The faults of the asynchronous cache (main 2757f70)
+
+1. Identity. The MoE n-gram scenarios (scenario_speed.py, MTP K = 1 +
+   n-gram, k4q4): edit-py generated 8000 tokens (text_sha256 2d7f36d1...)
+   against plain greedy's 4190 (b3dc98c3...); the other cells matched.
+   Reproduced with omph-run on the edit-py prompt (4073 tokens, OMPH_KV_K4=1),
+   oracle drafts --draft-k 15 --draft-corrupt 16, 800 tokens:
+   | variant | runs identical |
+   |---|---|
+   | main (fills on a copy stream, table by DMA) | 2 of 3 (one diverged at token 441) |
+   | LRU off | 5 of 5 |
+   | the host waits for the fills before the forward | 4 of 4 |
+   | hipDeviceSynchronize at the update | 3 of 4 |
+   | fills started after the forward's layers | 8 of 8 |
+   | **this change** | **6 of 6** |
+2. Speed. With fills on the DMA engine (after the identity fix), ita 400 tokens:
+   | variant | median step gpu per run |
+   |---|---|
+   | SDMA fills, table + log by DMA | 22.37 22.28 22.35 12.35 12.36 |
+   | SDMA fills, table + log by kernels | 22.05 22.09 21.87 11.92 11.91 11.88 |
+   | HSA_ENABLE_SDMA=0 | 12.30 12.22 12.17 12.22 (4.6-5.2 % host-read) |
+   | fills as kernels on a copy stream | 11.93 11.96 11.94 11.96 13.41 11.94 |
+   | ... at the lowest stream priority | 11.97 13.40 11.93 11.94 11.92 11.94 11.95 13.46 |
+   | **this change** (8 runs) | **12.32-12.33, 2.38 % every run** |
+
+## Decode after the change (median of 5, 400 tokens, tokens identical to the pre-cache reference)
+
+plain: the mean of "step wall"; K = 1: omph-run's ms per generated token.
+
+code plain 13.17 runs 13.17 13.18 13.18 13.17 13.17 miss% 4.24 identical
+code K=1 10.45 runs 10.46 10.73 10.44 10.45 10.44 miss% 4.63 identical
+ita plain 12.44 runs 12.44 12.43 12.43 12.44 12.44 miss% 2.38 identical
+ita K=1 10.90 runs 10.97 10.98 10.84 10.90 10.89 miss% 2.42 identical
+tech plain 12.63 runs 12.62 12.63 12.63 12.62 12.63 miss% 2.85 identical
+tech K=1 10.76 runs 10.76 10.76 10.76 10.75 10.76 miss% 3.06 identical
+
+The plain numbers are 0.3-0.8 ms above moe-expert-calibration-512.txt's,
+which were taken with the asynchronous fills (and their fast mode); the MTP
+K = 1 numbers match moe-mtp-496.txt.
