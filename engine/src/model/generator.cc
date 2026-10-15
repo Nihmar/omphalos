@@ -37,6 +37,11 @@ Generator::Generator(const Config & config, const omph::runtime::EnvOptions & en
                                        config_.context, config_.mtp, config_.dflash);
     if (runner_->dflash_on()) {
         config_.draft_k = runner_->dflash_block() - 1;
+    } else if (runner_->hparams().moe()) {
+        // the second model's MTP: one draft per step (#496: 10-16 % faster than
+        // the plain decode; K = 2 is even, 3 loses - a verification's tokens
+        // read different experts, so the verified rows are not cheap)
+        config_.draft_k = 1;
     }
     // #437: mirror the saved conversations to disk. The key is the .omph's
     // source digest: a reconverted or re-quantized model never reuses a file.

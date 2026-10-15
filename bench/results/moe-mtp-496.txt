@@ -1,0 +1,53 @@
+# MoE MTP: bit-identical verification, and the draft count (#496)
+
+Model: Ornith-1.5-35B-A3B-Q4_K_M.omph with the calibrated expert set (#512,
+`<model>.omph.experts`), auto host budget. `OMPH_TIMING=1 omph-run ... --gemv
+--generate 400 [--draft-mtp K]`, the prompts of moe-expert-cache-512.txt.
+plain: the mean of the 400 "step wall"; MTP: omph-run's "ms per generated
+token" (wall, the whole decode / tokens). Median of 5 runs.
+
+| prompt | plain | **K = 1** | K = 2 | accepted K=1 | accepted K=2 |
+|---|---:|---:|---:|---:|---:|
+| code | 12.52 ms | **10.53 ms (-16 %)** | 12.40 ms | 183 / 216 | 205 / 390 |
+| ita | 12.06 ms | **10.90 ms (-10 %)** | 12.37 ms | 153 / 246 | 174 / 450 |
+| tech | 12.66 ms | **10.80 ms (-15 %)** | 13.10 ms | 163 / 237 | 180 / 442 |
+
+runs:
+code plain 12.51 12.52 12.52 12.52 12.51 / K1 10.53 10.54 10.54 10.53 10.53 / K2 12.41 12.40 12.40 12.40 12.39
+ita  plain 12.07 12.06 12.05 12.06 12.06 / K1 10.90 10.90 10.91 10.91 10.90 / K2 12.37 12.36 12.42 12.83 12.34
+tech plain 12.16 12.66 12.66 12.66 12.67 / K1 10.80 10.80 10.80 10.82 10.82 / K2 13.10 13.10 12.37 13.10 13.09
+
+200-token runs, K = 3: 14.1-15.9 ms/token (a loss). All outputs identical to
+plain greedy (they were not before this work).
+
+The generator's default for this model is now K = 1 (the dense model keeps 3).
+
+## What it took (200 tokens, K = 2, ms per generated token)
+
+| | code | ita |
+|---|---:|---:|
+| #515 (drafts run; verification on the batched prefill path) | 20.08 | 21.24 |
+| verification through the decode's kernels (T x 8 expert slots) | 20.08 | 21.24 |
+| + the verification head on its tile GEMV (not the chunked f16 path) | 15.43 | 15.94 |
+| + the drafts read the head's vocabulary prefix | 14.68 | 15.18 |
+| + Q8_0 / Q4_0 / Q5_K 2..4-token GEMVs | 13.07 | 14.71 |
+| + the calibrated expert set (#517) | 11.35 | 12.30 |
+
+(the first row was not identical to plain greedy; every other is)
+
+## Why K > 1 does not pay here
+
+A verified token reads its own 8 experts: 3 tokens read ~2.2x the expert bytes
+of one, and the experts are a large part of the step, so the verification's
+rows are not cheap the way the dense model's are. Acceptance per draft is
+44-56 % at K = 2 (77-85 % for the first draft).
+
+## The server (omph-server, greedy, 3 prompts, 147-300 tokens)
+
+| | t/s |
+|---|---|
+| MTP K = 1, n-gram on (the default) | 78.3 / 84.0 / 69.2 |
+| MTP K = 1, OMPH_NGRAM=0 | 95.9 / 99.5 / 78.4 |
+
+The n-gram drafts (up to 15 per step) are rejected on prose and a 16-row
+verification is costly on this model: #513.
