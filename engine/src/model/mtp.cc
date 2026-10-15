@@ -124,8 +124,9 @@ bool Runner::mtp_block(const int32_t * toks, const float * h_in, const int64_t p
                                          static_cast<const float *>(x_),
                                          static_cast<float *>(resid_), L.post_norm, h16_, T, ne,
                                          (float) h_.eps, nullptr) ||
-        (h_.moe() ? moe_ffn(L, T)
-                  : ((grouped(h16_, ne, T,
+        // #496: the negation was lost in 0eb5aa0, so every draft "failed"
+        !(h_.moe() ? moe_ffn(L, T)
+                   : ((grouped(h16_, ne, T,
                               {{&L.ffn_up, ffn2_, h_.n_ff}, {&L.ffn_gate, ffn1_, h_.n_ff}}) ||
                       fork_join(
                           T,
