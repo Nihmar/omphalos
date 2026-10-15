@@ -401,8 +401,10 @@ uv run python omph_tui.py --profile long-context
 ```
 
 - **The model, the DFlash2 drafter and the vision encoder** default to the
-  repository's own `models/` files, so the form starts on the same "everything
-  on" setup as the recipes above; `--dflash ""` clears the drafter and starts
+  repository's own `models/` files of the model's family (Ornith has no drafter
+  and no encoder), so the form starts on the same "everything on" setup as the
+  recipes above; `m` / `F6` switches between the two models, keeping the rest
+  of the form (#527); `--dflash ""` clears the drafter and starts
   on the MTP head, `--mmproj ""` starts without vision (the encoder runs on the
   CPU: no VRAM), and the fields can be edited or emptied in the `Drafting` and
   `Vision` tabs.
@@ -423,8 +425,10 @@ uv run python omph_tui.py --profile long-context
   row) opens the detail, where `c` copies the request as JSON; `F8` writes the
   whole table to a CSV.
 - **`p` / `F7`** loads, saves (`s`) or deletes (`d`) a profile: the
-  `coding-agent` recipe below, `long-context`, `fast`, `vision`, `default`, or
-  your own under `~/.config/omphalos/profiles.json`. `--profile` picks the one
+  `coding-agent` recipe below, `long-context`, `fast`, `vision`, `default`, the
+  MoE model's `moe-chat` and `moe-coding-agent` (K4/V4, a 1024 chunk for long
+  prompts), or your own under `~/.config/omphalos/profiles.json`. A profile's
+  empty file fields mean its model family's files. `--profile` picks the one
   the form starts from.
 - **`t`** sends a small test prompt through the running server, the quick way
   to prove a configuration end to end before pointing an agent at it.
