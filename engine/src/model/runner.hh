@@ -296,6 +296,10 @@ private:
     // rows gathered per expert, one expert's tokens per GEMM, then the
     // slot-ordered weighted sum.
     bool moe_ffn_batched(const LayerWeights & L, const int64_t T);
+    // The routed gate's selection (#509): a GEMV for up to kMoeRouterGemvMax
+    // tokens (a step, a verification), the f16 GEMM above.
+    static constexpr int64_t kMoeRouterGemvMax = 16;
+    bool moe_route(const LayerWeights & L, const int64_t T);
     // The shared expert of a MoE layer, one pass for the whole chunk (#493).
     bool moe_shared(const LayerWeights & L, const int64_t T);
     // The router's f16 weights, converted once at load (#494): the logits are

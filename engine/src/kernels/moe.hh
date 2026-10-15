@@ -33,6 +33,12 @@ bool moe_order(const void * ids, int64_t n_pairs, int64_t n_expert, int64_t topk
 bool moe_topk(const void * logits, int * ids, float * weights, int64_t tokens, int64_t n_expert,
               int topk, hipStream_t stream);
 
+// The router logits of a few tokens (decode, verification; #509): y[t][e] =
+// w_f16[e] . x_f16[t], one wave per (expert, token) in a fixed order, so a
+// token's logits are the same for any token count. Needs k even.
+bool moe_router(const void * w_f16, const void * x_f16, float * logits, int64_t tokens,
+                int64_t n_expert, int64_t k, hipStream_t stream);
+
 // out[t][j] += weights[t * stride + slot] * y[t][j]: one expert's down output,
 // weighted by its router probability, accumulated into the block's output.
 bool moe_acc(float * out, const float * y, const float * weights, int64_t tokens, int64_t stride,
