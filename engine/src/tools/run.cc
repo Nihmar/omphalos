@@ -82,6 +82,7 @@ int main(int argc, char ** argv) {
     bool mtp = false;           // --mtp: load the MTP block (#124)
     bool draft_mtp = false;     // --draft-mtp K: speculative decode with MTP drafts
     std::string dflash;         // --dflash FILE: ... with DFlash2 drafts instead (#245)
+    std::string moe_counts;     // --moe-counts FILE: add the decode's expert picks to it (#512)
     std::string mtp_out;        // --mtp-out: the first two drafts' logits (validation)
     // A flag's numeric value: a whole non-negative number or nothing.
     const auto count = [](const char * s, int64_t & out) {
@@ -129,6 +130,8 @@ int main(int argc, char ** argv) {
             mtp = true;
         } else if (std::strcmp(argv[i], "--draft-k") == 0 && has_value) {
             if (!count(argv[++i], draft_k) || draft_k < 1) return usage();
+        } else if (std::strcmp(argv[i], "--moe-counts") == 0 && has_value) {
+            moe_counts = argv[++i];
         } else if (std::strcmp(argv[i], "--draft-corrupt") == 0 && has_value) {
             if (!count(argv[++i], draft_corrupt)) return usage();
         } else {
@@ -467,6 +470,10 @@ int main(int argc, char ** argv) {
             std::printf(" %lld", (long long) argmax(row));
         }
         std::printf("\n");
+        if (!moe_counts.empty() && !runner.moe_save_counts(moe_counts)) {
+            std::fprintf(stderr, "error: cannot write %s\n", moe_counts.c_str());
+            return 1;
+        }
     } catch (const std::exception & exc) {
         std::fprintf(stderr, "error: %s\n", exc.what());
         return 1;

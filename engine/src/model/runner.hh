@@ -110,6 +110,11 @@ public:
     // Memory is owned by mem_; the stream and the events are released here.
     ~Runner();
 
+    // Adds this run's expert picks to the counts file at `path` (#512): the
+    // next load of the model orders its fixed experts by them. False on a
+    // write error; a model without the expert cache has nothing to add.
+    bool moe_save_counts(const std::string & path) const;
+
     Runner(const Runner &) = delete;
     Runner & operator=(const Runner &) = delete;
 
@@ -322,6 +327,8 @@ private:
     static constexpr int64_t kMoeCacheSlots = 32;
     static constexpr int64_t kMoeLogTokens = 16;
     void moe_tables();
+    void moe_load_counts(const std::string & path);
+    const std::vector<int> & moe_order(int blk);
     bool moe_cache_begin();
     bool moe_cache_log(const int64_t T);
     // The shared expert of a MoE layer, one pass for the whole chunk (#493).
@@ -766,6 +773,8 @@ private:
     int64_t moe_cap_ = INT64_MAX;
     int64_t moe_fixed_ = 0;
     std::unordered_map<std::string, const void *> expert_host_;  // a cached tensor's pinned copies
+    std::unordered_map<int, std::vector<int>> moe_orders_;  // per layer: the experts, hottest first
+    std::vector<int> moe_identity_;
     void * moe_eptr_ = nullptr;                 // device: tables x 3 kinds x n_expert pointers
     std::vector<const void *> moe_eptr_host_;   // the same, as last uploaded
     void * moe_eptr_pin_ = nullptr;             // pinned staging of its upload
@@ -775,6 +784,9 @@ private:
         size_t pe[3] = {};             // bytes per expert
         std::vector<int> owner;        // per slot: the expert in it
         std::vector<int> slot_of;      // per expert: its slot, -1 if read from host
+        std::vector<int> hidx;         // per expert: its pinned copy's index, -1 for a fixed one
+        std::vector<int64_t> count;    // per expert: this run's logged picks
+        int blk = -1;
         std::vector<int64_t> last;     // per expert: the last step that chose it
     };
     std::vector<MoeTab> moe_tabs_;  // only for a cached model; the MTP layer is not logged

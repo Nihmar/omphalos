@@ -93,6 +93,12 @@ cmake -S engine -B engine/build -DOMPH_LLAMA_DIR=<llama.cpp> -DOMPH_LLAMA_LIB=/v
 # Q6_K tiles: 6, #258; IQ1_M tiles: 7, #275): reconvert (the DFlash2 drafter .omph too)
 engine/build/omph-convert <model.gguf> [<model.omph>]
 
+# the MoE model's expert cache (#512): when its experts do not fit VRAM, each layer keeps a
+# fixed set + 32 LRU slots in VRAM and pinned copies of the rest (~7.2 GiB of RAM). The fixed
+# set is the measured hot one when <model.omph>.experts exists: add a run's picks to it with
+engine/build/omph-run <model.omph> <tokens.txt> /tmp/x.f32 --last-logits --gemv --generate 400 \
+    --gen-out /tmp/g.txt --moe-counts <model.omph>.experts   # a few varied prompts; then reload
+
 # tokenizer (#148): text on stdin -> ids, or --decode ids -> text (reads a .gguf or an .omph)
 engine/build/omph-tokenize <model.gguf> [--no-parse-special] [--chat-template original|sharp] < prompt.txt > tokens.txt
 # chat template (#150): a JSON request {messages, tools?, add_generation_prompt?,
