@@ -1,0 +1,37 @@
+# The second model's integration checks, and the first model's regression guard (#497)
+
+Engine: main ee5b152 (#526) + this branch. llama.cpp: the pin, v0.6.0 @ d8123504.
+
+## Ornith-1.5-35B-A3B
+
+| check | result |
+|---|---|
+| check_tokenizer.py Q4_K_M vs llama-tokenize, --fuzz 200 | 235 cases x 2 modes, 208246 tokens: 0 failures |
+| check_chat_template.py Q4_K_M (jinja2 + llama-tokenize ids) | before: 18 of 27 requests differed (the engine rendered Qwen3.8's template, with its reasoning-effort system turn); after: 0 of 27 (19 id comparisons) |
+| --chat-template sharp on the MoE file | refused: "the Qwen Sharp chat template is written for Qwen3.8's chat format; ..." |
+| check_gpu_run.py --layers, Q4_K_M, its golden dump (5 tokens) | PASS: worst layer l_out-39 rel 1.108e-01 (tol 0.15), argmax 11751 = ref, top-5 5/5 |
+| check_gpu_run.py --layers, Q2_K_L (the per-expert fallback) | PASS: worst l_out-35 rel 8.815e-02, argmax = ref, top-5 5/5 |
+| check_server.py (the openai client: chat, stream, reasoning, tools, timings, logs) | all checks pass |
+| validate_gpu_dequant.py Q8_0 / Q5_K / Q4_0 | bit-exact (#492) |
+| KV, long context (160k reserved) | moe-kv-516.txt |
+
+check_server.py's "next turn" now sends preserve_thinking: the Qwen3.5 template
+drops an earlier turn's reasoning unless it is set, so the follow-up re-prefilled
+(0 of 66 cached); with it, 242 of 259 cached. Clients that want the cache across
+turns on this model send chat_template_kwargs.preserve_thinking = true.
+
+## Qwen3.8-27B: unchanged
+
+| | main 9af4056 (before the MoE decode work) | this branch |
+|---|---:|---:|
+| decode, 100 tokens, step gpu median of 5 | 40.93 ms (40.84-40.96) | 40.93 ms (40.92-40.94) |
+| prefill 4096 (wiki16k), median of 5 | 4065.9 ms (4024-4069) | 4075.6 ms (4063-4077) |
+| greedy 100 tokens | reference | identical |
+| --draft-mtp 3, 100 tokens | - | identical to the reference |
+| check_chat_template.py original / sharp | - | 0 / 27, 0 / 56 mismatches |
+| check_server.py | - | all checks pass |
+| CPU tests (ctest), tools tests (pytest) | - | 14 / 14, 59 passed |
+
+Not available here: the dense model's golden dump (models/golden/cpu), so its
+per-layer suite (check_gpu_run / check_gpu_attn / check_gpu_gdn) was not re-run;
+the greedy and MTP identity above cover the forward pass end to end.

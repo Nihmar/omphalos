@@ -1,8 +1,9 @@
 # omphalos
 
-A from-scratch inference engine for one model on one GPU: `Qwen3.8-27B`
-(GSQ-RCO IQ3_S GGUF) on an AMD Radeon RX 9060 XT 16 GB (RDNA4, `gfx1200`,
-ROCm/HIP). The priorities, in order: VRAM, decode speed, prefill speed. The
+A from-scratch inference engine for one GPU: `Qwen3.8-27B` (GSQ-RCO IQ3_S
+GGUF), and a second model, the mixture-of-experts `Ornith-1.5-35B-A3B`
+(qwen35moe, Q4_K_M / Q2_K_L GGUF; see [The second model](#the-second-model)),
+on an AMD Radeon RX 9060 XT 16 GB (RDNA4, `gfx1200`, ROCm/HIP). The priorities, in order: VRAM, decode speed, prefill speed. The
 weights stay bit-exact with the GGUF (lossless re-layouts only).
 
 - [PLAN.md](PLAN.md): the design and its rationale, the milestones, and the
@@ -86,6 +87,34 @@ they are the answers for anyone about to try the same thing.
 | cross-source draft tree ([#482](https://github.com/Nihmar/omphalos/issues/482)) | the n-gram and the drafter disagree on 6.7 % of steps and the n-gram is right 0/12 times | [draft-xcheck-482.txt](bench/results/draft-xcheck-482.txt) |
 | FFN activation sparsity ([#483](https://github.com/Nihmar/omphalos/issues/483)) | no block below 1e-3 (no exact zeros); a 0.25 %-energy skip is ~1.3 % of a step for ~5 % noise | [ffn-sparsity-483.txt](bench/results/ffn-sparsity-483.txt) |
 | decode megakernel ([#484](https://github.com/Nihmar/omphalos/issues/484)) | ~3 ms of device gap per verify step (5.6 %); a graph recovers ~0.3 ms of it | [launch-gap-484.txt](bench/results/launch-gap-484.txt) |
+
+## The second model
+
+`Ornith-1.5-35B-A3B` (qwen35moe: 40 layers, 256 experts of which 8 per token
+plus a shared one, an MTP block; #490) runs through the same binaries. Its
+Q4_K_M is 20.4 GiB against the card's 16 GiB: every layer keeps its hottest
+experts in VRAM and pins the others in host RAM (~7.2 GiB at a short context,
+~8.7 at 160k reserved), with an LRU over 32 VRAM slots per layer (#512).
+
+```sh
+engine/build/omph-convert models/Ornith-1.5-35B-A3B-Q4_K_M.gguf
+O=models/Ornith-1.5-35B-A3B-Q4_K_M.omph
+# once, optional: the experts' measured use, read at every load (#512) - a few
+# varied prompts' worth; without it the experts that stay in VRAM are by id
+engine/build/omph-run $O prompt-ids.txt /tmp/x.f32 --last-logits --gemv --generate 400 \
+    --gen-out /tmp/g.txt --moe-counts $O.experts
+# the server: MTP drafts 1 token per step on this model (#496); a long prompt
+# prefills faster with --chunk 1024 (#516)
+engine/build/omph-server $O --ctx 131072 --chunk 1024
+```
+
+Measured on this card (desktop active; `bench/results/`): decode 11.2-11.7
+ms/token plain and 9.4-9.8 with MTP (llama.cpp on the same file: 23 ms,
+`-ncmoe 16`; moe-fewer-launches-522.txt); 96 t/s on code edits with MTP +
+n-gram drafts against llama.cpp's 41 (moe-ngram-513.txt); a 128k prefill in
+97 s with 160k of context reserved (llama.cpp: 201 s; moe-kv-516.txt). The KL
+against llama.cpp's own dump is 0.0041, top-1 100 %; the per-layer check
+(`tools/check_gpu_run.py --dump`) passes for both files.
 
 ## Build
 
