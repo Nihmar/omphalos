@@ -206,10 +206,13 @@ def run_checks(url: str) -> None:
                                                   extra_body=effort)
     check(s_reasoning == reasoning and s_content == m.content, "streamed reasoning and answer")
 
-    # the next turn continues the cached sequence (the reasoning sent back)
+    # the next turn continues the cached sequence (the reasoning sent back and
+    # kept: Qwen3.8's template keeps it by default, the Qwen3.5 one - the MoE
+    # model's, #497 - only with preserve_thinking, else it re-prefills the turn)
     turn2 = q + [{"role": "assistant", "content": m.content, "reasoning_content": reasoning},
                  {"role": "user", "content": "And 97?"}]
-    r2 = client.chat.completions.create(model=model, messages=turn2, max_tokens=2048, extra_body=effort)
+    keep = {**effort, "chat_template_kwargs": {"preserve_thinking": True}}
+    r2 = client.chat.completions.create(model=model, messages=turn2, max_tokens=2048, extra_body=keep)
     cached = r2.usage.prompt_tokens_details.cached_tokens
     check(cached >= r.usage.prompt_tokens, f"next turn: {cached} of {r2.usage.prompt_tokens} prompt tokens cached")
     check("yes" in (r2.choices[0].message.content or "").lower(), f"answer: {r2.choices[0].message.content!r}")
