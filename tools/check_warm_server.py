@@ -283,6 +283,12 @@ def main() -> None:
             rng.shuffle(order)  # a different order each pass, back to back
             orders.append(order)
         warm: list[dict[str, str]] = []
+        # a variant's answer that differs from the default fresh one: judged
+        # after the warm server, against a fresh server of the same variant
+        # (#497: on the MoE model the variant's prefill split alone moves a
+        # token - the routing amplifies the GEMV / GEMM rounding - which is
+        # not state leaking between requests)
+        unmatched: dict[str, list[tuple[int, str, int]]] = {}
         with Server(args.omph, args.model, f"warm-{name}", ctx, env=env, extra=extra,
                     mmproj=args.mmproj or None) as url:
             for k, order in enumerate(orders):
@@ -297,14 +303,25 @@ def main() -> None:
                         continue
                     same = t == ref[0] and (n < 0 or ref[1] < 0 or n == ref[1])
                     if vi < BIT_IDENTICAL_VARIANTS:
-                        check(same, f"{name}, order {k + 1}, {item['tag']}: identical to the fresh run")
-                        if not same:
-                            print(f"     got {json.dumps(t[:80])}\n     ref {json.dumps(ref[0][:80])}",
-                                  flush=True)
+                        if same:
+                            check(True, f"{name}, order {k + 1}, {item['tag']}: identical to the fresh run")
+                        else:
+                            unmatched.setdefault(item["tag"], []).append((k, t, n))
                     elif k == 0 and not same:
                         print(f"     {name}, {item['tag']}: differs from the default fresh run "
                               f"(expected for another K precision, #297)", flush=True)
                 warm.append(answers)
+        for tag, runs in unmatched.items():
+            item = next(i for i in items if i["tag"] == tag)
+            with Server(args.omph, args.model, f"fresh-{tag}-{name}", ctx, env=env, extra=extra,
+                        mmproj=args.mmproj or None) as url:
+                own = ask(url, item)
+            for k, t, n in runs:
+                same = t == own[0] and (n < 0 or own[1] < 0 or n == own[1])
+                check(same, f"{name}, order {k + 1}, {tag}: identical to a fresh {name} server "
+                            f"(not the default's: its prefill split differs)")
+                if not same:
+                    print(f"     got {json.dumps(t[:80])}\n     ref {json.dumps(own[0][:80])}", flush=True)
         # The two orders against each other: any difference is state leaking
         # between requests, whatever the configuration.
         for tag in (i["tag"] for i in items):
