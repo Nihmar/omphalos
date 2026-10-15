@@ -80,6 +80,13 @@ bool gemv_q4_0(const void * blocks, const void * x_f16, float * y, int64_t rows,
 // bit of each weight (qh).
 bool gemv_q5k(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k,
               hipStream_t stream);
+// 1..4 tokens per weight read of the GGUF-block types (Q8_0 8, Q4_0 2, Q5_K
+// 13; #496): token t's x at x + t * k, its y at y + t * rows, each token's
+// result its one-token kernel's bit for bit. gemv_multi takes them at 2..4.
+bool gemv_q5k_n(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k, int nt,
+                hipStream_t stream);
+bool gemv_legacy_n(uint32_t type, const void * blocks, const void * x_f16, float * y, int64_t rows,
+                   int64_t k, int nt, hipStream_t stream);
 
 bool gemv_iq1_m(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k,
                 hipStream_t stream);
