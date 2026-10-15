@@ -66,6 +66,9 @@ class Runner {
         const void * dev = nullptr;                  // its bytes in the weight image
         bool sliced = false;  // dev is one expert of a 3-D tensor (#493): the
                               // staged path must read from it, not by name
+        // a routed expert tensor: n_expert device pointers, each expert's
+        // slice in VRAM or in pinned host memory (#512)
+        const void * const * experts = nullptr;
     };
     struct LayerWeights {
         bool recurrent = false;
@@ -90,6 +93,7 @@ class Runner {
         Mat ffn_gate_inp;  // the router, F32 [n_embd, n_expert]
         void * gate_inp16 = nullptr;  // the same weights as f16 (#494)
         Mat ffn_gate_exps, ffn_up_exps, ffn_down_exps;  // [k, n_ff_exp, n_expert]
+        int moe_tab = -1;  // its row of the expert tables and of moe_ids_ (#512)
         const float * ffn_gate_inp_shexp = nullptr;     // [n_embd]
         Mat ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp;
     };
@@ -300,6 +304,26 @@ private:
     // tokens (a step, a verification), the f16 GEMM above.
     static constexpr int64_t kMoeRouterGemvMax = 16;
     bool moe_route(const LayerWeights & L, const int64_t T);
+    // This layer's selection: moe_ids_ keeps one T x topk row per MoE layer,
+    // so a step's selections are all there at its end (#512).
+    // expert e of a routed expert tensor, where the device tables point now
+    const void * expert_ptr(const Mat & m, const int64_t e) const {
+        return moe_eptr_host_[(size_t) (m.experts - static_cast<const void * const *>(moe_eptr_)) + (size_t) e];
+    }
+    int * moe_ids(const LayerWeights & L) const {
+        return static_cast<int *>(moe_ids_) + (size_t) L.moe_tab * (size_t) moe_ids_stride_;
+    }
+    // The expert cache (#512). moe_tables() builds the pointer tables at load;
+    // moe_cache_begin() runs before a forward's kernels: it applies the fills
+    // that are done, turns the last logged selection into LRU decisions
+    // (victims back to their pinned copies, the table uploaded in stream
+    // order) and starts the new fills on the copy stream; moe_cache_log()
+    // copies a step's selections (T <= kMoeLogTokens) back after its layers.
+    static constexpr int64_t kMoeCacheSlots = 32;
+    static constexpr int64_t kMoeLogTokens = 16;
+    void moe_tables();
+    bool moe_cache_begin();
+    bool moe_cache_log(const int64_t T);
     // The shared expert of a MoE layer, one pass for the whole chunk (#493).
     bool moe_shared(const LayerWeights & L, const int64_t T);
     // The router's f16 weights, converted once at load (#494): the logits are
@@ -735,7 +759,40 @@ private:
     void * ffn16_ = nullptr;
     int64_t ffn_n_ = 0;  // the FFN scratch width (n_ff, or the experts' on a MoE model)
     GemvEntry slice_gemv_;  // one expert's slice of a 3-D tensor, for the call in flight (#493)
-    void * moe_ids_ = nullptr;   // tokens x topk int: the routed gate's selection (#493)
+    void * moe_ids_ = nullptr;   // MoE layers x tokens x topk int: the routed gate's selection (#493, #512)
+    int64_t moe_ids_stride_ = 0;  // ints per layer row of moe_ids_
+    // The expert cache (#512): CAP experts of every MoE layer in VRAM, the
+    // first moe_fixed_ of them for good, pinned host copies of the others
+    int64_t moe_cap_ = INT64_MAX;
+    int64_t moe_fixed_ = 0;
+    std::unordered_map<std::string, const void *> expert_host_;  // a cached tensor's pinned copies
+    void * moe_eptr_ = nullptr;                 // device: tables x 3 kinds x n_expert pointers
+    std::vector<const void *> moe_eptr_host_;   // the same, as last uploaded
+    void * moe_eptr_pin_ = nullptr;             // pinned staging of its upload
+    struct MoeTab {
+        const uint8_t * dev[3] = {};   // the slot pool of gate / up / down
+        const uint8_t * host[3] = {};  // their pinned copies of experts fixed..n-1
+        size_t pe[3] = {};             // bytes per expert
+        std::vector<int> owner;        // per slot: the expert in it
+        std::vector<int> slot_of;      // per expert: its slot, -1 if read from host
+        std::vector<int64_t> last;     // per expert: the last step that chose it
+    };
+    std::vector<MoeTab> moe_tabs_;  // only for a cached model; the MTP layer is not logged
+    int64_t moe_log_tabs_ = 0;      // the logged tables (the stack's layers)
+    int * moe_log_ = nullptr;       // pinned: moe_log_tabs_ x kMoeLogTokens x topk
+    int64_t moe_log_T_ = 0;         // the tokens of the logged step, 0: none pending
+    int64_t moe_clock_ = 0;
+    struct MoeFill {
+        int tab, slot, expert;
+    };
+    std::vector<MoeFill> moe_fills_;  // in flight on moe_copy_
+    hipStream_t moe_copy_ = nullptr;
+    hipEvent_t moe_ev_log_ = nullptr;
+    hipEvent_t moe_ev_tbl_ = nullptr;
+    hipEvent_t moe_ev_fill_ = nullptr;
+    hipEvent_t moe_ev_up_ = nullptr;  // the last table upload read moe_eptr_pin_
+    int64_t moe_misses_ = 0;   // OMPH_TIMING: selections read from host / all
+    int64_t moe_selects_ = 0;
     void * moe_w_ = nullptr;     // tokens x topk float: its renormalized weights
     void * moe_down_ = nullptr;  // tokens x n_embd float: one expert's down output
     void * moe_gate_ = nullptr;  // tokens float: the shared expert's sigmoid gate

@@ -110,6 +110,144 @@ bool Runner::embed(const int32_t * toks, const int64_t T, const ForwardInputs * 
 // slot-ordered weighted sum. The order of the sums is fixed (a store per
 // (token, slot) and one combine in slot order): the result does not depend on
 // the atomics' order.
+// The expert cache (#512), before a forward's kernels. Every step costs the
+// host a few microseconds; the device sees at most one table upload. In order:
+//  1. the fills that are done: their experts now read their slots;
+//  2. the selections the last logged step made (if its copy is done and no
+//     fill is in flight): each touches its expert, each host-read expert of a
+//     layer takes the least recently used slot whose expert this step did not
+//     choose - the victim points back at its pinned copy at once, the new
+//     expert only once its fill is done (a later call);
+//  3. the table goes up in the compute stream's order, before the kernels
+//     that read it, and the fills wait for it on the copy stream: a kernel
+//     never reads a slot being written (the victims' last readers came before
+//     the upload in stream order).
+bool Runner::moe_cache_begin() {
+    if (moe_tabs_.empty()) {
+        return true;
+    }
+    bool changed = false;
+    if (!moe_fills_.empty() && hipEventQuery(moe_ev_fill_) == hipSuccess) {
+        const int64_t n = h_.n_expert;
+        for (const MoeFill & f : moe_fills_) {
+            MoeTab & c = moe_tabs_[(size_t) f.tab];
+            c.slot_of[(size_t) f.expert] = f.slot;
+            for (int k = 0; k < 3; ++k) {
+                moe_eptr_host_[((size_t) f.tab * 3 + (size_t) k) * (size_t) n + (size_t) f.expert] =
+                    c.dev[k] + (size_t) f.slot * c.pe[k];
+            }
+        }
+        moe_fills_.clear();
+        changed = true;
+    }
+    std::vector<MoeFill> todo;
+    if (moe_log_T_ > 0 && moe_fills_.empty() && hipEventQuery(moe_ev_log_) == hipSuccess) {
+        const int64_t n = h_.n_expert;
+        const int64_t picks = moe_log_T_ * h_.n_expert_used;
+        ++moe_clock_;
+        for (int64_t tab = 0; tab < moe_log_tabs_; ++tab) {
+            MoeTab & c = moe_tabs_[(size_t) tab];
+            const int * ids = moe_log_ + (size_t) tab * (size_t) (kMoeLogTokens * h_.n_expert_used);
+            for (int64_t i = 0; i < picks; ++i) {
+                c.last[(size_t) ids[i]] = moe_clock_;
+            }
+            for (int64_t i = 0; i < picks; ++i) {
+                const int e = ids[i];
+                const int at = c.slot_of[(size_t) e];
+                if (at >= 0) {
+                    continue;
+                }
+                ++moe_misses_;
+                if (at == -2) {
+                    continue;  // read from host this step, its fill was started by another pick
+                }
+                // the least recently used slot whose expert this step did not
+                // choose (an expert already being filled holds its slot's
+                // owner, chosen now: it is skipped the same way)
+                int victim = -1;
+                for (int64_t s = moe_fixed_; s < moe_cap_; ++s) {
+                    const int o = c.owner[(size_t) s];
+                    if (c.last[(size_t) o] < moe_clock_ &&
+                        (victim < 0 || c.last[(size_t) o] < c.last[(size_t) c.owner[(size_t) victim]])) {
+                        victim = (int) s;
+                    }
+                }
+                if (victim < 0) {
+                    continue;
+                }
+                const int old = c.owner[(size_t) victim];
+                c.slot_of[(size_t) old] = -1;
+                for (int k = 0; k < 3; ++k) {
+                    moe_eptr_host_[((size_t) tab * 3 + (size_t) k) * (size_t) n + (size_t) old] =
+                        c.host[k] + (size_t) (old - moe_fixed_) * c.pe[k];
+                }
+                c.owner[(size_t) victim] = e;
+                c.last[(size_t) e] = moe_clock_;  // a second pick of e in this step is not a new fill
+                c.slot_of[(size_t) e] = -2;       // filling: read from host until it is done
+                todo.push_back(MoeFill{(int) tab, victim, e});
+                changed = true;
+            }
+            moe_selects_ += picks;
+        }
+        moe_log_T_ = 0;
+    }
+    // through a pinned buffer: a pageable source is pinned by the runtime
+    // during the copy, which under host memory pressure stalled the compute
+    // stream for seconds (#512)
+    if (changed) {
+        const size_t bytes = moe_eptr_host_.size() * sizeof(void *);
+        if (hipEventSynchronize(moe_ev_up_) != hipSuccess) {
+            return fail("expert table upload wait failed");
+        }
+        std::memcpy(moe_eptr_pin_, moe_eptr_host_.data(), bytes);
+        if (hipMemcpyAsync(moe_eptr_, moe_eptr_pin_, bytes, hipMemcpyHostToDevice, hipStreamPerThread) !=
+                hipSuccess ||
+            hipEventRecord(moe_ev_up_, hipStreamPerThread) != hipSuccess) {
+            return fail("expert table upload failed");
+        }
+    }
+    if (!todo.empty()) {
+        if (hipEventRecord(moe_ev_tbl_, hipStreamPerThread) != hipSuccess ||
+            hipStreamWaitEvent(moe_copy_, moe_ev_tbl_, 0) != hipSuccess) {
+            return fail("expert fill ordering failed");
+        }
+        for (const MoeFill & f : todo) {
+            const MoeTab & c = moe_tabs_[(size_t) f.tab];
+            for (int k = 0; k < 3; ++k) {
+                if (hipMemcpyAsync(const_cast<uint8_t *>(c.dev[k]) + (size_t) f.slot * c.pe[k],
+                                   c.host[k] + (size_t) (f.expert - moe_fixed_) * c.pe[k], c.pe[k],
+                                   hipMemcpyHostToDevice, moe_copy_) != hipSuccess) {
+                    return fail("expert fill failed");
+                }
+            }
+        }
+        if (hipEventRecord(moe_ev_fill_, moe_copy_) != hipSuccess) {
+            return fail("expert fill event failed");
+        }
+        moe_fills_ = std::move(todo);
+    }
+    return true;
+}
+
+// A step's selections back to the host (#512): one strided copy of every
+// logged layer's T x topk ids after the layers, its event polled by the next
+// moe_cache_begin. A chunk (T > kMoeLogTokens) is not logged, nor is a step
+// while the previous log is still unread.
+bool Runner::moe_cache_log(const int64_t T) {
+    if (moe_tabs_.empty() || T > kMoeLogTokens || moe_log_T_ > 0) {
+        return true;
+    }
+    const size_t row = (size_t) (T * h_.n_expert_used) * sizeof(int);
+    if (hipMemcpy2DAsync(moe_log_, (size_t) (kMoeLogTokens * h_.n_expert_used) * sizeof(int), moe_ids_,
+                         (size_t) moe_ids_stride_ * sizeof(int), row, (size_t) moe_log_tabs_,
+                         hipMemcpyDeviceToHost, hipStreamPerThread) != hipSuccess ||
+        hipEventRecord(moe_ev_log_, hipStreamPerThread) != hipSuccess) {
+        return fail("expert log copy failed");
+    }
+    moe_log_T_ = T;
+    return true;
+}
+
 // The routed gate's selection into moe_ids_ / moe_w_: the logits from a GEMV
 // for a step or a verification (one token's logits do not depend on T, #509)
 // and from the f16 GEMM for a prefill chunk (#494), then the top-k.
@@ -122,7 +260,7 @@ bool Runner::moe_route(const LayerWeights & L, const int64_t T) {
                                                     hipStreamPerThread)
                         : omph::kernels::gemm_f16(L.gate_inp16, h16_, logits, n_expert, ne, T, n_expert,
                                                   hipStreamPerThread);
-    return ok && omph::kernels::moe_topk(moe_logits_, static_cast<int *>(moe_ids_),
+    return ok && omph::kernels::moe_topk(moe_logits_, moe_ids(L),
                                          static_cast<float *>(moe_w_), T, n_expert,
                                          (int) h_.n_expert_used, hipStreamPerThread);
 }
@@ -133,7 +271,7 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
     const int64_t shexp = h_.n_ff_shexp;
     const int topk = (int) h_.n_expert_used;
     const int n_expert = (int) h_.n_expert;
-    auto * ids = static_cast<int *>(moe_ids_);
+    auto * ids = moe_ids(L);
     auto * weights = static_cast<float *>(moe_w_);
 
     if (!moe_route(L, T)) {
@@ -176,18 +314,15 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
     // The expert slices (the expert dim is the outermost in the 3-D tensor)
     // and the x of a grouped GEMM (the gathered rows for gate / up, the
     // swiglu output on the same rows for the down)
-    const int64_t gate_stride = (int64_t) L.ffn_gate_exps.t->stored / h_.n_expert;
-    const int64_t up_stride = (int64_t) L.ffn_up_exps.t->stored / h_.n_expert;
-    const int64_t down_stride = (int64_t) L.ffn_down_exps.t->stored / h_.n_expert;
     const int64_t gate_rows = (int64_t) L.ffn_gate_exps.t->ne[1];
     const int64_t up_rows = (int64_t) L.ffn_up_exps.t->ne[1];
     const int64_t down_rows = (int64_t) L.ffn_down_exps.t->ne[1];
     // The expert slices: the expert dim is the outermost in the 3-D tensor, so
     // a slice is a pointer plus a GemvEntry with the slice's rows/k
-    const auto slice = [this](const Mat & base, const int64_t off, const int64_t rows,
+    const auto slice = [this](const Mat & base, const int64_t e, const int64_t rows,
                               const int64_t k) -> Mat {
         Mat m = base;
-        m.dev = static_cast<const uint8_t *>(base.dev) + off;
+        m.dev = expert_ptr(base, e);
         m.sliced = true;
         if (base.gemv != nullptr) {
             slice_gemv_ = *base.gemv;
@@ -200,12 +335,12 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
     // The x of a grouped GEMM is the gathered rows (gate / up) or the swiglu
     // output on the same rows (down): both are laid out per gathered row.
     const bool no_group = std::getenv("OMPH_MOE_NO_GROUP") != nullptr;  // A/B (#494)
-    const auto grouped = [&](const Mat & w, const int64_t per_expert, const void * x,
+    const auto grouped = [&](const Mat & w, const void * x,
                              const int64_t n_out, const int64_t k, float * y, const int64_t ldy) {
         if (no_group) {
             return false;
         }
-        return omph::kernels::gemm_q_grouped(w.t->type, w.dev, per_expert, x,
+        return omph::kernels::gemm_q_grouped(w.t->type, w.experts, x,
                                              static_cast<const int *>(moe_off_),
                                              static_cast<const int *>(moe_cnt_), n_expert, max_rows, y,
                                              n_out, k, ldy, hipStreamPerThread);
@@ -227,8 +362,8 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
     };
     // gate and up: grouped when the type has a tile kernel, else one expert at a
     // time, both writing at the gathered row offsets
-    if (!grouped(L.ffn_gate_exps, gate_stride, xg, ffn, ne, ffn1, ffn) ||
-        !grouped(L.ffn_up_exps, up_stride, xg, ffn, ne, ffn2, ffn)) {
+    if (!grouped(L.ffn_gate_exps, xg, ffn, ne, ffn1, ffn) ||
+        !grouped(L.ffn_up_exps, xg, ffn, ne, ffn2, ffn)) {
         if (!ensure_host_counts()) {
             return fail("moe fallback readback failed");
         }
@@ -237,9 +372,9 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
             const int64_t off = at;
             at += n_e;
             if (n_e > 0 &&
-                (!matmul(slice(L.ffn_gate_exps, (int64_t) e * gate_stride, gate_rows, ne),
+                (!matmul(slice(L.ffn_gate_exps, e, gate_rows, ne),
                          xg + off * ne, ffn1 + off * ffn, ffn, ne, n_e) ||
-                 !matmul(slice(L.ffn_up_exps, (int64_t) e * up_stride, up_rows, ne), xg + off * ne,
+                 !matmul(slice(L.ffn_up_exps, e, up_rows, ne), xg + off * ne,
                          ffn2 + off * ffn, ffn, ne, n_e))) {
                 return fail("moe gate/up (batched) failed");
             }
@@ -251,7 +386,7 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
                                    hipStreamPerThread)) {
         return fail("moe swiglu (batched) failed");
     }
-    if (!grouped(L.ffn_down_exps, down_stride, ffn16_, ne, ffn, down_out, ne)) {
+    if (!grouped(L.ffn_down_exps, ffn16_, ne, ffn, down_out, ne)) {
         if (!ensure_host_counts()) {
             return fail("moe fallback readback failed");
         }
@@ -260,7 +395,7 @@ bool Runner::moe_ffn_batched(const LayerWeights & L, const int64_t T) {
             const int64_t off = at;
             at += n_e;
             if (n_e > 0 &&
-                !matmul(slice(L.ffn_down_exps, (int64_t) e * down_stride, down_rows, ffn),
+                !matmul(slice(L.ffn_down_exps, e, down_rows, ffn),
                         reinterpret_cast<const __half *>(ffn16_) + off * ffn, down_out + off * ne, ne,
                         ffn, n_e)) {
                 return fail("moe down (batched) failed");
@@ -287,7 +422,7 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
     const int64_t ffn = h_.n_ff_exp;
     const int64_t shexp = h_.n_ff_shexp;
     const int topk = (int) h_.n_expert_used;
-    auto * ids = static_cast<int *>(moe_ids_);
+    auto * ids = moe_ids(L);
     auto * weights = static_cast<float *>(moe_w_);
 
     if (!moe_route(L, T)) {
@@ -297,23 +432,20 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
     // each matrix kind is one launch over every selected expert. It needs all
     // three to be tile-layout types; the per-expert path below falls back.
     {
-        const int64_t gate_stride = (int64_t) L.ffn_gate_exps.t->stored / h_.n_expert;
-        const int64_t up_stride = (int64_t) L.ffn_up_exps.t->stored / h_.n_expert;
-        const int64_t down_stride = (int64_t) L.ffn_down_exps.t->stored / h_.n_expert;
         const int64_t gate_rows = (int64_t) L.ffn_gate_exps.t->ne[1];
         const int64_t up_rows = (int64_t) L.ffn_up_exps.t->ne[1];
         const int64_t down_rows = (int64_t) L.ffn_down_exps.t->ne[1];
         auto * ffn1 = static_cast<float *>(ffn1_);
         auto * ffn2 = static_cast<float *>(ffn2_);
         auto * down_out = static_cast<float *>(moe_down_);
-        if (omph::kernels::gemv_moe(L.ffn_gate_exps.t->type, L.ffn_gate_exps.dev, gate_stride, ids,
+        if (omph::kernels::gemv_moe(L.ffn_gate_exps.t->type, L.ffn_gate_exps.experts, ids,
                                     h16_, ffn1, gate_rows, ne, topk, false, hipStreamPerThread) &&
-            omph::kernels::gemv_moe(L.ffn_up_exps.t->type, L.ffn_up_exps.dev, up_stride, ids, h16_,
+            omph::kernels::gemv_moe(L.ffn_up_exps.t->type, L.ffn_up_exps.experts, ids, h16_,
                                     ffn2, up_rows, ne, topk, false, hipStreamPerThread) &&
             omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
                                       static_cast<const float *>(ffn2_), ffn16_, topk * h_.n_ff_exp,
                                       hipStreamPerThread) &&
-            omph::kernels::gemv_moe(L.ffn_down_exps.t->type, L.ffn_down_exps.dev, down_stride, ids,
+            omph::kernels::gemv_moe(L.ffn_down_exps.t->type, L.ffn_down_exps.experts, ids,
                                     ffn16_, down_out, down_rows, h_.n_ff_exp, topk, true,
                                     hipStreamPerThread) &&
             omph::kernels::moe_combine(static_cast<float *>(cur_), down_out, weights, 1, topk, ne,
@@ -335,10 +467,10 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
 
     // The expert dim is the outermost: one expert is a contiguous run of tiles
     // (and of GGUF blocks), so a slice is a pointer plus the entries' rows/k.
-    const auto slice = [this](const Mat & base, const int64_t off, const int64_t rows,
+    const auto slice = [this](const Mat & base, const int64_t e, const int64_t rows,
                               const int64_t k) -> Mat {
         Mat m = base;
-        m.dev = static_cast<const uint8_t *>(base.dev) + off;
+        m.dev = expert_ptr(base, e);
         m.sliced = true;
         if (base.gemv != nullptr) {
             // the entry's rows/k describe the whole tensor: the slice needs its
@@ -350,11 +482,6 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
         }
         return m;
     };
-    const int64_t gate_stride =
-        h_.n_expert > 0 ? (int64_t) L.ffn_gate_exps.t->stored / h_.n_expert : 0;
-    const int64_t up_stride = h_.n_expert > 0 ? (int64_t) L.ffn_up_exps.t->stored / h_.n_expert : 0;
-    const int64_t down_stride =
-        h_.n_expert > 0 ? (int64_t) L.ffn_down_exps.t->stored / h_.n_expert : 0;
     const int64_t gate_rows = (int64_t) L.ffn_gate_exps.t->ne[1];
     const int64_t up_rows = (int64_t) L.ffn_up_exps.t->ne[1];
     const int64_t down_rows = (int64_t) L.ffn_down_exps.t->ne[1];
@@ -368,17 +495,17 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
                 return fail("moe_route chose an out-of-range expert");
             }
             const char * what = nullptr;
-            if (!matmul(slice(L.ffn_gate_exps, e * gate_stride, gate_rows, ne), x16,
+            if (!matmul(slice(L.ffn_gate_exps, e, gate_rows, ne), x16,
                         static_cast<float *>(ffn1_), ffn, ne, 1)) {
                 what = "gate projection";
-            } else if (!matmul(slice(L.ffn_up_exps, e * up_stride, up_rows, ne), x16,
+            } else if (!matmul(slice(L.ffn_up_exps, e, up_rows, ne), x16,
                                static_cast<float *>(ffn2_), ffn, ne, 1)) {
                 what = "up projection";
             } else if (!omph::kernels::swiglu_f16(static_cast<const float *>(ffn1_),
                                                   static_cast<const float *>(ffn2_), ffn16_, ffn,
                                                   gemv_stream_)) {
                 what = "swiglu";
-            } else if (!matmul(slice(L.ffn_down_exps, e * down_stride, down_rows, ffn), ffn16_,
+            } else if (!matmul(slice(L.ffn_down_exps, e, down_rows, ffn), ffn16_,
                                static_cast<float *>(moe_down_), ne, ffn, 1)) {
                 what = "down projection";
             } else if (!omph::kernels::moe_acc(out_t, static_cast<const float *>(moe_down_),
@@ -478,6 +605,9 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
         (void) hipEventRecord(step_a, nullptr);
     }
     const int64_t ne = h_.n_embd;
+    if (!moe_cache_begin()) {
+        return false;
+    }
 
     if (!embed(toks.data(), T, in, static_cast<float *>(x_))) {
         return false;
@@ -574,6 +704,9 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
             (void) hipMemcpy(host.data(), x_, host.size() * 4, hipMemcpyDeviceToHost);
             write_f32(trace_dir + "/l_out-" + std::to_string(il) + ".f32", host);
         }
+    }
+    if (!moe_cache_log(T)) {
+        return false;
     }
 
     // MTP (#124): the h_p the block pairs with the next tokens, every row.

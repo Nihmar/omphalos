@@ -183,6 +183,14 @@ uint64_t type_nbytes(uint32_t type, const std::vector<uint64_t> & ne) {
     return n;
 }
 
+void File::release_data() const {
+    const size_t page = (size_t) ::sysconf(_SC_PAGESIZE);
+    const size_t from = ((size_t) data_offset_ + page - 1) / page * page;
+    if (from < size_) {
+        (void) ::madvise(const_cast<uint8_t *>(base_) + from, size_ - from, MADV_DONTNEED);
+    }
+}
+
 File::File(const std::string & path) {
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) {

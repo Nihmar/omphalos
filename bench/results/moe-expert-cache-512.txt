@@ -1,0 +1,61 @@
+# MoE expert cache: hot experts in VRAM slots, the rest pinned, an LRU (#512)
+
+Model: Ornith-1.5-35B-A3B-Q4_K_M.omph, auto host budget. Placement:
+
+| | main (#495 prefix) | #512 |
+|---|---|---|
+| VRAM experts | layers 11-39 whole | 186 of 256 per layer (154 fixed by id + 32 LRU slots) |
+| pinned host | 5.09 GiB (layers 0-10) | 7.24 GiB (experts 154-255 of every layer) |
+| process RAM during a run | 5.1 GiB anon + 15.4 GiB of the file mapped | 7.6 GiB anon, 65 MiB file (release_data + bounce upload) |
+| MemAvailable during a run (31 GiB machine) | - | 22.5 GiB |
+
+## Decode (`OMPH_TIMING=1 omph-run ... --gemv --generate 400`, step gpu)
+
+Median over the 400 steps, then the median of 5 runs. Chat prompts
+(enable_thinking false / false / true): code = a red-black tree in Python,
+ita = an Italian essay on Venice, tech = CPU caches and false sharing.
+"static" = the #512 placement with the LRU updates disabled (a temporary
+switch, measured for this table only). Engine: main 9af4056 vs the #512 branch.
+
+| prompt | main | static per expert | **LRU** | selections read from host (LRU) |
+|---|---:|---:|---:|---:|
+| code | 16.74 ms | 15.79 ms | **14.38 ms** | 7.61 % |
+| ita | 16.74 ms | 16.00 ms | **12.79 ms** | 5.84 % |
+| tech | 16.75 ms | 15.86 ms | **13.81 ms** | 6.47 % |
+
+runs (main / static / LRU):
+code 16.78 16.74 16.74 16.74 16.75 / 15.79 15.79 15.77 15.79 15.77 / 14.43 14.35 14.38 14.39 13.24
+ita  16.73 16.74 16.74 16.74 16.73 / 16.02 16.00 16.00 15.99 16.01 / 13.60 12.79 12.77 12.80 12.79
+tech 16.75 16.75 16.75 16.75 16.76 / 15.86 15.86 15.88 15.88 15.86 / 13.81 13.81 13.82 13.79 13.81
+
+Greedy tokens identical in all three configurations (400 per prompt).
+llama.cpp on the same file: 23 ms/step (-ncmoe 16, moe-placement-495.txt).
+
+The miss rates match the offline simulation from traced selections (by-id
+fixed set: 5.8-7.6 %); a calibrated fixed set simulated at 2.8-4.1 % (#512
+step 3).
+
+## Prefill and load
+
+| | main | #512 |
+|---|---:|---:|
+| prefill 4096 (wiki16k, chunk 1024), 3 runs | 2225 / 2254 / 2218 ms | 2111 / 2107 / 2112 ms |
+| load + 2 tokens (warm page cache), 3 runs | 1.81-1.82 s | 2.58-2.64 s |
+
+The load is slower: the device upload goes through a pinned bounce buffer.
+A hipMemcpy straight from the mapping registers those pages with the driver,
+which keeps them resident and faults them back after `madvise` - with the
+7.24 GiB pinned on top, the kernel's reclaim failed (`kswapd0: page allocation
+failure`) and decode steps stalled for up to 20 s.
+
+## Validation
+
+| | KL vs llama.cpp's CPU dump | top-1 |
+|---|---:|---:|
+| Q4_K_M prefill (5 tokens) | 0.004076 (unchanged) | 100 % |
+| Q4_K_M forced decode | 0.004104 (unchanged) | 100 % |
+| Q2_K_L with the cache forced (OMPH_MOE_HOST_MIB=4096), forced decode | 0.004337 (unchanged) | 100 % |
+
+Q2_K_L with the cache forced: prefill logits bit-identical to main, 300
+greedy tokens identical (the per-expert fallback reads through the tables).
+The dense model: 100 greedy tokens identical, 40.91 ms/step on both builds.
