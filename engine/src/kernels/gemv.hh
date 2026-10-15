@@ -89,10 +89,12 @@ bool gemv_iq2_s(const void * packed, const void * x_f16, float * y, int64_t rows
 
 // BF16 weights (type 30), single token: a plain dot product, no codebook.
 // One launch for every selected expert of a 3-D tensor's slice (#497): the
-// device ids pick the expert per slot (no host round trip) and the slot's rows
-// of output go to y + slot * rows. `per_slot_x` selects the down projections,
-// whose input rows are per slot. False for a type without a tile body.
-bool gemv_moe(uint32_t type, const void * exps, int64_t per_expert, const void * ids,
+// device ids pick the expert per slot (no host round trip), `exps[expert]` its
+// slice (a device array of pointers into VRAM or pinned host memory, #512),
+// and the slot's rows of output go to y + slot * rows. `per_slot_x` selects
+// the down projections, whose input rows are per slot. False for a type
+// without a tile body.
+bool gemv_moe(uint32_t type, const void * const * exps, const void * ids,
               const void * x_f16, float * y, int64_t rows, int64_t k, int64_t topk,
               bool per_slot_x, hipStream_t stream);
 

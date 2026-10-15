@@ -2976,7 +2976,7 @@ bool dequant_repacked(const uint32_t type, const void * packed, void * dst_f16,
 //
 // One launch for every selected expert of one matrix of a 3-D tensor (#497):
 // grid.z is the expert *slot* (the router's ranking), ids[slot] picks the
-// expert and the slot's rows of output go to y + slot * rows. `PerSlotX` is the
+// expert, exps[expert] its slice (VRAM or pinned host memory, #512) and the slot's rows of output go to y + slot * rows. `PerSlotX` is the
 // down projections, whose input rows are per slot; the gate / up read the same
 // token. The tile layout's offsets are a function of the tile and block index
 // alone, so an expert is a contiguous run of tiles and one launch covers all
@@ -2986,44 +2986,44 @@ namespace {
 
 template <class TD, bool PerSlotX>
 __global__ __launch_bounds__(256, 8) void gemv_moe_tile_kernel(
-    const uint8_t * __restrict__ wt, const int * __restrict__ ids, const long long per_expert,
+    const uint8_t * const * __restrict__ exps, const int * __restrict__ ids,
     const __half * __restrict__ x, float * __restrict__ y, const long long rows,
     const long long blocks) {
     __shared__ __attribute__((aligned(16))) uint8_t lds[TD::kLds + 8704];
     const long long slot = blockIdx.z;
-    const uint8_t * w = wt + (size_t) ids[slot] * (size_t) per_expert;
+    const uint8_t * w = exps[ids[slot]];
     const __half * xs = PerSlotX ? x + slot * (blocks * 256) : x;
     tiles_body<TD, 1>(w, xs, y + slot * rows, rows, blocks, (long long) blockIdx.x, lds);
 }
 
 template <class TD, bool PerSlotX>
-bool launch_moe_tile(const uint8_t * wt, const int * ids, const int64_t per_expert, const __half * x,
+bool launch_moe_tile(const uint8_t * const * exps, const int * ids, const __half * x,
                      float * y, const int64_t rows, const int64_t k, const int topk, hipStream_t stream) {
     if (rows % 16 != 0 || k % 256 != 0 || topk <= 0 || topk > 64) {
         return false;
     }
     const unsigned grid = (unsigned) ((rows / 16 + kTileTiles - 1) / kTileTiles);
     gemv_moe_tile_kernel<TD, PerSlotX><<<dim3(grid, 1, (unsigned) topk), 256, 0, stream>>>(
-        wt, ids, per_expert, x, y, rows, k / 256);
+        exps, ids, x, y, rows, k / 256);
     return hipGetLastError() == hipSuccess;
 }
 
 } // namespace
 
-bool gemv_moe(const uint32_t type, const void * exps, const int64_t per_expert, const void * ids,
+bool gemv_moe(const uint32_t type, const void * const * exps, const void * ids,
               const void * x_f16, float * y, const int64_t rows, const int64_t k, const int64_t topk,
               const bool per_slot_x, hipStream_t stream) {
-    if (exps == nullptr || ids == nullptr || x_f16 == nullptr || y == nullptr || per_expert <= 0 ||
+    if (exps == nullptr || ids == nullptr || x_f16 == nullptr || y == nullptr ||
         rows <= 0 || k <= 0 || topk <= 0 || topk > 64) {
         return false;
     }
-    const auto * wt = static_cast<const uint8_t *>(exps);
+    const auto * wt = reinterpret_cast<const uint8_t * const *>(exps);
     const auto * id = static_cast<const int *>(ids);
     const auto * x = static_cast<const __half *>(x_f16);
     const auto run = [&](const auto td) {
-        return per_slot_x ? launch_moe_tile<decltype(td), true>(wt, id, per_expert, x, y, rows, k,
+        return per_slot_x ? launch_moe_tile<decltype(td), true>(wt, id, x, y, rows, k,
                                                                 (int) topk, stream)
-                          : launch_moe_tile<decltype(td), false>(wt, id, per_expert, x, y, rows, k,
+                          : launch_moe_tile<decltype(td), false>(wt, id, x, y, rows, k,
                                                                  (int) topk, stream);
     };
     switch (type) {

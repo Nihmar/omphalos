@@ -73,6 +73,8 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
             std::string name;
             size_t off;
             bool host = false;
+            size_t src = 0;  // the bytes of the tensor it holds (len 0: all of them)
+            size_t len = 0;
         };
         std::vector<Place> places;
         std::vector<std::pair<const omph::gguf::File *, const omph::gguf::TensorInfo *>> all;
@@ -126,7 +128,23 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 host_budget = std::max<int64_t>(0, total_bytes + margin - (int64_t) free_vram);
             }
             host_budget = std::min(host_budget, expert_bytes);
+            // The expert cache (#512): every MoE layer keeps the same number of
+            // experts (CAP) in VRAM slots - the budget's share of one expert of
+            // every expert tensor - and pinned host copies of the experts from
+            // R = CAP - kMoeCacheSlots up. Experts below R never move; the
+            // slots R..CAP-1 hold the recently used ones of the rest.
+            if (host_budget > 0) {
+                int64_t per_set = 0;
+                for (const auto & [f, tp] : all) {
+                    if (f == &file_ && in_stack(tp->name) && is_expert(tp->name)) {
+                        per_set += (int64_t) (tp->stored / (uint64_t) h_.n_expert);
+                    }
+                }
+                moe_cap_ = std::clamp<int64_t>((expert_bytes - host_budget) / per_set, 0, h_.n_expert);
+                moe_fixed_ = std::max<int64_t>(0, moe_cap_ - kMoeCacheSlots);
+            }
         }
+        const bool cached = moe_cap_ < h_.n_expert;
         int64_t host_used = 0;
         size_t dev_total = 0;
         size_t host_total = 0;
@@ -174,7 +192,18 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 e.type = t.type;
                 gems_[name] = e;
             }
-            const bool host = f == &file_ && is_expert(name) && host_used < host_budget;
+            if (cached && f == &file_ && is_expert(name)) {
+                // experts 0..CAP-1 in the device pool, R..n-1 in pinned memory
+                const size_t pe = (size_t) (t.stored / (uint64_t) h_.n_expert);
+                const size_t dev_len = (size_t) moe_cap_ * pe;
+                const size_t host_len = (size_t) (h_.n_expert - moe_fixed_) * pe;
+                places.push_back(Place{f, &t, name, dev_total, false, 0, dev_len});
+                places.push_back(Place{f, &t, name, host_total, true, (size_t) moe_fixed_ * pe, host_len});
+                dev_total += aligned(dev_len);
+                host_total += aligned(host_len);
+                continue;
+            }
+            const bool host = !cached && f == &file_ && is_expert(name) && host_used < host_budget;
             const size_t bytes = aligned(t.stored);
             Place pl{f, &t, name, host ? host_total : dev_total, host};
             if (host) {
@@ -196,28 +225,83 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
             host_weights_ = mem_.host(host_total, "cannot allocate the host weight image");
             host_weight_bytes_ = host_total;
         }
+        // The device uploads go through a pinned bounce buffer: a hipMemcpy
+        // from the mapping itself has the runtime register those pages with
+        // the driver, which keeps them resident (and re-faults them after
+        // release_data) - 15 GiB of the second model's file stayed mapped (#512)
+        // (two of them: the memcpy of one chunk overlaps the DMA of the last)
+        constexpr size_t kBounce = 64 << 20;
+        void * bounce[2] = {};
+        hipEvent_t done[2] = {};
+        const auto release = [&]() {
+            (void) hipStreamSynchronize(hipStreamPerThread);
+            for (int i = 0; i < 2; ++i) {
+                if (bounce[i] != nullptr) {
+                    (void) hipHostFree(bounce[i]);
+                }
+                if (done[i] != nullptr) {
+                    (void) hipEventDestroy(done[i]);
+                }
+            }
+        };
+        for (int i = 0; dev_total > 0 && i < 2; ++i) {
+            if (hipHostMalloc(&bounce[i], kBounce) != hipSuccess ||
+                hipEventCreateWithFlags(&done[i], hipEventDisableTiming) != hipSuccess) {
+                release();
+                throw std::runtime_error("cannot allocate the upload buffers");
+            }
+        }
+        int turn = 0;
         for (const Place & p : places) {
             uint8_t * base = p.host ? static_cast<uint8_t *>(host_weights_)
                                     : static_cast<uint8_t *>(dev_weights_);
-            if (hipMemcpy(base + p.off, p.f->tensor_data(*p.t), (size_t) p.t->stored,
-                          p.host ? hipMemcpyHostToHost : hipMemcpyHostToDevice) != hipSuccess) {
-                throw std::runtime_error("cannot upload " + p.name);
+            const size_t len = p.len > 0 ? p.len : (size_t) p.t->stored;
+            const uint8_t * src = p.f->tensor_data(*p.t) + p.src;
+            if (p.host) {
+                std::memcpy(base + p.off, src, len);
+            } else {
+                for (size_t at = 0; at < len; at += kBounce, turn ^= 1) {
+                    const size_t n = std::min(kBounce, len - at);
+                    if (hipEventSynchronize(done[turn]) != hipSuccess) {
+                        release();
+                        throw std::runtime_error("cannot upload " + p.name);
+                    }
+                    std::memcpy(bounce[turn], src + at, n);
+                    if (hipMemcpyAsync(base + p.off + at, bounce[turn], n, hipMemcpyHostToDevice,
+                                       hipStreamPerThread) != hipSuccess ||
+                        hipEventRecord(done[turn], hipStreamPerThread) != hipSuccess) {
+                        release();
+                        throw std::runtime_error("cannot upload " + p.name);
+                    }
+                }
             }
-            weight_ptr_[p.name] = base + p.off;
+            // a cached expert tensor (#512): the pool is the tensor's pointer
+            (cached && p.host && is_expert(p.name) ? expert_host_ : weight_ptr_)[p.name] = base + p.off;
         }
+        release();
         if (env_.timing && host_total > 0) {
             std::fprintf(stderr, "weights: %.2f GiB device, %.2f GiB host-mapped (OMPH_MOE_HOST_MIB=%lld)\n",
                          (double) dev_total / 1073741824.0, (double) host_total / 1073741824.0,
                          (long long) env_.moe_host_mib);
+            if (cached) {
+                std::fprintf(stderr, "expert cache: %lld of %lld experts per layer in VRAM, %lld fixed (#512)\n",
+                             (long long) moe_cap_, (long long) h_.n_expert, (long long) moe_fixed_);
+            }
         }
     }
 
     resolve_layers();
     if (h_.moe()) {
         moe_router_f16();
+        moe_tables();
     }
     if (dft_file_ != nullptr) {
         dflash_load();
+    }
+    // the weights are all uploaded: the mapping is only the metadata's now
+    file_.release_data();
+    if (dft_file_ != nullptr) {
+        dft_file_->release_data();
     }
 
     // The f16 staging scratch holds the slice of rows of one weight that a
@@ -270,7 +354,9 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
     alloc(&ffn2_, T * ffn_n_ * 4);
     alloc(&ffn16_, T * ffn_n_ * 2);
     if (h_.moe()) {
-        alloc(&moe_ids_, (size_t) T * h_.n_expert_used * sizeof(int));
+        moe_ids_stride_ = T * h_.n_expert_used;
+        alloc(&moe_ids_, (size_t) moe_eptr_host_.size() / 3 / (size_t) h_.n_expert * (size_t) moe_ids_stride_ *
+                             sizeof(int));
         alloc(&moe_w_, (size_t) T * h_.n_expert_used * sizeof(float));
         // the batched path keeps one down output per gathered row (#494)
         alloc(&moe_down_, (size_t) T * h_.n_expert_used * ne * 4);
@@ -540,6 +626,19 @@ Runner::~Runner() {
         (void) hipStreamDestroy(side_);
         (void) hipEventDestroy(ev_fork_);
         (void) hipEventDestroy(ev_join_);
+    }
+    if (moe_copy_ != nullptr) {
+        if (env_.timing && moe_selects_ > 0) {
+            std::fprintf(stderr, "expert cache: %lld of %lld logged selections read from host (%.2f %%)\n",
+                         (long long) moe_misses_, (long long) moe_selects_,
+                         100.0 * (double) moe_misses_ / (double) moe_selects_);
+        }
+        (void) hipStreamSynchronize(moe_copy_);
+        (void) hipStreamDestroy(moe_copy_);
+        (void) hipEventDestroy(moe_ev_log_);
+        (void) hipEventDestroy(moe_ev_tbl_);
+        (void) hipEventDestroy(moe_ev_fill_);
+        (void) hipEventDestroy(moe_ev_up_);
     }
 }
 
@@ -1393,6 +1492,82 @@ void Runner::moe_router_f16() {
     }
     if (hipDeviceSynchronize() != hipSuccess) {
         throw std::runtime_error("the router conversion failed");
+    }
+}
+
+// The expert pointer tables (#512): one row of n_expert pointers per MoE
+// layer and matrix kind, every kernel reads an expert through it. Without a
+// cache (the experts fit) a row is base + e * per_expert, the addresses the
+// kernels computed before; with one, experts 0..CAP-1 start in their own
+// slots and the rest point at their pinned copies.
+void Runner::moe_tables() {
+    std::vector<LayerWeights *> ls;
+    for (LayerWeights & L : layers_) {
+        if (L.ffn_gate_exps.t != nullptr) {
+            ls.push_back(&L);
+        }
+    }
+    moe_log_tabs_ = (int64_t) ls.size();
+    if (mtp_L_.ffn_gate_exps.t != nullptr) {
+        ls.push_back(&mtp_L_);
+    }
+    const int64_t n = h_.n_expert;
+    const bool cached = moe_cap_ < n;
+    moe_eptr_host_.assign(ls.size() * 3 * (size_t) n, nullptr);
+    moe_eptr_ = mem_.device(moe_eptr_host_.size() * sizeof(void *), "cannot allocate the expert tables");
+    if (cached) {
+        moe_tabs_.resize(ls.size());
+    }
+    for (size_t i = 0; i < ls.size(); ++i) {
+        LayerWeights & L = *ls[i];
+        L.moe_tab = (int) i;
+        Mat * kinds[3] = {&L.ffn_gate_exps, &L.ffn_up_exps, &L.ffn_down_exps};
+        for (int k = 0; k < 3; ++k) {
+            Mat & m = *kinds[k];
+            const size_t pe = (size_t) (m.t->stored / (uint64_t) n);
+            const auto * dev = static_cast<const uint8_t *>(m.dev);
+            const auto it = expert_host_.find(m.name);
+            const auto * host = it != expert_host_.end() ? static_cast<const uint8_t *>(it->second) : nullptr;
+            if (cached && host == nullptr) {
+                throw std::runtime_error(m.name + ": no pinned copy for the expert cache");
+            }
+            const void ** row = moe_eptr_host_.data() + (i * 3 + (size_t) k) * (size_t) n;
+            for (int64_t e = 0; e < n; ++e) {
+                row[e] = cached && e >= moe_cap_ ? host + (size_t) (e - moe_fixed_) * pe : dev + (size_t) e * pe;
+            }
+            m.experts = static_cast<const void * const *>(moe_eptr_) + (i * 3 + (size_t) k) * (size_t) n;
+            if (cached) {
+                moe_tabs_[i].dev[k] = dev;
+                moe_tabs_[i].host[k] = host;
+                moe_tabs_[i].pe[k] = pe;
+            }
+        }
+        if (cached) {
+            MoeTab & c = moe_tabs_[i];
+            c.owner.resize((size_t) moe_cap_);
+            c.slot_of.assign((size_t) n, -1);
+            c.last.assign((size_t) n, 0);
+            for (int64_t e = 0; e < moe_cap_; ++e) {
+                c.owner[(size_t) e] = (int) e;
+                c.slot_of[(size_t) e] = (int) e;
+            }
+        }
+    }
+    if (hipMemcpy(moe_eptr_, moe_eptr_host_.data(), moe_eptr_host_.size() * sizeof(void *),
+                  hipMemcpyHostToDevice) != hipSuccess) {
+        throw std::runtime_error("cannot upload the expert tables");
+    }
+    if (cached) {
+        moe_eptr_pin_ = mem_.host(moe_eptr_host_.size() * sizeof(void *), "cannot allocate the expert table staging");
+        moe_log_ = static_cast<int *>(mem_.host((size_t) moe_log_tabs_ * kMoeLogTokens * h_.n_expert_used * sizeof(int),
+                                                "cannot allocate the expert log"));
+        if (hipStreamCreateWithFlags(&moe_copy_, hipStreamNonBlocking) != hipSuccess ||
+            hipEventCreateWithFlags(&moe_ev_log_, hipEventDisableTiming) != hipSuccess ||
+            hipEventCreateWithFlags(&moe_ev_tbl_, hipEventDisableTiming) != hipSuccess ||
+            hipEventCreateWithFlags(&moe_ev_fill_, hipEventDisableTiming) != hipSuccess ||
+            hipEventCreateWithFlags(&moe_ev_up_, hipEventDisableTiming) != hipSuccess) {
+            throw std::runtime_error("cannot create the expert cache's stream");
+        }
     }
 }
 
