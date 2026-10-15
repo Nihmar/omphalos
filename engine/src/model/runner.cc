@@ -162,7 +162,37 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                     ctx_bytes += (int64_t) omph::kernels::attention_gqa_work_bytes(
                         T, h_.n_head, h_.n_head_kv, h_.head_dim, kvcap, omph::kernels::attention_key_chunk(kvcap));
                 }
-                host_budget = std::max<int64_t>(0, total_bytes + margin + ctx_bytes - (int64_t) free_vram);
+                // The chunk-sized allocations past a 512 chunk, which the margin
+                // was measured with (#525: --chunk 2048 at 160k filled the card
+                // and the driver evicted 14 GB to GTT): the same expressions as
+                // the allocations below - the activations, the FFN and MoE
+                // buffers, the MTP h rows, the delta-net's prefill scratch and
+                // the chunked head's f32 logits (tmp_logits_, on first use)
+                int64_t act_bytes = 0;
+                if (T > 512) {
+                    const int64_t topk = h_.n_expert_used;
+                    const int64_t ffn_n = std::max(std::max(h_.n_ff, std::max(std::max(h_.n_ff_exp, h_.n_ff_shexp),
+                                                                              h_.ssm_inner)),
+                                                   topk * h_.n_ff_exp);
+                    const int64_t mtp_rows = mtp ? 2 * ne * 4 : 0;
+                    const int64_t per_token = 4 * ne * 4 + ne * 2 + fused * 4 + ssm_v * 4 + 2 * attn_q * 4 +
+                                              2 * attn_kv * 4 + ffn_n * (4 + 4 + 2) +
+                                              topk * (4 + ne * 4 + ne * 2 + ne * 4 + 4 + 4) + h_.n_expert * 4 +
+                                              (h_.n_layer + 1) * topk * 4 + mtp_rows +
+                                              std::min<int64_t>(h_.n_vocab, 32768) * 4;
+                    const int64_t gdn = h_.ssm_n_vh > 0
+                                            ? (omph::kernels::gdn_work_floats(T, h_.ssm_n_vh, h_.ssm_n_kh) +
+                                               omph::kernels::gdn_wy_floats(T, h_.ssm_n_vh, h_.ssm_n_kh)) * 4 *
+                                                  (T - 512) / T
+                                            : 0;
+                    act_bytes = per_token * (T - 512) + gdn;
+                }
+                if (env_.timing) {
+                    std::fprintf(stderr, "expert budget: margin %lld + context %lld + chunk %lld MiB\n",
+                                 (long long) (margin >> 20), (long long) (ctx_bytes >> 20),
+                                 (long long) (act_bytes >> 20));
+                }
+                host_budget = std::max<int64_t>(0, total_bytes + margin + ctx_bytes + act_bytes - (int64_t) free_vram);
             }
             host_budget = std::min(host_budget, expert_bytes);
             // The expert cache (#512): every MoE layer keeps the same number of

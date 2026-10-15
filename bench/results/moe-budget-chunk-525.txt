@@ -1,0 +1,25 @@
+# The auto expert budget and the prefill chunk's activations (#525)
+
+Ornith-1.5-35B-A3B-Q4_K_M, omph-server --ctx 163840, K4/V4, MTP, a 131072-token
+prompt (wikitext-2 test rebuilt as text, then 32k more), 128 tokens generated;
+tools/check_max_context.py (rows in max-context-237.txt). VRAM is the device
+total with the desktop; GTT unchanged means the driver evicted nothing.
+
+The budget kept a fixed 768 MiB after the weights (and, since #516, the KV,
+the MTP cache and the attention work at the configured context). The chunk's
+activations grow with --chunk; past 512 they did not fit. The budget now adds
+the chunk-sized allocations past 512 (the same expressions as the
+allocations: activations, FFN and MoE buffers, MTP h rows, the delta-net's
+prefill scratch, the chunked head's f32 logits): 277 MiB at 1024, 832 MiB at
+2048 (OMPH_TIMING prints "expert budget: margin + context + chunk").
+
+| chunk | before: prefill / decode / VRAM peak / GTT | after: prefill / decode / VRAM peak / GTT | experts in VRAM, pinned |
+|---:|---|---|---|
+| 1024 | 97.1 s / 12.2 ms / 16010 MiB / 178 -> 178 | 97.3 s / 10.9 ms / 15781 MiB / 178 -> 178 | 165 per layer, 8.93 GiB |
+| 2048 | 124.2 s / 14.6 ms / 16303 MiB / 178 -> **14348** | **80.4 s (1631 t/s)** / 11.5 ms / 15637 MiB / 178 -> 178 | 157 per layer, 9.51 GiB |
+
+(512 and smaller chunks are unchanged: the addition starts past 512.)
+
+The 128k prefill with 160k reserved is now 80.4 s at chunk 2048 (llama.cpp:
+201 s), at the cost of 9.5 GiB of pinned experts and a ~5 % slower decode than
+chunk 1024 (fewer experts resident). The moe-coding-agent preset stays at 1024.
