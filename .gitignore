@@ -32,6 +32,9 @@ tools/native/dump_tensors
 tools/native/isa_probe
 tools/native/dump_mtmd_logits
 
+# The AppImage tools/appimage/build.sh writes (#534)
+tools/appimage/dist/
+
 # rocprofv3 output
 .rocprofv3/
 

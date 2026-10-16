@@ -1,0 +1,8 @@
+# The TUI's runtime tree, for the AppImage (#534). tools/pyproject.toml keeps the
+# floor (textual>=8.2.8, tools/uv.lock); requirements.txt is the build's pin, with
+# hashes, generated from this file by `tools/appimage/build.sh --refresh-requirements`.
+#
+# Nothing else of tools/pyproject.toml is here on purpose: omph_tui.py and tui/
+# import the standard library, Textual and Rich, and nothing more (no gguf, no
+# numpy, no openai).
+textual>=8.2.8
