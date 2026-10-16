@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=omph-tui
+Comment=The terminal UI around omph-server (omphalos, Qwen3.8-27B on gfx1200)
+Exec=omph-tui
+Icon=omph-tui
+Categories=Development;
+Keywords=LLM;inference;omphalos;Qwen;
+Terminal=true
