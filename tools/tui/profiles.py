@@ -26,7 +26,14 @@ PROFILES_PATH = CONFIG_DIR / "profiles.json"
 # The two models the engine runs (#527), each with its files in the repo's
 # models/ (the .omph omph-convert writes; the DFlash2 drafter and the vision
 # encoder are Qwen3.8's - Ornith has neither) and the family a file name says.
-REPO_MODELS = Path(__file__).resolve().parents[2] / "models"
+#
+# `OMPH_MODELS_DIR` moves the directory (#534): the AppImage's sources live in a
+# read-only mount, so the picker (#532) and the family defaults have to be told
+# where the user's models/ is. Read here, at import, because MODELS is built from
+# it. The name follows the tool-level `OMPH_LLAMA_STRICT` of tools/llama_pin.py,
+# and the engine never sees it: tools/tui/server.py strips every OMPH_* from the
+# child.
+REPO_MODELS = Path(os.environ.get("OMPH_MODELS_DIR") or Path(__file__).resolve().parents[2] / "models")
 MODELS: dict[str, dict[str, Path | None]] = {
     "qwen3.8": {"model": REPO_MODELS / "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph",
                 "dflash": REPO_MODELS / "Qwen3.8-27B-DFlash2-Q4_K_M.omph",
