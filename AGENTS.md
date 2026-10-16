@@ -151,6 +151,18 @@ engine/build/omph-capi-demo <model.omph> [<mmproj.gguf> <image>]
 # speculative drafts, the device argmax cannot see them)
 engine/build/omph-server <model.omph> [--port 8080]
 
+# the terminal UI around it (#304, #385): the form, the server's log and one row per request,
+# no GPU work of its own (it starts the server itself); the models directory is the repo's
+# models/, or OMPH_MODELS_DIR (#534, the AppImage's case)
+cd tools && uv run python omph_tui.py --profile coding-agent && cd ..
+
+# the same UI as a single file (#534): a relocatable CPython + Textual inside, the engine
+# binary and the models left on the host (AppRun looks for both); ~70 MiB, no uv needed;
+# the build ends by rendering the real widgets headless (--screenshot), and the AppRun
+# alone is covered by tools/tests/test_appimage_apprun.py
+tools/appimage/build.sh
+tools/appimage/dist/omph-tui-x86_64.AppImage --model models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph
+
 # full forward pass: prefill + greedy decode (options in the table below)
 engine/build/omph-run <model.omph> models/golden/cpu/tokens.txt <out-logits.f32> \
     --gemv --generate 3 --gen-out /tmp/gen.txt [--trace-dir DIR] [--tokens N]

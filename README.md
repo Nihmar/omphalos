@@ -441,6 +441,12 @@ the server and `--demo FILE` replays a saved log, which is how the UI is
 developed and tested without a GPU. The full option, key and mouse tables are
 in [docs/tools.md](docs/tools.md#omph-tui).
 
+The same UI is also one file, no install and no `uv`: `tools/appimage/build.sh`
+writes `omph-tui-x86_64.AppImage` (~70 MiB; a relocatable CPython and Textual
+inside, while the `omph-server` binary and the models stay on the host -- its
+`AppRun` looks for both, `--help` lists everything else). If FUSE is missing,
+`APPIMAGE_EXTRACT_AND_RUN=1` runs the same file (#534).
+
 ### Serving a coding agent
 
 An agent whose model entry has no sampling parameters does not send

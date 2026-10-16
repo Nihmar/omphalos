@@ -32,3 +32,11 @@ The exact commands and the layers each check uses are in
 [AGENTS.md](../AGENTS.md) ("Entry points"). The golden dump lives in
 `models/golden/cpu` (local, git-ignored) and is regenerated with `native/`
 (`build.sh` + `dump_tensors`) against a llama.cpp build.
+
+## The terminal UI, and its AppImage
+
+`omph_tui.py` and `tui/` are the terminal UI around `omph-server` (#304), run
+from here (`uv run python omph_tui.py`): no GPU work of their own, and no part of
+the importable package above. `appimage/` packs the same UI into one file
+(`build.sh`, ~70 MiB, #534): a relocatable CPython and Textual inside, the engine
+binary and the models left on the host.
