@@ -1,0 +1,67 @@
+#!/bin/sh
+# omph-tui's AppRun (#534): start the bundled UI on the host's server and models.
+#
+# The image carries the TUI and a Python, nothing else: omph-server needs ROCm,
+# a gfx1200 GPU and an 11 GiB .omph, so it stays a host file, and the weights
+# stay where the host keeps them. Two lookups happen here, before the UI parses
+# its own options; everything else is passed through untouched.
+#
+#   models    $OMPH_MODELS_DIR if the caller set one; else $PWD/models when the
+#             current directory is a checkout; else $XDG_DATA_HOME/omphalos/models
+#             (created). tools/tui/profiles.py reads it for the picker and for
+#             the form's family defaults.
+#   binary    --binary on the command line wins; else $PWD/engine/build/omph-server
+#             when the current directory is a checkout; else `omph-server` in PATH.
+#             --exec (run something else) and --demo (replay a log) need none.
+#
+# Usage is the TUI's own (--model, --profile, --demo, --screenshot, ...): see
+# `--help`, or docs/tools.md.
+set -eu
+
+# $APPDIR is the mount point the runtime sets; readlink keeps a symlinked
+# launcher, and the extract-and-run fallback, working the same way.
+HERE=$(dirname "$(readlink -f "$0")")
+BUNDLE="$HERE/usr/lib/omphalos"
+PY="$BUNDLE/bin/python3"
+
+if [ ! -x "$PY" ]; then
+    echo "omph-tui: no bundled interpreter at $PY" >&2
+    exit 1
+fi
+
+# An AppImage is hermetic: a shell that exports PYTHONPATH (or has a Python
+# user site) must not shadow the Textual the image was built against.
+unset PYTHONPATH PYTHONHOME
+PYTHONNOUSERSITE=1
+export PYTHONNOUSERSITE
+
+# 1. the models directory
+if [ -z "${OMPH_MODELS_DIR:-}" ]; then
+    if [ -d "$PWD/models" ]; then
+        OMPH_MODELS_DIR="$PWD/models"
+    else
+        OMPH_MODELS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/omphalos/models"
+        # A missing directory is not fatal: the form still takes an explicit
+        # path (`--model`) and the preflight names what is missing.
+        mkdir -p "$OMPH_MODELS_DIR" 2>/dev/null || true
+    fi
+    export OMPH_MODELS_DIR
+fi
+
+# 2. the server binary, unless one was named or no server is wanted
+want_binary=1
+for arg in "$@"; do
+    case "$arg" in
+        --binary|--binary=*) want_binary=0 ;;
+        --exec|--exec=*|--demo|--demo=*) want_binary=0 ;;
+    esac
+done
+if [ "$want_binary" = 1 ]; then
+    if [ -x "$PWD/engine/build/omph-server" ]; then
+        set -- --binary "$PWD/engine/build/omph-server" "$@"
+    elif command -v omph-server >/dev/null 2>&1; then
+        set -- --binary "$(command -v omph-server)" "$@"
+    fi
+fi
+
+exec "$PY" "$BUNDLE/tools/omph_tui.py" "$@"

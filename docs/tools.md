@@ -148,7 +148,7 @@ server's own log, so it also shows the requests another client (pi, curl) sent.
 | `--dflash FILE` | the model family's: `models/Qwen3.8-27B-DFlash2-Q4_K_M.omph` when it exists, none for Ornith | the DFlash2 drafter `.omph` the form starts on (`--dflash ""` for the MTP head) |
 | `--mmproj FILE` | the model family's: `models/mmproj-Qwen3.8-27B-BF16.gguf` when it exists, none for Ornith | the vision encoder the form starts on, run on the CPU (`--mmproj ""` for no vision; #385) |
 | `--profile NAME` | `coding-agent` | the profile to start the form from (see `tools/tui/profiles.py`: `default`, `coding-agent`, `long-context`, `fast`, `vision`, and the MoE model's `moe-chat`, `moe-coding-agent`, #527) |
-| `--binary PATH` | `engine/build/omph-server` | the server to run |
+| `--binary PATH` | `engine/build/omph-server` | the server to run (the AppImage's `AppRun` fills it in when you pass none, #534) |
 | `--exec CMD` | off | run this command instead of the server: a fake server for development |
 | `--demo FILE` | off | replay a saved log instead of running anything |
 | `--poll SECONDS` | `0.1` | how often the UI drains the server's lines |
@@ -192,6 +192,44 @@ command, which is how `tools/tests/test_tui.py` drives the UI headlessly
 (Textual's `Pilot`: clicks, keys, the narrow layout, the modal flows) next to
 `tools/tests/test_tui_log.py` (the log parser) and `test_tui_schema.py` (every
 flag in the form exists in `engine/src/tools/server.cc`).
+
+The **models directory** is the repository's `models/`, or `OMPH_MODELS_DIR` when
+that is set (#534): the picker (#532), the families' default drafter and encoder,
+the VRAM estimate's family and `--model qwen3.8` / `--model ornith` all follow it.
+The engine never sees the variable -- `tools/tui/server.py` strips every `OMPH_*`
+from the child's environment, so it cannot reach a run's configuration.
+
+### AppImage
+
+`tools/appimage/build.sh` writes `tools/appimage/dist/omph-tui-x86_64.AppImage`
+(~70 MiB): one executable, no install, no `uv`, no checkout -- the way to drive a
+server from another machine, or from a phone over ssh. It carries a relocatable
+CPython (python-build-standalone, pinned by release *and* sha256), the TUI's runtime
+tree from `tools/appimage/requirements.txt` (Textual and Rich, hashed; the TUI
+imports nothing else of `tools/pyproject.toml`) and `tools/omph_tui.py` +
+`tools/tui/` byte for byte.
+
+The engine is not in it: `omph-server` needs ROCm, gfx1200 and an 11 GiB `.omph`.
+`AppRun` looks for it -- `--binary` if you passed one, else
+`$PWD/engine/build/omph-server`, else `omph-server` in `PATH` -- and for the models
+directory (`$OMPH_MODELS_DIR`, else `$PWD/models`, else
+`$XDG_DATA_HOME/omphalos/models`, created). Everything else is this tool's own CLI,
+`--help` included.
+
+```sh
+tools/appimage/build.sh              # build, then smoke-test the artifact headless
+tools/appimage/build.sh --refresh-requirements   # re-resolve the pin first (network)
+./tools/appimage/dist/omph-tui-x86_64.AppImage --profile long-context
+```
+
+The last build step runs the artifact from a directory with no checkout in sight:
+`--screenshot` renders the real widgets and exits, so an interpreter or a Textual
+that does not import fails the build rather than the first launch. Without FUSE,
+`APPIMAGE_EXTRACT_AND_RUN=1` runs the same file. The build is pinned rather than
+bit-reproducible -- the interpreter by release and tarball sha256, the dependency
+tree by the hashes in `requirements.txt` (the AppImage carries mksquashfs'
+timestamps) -- and refreshing the interpreter is a one-line edit at the top of
+`build.sh`.
 
 ## omph-capi-demo
 
