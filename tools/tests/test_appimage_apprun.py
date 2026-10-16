@@ -24,7 +24,8 @@ def appdir(tmp_path: Path) -> Path:
                       'for a in "$@"; do echo "arg:$a"; done\n'
                       'echo "models:${OMPH_MODELS_DIR:-}"\n'
                       'echo "pythonpath:${PYTHONPATH:-}"\n'
-                      'echo "usersite:${PYTHONNOUSERSITE:-}"\n')
+                      'echo "usersite:${PYTHONNOUSERSITE:-}"\n'
+                      'echo "ld:${LD_LIBRARY_PATH:-}"\n')
     python.chmod(python.stat().st_mode | stat.S_IXUSR)
     (app / "usr/lib/omphalos/tools").mkdir()
     (app / "usr/lib/omphalos/tools/omph_tui.py").write_text("")
@@ -42,6 +43,15 @@ def run_app(app: Path, cwd: Path, *args: str, **env: str) -> subprocess.Complete
     e = {"PATH": "/usr/bin:/bin", "HOME": str(home), "LC_ALL": "C", **env}
     return subprocess.run([str(app / "AppRun"), *args], cwd=cwd, env=e,
                           capture_output=True, text=True, check=False)
+
+
+def bundle_engine(app: Path) -> Path:
+    """The engine copy the build puts in the image."""
+    server = app / "usr/lib/omphalos/engine/omph-server"
+    server.parent.mkdir(parents=True, exist_ok=True)
+    server.write_text("#!/bin/sh\n")
+    server.chmod(server.stat().st_mode | stat.S_IXUSR)
+    return server
 
 
 def test_the_checkout_supplies_both(tmp_path) -> None:
@@ -112,6 +122,69 @@ def test_an_explicit_choice_is_left_alone(tmp_path) -> None:
         p = run_app(app, here, *other)
         assert p.returncode == 0, p.stderr
         assert str(server) not in p.stdout, other
+
+
+def test_the_bundled_engine_is_the_default(tmp_path) -> None:
+    """An installed AppImage needs no checkout and no PATH entry: its own copy of
+    omph-server, with its own libraries (and only then LD_LIBRARY_PATH)."""
+    app = appdir(tmp_path)
+    server = bundle_engine(app)
+    here = tmp_path / "elsewhere"
+    here.mkdir()
+
+    p = run_app(app, here)
+    assert p.returncode == 0, p.stderr
+    assert f"arg:--binary\narg:{server}\n" in p.stdout
+    assert f"ld:{server.parent}\n" in p.stdout
+
+
+def test_a_checkout_engine_keeps_its_own_libraries(tmp_path) -> None:
+    """A fresher build in $PWD must not be handed the image's older libraries:
+    an engine built here loads its build tree's, and a newer binary against an
+    older libomphalos.so is a mixed-ABI crash."""
+    app = appdir(tmp_path)
+    bundle_engine(app)
+    here = tmp_path / "omphalos"
+    (here / "engine/build").mkdir(parents=True)
+    built = here / "engine/build/omph-server"
+    built.write_text("#!/bin/sh\n")
+    built.chmod(built.stat().st_mode | stat.S_IXUSR)
+
+    p = run_app(app, here, "--binary", str(built))
+    assert f"arg:--binary\narg:{built}\n" in p.stdout
+    assert "ld:\n" in p.stdout
+
+
+def test_the_env_names_the_engine(tmp_path) -> None:
+    """OMPH_SERVER_BINARY: an installed AppImage pointed at any engine."""
+    app = appdir(tmp_path)
+    bundled = bundle_engine(app)
+    here = tmp_path / "elsewhere"
+    here.mkdir()
+
+    p = run_app(app, here, OMPH_SERVER_BINARY="/opt/omph-server")
+    assert "arg:--binary\narg:/opt/omph-server\n" in p.stdout
+    assert str(bundled) not in p.stdout
+    assert "ld:\n" in p.stdout
+
+
+def test_the_bundled_copy_beats_the_checkout_and_the_path(tmp_path) -> None:
+    app = appdir(tmp_path)
+    bundled = bundle_engine(app)
+    here = tmp_path / "omphalos"
+    (here / "engine/build").mkdir(parents=True)
+    built = here / "engine/build/omph-server"
+    built.write_text("#!/bin/sh\n")
+    built.chmod(built.stat().st_mode | stat.S_IXUSR)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    in_path = bindir / "omph-server"
+    in_path.write_text("#!/bin/sh\n")
+    in_path.chmod(in_path.stat().st_mode | stat.S_IXUSR)
+
+    p = run_app(app, here, PATH=f"{bindir}:/usr/bin:/bin")
+    assert f"arg:--binary\narg:{bundled}\n" in p.stdout
+    assert str(built) not in p.stdout and str(in_path) not in p.stdout
 
 
 def test_the_models_dir_can_be_set_from_outside(tmp_path) -> None:

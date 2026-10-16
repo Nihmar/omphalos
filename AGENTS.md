@@ -156,10 +156,11 @@ engine/build/omph-server <model.omph> [--port 8080]
 # models/, or OMPH_MODELS_DIR (#534, the AppImage's case)
 cd tools && uv run python omph_tui.py --profile coding-agent && cd ..
 
-# the same UI as a single file (#534): a relocatable CPython + Textual inside, the engine
-# binary and the models left on the host (AppRun looks for both); ~70 MiB, no uv needed;
-# the build ends by rendering the real widgets headless (--screenshot), and the AppRun
-# alone is covered by tools/tests/test_appimage_apprun.py
+# the same UI as a single file (#534): a relocatable CPython + Textual and the engine inside
+# (omph-server and the libraries ldd finds outside the system and ROCm), the models left on the
+# host (AppRun looks for OMPH_MODELS_DIR / $PWD/models / $XDG_DATA_HOME/omphalos/models), ~81 MiB,
+# no uv needed; the build renders the real widgets headless (--screenshot) and starts the bundled
+# engine once, and the AppRun alone is covered by tools/tests/test_appimage_apprun.py
 tools/appimage/build.sh
 tools/appimage/dist/omph-tui-x86_64.AppImage --model models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph
 
