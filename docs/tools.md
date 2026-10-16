@@ -206,18 +206,24 @@ from the child's environment, so it cannot reach a run's configuration.
 server from another machine, or from a phone over ssh. It carries a relocatable
 CPython (python-build-standalone, pinned by release *and* sha256), the TUI's runtime
 tree from `tools/appimage/requirements.txt` (Textual and Rich, hashed; the TUI
-imports nothing else of `tools/pyproject.toml`) and `tools/omph_tui.py` +
-`tools/tui/` byte for byte.
+imports nothing else of `tools/pyproject.toml`), `tools/omph_tui.py` + `tools/tui/`
+byte for byte, and **the engine**: `omph-server` plus every library it loads from
+outside the system and outside ROCm (`ldd` decides: `libomphalos.so` from the build
+tree and the mtmd/llama/ggml stack of the CPU vision build), ~23 MB. Once built, the
+image needs nothing of the checkout it came from.
 
-The engine is not in it: `omph-server` needs ROCm, gfx1200 and an 11 GiB `.omph`.
-`AppRun` looks for it -- `--binary` if you passed one, else
-`$PWD/engine/build/omph-server`, else `omph-server` in `PATH` -- and for the models
+ROCm stays the host's -- it has to match the driver and the GPU, and shipping it
+would double the image -- and so do the weights. `AppRun` looks for the models
 directory (`$OMPH_MODELS_DIR`, else `$PWD/models`, else
-`$XDG_DATA_HOME/omphalos/models`, created). Everything else is this tool's own CLI,
-`--help` included.
+`$XDG_DATA_HOME/omphalos/models`, created) and for the engine in this order:
+`--binary` if you passed one, else `$OMPH_SERVER_BINARY`, else the copy in the image,
+else `$PWD/engine/build/omph-server` (a checkout with a fresher build, which loads
+its own build tree's libraries), else `omph-server` in `PATH`. Everything else is
+this tool's own CLI, `--help` included.
 
 ```sh
 tools/appimage/build.sh              # build, then smoke-test the artifact headless
+tools/appimage/build.sh --no-server  # UI only: omph-server is looked up on the host
 tools/appimage/build.sh --refresh-requirements   # re-resolve the pin first (network)
 ./tools/appimage/dist/omph-tui-x86_64.AppImage --profile long-context
 ```

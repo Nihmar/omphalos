@@ -1,18 +1,20 @@
 #!/bin/sh
-# omph-tui's AppRun (#534): start the bundled UI on the host's server and models.
+# omph-tui's AppRun (#534): start the bundled UI and engine on the host's models.
 #
-# The image carries the TUI and a Python, nothing else: omph-server needs ROCm,
-# a gfx1200 GPU and an 11 GiB .omph, so it stays a host file, and the weights
-# stay where the host keeps them. Two lookups happen here, before the UI parses
-# its own options; everything else is passed through untouched.
+# The image carries the TUI, a Python and the engine (`omph-server` with the
+# libraries it needs beyond the system's and ROCm's). ROCm stays the host's -- it
+# has to match the driver -- and the weights are the user's.
 #
 #   models    $OMPH_MODELS_DIR if the caller set one; else $PWD/models when the
 #             current directory is a checkout; else $XDG_DATA_HOME/omphalos/models
 #             (created). tools/tui/profiles.py reads it for the picker and for
 #             the form's family defaults.
-#   binary    --binary on the command line wins; else $PWD/engine/build/omph-server
-#             when the current directory is a checkout; else `omph-server` in PATH.
-#             --exec (run something else) and --demo (replay a log) need none.
+#   engine    --binary on the command line wins; then $OMPH_SERVER_BINARY; then the
+#             copy inside the image; then $PWD/engine/build/omph-server (a checkout
+#             with a fresher build); then `omph-server` in PATH. --exec (run
+#             something else) and --demo (replay a log) need none of them.
+#             The image's copy gets the image's libraries, nothing else does: an
+#             engine built in the checkout must load its own.
 #
 # Usage is the TUI's own (--model, --profile, --demo, --screenshot, ...): see
 # `--help`, or docs/tools.md.
@@ -23,6 +25,7 @@ set -eu
 HERE=$(dirname "$(readlink -f "$0")")
 BUNDLE="$HERE/usr/lib/omphalos"
 PY="$BUNDLE/bin/python3"
+ENGINE="$BUNDLE/engine"
 
 if [ ! -x "$PY" ]; then
     echo "omph-tui: no bundled interpreter at $PY" >&2
@@ -48,7 +51,7 @@ if [ -z "${OMPH_MODELS_DIR:-}" ]; then
     export OMPH_MODELS_DIR
 fi
 
-# 2. the server binary, unless one was named or no server is wanted
+# 2. the engine, unless one was named or no server is wanted
 want_binary=1
 for arg in "$@"; do
     case "$arg" in
@@ -57,7 +60,15 @@ for arg in "$@"; do
     esac
 done
 if [ "$want_binary" = 1 ]; then
-    if [ -x "$PWD/engine/build/omph-server" ]; then
+    if [ -n "${OMPH_SERVER_BINARY:-}" ]; then
+        set -- --binary "$OMPH_SERVER_BINARY" "$@"
+    elif [ -x "$ENGINE/omph-server" ]; then
+        # the image's own copy, with the image's own libraries (LD_LIBRARY_PATH is
+        # only for this one: a checkout's engine has to load its build tree's)
+        LD_LIBRARY_PATH="$ENGINE${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        export LD_LIBRARY_PATH
+        set -- --binary "$ENGINE/omph-server" "$@"
+    elif [ -x "$PWD/engine/build/omph-server" ]; then
         set -- --binary "$PWD/engine/build/omph-server" "$@"
     elif command -v omph-server >/dev/null 2>&1; then
         set -- --binary "$(command -v omph-server)" "$@"

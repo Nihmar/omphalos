@@ -442,10 +442,11 @@ developed and tested without a GPU. The full option, key and mouse tables are
 in [docs/tools.md](docs/tools.md#omph-tui).
 
 The same UI is also one file, no install and no `uv`: `tools/appimage/build.sh`
-writes `omph-tui-x86_64.AppImage` (~70 MiB; a relocatable CPython and Textual
-inside, while the `omph-server` binary and the models stay on the host -- its
-`AppRun` looks for both, `--help` lists everything else). If FUSE is missing,
-`APPIMAGE_EXTRACT_AND_RUN=1` runs the same file (#534).
+writes `omph-tui-x86_64.AppImage` (~81 MiB; a relocatable CPython, Textual and the
+engine inside -- `omph-server` with the libraries it needs beyond the system's and
+ROCm's -- while ROCm itself and the weights stay on the host, and `AppRun` finds
+your `models/`). If FUSE is missing, `APPIMAGE_EXTRACT_AND_RUN=1` runs the same
+file (#534).
 
 ### Serving a coding agent
 
