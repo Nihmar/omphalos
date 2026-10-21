@@ -106,6 +106,9 @@ uv run python check_gpu_run.py ../models/Ornith-1.5-35B-A3B-Q4_K_M.gguf --dump <
 uv run python check_chat_template.py ../models/Ornith-1.5-35B-A3B-Q4_K_M.gguf <llama.cpp>/bin/llama-tokenize
 uv run python check_tokenizer.py ../models/Ornith-1.5-35B-A3B-Q4_K_M.gguf <llama.cpp>/bin/llama-tokenize --fuzz 200
 uv run python check_server.py --model ../models/Ornith-1.5-35B-A3B-Q4_K_M.gguf
+# the router's expert picks vs an exact one, on llama.cpp's own router inputs (#544): a dump of
+# only those tensors (native/dump_tensors ... --only attn_post_norm,ffn_moe_logits), then
+uv run python moe_router_precision.py ../models/Ornith-1.5-35B-A3B-Q4_K_M.gguf <dump-dir>
 cd ..
 
 # tokenizer (#148): text on stdin -> ids, or --decode ids -> text (reads a .gguf or an .omph)

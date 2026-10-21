@@ -1,0 +1,66 @@
+# omphalos
+
+A from-scratch inference engine for one GPU: `Qwen3.8-27B` (GSQ-RCO IQ3_S
+GGUF), and a second model, the mixture-of-experts `Ornith-1.5-35B-A3B`
+(qwen35moe, Q4_K_M / Q2_K_L GGUF; see [The second model](#the-second-model)),
+on an AMD Radeon RX 9060 XT 16 GB (RDNA4, `gfx1200`, ROCm/HIP). The priorities, in order: VRAM, decode speed, prefill speed. The
+weights stay bit-exact with the GGUF (lossless re-layouts only).
+
+- [PLAN.md](PLAN.md): the design and its rationale, the milestones, and the
+  measured status;
+- [AGENTS.md](AGENTS.md): how work is done here, plus every build, run and
+  check command (Entry points);
+- [docs/technical-report.md](docs/technical-report.md): the kernels, layouts
+  and measurements, with the math;
+- [docs/roadmap.md](docs/roadmap.md): the measured status at short and long
+  context and the planned performance work, one issue per item;
+- [tools/README.md](tools/README.md): the Python tooling and validation
+  scripts.
+
+## What it does
+
+| | |
+|---|---|
+| Decode | fused dequant + dot GEMVs on load-time repacked weights; every decode drafts 3 tokens per step with the model's own MTP head, 7 with the DFlash2 drafter (`--dflash`, #245) or up to 15 from an n-gram lookup when the context repeats (#199), and verifies them in one pass: greedy output bit-identical to plain greedy, sampled output with plain sampling's distribution (speculative sampling, #197) |
+| Prefill | fused dequant + WMMA GEMM, WMMA flash attention, token-parallel delta net |
+"""How often the f16 router changes the MoE expert selection (#544).
+
+omphalos computes the router logits from f16 copies of ffn_gate_inp and of the
+FFN input (moe_router / gemm_f16, #494, #509) and the shared expert's gate from
+the f16 input (moe_finish, #522); llama.cpp computes both in f32. This takes
+llama.cpp's own router inputs (attn_post_norm-N) from a golden dump and
+compares, per layer and token, the top-k selection and its renormalized
+weights with f32 and with f16-rounded operands.
+
+    tools/native/dump_tensors -m <model.gguf> -p "$(cat prompt.txt)" -o <dir> -c 1024 \\
+        --only attn_post_norm,ffn_moe_logits
+    uv run python moe_router_precision.py <model.gguf> <dir>
+"""
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+from gguf import GGUFReader
+
+
+def load_dump(d: Path) -> dict[str, np.ndarray]:
+    out = {}
+    for line in (d / "index.jsonl").read_text().splitlines():
+        e = json.loads(line)
+        if e["type"] != "f32":
+            continue
+        ne = [n for n in e["ne"] if n > 1] or [1]
+        out[e["name"]] = np.fromfile(d / e["file"], dtype=np.float32).reshape(ne[::-1])
+    return out
+
+
+def topk(logits: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+    """The selection as moe_topk makes it: softmax over all, the k largest (ties
+    to the lower id), renormalized to sum 1. Rows are tokens."""
+    p = np.exp(logits - logits.max(axis=1, keepdims=True))
+    p /= p.sum(axis=1, keepdims=True)
+    ids = np.argsort(-p, axis=1, kind="stable")[:, :k]
+    w = np.take_along_axis(p, ids, axis=1)
+    return ids, w / w.sum(axis=1, keepdims=True)
+Il faro era rimasto spento per trent'anni. Quando il vecchio guardiano risalì la scala a chiocciola, ogni gradino gli ricordava una notte di tempesta, una nave salvata, una lettera mai spedita.

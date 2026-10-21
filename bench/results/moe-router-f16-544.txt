@@ -1,0 +1,17 @@
+# #544: the f16 router's expert selections vs an exact (f64) router, Ornith-1.5-35B-A3B-Q4_K_M
+# llama.cpp: v0.6.0 b11429 @ d8123504 (pin), build-hip-pin with -ngl 0 (CPU), engine: not involved (offline)
+# tools/native/dump_tensors -m models/Ornith-1.5-35B-A3B-Q4_K_M.gguf -p "$(cat bench/results/moe-router-f16-544.prompt.txt)" \
+#     -o /var/tmp/dump-router-544 -c 2048 -ngl 0 --only attn_post_norm,ffn_moe_logits
+# cd tools && uv run python moe_router_precision.py ../models/Ornith-1.5-35B-A3B-Q4_K_M.gguf /var/tmp/dump-router-544
+# prompt: README head, a Python file, an Italian paragraph (1022 tokens)
+
+40 layers x 1022 tokens = 40880 selections of 8
+    llama.cpp f32 (dumped): 2 selections differ from the exact one (0.005 %), dropped expert weight median 0.0720 max 0.0788
+    f16 weights, f16 input: 59 selections differ from the exact one (0.144 %), dropped expert weight median 0.0784 max 0.1148
+  f16 weights, hi+lo input: 0 selections differ from the exact one (0.000 %), dropped expert weight median 0.0000 max 0.0000
+f16 input vs llama.cpp f32: 59 selections differ (0.144 %)
+same selection: max |weight diff| (f16 vs exact) 0.000195
+shared expert gate: max |sigmoid diff| (f16 input vs exact) 7.1e-05
+
+# the split by operand (same data): f16 weights + f32 input 0 flips, f32 weights + f16 input 59, both f16 59:
+# the input's f16 rounding is the whole effect. Fix: #547 (the input as f16 hi + lo).
