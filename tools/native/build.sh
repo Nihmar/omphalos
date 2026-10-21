@@ -11,7 +11,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -d "$llama_dir/$build/bin" ]] || { echo "missing $llama_dir/$build/bin" >&2; exit 1; }
 
 # the llama.cpp reference (#393): warns when the checkout is not the pin
-uv run python "$here/llama_pin.py" --check "$llama_dir/$build"
+uv run --project "$here/.." python "$here/../llama_pin.py" --check "$llama_dir/$build"
 
 g++ -O2 -std=c++17 "$here/dump_tensors.cpp" \
     -I"$llama_dir/include" -I"$llama_dir/ggml/include" \

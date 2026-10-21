@@ -56,46 +56,54 @@ def main() -> None:
     dump = load_dump(Path(a.dump))
 
     layers = sorted(int(n.rsplit("-", 1)[1]) for n in dump if n.startswith("attn_post_norm-"))
-    picks = changed_tok = tokens = 0
-    worst_w = worst_logit = worst_gate = 0.0
-    swaps = []  # (layer, token, probability gap at the cut of the reference)
+    # each variant's selections against the exact (f64) router: llama.cpp's own
+    # f32 logits (the dump) are the control, the f16 operands what omphalos did
+    # before #547, f16 weights with the input as two f16 halves (hi + lo) after
+    names = ("llama.cpp f32 (dumped)", "f16 weights, f16 input", "f16 weights, hi+lo input")
+    flips = [0, 0, 0]
+    flip_w = [[], [], []]  # the exact weight of the expert a flip dropped
+    between = tokens = 0
+    worst_w = worst_gate = 0.0
     for il in layers:
         x = dump[f"attn_post_norm-{il}"]
         w = w_router[f"blk.{il}.ffn_gate_inp.weight"]
-        ref = x @ w.T
-        if f"ffn_moe_logits-{il}" in dump:  # the dump's own logits: the recomputation is llama.cpp's
-            worst_logit = max(worst_logit, float(np.abs(ref - dump[f"ffn_moe_logits-{il}"].reshape(ref.shape)).max()))
-        x16 = x.astype(np.float16).astype(np.float32)
-        test = x16 @ w.astype(np.float16).astype(np.float32).T
-        ids_r, w_r = topk(ref, k)
-        ids_t, w_t = topk(test, k)
+        exact = x.astype(np.float64) @ w.astype(np.float64).T
+        w16 = w.astype(np.float16).astype(np.float32)
+        hi = x.astype(np.float16).astype(np.float32)
+        lo = (x - hi).astype(np.float16).astype(np.float32)
+        ids_e, w_e = topk(exact, k)
+        sel = [topk(dump[f"ffn_moe_logits-{il}"].reshape(exact.shape), k), topk(hi @ w16.T, k),
+               topk(hi @ w16.T + lo @ w16.T, k)]
         for t in range(x.shape[0]):
-            same = set(ids_r[t]) == set(ids_t[t])
             tokens += 1
-            picks += k
-            if not same:
-                changed_tok += 1
-                p = np.sort(np.exp(ref[t] - ref[t].max()))[::-1]
-                p /= p.sum()
-                swaps.append((il, t, float(p[k - 1] - p[k])))
-            else:
-                o_r = np.argsort(ids_r[t])
-                o_t = np.argsort(ids_t[t])
-                worst_w = max(worst_w, float(np.abs(w_r[t][o_r] - w_t[t][o_t]).max()))
+            ref = set(ids_e[t])
+            for v in range(3):
+                got = set(sel[v][0][t])
+                if got != ref:
+                    flips[v] += 1
+                    dropped = list(ref - got)
+                    flip_w[v] += [float(w_e[t][list(ids_e[t]).index(e)]) for e in dropped]
+            if set(sel[0][0][t]) != set(sel[1][0][t]):
+                between += 1
+            elif set(sel[1][0][t]) == ref:
+                o_e = np.argsort(ids_e[t])
+                o_t = np.argsort(sel[1][0][t])
+                worst_w = max(worst_w, float(np.abs(w_e[t][o_e] - sel[1][1][t][o_t]).max()))
         wg = w_router.get(f"blk.{il}.ffn_gate_inp_shexp.weight")
         if wg is not None:
-            g_r = 1 / (1 + np.exp(-(x @ wg.reshape(-1))))
-            g_t = 1 / (1 + np.exp(-(x16 @ wg.reshape(-1))))
-            worst_gate = max(worst_gate, float(np.abs(g_r - g_t).max()))
+            g_e = 1 / (1 + np.exp(-(x.astype(np.float64) @ wg.reshape(-1).astype(np.float64))))
+            g_t = 1 / (1 + np.exp(-(x.astype(np.float16).astype(np.float32) @ wg.reshape(-1))))
+            worst_gate = max(worst_gate, float(np.abs(g_e - g_t).max()))
 
     print(f"{len(layers)} layers x {tokens // max(len(layers), 1)} tokens = {tokens} selections of {k}")
-    print(f"dumped vs recomputed f32 logits: max |diff| {worst_logit:.3g}")
-    print(f"selections that differ (f16 vs f32): {changed_tok} / {tokens} ({100 * changed_tok / max(tokens, 1):.3f} %)")
-    for il, t, gap in swaps[:20]:
-        print(f"  layer {il} token {t}: the reference's k-th / (k+1)-th probability gap {gap:.2e}")
-    print(f"same selection: max |weight diff| {worst_w:.3g}")
-    print(f"shared expert gate: max |sigmoid diff| {worst_gate:.3g}")
-
+    for v in range(3):
+        fw = flip_w[v]
+        print(f"{names[v]:>26}: {flips[v]} selections differ from the exact one "
+              f"({100 * flips[v] / max(tokens, 1):.3f} %), dropped expert weight "
+              f"median {np.median(fw) if fw else 0:.4f} max {max(fw) if fw else 0:.4f}")
+    print(f"f16 input vs llama.cpp f32: {between} selections differ ({100 * between / max(tokens, 1):.3f} %)")
+    print(f"same selection: max |weight diff| (f16 vs exact) {worst_w:.3g}")
+    print(f"shared expert gate: max |sigmoid diff| (f16 input vs exact) {worst_gate:.3g}")
 
 if __name__ == "__main__":
     main()
