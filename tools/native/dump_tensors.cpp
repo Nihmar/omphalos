@@ -6,10 +6,12 @@
 // tokens are saved to tokens.txt.
 //
 // build: tools/native/build.sh <llama.cpp-dir>
-// usage: dump_tensors -m model.gguf -p "prompt" -o outdir [-ngl 0] [-c 512] [--only P1,P2,...]
+// usage: dump_tensors -m model.gguf -p "prompt" -o outdir [-ngl 0] [-c 512] [--only P1,P2,...] [--all-logits]
 //
 // --only keeps the tensors whose name starts with one of the prefixes (#544: a
 // long prompt's router inputs and logits without the rest of the graph).
+// --all-logits also writes every position's logits to <out>/logits.f32
+// (tokens x vocab), the teacher-forced reference compare_logits.py reads (#547).
 
 #include "llama.h"
 #include "ggml.h"
@@ -127,7 +129,7 @@ static void log_cb(enum ggml_log_level level, const char * text, void * /*user_d
 }
 
 static void usage(const char * prog) {
-    std::fprintf(stderr, "usage: %s -m model.gguf -p \"prompt\" -o outdir [-ngl N] [-c N] [--only P1,P2,...]\n",
+    std::fprintf(stderr, "usage: %s -m model.gguf -p \"prompt\" -o outdir [-ngl N] [-c N] [--only P1,P2,...] [--all-logits]\n",
                  prog);
 }
 
@@ -138,6 +140,7 @@ int main(int argc, char ** argv) {
     int ngl = 0;
     int n_ctx = 512;
     std::vector<std::string> only;
+    bool all_logits = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string key = argv[i];
@@ -165,6 +168,8 @@ int main(int argc, char ** argv) {
                 if (e > b) only.push_back(v.substr(b, e - b));
                 b = e + 1;
             }
+        } else if (key == "--all-logits") {
+            all_logits = true;
         } else if (key == "-h" || key == "--help") {
             usage(argv[0]);
             return 0;
@@ -242,11 +247,31 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    llama_batch batch = llama_batch_get_one(tokens.data(), n_tok);
+    llama_batch batch = llama_batch_init(n_tok, 0, 1);
+    for (int i = 0; i < n_tok; ++i) {
+        batch.token[i] = tokens[i];
+        batch.pos[i] = i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = all_logits || i == n_tok - 1;
+    }
+    batch.n_tokens = n_tok;
     if (llama_decode(ctx, batch) != 0) {
         std::fprintf(stderr, "llama_decode failed\n");
         return 1;
     }
+    if (all_logits) {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        FILE * lf = std::fopen((outdir + "/logits.f32").c_str(), "wb");
+        for (int i = 0; lf != nullptr && i < n_tok; ++i) {
+            std::fwrite(llama_get_logits_ith(ctx, i), sizeof(float), (size_t) n_vocab, lf);
+        }
+        if (lf == nullptr || std::fclose(lf) != 0) {
+            std::fprintf(stderr, "cannot write %s/logits.f32\n", outdir.c_str());
+            return 1;
+        }
+    }
+    llama_batch_free(batch);
 
     std::fclose(st.index);
     std::fprintf(stderr, "dumped %lld tensors (%lld bytes) to %s\n", st.saved, st.bytes,
