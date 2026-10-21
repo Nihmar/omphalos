@@ -817,7 +817,8 @@ private:
     void * moe_cnt_ = nullptr;   // n_expert int: the rows per expert
     std::vector<int> moe_host_ids_;  // the selection, read back for the expert slices
     std::vector<int> moe_counts_;    // per-expert rows in the batched path
-    void * moe_logits_ = nullptr;    // tokens x n_expert f32: the router's logits
+    void * moe_logits_ = nullptr;    // 2 x tokens x n_expert f32: the router's logits (hi, lo; #547)
+    void * h16lo_ = nullptr;         // the MoE FFN input's f16 rounding error (#547)
     void * moe_cnt_max_ = nullptr;   // int: the largest per-expert count of a chunk
     // The delta-net's own scratch (#494): on an expert model the FFN scratch is
     // the experts' width, too small for the token-parallel / WY forms
