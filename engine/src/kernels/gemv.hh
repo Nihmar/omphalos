@@ -76,6 +76,9 @@ bool gemv_q8_0(const void * blocks, const void * x_f16, float * y, int64_t rows,
 bool gemv_q4_0(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k,
                hipStream_t stream);
 
+// Q3_K from its GGUF blocks (#541: the Q2_K_L's down experts), single token.
+bool gemv_q3k(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k, hipStream_t stream);
+
 // Q5_K from its GGUF blocks (#492): d, dmin, the 6-bit scales and the fifth
 // bit of each weight (qh).
 bool gemv_q5k(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k,
@@ -106,8 +109,8 @@ bool gemv_iq2_s(const void * packed, const void * x_f16, float * y, int64_t rows
 // s / slots_per_x: topk for the gate / up of T tokens (slot t * topk + j reads
 // token t), 1 for the down projections (a row per slot). A slot's work does not
 // depend on the slot count, so T tokens give each token's decode result bit for
-// bit (#496). False for a type without a tile body or a legacy 32-wide one
-// (Q8_0 / Q4_0, #540).
+// bit (#496). False for a type without a tile body, a legacy 32-wide one
+// (Q8_0 / Q4_0, #540) or Q3_K (#541).
 constexpr int64_t kMoeMaxSlots = 128;
 // The gate and up projections of the same slots and their SwiGLU in one
 // launch (#522): out_f16[slot * rows + r] = f16(silu(gate . x) * (up . x)), the
