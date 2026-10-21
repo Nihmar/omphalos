@@ -21,9 +21,11 @@ namespace omph::kernels {
 // The routing table on the device (#493): the per-expert counts, their
 // exclusive prefix sum and the gather (xgi = the token) / slot arrays in
 // expert-major order. n_pairs = tokens * topk; at most 256 experts (one
-// thread each).
+// thread each). `act` (optional, n_expert + 1 ints) receives the number of
+// chosen experts, then their ids in increasing order (#551).
 bool moe_order(const void * ids, int64_t n_pairs, int64_t n_expert, int64_t topk, void * counts,
-               void * offs, void * xgi, void * slot, void * max_count, hipStream_t stream);
+               void * offs, void * xgi, void * slot, void * max_count, hipStream_t stream,
+               void * act = nullptr);
 
 // The routed gate's selection: the softmax over a token's router logits (the
 // [tokens, n_expert] f32 rows of the router GEMM, plus the rows of `logits_lo`

@@ -178,7 +178,7 @@ constexpr int kOrderThreads = 256;
 __global__ void moe_order_kernel(const int * __restrict__ ids, const int n_pairs, const int n_expert,
                                  const int topk, int * __restrict__ counts, int * __restrict__ offs,
                                  int * __restrict__ xgi, int * __restrict__ slot,
-                                 int * __restrict__ max_count) {
+                                 int * __restrict__ max_count, int * __restrict__ act) {
     extern __shared__ int cnt[];  // n_expert + 1 counters
     const int e = threadIdx.x;
     if (e < n_expert) {
@@ -195,15 +195,22 @@ __global__ void moe_order_kernel(const int * __restrict__ ids, const int n_pairs
     if (threadIdx.x == 0) {
         int at = 0;
         int mx = 0;
+        int n_act = 0;
         for (int i = 0; i < n_expert; ++i) {
             offs[i] = at;
             const int c = cnt[i];
             cnt[i] = at;
             at += c;
             mx = c > mx ? c : mx;
+            if (act != nullptr && c > 0) {
+                act[1 + n_act++] = i;
+            }
         }
         offs[n_expert] = at;
         *max_count = mx;
+        if (act != nullptr) {
+            act[0] = n_act;
+        }
     }
     __syncthreads();
     for (int i = (int) threadIdx.x; i < n_pairs; i += (int) blockDim.x) {
@@ -334,7 +341,7 @@ bool moe_copy_words(void * dst, const int64_t dpitch, const void * src, const in
 
 bool moe_order(const void * ids, const int64_t n_pairs, const int64_t n_expert, const int64_t topk,
                void * counts, void * offs, void * xgi, void * slot, void * max_count,
-               hipStream_t stream) {
+               hipStream_t stream, void * act) {
     if (ids == nullptr || counts == nullptr || offs == nullptr || xgi == nullptr || slot == nullptr ||
         max_count == nullptr || n_pairs <= 0 || n_expert <= 0 || n_expert > kOrderThreads || topk <= 0) {
         return false;
@@ -344,7 +351,7 @@ bool moe_order(const void * ids, const int64_t n_pairs, const int64_t n_expert, 
                                                    (int) n_expert, (int) topk,
                                                    static_cast<int *>(counts), static_cast<int *>(offs),
                                                    static_cast<int *>(xgi), static_cast<int *>(slot),
-                                                   static_cast<int *>(max_count));
+                                                   static_cast<int *>(max_count), static_cast<int *>(act));
     return hipGetLastError() == hipSuccess;
 }
 

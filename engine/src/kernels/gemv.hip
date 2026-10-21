@@ -3105,6 +3105,185 @@ bool launch_moe_gu(const uint8_t * const * gate, const uint8_t * const * up, con
     return hipGetLastError() == hipSuccess;
 }
 
+
+// The verification's experts grouped (#551): grid.z is the a-th chosen expert
+// (act[1 + a], act[0] of them), whose n = counts[e] <= 16 gathered rows
+// offs[e] .. offs[e] + n - 1 are the WMMA's B columns: the expert's weights are
+// read once for all of its tokens. Column t reads x row xrows[r0 + t] (a
+// token, for gate / up) or r0 + t (a gathered row, for the down projection)
+// and writes row r0 + t. A WMMA output column does not depend on the other
+// columns and the k split's sums do not depend on n, so each (token, expert)
+// is gemv_moe's / gemv_moe_gu's result for that slot bit for bit.
+template <class TD, int KW>
+__global__ __launch_bounds__(256, 8) void gemv_moe_rows_kernel(
+    const uint8_t * const * __restrict__ exps, const int * __restrict__ act, const int * __restrict__ offs,
+    const int * __restrict__ counts, const int * __restrict__ xrows, const __half * __restrict__ x,
+    float * __restrict__ y, const long long rows, const long long blocks) {
+    __shared__ __attribute__((aligned(16))) uint8_t lds[TD::kLds + 8704];
+    if ((int) blockIdx.z >= act[0]) {
+        return;  // the whole workgroup: no barrier is skipped
+    }
+    constexpr int kTiles = 8 / KW;
+    const int e = act[1 + blockIdx.z];
+    const long long r0 = offs[e];
+    const int n = counts[e];
+    float (*red)[16][17] = reinterpret_cast<float (*)[16][17]>(lds + TD::kLds);
+    const int tid = (int) threadIdx.x;
+    TD::init(lds);
+    __syncthreads();
+    const int lane = tid & 31;
+    const int wv = tid >> 5;
+    const int tl = wv / KW;
+    const int kp = wv % KW;
+    const int h = lane >> 4;
+    const int t = lane & 15;
+    const long long tile = (long long) blockIdx.x * kTiles + tl;
+    const bool valid = tile < rows / 16;
+    const long long k = blocks * 256;
+    const long long per = (blocks + KW - 1) / KW;
+    const long long b0 = kp * per;
+    const long long b1 = valid ? (b0 + per < blocks ? b0 + per : blocks) : b0;
+    const __half * xc = t < n ? x + (xrows != nullptr ? (long long) xrows[r0 + t] : r0 + t) * k : nullptr;
+    const uint8_t * wt = exps[e];
+    tile_f8 acc = {};
+    for (long long b = b0; b < b1; ++b) {
+        const typename TD::Blk kb = TD::load(wt + (tile * blocks + b) * TD::kBytes, lane);
+#pragma unroll
+        for (int sb = 0; sb < 8; ++sb) {
+            const long long s = b * 8 + sb;
+#pragma unroll
+            for (int gl = 0; gl < 2; ++gl) {
+                const tile_h8 a = TD::frag(lds, kb, sb, gl, h);
+                tile_h8 bv = {};
+                if (xc != nullptr) {
+                    bv = *reinterpret_cast<const tile_h8 *>(xc + s * 32 + h * 16 + gl * 8);
+                }
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bv, acc);
+            }
+        }
+    }
+#pragma unroll
+    for (int v = 0; v < 8; ++v) {
+        red[wv][h * 8 + v][t] = acc[v];
+    }
+    __syncthreads();
+    for (int idx = tid; idx < kTiles * 16 * n; idx += blockDim.x) {
+        const int tt2 = idx / (16 * n);
+        const int m = (idx / n) % 16;
+        const int tt = idx % n;
+        float sum = red[tt2 * KW][m][tt];
+#pragma unroll
+        for (int i = 1; i < KW; ++i) {
+            sum += red[tt2 * KW + i][m][tt];
+        }
+        const long long row = ((long long) blockIdx.x * kTiles + tt2) * 16 + m;
+        if (row < rows) {
+            y[(r0 + tt) * rows + row] = sum;
+        }
+    }
+}
+
+// ... gate, up and SwiGLU, gemv_moe_gu_kernel's arithmetic per column
+template <class TD>
+__global__ __launch_bounds__(256, 8) void gemv_moe_rows_gu_kernel(
+    const uint8_t * const * __restrict__ gate, const uint8_t * const * __restrict__ up, const int * __restrict__ act,
+    const int * __restrict__ offs, const int * __restrict__ counts, const int * __restrict__ xrows,
+    const __half * __restrict__ x, __half * __restrict__ out, const long long rows, const long long blocks) {
+    __shared__ __attribute__((aligned(16))) uint8_t lds[TD::kLds + 8704];
+    if ((int) blockIdx.z >= act[0]) {
+        return;
+    }
+    const int e = act[1 + blockIdx.z];
+    const long long r0 = offs[e];
+    const int n = counts[e];
+    float (*red)[16][17] = reinterpret_cast<float (*)[16][17]>(lds + TD::kLds);
+    const int tid = (int) threadIdx.x;
+    TD::init(lds);
+    __syncthreads();
+    const int lane = tid & 31;
+    const int wv = tid >> 5;
+    const int tl = wv / kTileKW;  // 0: the gate, 1: the up
+    const int kp = wv % kTileKW;
+    const int h = lane >> 4;
+    const int t = lane & 15;
+    const long long tile = blockIdx.x;
+    const bool valid = tile < rows / 16;
+    const long long k = blocks * 256;
+    const uint8_t * wt = tl == 0 ? gate[e] : up[e];
+    const long long per = (blocks + kTileKW - 1) / kTileKW;
+    const long long b0 = kp * per;
+    const long long b1 = valid ? (b0 + per < blocks ? b0 + per : blocks) : b0;
+    const __half * xc = t < n ? x + (long long) xrows[r0 + t] * k : nullptr;
+    tile_f8 acc = {};
+    for (long long b = b0; b < b1; ++b) {
+        const typename TD::Blk kb = TD::load(wt + (tile * blocks + b) * TD::kBytes, lane);
+#pragma unroll
+        for (int sb = 0; sb < 8; ++sb) {
+            const long long s = b * 8 + sb;
+#pragma unroll
+            for (int gl = 0; gl < 2; ++gl) {
+                const tile_h8 a = TD::frag(lds, kb, sb, gl, h);
+                tile_h8 bv = {};
+                if (xc != nullptr) {
+                    bv = *reinterpret_cast<const tile_h8 *>(xc + s * 32 + h * 16 + gl * 8);
+                }
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bv, acc);
+            }
+        }
+    }
+#pragma unroll
+    for (int v = 0; v < 8; ++v) {
+        red[wv][h * 8 + v][t] = acc[v];
+    }
+    __syncthreads();
+    for (int idx = tid; idx < 16 * n; idx += blockDim.x) {
+        const int m = idx / n;
+        const int tt = idx % n;
+        float g = red[0][m][tt];
+        float u = red[kTileKW][m][tt];
+#pragma unroll
+        for (int i = 1; i < kTileKW; ++i) {
+            g += red[i][m][tt];
+            u += red[kTileKW + i][m][tt];
+        }
+        const long long row = tile * 16 + m;
+        if (row < rows) {
+            out[(r0 + tt) * rows + row] = __float2half((g / (1.0f + expf(-g))) * u);
+        }
+    }
+}
+
+template <class TD>
+bool launch_moe_rows(const uint8_t * const * exps, const int * act, const int * offs, const int * counts,
+                     const int * xrows, const __half * x, float * y, const int64_t rows, const int64_t k,
+                     const int max_act, hipStream_t stream) {
+    if (rows % 16 != 0 || k % 256 != 0 || max_act <= 0) {
+        return false;
+    }
+    // the same k split as launch_moe_tile, so the sums are its own
+    if (k / 256 <= 2) {
+        gemv_moe_rows_kernel<TD, 2><<<dim3((unsigned) ((rows / 16 + 3) / 4), 1, (unsigned) max_act), 256, 0,
+                                       stream>>>(exps, act, offs, counts, xrows, x, y, rows, k / 256);
+    } else {
+        gemv_moe_rows_kernel<TD, kTileKW>
+            <<<dim3((unsigned) ((rows / 16 + kTileTiles - 1) / kTileTiles), 1, (unsigned) max_act), 256, 0,
+               stream>>>(exps, act, offs, counts, xrows, x, y, rows, k / 256);
+    }
+    return hipGetLastError() == hipSuccess;
+}
+
+template <class TD>
+bool launch_moe_rows_gu(const uint8_t * const * gate, const uint8_t * const * up, const int * act, const int * offs,
+                        const int * counts, const int * xrows, const __half * x, __half * out, const int64_t rows,
+                        const int64_t k, const int max_act, hipStream_t stream) {
+    if (rows % 16 != 0 || k % 256 != 0 || max_act <= 0) {
+        return false;
+    }
+    gemv_moe_rows_gu_kernel<TD><<<dim3((unsigned) (rows / 16), 1, (unsigned) max_act), 256, 0, stream>>>(
+        gate, up, act, offs, counts, xrows, x, out, rows, k / 256);
+    return hipGetLastError() == hipSuccess;
+}
+
 } // namespace
 
 // Q8_0 / Q4_0 experts (#540: the MoE MTP block's) and Q3_K ones (#541: the
@@ -3178,6 +3357,69 @@ bool gemv_moe(const uint32_t type, const void * const * exps, const void * ids,
     }
 }
 
+bool gemv_moe_rows_type(const uint32_t type) {
+    switch (type) {
+        case 21: case 18: case 12: case 23: case 17: case 16: case 22: case 10: case 14: return true;
+        default: return false;
+    }
+}
+
+bool gemv_moe_rows(const uint32_t type, const void * const * exps, const void * act, const void * offs,
+                   const void * counts, const void * xrows, const void * x_f16, float * y, const int64_t rows,
+                   const int64_t k, const int64_t max_act, hipStream_t stream) {
+    if (exps == nullptr || act == nullptr || offs == nullptr || counts == nullptr || x_f16 == nullptr || y == nullptr ||
+        rows <= 0 || k <= 0 || max_act <= 0 || max_act > 65535) {
+        return false;
+    }
+    const auto * wt = reinterpret_cast<const uint8_t * const *>(exps);
+    const auto run = [&](const auto td) {
+        return launch_moe_rows<decltype(td)>(wt, static_cast<const int *>(act), static_cast<const int *>(offs),
+                                             static_cast<const int *>(counts), static_cast<const int *>(xrows),
+                                             static_cast<const __half *>(x_f16), y, rows, k, (int) max_act, stream);
+    };
+    switch (type) {
+        case 21: return run(qd::TileIq3s{});
+        case 18: return run(qd::TileIq3xxs{});
+        case 12: return run(qd::TileQ4k{});
+        case 23: return run(qd::TileIq4xs{});
+        case 17: return run(qd::TileIq2xs{});
+        case 16: return run(qd::TileIq2xxs{});
+        case 22: return run(qd::TileIq2s{});
+        case 10: return run(qd::TileQ2k{});
+        case 14: return run(qd::TileQ6k{});
+        default: return false;
+    }
+}
+
+bool gemv_moe_rows_gu(const uint32_t type, const void * const * gate, const void * const * up, const void * act,
+                      const void * offs, const void * counts, const void * xrows, const void * x_f16, void * out_f16,
+                      const int64_t rows, const int64_t k, const int64_t max_act, hipStream_t stream) {
+    if (gate == nullptr || up == nullptr || act == nullptr || offs == nullptr || counts == nullptr ||
+        xrows == nullptr || x_f16 == nullptr || out_f16 == nullptr || rows <= 0 || k <= 0 || max_act <= 0 ||
+        max_act > 65535) {
+        return false;
+    }
+    const auto * g = reinterpret_cast<const uint8_t * const *>(gate);
+    const auto * u = reinterpret_cast<const uint8_t * const *>(up);
+    const auto run = [&](const auto td) {
+        return launch_moe_rows_gu<decltype(td)>(g, u, static_cast<const int *>(act), static_cast<const int *>(offs),
+                                                static_cast<const int *>(counts), static_cast<const int *>(xrows),
+                                                static_cast<const __half *>(x_f16), static_cast<__half *>(out_f16),
+                                                rows, k, (int) max_act, stream);
+    };
+    switch (type) {
+        case 21: return run(qd::TileIq3s{});
+        case 18: return run(qd::TileIq3xxs{});
+        case 12: return run(qd::TileQ4k{});
+        case 23: return run(qd::TileIq4xs{});
+        case 17: return run(qd::TileIq2xs{});
+        case 16: return run(qd::TileIq2xxs{});
+        case 22: return run(qd::TileIq2s{});
+        case 10: return run(qd::TileQ2k{});
+        case 14: return run(qd::TileQ6k{});
+        default: return false;
+    }
+}
 
 // -------------------------------------------------------------- Q8_0 / Q4_0
 //

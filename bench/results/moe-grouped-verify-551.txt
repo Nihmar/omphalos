@@ -1,0 +1,43 @@
+# The MoE verification grouped by expert (#551), Ornith-1.5-35B-A3B-Q4_K_M
+
+engine: perf/551-moe-grouped-verify 7174c6c; the per-slot shape is the same binary with
+OMPH_MOE_NO_ROWS=1 (main's path). RX 9060 XT 16 GB, desktop active. The calibrated expert set.
+
+## 1. Verification cost per block size (oracle drafts, every draft accepted)
+
+omph-run <model> <code prompt, 38 tokens> /dev/null --last-logits --gemv --generate 400
+--draft-oracle <plain greedy ids> --draft-k K, OMPH_TIMING=1 ("ms per generated token"; a step
+verifies K + 1 tokens). One run per cell, before (main 5bf5672 + --moe-trace) and after.
+
+| K (T = K + 1) | per slot: ms/token | grouped: ms/token | ms per step |
+|---:|---:|---:|---|
+| 1 (2) | 8.79 | 8.33 | 17.6 -> 16.7 (-5 %) |
+| 3 (4) | 6.56 | 6.13 | 26.2 -> 24.5 (-7 %) |
+| 7 (8) | 5.58 | 4.86 | 44.6 -> 38.9 (-13 %) |
+| 15 (16) | 7.19 | 4.04 | 115.0 -> 64.6 (-44 %) |
+
+Output identical to plain greedy in all eight runs; --draft-mtp 1 and 3 with OMPH_SPEC_CHECK=1
+identical to plain greedy on the Q4_K_M and the Q2_K_L (whose Q3_K down projections keep the
+per-slot shape).
+
+## 2. Scenarios (tools/scenario_speed.py, MTP, n-gram off / on, KV Q4/Q4, greedy)
+
+Two runs per variant, alternated (rows run 1, slots run 1, rows run 2, slots run 2). Every
+cell wrote the same text in all four runs (text_sha256 equal per scenario and n-gram).
+
+| scenario | n-gram | per slot (t/s) | grouped (t/s) |
+|---|---|---|---|
+| edit-cc | off | 85.0 / 82.3 | 82.9 / 84.4 |
+| edit-cc | on | 98.2 / 93.5 | **117.8 / 121.0** |
+| edit-py | off | 90.0 / 70.4 | 88.6 / 88.6 |
+| edit-py | on | 78.8 / 70.6 | **88.5 / 87.9** |
+| prose | off | 91.2 / 82.9 | 93.5 / 94.1 |
+| prose | on | 89.2 / 86.7 | 91.2 / 90.4 |
+
+The second per-slot run has three low cells (70.4, 82.9, 70.6) that the first does not: with
+MTP alone (2-token blocks, -5 % per step above) the change is within the noise. With the
+n-gram drafts (up to 16-token blocks): edit-cc +23-26 %, edit-py +12-25 %, prose +2-4 %, and
+on edit-py the n-gram drafts no longer lose against MTP alone (88.5 vs 88.6; per slot
+78.8 vs 90.0, #542).
+
+Raw rows: moe-grouped-verify-551-{rows,slots}-{1,2}.jsonl.

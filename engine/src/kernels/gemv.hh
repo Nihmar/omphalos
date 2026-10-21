@@ -123,6 +123,20 @@ bool gemv_moe_gu(uint32_t type, const void * const * gate, const void * const * 
 bool gemv_moe(uint32_t type, const void * const * exps, const void * ids,
               const void * x_f16, float * y, int64_t rows, int64_t k, int64_t slots,
               int64_t slots_per_x, hipStream_t stream);
+// A verification's experts grouped (#551): moe_order's table (act: the chosen
+// experts; offs / counts: each one's gathered rows, at most 16) and one
+// workgroup column per chosen expert (max_act bounds act[0]), so an expert's
+// weights are read once for all of its tokens. Gathered row r reads x row
+// xrows[r] (gate / up: the token) or r (xrows null: the down projection) and
+// writes row r; each row is gemv_moe's / gemv_moe_gu's result for its slot
+// bit for bit. Tile types only (false otherwise).
+bool gemv_moe_rows(uint32_t type, const void * const * exps, const void * act, const void * offs,
+                   const void * counts, const void * xrows, const void * x_f16, float * y, int64_t rows,
+                   int64_t k, int64_t max_act, hipStream_t stream);
+bool gemv_moe_rows_type(uint32_t type);  // the types gemv_moe_rows / _gu take
+bool gemv_moe_rows_gu(uint32_t type, const void * const * gate, const void * const * up, const void * act,
+                      const void * offs, const void * counts, const void * xrows, const void * x_f16,
+                      void * out_f16, int64_t rows, int64_t k, int64_t max_act, hipStream_t stream);
 
 bool gemv_bf16(const void * w, const void * x_f16, float * y, int64_t rows, int64_t k,
                hipStream_t stream);

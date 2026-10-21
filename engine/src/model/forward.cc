@@ -411,6 +411,35 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
     if (!moe_route(L, T)) {
         return fail("moe route failed");
     }
+    // A verification (#551): the routing table orders the block's picks by
+    // expert, and each chosen expert's weights are read once for all of its
+    // tokens (the per-slot shape below read them once per (token, expert)).
+    // Every (token, expert) is that slot's decode result bit for bit, and the
+    // combine runs in slot order as below, so the text cannot change.
+    const auto & ge = L.ffn_gate_exps;
+    const auto & de = L.ffn_down_exps;
+    if (T > 1 && !env_.moe_no_rows && ge.t->type == L.ffn_up_exps.t->type &&
+        ge.t->ne[1] == L.ffn_up_exps.t->ne[1] && omph::kernels::gemv_moe_rows_type(ge.t->type) &&
+        omph::kernels::gemv_moe_rows_type(de.t->type)) {
+        const int64_t n_rows = T * topk;
+        const int64_t max_act = std::min<int64_t>(n_rows, h_.n_expert);
+        auto * xgi = static_cast<int *>(moe_xgi_);
+        auto * slot = static_cast<int *>(moe_slot_);
+        auto * down_out = static_cast<float *>(moe_down_);
+        auto * xo = static_cast<float *>(moe_xo_);
+        if (!omph::kernels::moe_order(ids, n_rows, h_.n_expert, topk, moe_cnt_, moe_off_, xgi, slot, moe_cnt_max_,
+                                      hipStreamPerThread, moe_act_) ||
+            !omph::kernels::gemv_moe_rows_gu(ge.t->type, ge.experts, L.ffn_up_exps.experts, moe_act_, moe_off_,
+                                             moe_cnt_, xgi, h16_, ffn16_, (int64_t) ge.t->ne[1], ne, max_act,
+                                             hipStreamPerThread) ||
+            !omph::kernels::gemv_moe_rows(de.t->type, de.experts, moe_act_, moe_off_, moe_cnt_, nullptr, ffn16_,
+                                          down_out, (int64_t) de.t->ne[1], ffn, max_act, hipStreamPerThread) ||
+            !omph::kernels::moe_scatter_store(xo, down_out, slot, xgi, n_rows, ne, topk, hipStreamPerThread)) {
+            return fail("moe grouped verification failed");
+        }
+        // the routed rows are in xo: the shared expert takes moe_down_
+        return moe_shared(L, T, down_out) && moe_finish(L, T, xo, down_out);
+    }
     // The device-side shape (#497): the selection never leaves the device, and
     // each matrix kind is one launch over every selected expert of every token.
     // It needs all three to be tile-layout types; the per-expert path below
