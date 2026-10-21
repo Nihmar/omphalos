@@ -169,6 +169,9 @@ __global__ void moe_acc_kernel(float * __restrict__ out, const float * __restric
 // order - so a batched step needs no host round trip. The order *inside* an
 // expert's rows does not affect any result: the outputs are summed back per
 // (token, slot), and the combine runs in slot order.
+// one block, one thread per expert (its counter)
+constexpr int kOrderThreads = 256;
+
 __global__ void moe_order_kernel(const int * __restrict__ ids, const int n_pairs, const int n_expert,
                                  const int topk, int * __restrict__ counts, int * __restrict__ offs,
                                  int * __restrict__ xgi, int * __restrict__ slot,
@@ -188,18 +191,15 @@ __global__ void moe_order_kernel(const int * __restrict__ ids, const int n_pairs
     __syncthreads();
     if (threadIdx.x == 0) {
         int at = 0;
+        int mx = 0;
         for (int i = 0; i < n_expert; ++i) {
             offs[i] = at;
             const int c = cnt[i];
             cnt[i] = at;
             at += c;
-        }
-        offs[n_expert] = at;
-        int mx = 0;
-        for (int i = 0; i < n_expert; ++i) {
-            const int c = offs[i + 1 > n_expert ? n_expert : i + 1] - offs[i];
             mx = c > mx ? c : mx;
         }
+        offs[n_expert] = at;
         *max_count = mx;
     }
     __syncthreads();
@@ -331,11 +331,11 @@ bool moe_order(const void * ids, const int64_t n_pairs, const int64_t n_expert, 
                void * counts, void * offs, void * xgi, void * slot, void * max_count,
                hipStream_t stream) {
     if (ids == nullptr || counts == nullptr || offs == nullptr || xgi == nullptr || slot == nullptr ||
-        max_count == nullptr || n_pairs <= 0 || n_expert <= 0 || n_expert > 4096 || topk <= 0) {
+        max_count == nullptr || n_pairs <= 0 || n_expert <= 0 || n_expert > kOrderThreads || topk <= 0) {
         return false;
     }
     const size_t sh_bytes = (size_t) (n_expert + 1) * sizeof(int);
-    moe_order_kernel<<<1, 256, sh_bytes, stream>>>(static_cast<const int *>(ids), (int) n_pairs,
+    moe_order_kernel<<<1, kOrderThreads, sh_bytes, stream>>>(static_cast<const int *>(ids), (int) n_pairs,
                                                    (int) n_expert, (int) topk,
                                                    static_cast<int *>(counts), static_cast<int *>(offs),
                                                    static_cast<int *>(xgi), static_cast<int *>(slot),
