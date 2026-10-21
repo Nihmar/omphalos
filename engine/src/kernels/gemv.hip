@@ -3107,6 +3107,13 @@ bool launch_moe_gu(const uint8_t * const * gate, const uint8_t * const * up, con
 
 } // namespace
 
+// Q8_0 / Q4_0 experts (#540: the MoE MTP block's), defined with the legacy kernels below
+bool moe_legacy32(bool q8, const uint8_t * const * exps, const int * ids, const __half * x, float * y, int64_t rows,
+                  int64_t k, int64_t slots, int64_t slots_per_x, hipStream_t stream);
+bool moe_legacy32_gu(bool q8, const uint8_t * const * gate, const uint8_t * const * up, const int * ids,
+                     const __half * x, __half * out, int64_t rows, int64_t k, int64_t slots, int64_t slots_per_x,
+                     hipStream_t stream);
+
 bool gemv_moe_gu(const uint32_t type, const void * const * gate, const void * const * up, const void * ids,
                  const void * x_f16, void * out_f16, const int64_t rows, const int64_t k, const int64_t slots,
                  const int64_t slots_per_x, hipStream_t stream) {
@@ -3132,6 +3139,8 @@ bool gemv_moe_gu(const uint32_t type, const void * const * gate, const void * co
         case 22: return run(qd::TileIq2s{});
         case 10: return run(qd::TileQ2k{});
         case 14: return run(qd::TileQ6k{});
+        case 8:
+        case 2: return moe_legacy32_gu(type == 8, g, u, id, x, o, rows, k, slots, slots_per_x, stream);
         default: return false;
     }
 }
@@ -3159,6 +3168,8 @@ bool gemv_moe(const uint32_t type, const void * const * exps, const void * ids,
         case 22: return run(qd::TileIq2s{});
         case 10: return run(qd::TileQ2k{});
         case 14: return run(qd::TileQ6k{});
+        case 8:
+        case 2: return moe_legacy32(type == 8, wt, id, x, y, rows, k, slots, slots_per_x, stream);
         default: return false;
     }
 }
@@ -3179,9 +3190,8 @@ constexpr long long kLegacyChunkSub = 256;
 // any chunk that is a multiple of 32), so every token's result is its
 // one-token result bit for bit.
 template <bool Q8, int NT>
-__global__ void gemv_legacy32_kernel(const uint8_t * __restrict__ blocks,
-                                     const __half * __restrict__ x, float * __restrict__ y,
-                                     const long long rows, const long long n_sub,
+__device__ inline void legacy32_body(const uint8_t * __restrict__ blocks, const __half * __restrict__ x,
+                                     float * __restrict__ y, const long long rows, const long long n_sub,
                                      const long long chunk_sub) {
     extern __shared__ __half xs[];  // the x chunk of each token
     const int warp = (int) threadIdx.x / 32;
@@ -3248,6 +3258,27 @@ __global__ void gemv_legacy32_kernel(const uint8_t * __restrict__ blocks,
     }
 }
 
+template <bool Q8, int NT>
+__global__ void gemv_legacy32_kernel(const uint8_t * __restrict__ blocks,
+                                     const __half * __restrict__ x, float * __restrict__ y,
+                                     const long long rows, const long long n_sub,
+                                     const long long chunk_sub) {
+    legacy32_body<Q8, NT>(blocks, x, y, rows, n_sub, chunk_sub);
+}
+
+// gemv_moe's legacy body (#540): grid.z is the slot, its expert's blocks from
+// exps[ids[slot]]; each slot is the one-token kernel, so its sums are
+// gemv_q8_0 / gemv_q4_0's bit for bit.
+template <bool Q8>
+__global__ void gemv_moe_legacy32_kernel(const uint8_t * const * __restrict__ exps, const int * __restrict__ ids,
+                                         const __half * __restrict__ x, float * __restrict__ y,
+                                         const long long rows, const long long n_sub,
+                                         const long long chunk_sub, const int slots_per_x) {
+    const long long slot = blockIdx.z;
+    legacy32_body<Q8, 1>(exps[ids[slot]], x + (slot / slots_per_x) * (n_sub * 32), y + slot * rows, rows,
+                         n_sub, chunk_sub);
+}
+
 // the x chunk of NT tokens: a multiple of 32 sub-blocks (the order above),
 // smaller with more tokens so their chunks stay at 16 KB of LDS
 inline int64_t legacy_chunk(const int64_t n_sub, const int nt) {
@@ -3275,7 +3306,7 @@ bool gemv_legacy32(const void * blocks, const void * x_f16, float * y, const int
 // the MoE shared expert's gate and up): a warp's rows of both, each summed in
 // gemv_legacy32_kernel's order, then f16(silu(g) * u) as swiglu_f16 writes it.
 template <bool Q8>
-__global__ void gemv_legacy32_gu_kernel(const uint8_t * __restrict__ gate, const uint8_t * __restrict__ up,
+__device__ inline void legacy32_gu_body(const uint8_t * __restrict__ gate, const uint8_t * __restrict__ up,
                                         const __half * __restrict__ x, __half * __restrict__ out,
                                         const long long rows, const long long n_sub, const long long chunk_sub) {
     extern __shared__ __half xs[];
@@ -3339,6 +3370,26 @@ __global__ void gemv_legacy32_gu_kernel(const uint8_t * __restrict__ gate, const
     }
 }
 
+template <bool Q8>
+__global__ void gemv_legacy32_gu_kernel(const uint8_t * __restrict__ gate, const uint8_t * __restrict__ up,
+                                        const __half * __restrict__ x, __half * __restrict__ out,
+                                        const long long rows, const long long n_sub, const long long chunk_sub) {
+    legacy32_gu_body<Q8>(gate, up, x, out, rows, n_sub, chunk_sub);
+}
+
+// gemv_moe_gu's legacy body (#540): the slot's expert from gate / up[ids[slot]]
+template <bool Q8>
+__global__ void gemv_moe_legacy32_gu_kernel(const uint8_t * const * __restrict__ gate,
+                                            const uint8_t * const * __restrict__ up, const int * __restrict__ ids,
+                                            const __half * __restrict__ x, __half * __restrict__ out,
+                                            const long long rows, const long long n_sub,
+                                            const long long chunk_sub, const int slots_per_x) {
+    const long long slot = blockIdx.z;
+    const int e = ids[slot];
+    legacy32_gu_body<Q8>(gate[e], up[e], x + (slot / slots_per_x) * (n_sub * 32), out + slot * rows, rows, n_sub,
+                         chunk_sub);
+}
+
 bool gemv_legacy_gu(const uint32_t type, const void * gate, const void * up, const void * x_f16, void * out_f16,
                     const int64_t rows, const int64_t k, hipStream_t stream) {
     if (gate == nullptr || up == nullptr || x_f16 == nullptr || out_f16 == nullptr || rows <= 0 || k <= 0 ||
@@ -3357,6 +3408,46 @@ bool gemv_legacy_gu(const uint32_t type, const void * gate, const void * up, con
         gemv_legacy32_gu_kernel<true><<<grid, 256, smem, stream>>>(g, u, x, o, rows, n_sub, chunk);
     } else {
         gemv_legacy32_gu_kernel<false><<<grid, 256, smem, stream>>>(g, u, x, o, rows, n_sub, chunk);
+    }
+    return hipGetLastError() == hipSuccess;
+}
+
+bool moe_legacy32(const bool q8, const uint8_t * const * exps, const int * ids, const __half * x, float * y,
+                  const int64_t rows, const int64_t k, const int64_t slots, const int64_t slots_per_x,
+                  hipStream_t stream) {
+    if (k % 256 != 0) {
+        return false;
+    }
+    const int64_t n_sub = k / 32;
+    const int64_t chunk = legacy_chunk(n_sub, 1);
+    const size_t smem = (size_t) chunk * 64;
+    const dim3 grid((unsigned) ((rows + 8 * kLegacyRows - 1) / (8 * kLegacyRows)), 1, (unsigned) slots);
+    if (q8) {
+        gemv_moe_legacy32_kernel<true><<<grid, 256, smem, stream>>>(exps, ids, x, y, rows, n_sub, chunk,
+                                                                    (int) slots_per_x);
+    } else {
+        gemv_moe_legacy32_kernel<false><<<grid, 256, smem, stream>>>(exps, ids, x, y, rows, n_sub, chunk,
+                                                                     (int) slots_per_x);
+    }
+    return hipGetLastError() == hipSuccess;
+}
+
+bool moe_legacy32_gu(const bool q8, const uint8_t * const * gate, const uint8_t * const * up, const int * ids,
+                     const __half * x, __half * out, const int64_t rows, const int64_t k, const int64_t slots,
+                     const int64_t slots_per_x, hipStream_t stream) {
+    if (k % 256 != 0) {
+        return false;
+    }
+    const int64_t n_sub = k / 32;
+    const int64_t chunk = legacy_chunk(n_sub, 1);
+    const size_t smem = (size_t) chunk * 64;
+    const dim3 grid((unsigned) ((rows + 8 * kLegacyRows - 1) / (8 * kLegacyRows)), 1, (unsigned) slots);
+    if (q8) {
+        gemv_moe_legacy32_gu_kernel<true><<<grid, 256, smem, stream>>>(gate, up, ids, x, out, rows, n_sub, chunk,
+                                                                       (int) slots_per_x);
+    } else {
+        gemv_moe_legacy32_gu_kernel<false><<<grid, 256, smem, stream>>>(gate, up, ids, x, out, rows, n_sub, chunk,
+                                                                        (int) slots_per_x);
     }
     return hipGetLastError() == hipSuccess;
 }
