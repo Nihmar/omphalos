@@ -713,6 +713,9 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
 
 // Memory is owned by mem_; the stream and the events are released here.
 Runner::~Runner() {
+    if (moe_trace_ != nullptr) {
+        std::fclose(moe_trace_);
+    }
     if (side_ != nullptr) {
         (void) hipStreamDestroy(side_);
         (void) hipEventDestroy(ev_fork_);
@@ -1740,6 +1743,23 @@ const std::vector<int> & Runner::moe_order(const int blk) {
         }
     }
     return moe_identity_;
+}
+
+bool Runner::moe_trace_open(const std::string & path) {
+    if (moe_tabs_.empty()) {
+        return true;  // nothing is logged without the cache
+    }
+    moe_trace_ = std::fopen(path.c_str(), "wb");
+    if (moe_trace_ == nullptr) {
+        return false;
+    }
+    const int32_t head[2] = {(int32_t) moe_log_tabs_, (int32_t) h_.n_expert_used};
+    std::fwrite(head, 4, 2, moe_trace_);
+    for (int64_t tab = 0; tab < moe_log_tabs_; ++tab) {
+        const int32_t blk = (int32_t) moe_tabs_[(size_t) tab].blk;
+        std::fwrite(&blk, 4, 1, moe_trace_);
+    }
+    return true;
 }
 
 bool Runner::moe_save_counts(const std::string & path) const {

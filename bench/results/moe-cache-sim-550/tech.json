@@ -1,0 +1,1 @@
+{"messages": [{"role": "user", "content": "Explain CPU caches, cache lines and false sharing, with a C example that shows the problem and how to fix it."}], "enable_thinking": true, "add_generation_prompt": true}

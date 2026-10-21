@@ -1,0 +1,72 @@
+# The expert cache's policies replayed on traced decode picks (#550)
+# engine: perf/550-moe-cache-study (main 5bf5672 + --moe-trace); Ornith-1.5-35B-A3B-Q4_K_M.omph, the calibrated
+# fixed set (models/...omph.experts, six other prompts); RX 9060 XT 16 GB; 185 of 256 experts per layer in VRAM
+# traces: omph-run <model> <prompt> /dev/null --last-logits --gemv --generate 600 --moe-trace <trace> (598 logged steps)
+#   code / ita / tech: the chat requests in moe-cache-sim-550/ (omph-tokenize --chat-ids); wiki: 4096 tokens of
+#   wiki text (/var/tmp/omphalos-prompts/wiki4k.txt), a continuation outside the calibration's domains
+# engine's own count (OMPH_TIMING) vs the simulator's 'today': code 6.83 / 6.83, ita 2.62 / 2.62, tech 3.69 / 3.69,
+#   wiki 10.37 / 10.39 % of picks read from host
+# cd tools && uv run python moe_cache_sim.py ../models/Ornith-1.5-35B-A3B-Q4_K_M.gguf \
+#     ../models/Ornith-1.5-35B-A3B-Q4_K_M.omph.experts code.trace ita.trace tech.trace wiki.trace --cap 185 [--grid]
+
+cap 185 per layer (153 fixed + 32 LRU today); 3 expert layouts
+trace                            today      pool  pool-fix     llama   (% of picks read from host)
+code.trace                        6.83      6.48      5.99      2.60   (598 steps)
+                            today per layer: min 2.93 median 5.84 max 18.73 %
+ita.trace                         2.62      2.08      1.75      1.05   (598 steps)
+                            today per layer: min 0.71 median 1.56 max 14.40 %
+tech.trace                        3.69      3.30      2.95      1.96   (598 steps)
+                            today per layer: min 1.09 median 2.73 max 15.61 %
+wiki.trace                       10.39     10.03      9.52      2.26   (598 steps)
+                            today per layer: min 3.62 median 11.04 max 17.60 %
+
+cap 185; pinned = the share of experts with a host copy (today 103 of 256)
+dyn  admit  shared  pinned          code.trace           ita.trace          tech.trace          wiki.trace   (host-read % / fills per 100 picks)
+ 32  2nd    no         40%        6.83 /  1.53        2.62 /  0.45        3.69 /  0.74       10.39 /  2.54
+ 32  2nd    yes        40%        6.48 /  1.44        2.08 /  0.33        3.30 /  0.66       10.03 /  2.41
+ 32  1st    no         40%        5.85 /  5.85        2.16 /  2.16        2.81 /  2.81       10.14 / 10.14
+ 32  1st    yes        40%        5.35 /  5.35        1.37 /  1.37        2.33 /  2.33        9.74 /  9.74
+ 64  2nd    no         53%        6.00 /  1.29        2.48 /  0.40        3.74 /  0.76        7.14 /  1.52
+ 64  2nd    yes        53%        5.57 /  1.18        2.11 /  0.34        3.26 /  0.66        6.66 /  1.36
+ 64  1st    no         53%        4.65 /  4.65        1.95 /  1.95        2.74 /  2.74        6.29 /  6.29
+ 64  1st    yes        53%        4.29 /  4.29        1.15 /  1.15        2.17 /  2.17        5.95 /  5.95
+ 96  2nd    no         65%        5.76 /  1.24        2.45 /  0.41        3.86 /  0.80        6.19 /  1.25
+ 96  2nd    yes        65%        5.32 /  1.15        2.13 /  0.35        3.38 /  0.70        6.07 /  1.23
+ 96  1st    no         65%        4.23 /  4.23        1.84 /  1.84        2.76 /  2.76        4.35 /  4.35
+ 96  1st    yes        65%        3.81 /  3.81        1.11 /  1.11        2.12 /  2.12        4.00 /  4.00
+128  2nd    no         78%        5.49 /  1.18        2.42 /  0.41        3.78 /  0.78        5.89 /  1.21
+128  2nd    yes        78%        5.02 /  1.06        2.15 /  0.35        3.34 /  0.70        5.79 /  1.19
+128  1st    no         78%        3.84 /  3.84        1.78 /  1.78        2.74 /  2.74        3.39 /  3.39
+128  1st    yes        78%        3.40 /  3.40        1.12 /  1.12        2.14 /  2.14        2.73 /  2.73
+185  2nd    no        100%        4.96 /  1.04        2.32 /  0.38        3.60 /  0.74        5.45 /  1.12
+185  2nd    yes       100%        4.52 /  0.95        2.10 /  0.34        3.10 /  0.63        5.37 /  1.10
+185  1st    no        100%        3.21 /  3.21        1.62 /  1.62        2.66 /  2.66        2.60 /  2.60
+185  1st    yes       100%        2.60 /  2.60        1.05 /  1.05        1.96 /  1.96        2.26 /  2.26
+
+## Reading it
+
+A miss is one expert (~2 MB on this file) over PCIe, read in place; a fill is a second
+transfer of the same bytes (the copy into the slot). PCIe transfers per 100 picks = read +
+fills (320 picks per step: 40 layers x 8):
+
+| policy (pinned share) | code | ita | tech | wiki |
+|---|---:|---:|---:|---:|
+| today: 32 slots per layer, 2nd-miss admission (40 %) | 8.36 | 3.07 | 4.43 | 12.93 |
+| 32 slots shared per layout, 2nd-miss admission (40 %) | 7.92 | 2.41 | 3.96 | 12.44 |
+| 32 slots shared, 1st-miss admission, fill counted (40 %) | 10.70 | 2.74 | 4.66 | 19.48 |
+| 32 slots shared, 1st-miss admission, fill = the read (40 %) | 5.35 | 1.37 | 2.33 | 9.74 |
+| 64 slots shared, 2nd-miss admission (53 %) | 6.75 | 2.45 | 3.92 | 8.02 |
+| llama.cpp's shape: all slots shared, 1st-miss upload (100 %) | 2.60 | 1.05 | 1.96 | 2.26 |
+
+The scale in time: #512 step 3 moved code from 7.61 % to 4.24 % read (both with their fills)
+and the step from 14.43 to 12.33 ms, ~0.6 ms per point of host reads on this machine.
+
+1. Sharing the LRU slots across the layers of a layout (llama.cpp's grouping), same RAM:
+   -0.4..-0.7 transfers per 100 picks, ~0.2-0.4 ms per step (2-3 %).
+2. llama.cpp's admission (every miss enters) only pays when the fill is not a second
+   transfer: llama.cpp computes from the uploaded copy (a host sync per layer). The
+   omphalos-native equivalent is a fill written by the expert kernel itself while it reads
+   the miss (the victim slot chosen ahead, on the device): -36 % / -55 % / -47 % / -25 % of
+   the transfers at the same RAM, ~1-2 ms per step on code by the scale above.
+3. More pinned RAM buys the rest (wiki 12.9 -> 8.0 at 53 %, 2.3 at 100 %): a RAM decision
+   (#512 chose ~7.8 GB).
