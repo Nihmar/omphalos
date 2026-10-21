@@ -75,6 +75,7 @@ class Pool:
         self.n = n_slots
         self.admit_first = admit_first
         self.missed = {}
+        self.fills = 0
 
     def step(self, clock: int, picks: list, fixed: set) -> int:
         misses = 0
@@ -97,51 +98,57 @@ class Pool:
                 continue
             del self.lru[victim]
             self.lru[k] = clock
+            self.fills += 1
         return misses
 
 
-def simulate(policy: str, steps: list, blks: list, order: dict, lay: dict, cap: int) -> tuple[float, np.ndarray]:
-    fixed_n = 0 if policy == "llama" else cap - SLOTS
+POLICIES = {  # name: (fixed per layer = cap - this many dynamic slots, admit on first miss, shared, global fixed)
+    "today": (SLOTS, False, False, False),
+    "pool": (SLOTS, False, True, False),
+    "pool-fix": (SLOTS, False, True, True),
+    "llama": (None, True, True, False),
+}
+
+
+def simulate(dyn: int | None, admit_first: bool, shared: bool, global_fix: bool, steps: list, blks: list,
+             order: dict, lay: dict, cap: int) -> tuple[float, float, np.ndarray]:
+    """% of picks read from host, fills per 100 picks, per-layer miss % (unshared only).
+    dyn: dynamic slots per layer (None: all of cap)."""
+    fixed_n = 0 if dyn is None else cap - dyn
     groups = defaultdict(list)
     for b in blks:
-        groups[lay[b]].append(b)
+        groups[lay[b] if shared else b].append(b)
     fixed = set()
-    pools = {}  # blk -> Pool
-    if policy == "today":
-        for b in blks:
-            fixed |= {(b, int(e)) for e in order[b][:fixed_n]}
-            pools[b] = Pool(SLOTS, [(b, int(e)) for e in order[b][fixed_n:cap]], False)
-    else:
-        for members in groups.values():
-            if policy == "pool-fix":
-                # the group's fixed count goes to its most chosen (layer, expert) pairs
-                score = [(-int(cnt[e]), b, int(e)) for b in members for cnt in [counts_of[b]] for e in range(cnt.size)]
-                score.sort()
-                fix = [(b, e) for _, b, e in score[:fixed_n * len(members)]]
-                rest = [(b, e) for _, b, e in score[fixed_n * len(members):]]
-            else:
-                fix = [(b, int(e)) for b in members for e in order[b][:fixed_n]]
-                # the slots start with each layer's next experts, interleaved
-                rest = [(b, int(order[b][fixed_n + i])) for i in range(cap - fixed_n) for b in members]
-            fixed |= set(fix)
-            pool = Pool((cap - fixed_n) * len(members), rest, policy == "llama")
-            for b in members:
-                pools[b] = pool
+    pools = []
+    pool_of = {}
+    for members in groups.values():
+        if global_fix:
+            # the group's fixed count goes to its most chosen (layer, expert) pairs
+            score = sorted((-int(counts_of[b][e]), b, int(e)) for b in members for e in range(counts_of[b].size))
+            fix = [(b, e) for _, b, e in score[:fixed_n * len(members)]]
+            rest = [(b, e) for _, b, e in score[fixed_n * len(members):]]
+        else:
+            fix = [(b, int(e)) for b in members for e in order[b][:fixed_n]]
+            # the slots start with each layer's next experts, interleaved
+            rest = [(b, int(order[b][fixed_n + i])) for i in range(cap - fixed_n) for b in members]
+        fixed |= set(fix)
+        pool = Pool((cap - fixed_n) * len(members), rest, admit_first)
+        pools.append(pool)
+        for b in members:
+            pool_of[b] = pool
     per_layer = np.zeros(len(blks))
     total = misses = 0
+    idx = {b: i for i, b in enumerate(blks)}
     for clock, st in enumerate(steps, start=1):
-        if policy == "today":
-            for i, b in enumerate(blks):
-                m = pools[b].step(clock, [(b, int(e)) for e in st[i]], fixed)
-                per_layer[i] += m
-                misses += m
-        else:
-            for members in groups.values():
-                pool = pools[members[0]]
-                picks = [(b, int(e)) for b in members for e in st[blks.index(b)]]
-                misses += pool.step(clock, picks, fixed)
+        for members in groups.values():
+            picks = [(b, int(e)) for b in members for e in st[idx[b]]]
+            m = pool_of[members[0]].step(clock, picks, fixed)
+            misses += m
+            if not shared:
+                per_layer[idx[members[0]]] += m
         total += st.size
-    return 100.0 * misses / max(total, 1), per_layer / max(len(steps) * steps[0].shape[1], 1) * 100
+    fills = sum(p.fills for p in pools)
+    return 100.0 * misses / max(total, 1), 100.0 * fills / max(total, 1), per_layer / max(len(steps) * steps[0].shape[1], 1) * 100
 
 
 counts_of: dict[int, np.ndarray] = {}
@@ -154,30 +161,45 @@ def main() -> None:
     ap.add_argument("traces", nargs="+")
     ap.add_argument("--cap", type=int, default=185, help="experts per layer in VRAM (the engine prints it)")
     ap.add_argument("--policies", default="today,pool,pool-fix,llama")
+    ap.add_argument("--grid", action="store_true",
+                    help="dynamic slots per layer x admission x sharing, with the pinned share and the fills")
     a = ap.parse_args()
 
     lay = layouts(a.model)
     counts_of.update(read_counts(a.counts))
     order = {b: np.argsort(-c, kind="stable") for b, c in counts_of.items()}
+    traces = [(path.rsplit("/", 1)[-1], *read_trace(path)) for path in a.traces]
+    if a.grid:
+        n = len(next(iter(counts_of.values())))
+        print(f"cap {a.cap}; pinned = the share of experts with a host copy (today {n - a.cap + SLOTS} of {n})")
+        print("dyn  admit  shared  pinned" + "".join(f"{t[0][:12]:>20}" for t in traces) + "   (host-read % / fills per 100 picks)")
+        for dyn in (SLOTS, 64, 96, 128, a.cap):
+            for first in (False, True):
+                for shared in (False, True):
+                    cells = []
+                    for _, blks, steps in traces:
+                        r, f, _ = simulate(dyn, first, shared, False, steps, blks, order, lay, a.cap)
+                        cells.append(f"{r:6.2f} / {f:5.2f}")
+                    print(f"{dyn:3d}  {'1st' if first else '2nd':5}  {'yes' if shared else 'no':6}  "
+                          f"{(n - a.cap + dyn) / n:6.0%}" + "".join(f"{c:>20}" for c in cells))
+        return
     pols = a.policies.split(",")
     print(f"cap {a.cap} per layer ({a.cap - SLOTS} fixed + {SLOTS} LRU today); "
           f"{len(set(lay.values()))} expert layouts")
     print("trace".ljust(28) + "".join(p.rjust(10) for p in pols) + "   (% of picks read from host)")
-    for path in a.traces:
-        blks, steps = read_trace(path)
+    for name, blks, steps in traces:
         row = []
         spread = None
         for p in pols:
-            rate, per_layer = simulate(p, steps, blks, order, lay, a.cap)
+            dyn, first, shared, gfix = POLICIES[p]
+            rate, _, per_layer = simulate(dyn, first, shared, gfix, steps, blks, order, lay, a.cap)
             row.append(rate)
             if p == "today":
                 spread = per_layer
-        print(path.rsplit("/", 1)[-1][:27].ljust(28) + "".join(f"{r:10.2f}" for r in row) +
-              f"   ({len(steps)} steps)")
+        print(name[:27].ljust(28) + "".join(f"{r:10.2f}" for r in row) + f"   ({len(steps)} steps)")
         if spread is not None:
             print(" " * 28 + f"today per layer: min {spread.min():.2f} median {np.median(spread):.2f} "
                   f"max {spread.max():.2f} %")
-
 
 if __name__ == "__main__":
     main()
