@@ -128,6 +128,14 @@ bool Runner::moe_cache_begin() {
     const int64_t n = h_.n_expert;
     const int64_t picks = moe_log_T_ * h_.n_expert_used;
     ++moe_clock_;
+    if (moe_trace_ != nullptr) {
+        const int32_t t32 = (int32_t) moe_log_T_;
+        std::fwrite(&t32, 4, 1, moe_trace_);
+        for (int64_t tab = 0; tab < moe_log_tabs_; ++tab) {
+            std::fwrite(moe_log_ + (size_t) tab * (size_t) (kMoeLogTokens * h_.n_expert_used), 4, (size_t) picks,
+                        moe_trace_);
+        }
+    }
     bool changed = false;
     for (int64_t tab = 0; tab < moe_log_tabs_; ++tab) {
         MoeTab & c = moe_tabs_[(size_t) tab];

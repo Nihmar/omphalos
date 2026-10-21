@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <algorithm>
 #include <functional>
 #include <initializer_list>
@@ -117,6 +118,13 @@ public:
     // next load of the model orders its fixed experts by them. False on a
     // write error; a model without the expert cache has nothing to add.
     bool moe_save_counts(const std::string & path) const;
+
+    // Writes every logged decode step's expert picks to `path` (#550, for an
+    // offline cache simulation): a header of int32 (tables, topk, then each
+    // table's block), then per step int32 T and tables x T x topk ids. A step
+    // whose log the cache skipped (a chunk, or the previous log unread) is not
+    // in it. False when the file cannot be opened.
+    bool moe_trace_open(const std::string & path);
 
     Runner(const Runner &) = delete;
     Runner & operator=(const Runner &) = delete;
@@ -805,6 +813,7 @@ private:
     int64_t moe_clock_ = 0;
     hipEvent_t moe_ev_log_ = nullptr;
     hipEvent_t moe_ev_up_ = nullptr;  // the last table upload read moe_eptr_pin_
+    std::FILE * moe_trace_ = nullptr;  // omph-run --moe-trace (#550)
     int64_t moe_misses_ = 0;   // OMPH_TIMING: selections read from host / all
     int64_t moe_selects_ = 0;
     void * moe_w_ = nullptr;     // tokens x topk float: its renormalized weights

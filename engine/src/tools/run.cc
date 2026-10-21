@@ -83,6 +83,7 @@ int main(int argc, char ** argv) {
     bool draft_mtp = false;     // --draft-mtp K: speculative decode with MTP drafts
     std::string dflash;         // --dflash FILE: ... with DFlash2 drafts instead (#245)
     std::string moe_counts;     // --moe-counts FILE: add the decode's expert picks to it (#512)
+    std::string moe_trace;      // --moe-trace FILE: every logged step's picks (#550)
     std::string mtp_out;        // --mtp-out: the first two drafts' logits (validation)
     // A flag's numeric value: a whole non-negative number or nothing.
     const auto count = [](const char * s, int64_t & out) {
@@ -132,6 +133,8 @@ int main(int argc, char ** argv) {
             if (!count(argv[++i], draft_k) || draft_k < 1) return usage();
         } else if (std::strcmp(argv[i], "--moe-counts") == 0 && has_value) {
             moe_counts = argv[++i];
+        } else if (std::strcmp(argv[i], "--moe-trace") == 0 && has_value) {
+            moe_trace = argv[++i];
         } else if (std::strcmp(argv[i], "--draft-corrupt") == 0 && has_value) {
             if (!count(argv[++i], draft_corrupt)) return usage();
         } else {
@@ -215,6 +218,10 @@ int main(int argc, char ** argv) {
         }
         omph::model::Runner runner(model, act_chunk, use_gemv && generate > 0, env, last_logits,
                                    total_len, mtp, dflash);
+        if (!moe_trace.empty() && !runner.moe_trace_open(moe_trace)) {
+            std::fprintf(stderr, "error: cannot write %s\n", moe_trace.c_str());
+            return 1;
+        }
         if (!dflash.empty()) {
             draft_k = runner.dflash_block() - 1;  // the runtime block's masks (#414)
         }
