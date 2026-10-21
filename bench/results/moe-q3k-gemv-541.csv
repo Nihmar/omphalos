@@ -1,0 +1,70 @@
+# #541: a Q3_K GEMV and its gemv_moe body (Ornith Q2_K_L's down experts)
+# engine: base ef58d51 (main after #540) vs perf/541-q3k-gemv 222001a; llama.cpp: not involved
+# omph-run models/Ornith-1.5-35B-A3B-Q2_K_L.omph <prompt> --last-logits --gemv --generate 128 [--draft-mtp 1], OMPH_TIMING=1
+# RX 9060 XT 16 GB, gfx1200; 5 runs per binary, alternated; plain: median 'step wall' of a run; mtp: 'ms per generated token'
+# prompts: tok = 21-token code request, prose = 28-token Italian story request, long = 2065 tokens of PLAN.md
+# medians plain step wall: tok 17.17 -> 9.54 ms, prose 17.20 -> 9.55, long 17.28 -> 9.65
+# medians mtp ms/token: tok 17.11 -> 8.72, prose 21.88 -> 12.73, long 19.65 -> 9.20
+# rocprofv3 (64 tokens, tok): the down experts' kernel 31.2 us per layer (8 experts); before: dequant_q3_k 19.1 us + gemm_f16 9.4 us per expert, plus the per-expert fallback's host sync
+# accuracy vs llama.cpp's f32 CPU dump (5 tokens, GEMV path): last-token KL 0.00432 (old path 0.00437), argmax equal; mtp output == plain greedy (OMPH_SPEC_CHECK=1)
+mode,prompt,binary,run,ms_per_token,draft_ms_median,step_wall_median
+plain,tok,base,0,nan,nan,17.21
+plain,tok,new,0,nan,nan,9.55
+plain,tok,base,1,nan,nan,17.18
+plain,tok,new,1,nan,nan,9.54
+plain,tok,base,2,nan,nan,17.17
+plain,tok,new,2,nan,nan,9.54
+plain,tok,base,3,nan,nan,17.17
+plain,tok,new,3,nan,nan,9.54
+plain,tok,base,4,nan,nan,17.17
+plain,tok,new,4,nan,nan,9.54
+plain,prose,base,0,nan,nan,17.2
+plain,prose,new,0,nan,nan,9.55
+plain,prose,base,1,nan,nan,17.23
+plain,prose,new,1,nan,nan,9.55
+plain,prose,base,2,nan,nan,17.2
+plain,prose,new,2,nan,nan,9.55
+plain,prose,base,3,nan,nan,17.21
+plain,prose,new,3,nan,nan,9.55
+plain,prose,base,4,nan,nan,17.2
+plain,prose,new,4,nan,nan,9.55
+plain,long,base,0,nan,nan,17.15
+plain,long,new,0,nan,nan,9.65
+plain,long,base,1,nan,nan,17.32
+plain,long,new,1,nan,nan,9.65
+plain,long,base,2,nan,nan,17.28
+plain,long,new,2,nan,nan,9.64
+plain,long,base,3,nan,nan,17.28
+plain,long,new,3,nan,nan,9.64
+plain,long,base,4,nan,nan,17.29
+plain,long,new,4,nan,nan,9.65
+mtp,tok,base,0,17.08,0.99,nan
+mtp,tok,new,0,8.7,1.0,nan
+mtp,tok,base,1,17.1,0.99,nan
+mtp,tok,new,1,8.71,0.99,nan
+mtp,tok,base,2,17.11,0.99,nan
+mtp,tok,new,2,8.72,1.0,nan
+mtp,tok,base,3,17.11,0.99,nan
+mtp,tok,new,3,8.73,1.0,nan
+mtp,tok,base,4,17.11,0.99,nan
+mtp,tok,new,4,8.72,1.0,nan
+mtp,prose,base,0,22.31,2.03,nan
+mtp,prose,new,0,12.82,2.04,nan
+mtp,prose,base,1,22.02,2.03,nan
+mtp,prose,new,1,12.72,2.03,nan
+mtp,prose,base,2,21.88,2.03,nan
+mtp,prose,new,2,12.72,2.03,nan
+mtp,prose,base,3,21.88,2.03,nan
+mtp,prose,new,3,12.73,2.03,nan
+mtp,prose,base,4,21.86,2.03,nan
+mtp,prose,new,4,12.74,2.03,nan
+mtp,long,base,0,19.65,1.03,nan
+mtp,long,new,0,9.21,1.01,nan
+mtp,long,base,1,19.69,1.03,nan
+mtp,long,new,1,9.2,1.02,nan
+mtp,long,base,2,19.64,1.03,nan
+mtp,long,new,2,9.2,1.02,nan
+mtp,long,base,3,19.65,1.03,nan
+mtp,long,new,3,9.19,1.02,nan
+mtp,long,base,4,19.66,1.03,nan
+mtp,long,new,4,9.2,1.02,nan
