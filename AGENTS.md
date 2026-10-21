@@ -94,7 +94,8 @@ cmake -S engine -B engine/build -DOMPH_LLAMA_DIR=<llama.cpp> -DOMPH_LLAMA_LIB=/v
 engine/build/omph-convert <model.gguf> [<model.omph>]
 
 # the MoE model's expert cache (#512): when its experts do not fit VRAM, each layer keeps a
-# fixed set + 32 LRU slots in VRAM and pinned copies of the rest (~7.2 GiB of RAM). The fixed
+# fixed set + 32 LRU slots in VRAM (pooled across the layers of one expert layout, #550) and
+# pinned copies of the rest (~7.2 GiB of RAM). The fixed
 # set is the measured hot one when <model.omph>.experts exists: add a run's picks to it with
 engine/build/omph-run <model.omph> <tokens.txt> /tmp/x.f32 --last-logits --gemv --generate 400 \
     --gen-out /tmp/g.txt --moe-counts <model.omph>.experts   # a few varied prompts; then reload
@@ -305,6 +306,7 @@ The `OMPH_*` switches are parsed once, in `engine/src/runtime/options.{hh,cc}` (
 | `OMPH_NO_B4` | A/B | no NT = 2..4-token GEMVs (verifications, short `--gemv` prefills): one launch per token |
 | `OMPH_SPEC_POINTMASS` | A/B | sampled decoding: MTP drafts stay the drafter's argmax kept with p(x) instead of sampling from the MTP distribution q and accepting with min(1, p/q) (#394; DFlash2 and n-gram drafts are point masses either way: #451 measured the sampled alternative for the DFlash2 lattice - prose accepted 30.7 % against 25.7 %, +12.5 % t/s, while the edit scenarios moved to different texts with nothing to gain - so the point mass stays, `bench/results/dflash-sampled-451.txt`) |
 | `OMPH_NO_GROUP` | A/B | the sibling GEMVs of one input (gate + up, qkv + gate, q + k + v) as separate launches instead of one grouped launch (#214; 1..16 tokens since #255) |
+| `OMPH_MOE_LAYER_LRU` | A/B | the expert cache's 32 LRU slots per layer, each layer's own, instead of one pool per expert layout (#550: the slots go to the layers whose recent picks claim them; host reads 6.83 -> 6.34 % on code, 2.62 -> 2.19 % on Italian prose, tokens identical) |
 | `OMPH_MOE_NO_ROWS` | A/B | a MoE verification (2..16 tokens) per (token, expert) slot, each expert read once per token, instead of grouped by expert, each chosen expert read once per block (#551; bit-identical either way: 16-token blocks 115 -> 65 ms) |
 | `OMPH_MTP_WINDOW=N` | decode | the MTP block keeps 16 sink positions plus its last N..2N in its KV and a prompt fills only those (default 16384; 0: the whole context; #171): -150 MiB of VRAM at a 128k context, output unchanged, drafts at 100k from -1.6 % (code) to +7 % (prose) ms/token; contexts up to 2N + 16 unaffected |
 | `OMPH_DRAFT_VOCAB=N` | decode | MTP drafts take their argmax, and DFlash2 its top-16 candidates (#245), over the first N token ids (default 98304; 0 = the whole head; N is rounded down to a multiple of 16, the head tile's height, #340) while the recent text stays inside them, the whole head otherwise (#217): output unchanged, ~3-7 % faster speculative decoding in English and code |
