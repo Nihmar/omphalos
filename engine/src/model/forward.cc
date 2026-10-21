@@ -136,7 +136,8 @@ bool Runner::moe_cache_begin() {
                         moe_trace_);
         }
     }
-    bool changed = false;
+    // every logged layer's picks first: a pool shared by layers (#550) must
+    // not evict an expert another layer chose in this step
     for (int64_t tab = 0; tab < moe_log_tabs_; ++tab) {
         MoeTab & c = moe_tabs_[(size_t) tab];
         const int * ids = moe_log_ + (size_t) tab * (size_t) (kMoeLogTokens * h_.n_expert_used);
@@ -144,6 +145,13 @@ bool Runner::moe_cache_begin() {
             c.last[(size_t) ids[i]] = moe_clock_;
             ++c.count[(size_t) ids[i]];
         }
+        moe_selects_ += picks;
+    }
+    bool changed = false;
+    for (int64_t tab = 0; tab < moe_log_tabs_; ++tab) {
+        MoeTab & c = moe_tabs_[(size_t) tab];
+        MoePool & P = moe_pools_[(size_t) c.pool];
+        const int * ids = moe_log_ + (size_t) tab * (size_t) (kMoeLogTokens * h_.n_expert_used);
         for (int64_t i = 0; i < picks; ++i) {
             const int e = ids[i];
             if (c.slot_of[(size_t) e] >= 0) {
@@ -161,26 +169,31 @@ bool Runner::moe_cache_begin() {
             if (prev == 0 || moe_clock_ - prev > kMoeAdmitSteps) {
                 continue;
             }
-            // the least recently used slot whose expert this step did not choose
+            // the pool's least recently used slot whose expert this step did not choose
             int victim = -1;
-            for (int64_t s = moe_fixed_; s < moe_cap_; ++s) {
-                const int o = c.owner[(size_t) s];
-                if (c.last[(size_t) o] < moe_clock_ &&
-                    (victim < 0 || c.last[(size_t) o] < c.last[(size_t) c.owner[(size_t) victim]])) {
-                    victim = (int) s;
+            int64_t oldest = 0;
+            for (size_t q = 0; q < P.owner.size(); ++q) {
+                const auto [ot, oe] = P.owner[q];
+                const int64_t last = moe_tabs_[(size_t) ot].last[(size_t) oe];
+                if (last < moe_clock_ && (victim < 0 || last < oldest)) {
+                    victim = (int) q;
+                    oldest = last;
                 }
             }
             if (victim < 0) {
                 continue;
             }
-            const int old = c.owner[(size_t) victim];
-            c.slot_of[(size_t) old] = -1;
-            c.owner[(size_t) victim] = e;
-            c.slot_of[(size_t) e] = victim;
+            const auto [ot, oe] = P.owner[(size_t) victim];
+            const auto [mt, ms] = P.slot[(size_t) victim];
+            MoeTab & o = moe_tabs_[(size_t) ot];
+            o.slot_of[(size_t) oe] = -1;
+            P.owner[(size_t) victim] = {(int) tab, e};
+            c.slot_of[(size_t) e] = (int) moe_fixed_ + victim;
             for (int k = 0; k < 3; ++k) {
+                const void ** orow = moe_eptr_host_.data() + ((size_t) ot * 3 + (size_t) k) * (size_t) n;
                 const void ** row = moe_eptr_host_.data() + ((size_t) tab * 3 + (size_t) k) * (size_t) n;
-                uint8_t * slot = const_cast<uint8_t *>(c.dev[k]) + (size_t) victim * c.pe[k];
-                row[old] = c.host[k] + (size_t) c.hidx[(size_t) old] * c.pe[k];
+                uint8_t * slot = const_cast<uint8_t *>(moe_tabs_[(size_t) mt].dev[k]) + (size_t) ms * c.pe[k];
+                orow[oe] = o.host[k] + (size_t) o.hidx[(size_t) oe] * o.pe[k];
                 row[e] = slot;
                 if (!omph::kernels::moe_copy_words(slot, 0, c.host[k] + (size_t) c.hidx[(size_t) e] * c.pe[k], 0,
                                                    (int64_t) (c.pe[k] / 4), 1, hipStreamPerThread)) {
@@ -189,7 +202,6 @@ bool Runner::moe_cache_begin() {
             }
             changed = true;
         }
-        moe_selects_ += picks;
     }
     moe_log_T_ = 0;
     // through a pinned buffer (a pageable source is pinned by the runtime

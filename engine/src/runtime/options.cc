@@ -67,6 +67,7 @@ EnvOptions EnvOptions::from_env() {
     o.spec_pointmass = flag("OMPH_SPEC_POINTMASS");
     o.no_group = flag("OMPH_NO_GROUP");
     o.moe_no_rows = flag("OMPH_MOE_NO_ROWS");
+    o.moe_layer_lru = flag("OMPH_MOE_LAYER_LRU");
     o.no_swiglu_gemm = flag("OMPH_NO_SWIGLU_GEMM");
     if (const char * v = std::getenv("OMPH_MTP_WINDOW")) {
         o.mtp_window = std::atoll(v);

@@ -1,0 +1,37 @@
+# The expert cache's LRU slots pooled per expert layout (#550, option A)
+
+engine: perf/550-shared-lru e4d7669 (main d0a142e + the pooled LRU); the per-layer policy is the
+same binary with OMPH_MOE_LAYER_LRU=1. Ornith-1.5-35B-A3B-Q4_K_M, the calibrated expert set: 185 of
+256 experts per layer in VRAM, 153 fixed + 32 LRU per layer, pooled as 2 pools of 640 slots (one
+per expert layout). RX 9060 XT 16 GB, desktop active.
+
+## Host reads (OMPH_TIMING, omph-run ... --gemv --generate 600, the #550 trace prompts)
+
+| prompt | per layer (two runs) | pooled | moe_cache_sim.py 'pool' |
+|---|---:|---:|---:|
+| code | 6.83 / 6.65 % | 6.34 % | 6.48 % |
+| ita | 2.62 / 2.59 % | 2.19 % | 2.08 % |
+| tech | 3.69 / 3.61 % | 3.30 % | 3.30 % |
+| wiki | 10.37 / 10.37 % | 10.10 % | 10.03 % |
+
+Tokens identical to main in every run (the cache only moves bytes). The per-layer count varies
+by ~0.2 points between runs: the cache applies a step's log only once its copy is done, so the
+fills' timing (and which misses they save) depends on the run.
+
+## Decode (tools/scenario_speed.py --specs plain --ngram 0 --kv k4q4, greedy)
+
+Three runs per variant, alternated (layer 1, shared 1, layer 2, ...); one server per run.
+
+| scenario | per layer (t/s) | pooled (t/s) | medians |
+|---|---|---|---|
+| edit-cc | 68.9 / 68.8 / 68.8 | 69.3 / 69.1 / 69.9 | 68.8 -> 69.3 (+0.7 %) |
+| edit-py | 73.8 / 73.7 / 73.7 | 73.6 / 73.5 / 74.2 | 73.7 -> 73.6 (-0.1 %) |
+| prose | 88.0 / 87.9 / 87.3 | 88.1 / 88.4 / 89.2 | 87.9 -> 88.4 (+0.6 %) |
+
+Every run wrote the same text per scenario. The gain is below the 2-3 % the simulation's
+transfer counts suggested: on these texts the host reads are a smaller share of the step.
+(edit-cc's prompt embeds an engine source file, so its text differs from older results.)
+
+A first attempt at 5 x omph-run per prompt and variant stalled: with ~10 GB of the machine in
+zram swap, one load read the model file at ~1.6 MB/s for 28 min; the server-based runs above
+load the model once per cell.
