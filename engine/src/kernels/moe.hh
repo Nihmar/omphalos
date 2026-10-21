@@ -20,7 +20,8 @@ namespace omph::kernels {
 
 // The routing table on the device (#493): the per-expert counts, their
 // exclusive prefix sum and the gather (xgi = the token) / slot arrays in
-// expert-major order. n_pairs = tokens * topk.
+// expert-major order. n_pairs = tokens * topk; at most 256 experts (one
+// thread each).
 bool moe_order(const void * ids, int64_t n_pairs, int64_t n_expert, int64_t topk, void * counts,
                void * offs, void * xgi, void * slot, void * max_count, hipStream_t stream);
 
