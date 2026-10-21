@@ -73,7 +73,8 @@ constexpr int kNormVecs = 2;  // float4s per thread: rows up to 8192
 
 __global__ __launch_bounds__(kNormThreads) void add_rms_norm_f16_kernel(
     const float * __restrict__ a, const float * __restrict__ b, float * __restrict__ sum_out,
-    const float * __restrict__ w, __half * __restrict__ y, const long long n, const float eps) {
+    const float * __restrict__ w, __half * __restrict__ y, __half * __restrict__ y_lo, const long long n,
+    const float eps) {
     __shared__ float warp_sums[kNormThreads / 32];
     const long long row = blockIdx.x;
     const long long n4 = n / 4;
@@ -116,6 +117,7 @@ __global__ __launch_bounds__(kNormThreads) void add_rms_norm_f16_kernel(
     const float4 * w4 = reinterpret_cast<const float4 *>(w);
     float4 * s4 = sum_out != nullptr ? reinterpret_cast<float4 *>(sum_out + row * n) : nullptr;
     __half2 * y2 = reinterpret_cast<__half2 *>(y + row * n);
+    __half2 * lo2 = y_lo != nullptr ? reinterpret_cast<__half2 *>(y_lo + row * n) : nullptr;
 #pragma unroll
     for (int k = 0; k < kNormVecs; ++k) {
         const long long i = threadIdx.x + (long long) k * kNormThreads;
@@ -124,8 +126,15 @@ __global__ __launch_bounds__(kNormThreads) void add_rms_norm_f16_kernel(
                 s4[i] = v[k];
             }
             const float4 g = w4[i];
-            y2[2 * i] = __floats2half2_rn(v[k].x * inv * g.x, v[k].y * inv * g.y);
-            y2[2 * i + 1] = __floats2half2_rn(v[k].z * inv * g.z, v[k].w * inv * g.w);
+            const float4 o = {v[k].x * inv * g.x, v[k].y * inv * g.y, v[k].z * inv * g.z, v[k].w * inv * g.w};
+            const __half2 h0 = __floats2half2_rn(o.x, o.y);
+            const __half2 h1 = __floats2half2_rn(o.z, o.w);
+            y2[2 * i] = h0;
+            y2[2 * i + 1] = h1;
+            if (lo2 != nullptr) {
+                lo2[2 * i] = __floats2half2_rn(o.x - __low2float(h0), o.y - __high2float(h0));
+                lo2[2 * i + 1] = __floats2half2_rn(o.z - __low2float(h1), o.w - __high2float(h1));
+            }
         }
     }
 }
@@ -273,13 +282,14 @@ bool add_out(const float * x, const float * y, float * out, const int64_t n, hip
 
 bool add_rms_norm_f16(const float * a, const float * b, float * sum_out, const float * w,
                       void * y_f16, const int64_t rows, const int64_t n, const float eps,
-                      hipStream_t stream) {
+                      hipStream_t stream, void * y_lo_f16) {
     if (a == nullptr || w == nullptr || y_f16 == nullptr || rows <= 0 || n <= 0 || n % 4 != 0 ||
         n > 4LL * kNormThreads * kNormVecs) {
         return false;
     }
     add_rms_norm_f16_kernel<<<(unsigned) rows, kNormThreads, 0, stream>>>(
-        a, b, sum_out, w, reinterpret_cast<__half *>(y_f16), (long long) n, eps);
+        a, b, sum_out, w, reinterpret_cast<__half *>(y_f16), reinterpret_cast<__half *>(y_lo_f16), (long long) n,
+        eps);
     return hipGetLastError() == hipSuccess;
 }
 

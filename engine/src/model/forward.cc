@@ -221,17 +221,23 @@ bool Runner::moe_cache_log(const int64_t T) {
 
 // The routed gate's selection into moe_ids_ / moe_w_: the logits from a GEMV
 // for a step or a verification (one token's logits do not depend on T, #509)
-// and from the f16 GEMM for a prefill chunk (#494), then the top-k.
+// and from the f16 GEMM for a prefill chunk (#494), then the top-k. The input
+// is h16_ + h16lo_ (#547): rounded to f16 alone it flipped 0.14 % of the picks
+// against an exact router (llama.cpp's f32 one: 0.005 %); the chunk's GEMM
+// runs on each half and the top-k sums the two.
 bool Runner::moe_route(const LayerWeights & L, const int64_t T) {
     const int64_t ne = h_.n_embd;
     const int64_t n_expert = h_.n_expert;
     auto * logits = static_cast<float *>(moe_logits_);
-    const bool ok = T <= kMoeRouterGemvMax
-                        ? omph::kernels::moe_router(L.gate_inp16, h16_, logits, T, n_expert, ne,
-                                                    hipStreamPerThread)
-                        : omph::kernels::gemm_f16(L.gate_inp16, h16_, logits, n_expert, ne, T, n_expert,
-                                                  hipStreamPerThread);
-    return ok && omph::kernels::moe_topk(moe_logits_, moe_ids(L),
+    auto * logits_lo = logits + T * n_expert;
+    const bool gemv = T <= kMoeRouterGemvMax;
+    const bool ok = gemv ? omph::kernels::moe_router(L.gate_inp16, h16_, h16lo_, logits, T, n_expert, ne,
+                                                     hipStreamPerThread)
+                         : omph::kernels::gemm_f16(L.gate_inp16, h16_, logits, n_expert, ne, T, n_expert,
+                                                   hipStreamPerThread) &&
+                               omph::kernels::gemm_f16(L.gate_inp16, h16lo_, logits_lo, n_expert, ne, T, n_expert,
+                                                       hipStreamPerThread);
+    return ok && omph::kernels::moe_topk(logits, gemv ? nullptr : logits_lo, moe_ids(L),
                                          static_cast<float *>(moe_w_), T, n_expert,
                                          (int) h_.n_expert_used, hipStreamPerThread);
 }
@@ -643,7 +649,7 @@ bool Runner::forward(const std::vector<int32_t> & toks, std::vector<float> & log
         if (!omph::kernels::add_rms_norm_f16(static_cast<const float *>(blk_),
                                              static_cast<const float *>(x_),
                                              static_cast<float *>(resid_), post_norm, h16_,
-                                             T, ne, (float) h_.eps, nullptr)) {
+                                             T, ne, (float) h_.eps, nullptr, h16lo_)) {
             return fail("residual/norm failed");
         }
         if (h_.moe()) {

@@ -123,7 +123,7 @@ bool Runner::mtp_block(const int32_t * toks, const float * h_in, const int64_t p
     if (!omph::kernels::add_rms_norm_f16(static_cast<const float *>(blk_),
                                          static_cast<const float *>(x_),
                                          static_cast<float *>(resid_), L.post_norm, h16_, T, ne,
-                                         (float) h_.eps, nullptr) ||
+                                         (float) h_.eps, nullptr, h16lo_) ||
         // #496: the negation was lost in 0eb5aa0, so every draft "failed"
         !(h_.moe() ? moe_ffn(L, T)
                    : ((grouped(h16_, ne, T,

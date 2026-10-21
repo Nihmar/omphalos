@@ -46,7 +46,7 @@ __device__ inline void wave_argmax(float & v, int & i) {
 constexpr int kRouterWaves = 8;
 
 __global__ void __launch_bounds__(kRouterWaves * kWave)
-moe_router_kernel(const __half * __restrict__ w, const __half * __restrict__ x,
+moe_router_kernel(const __half * __restrict__ w, const __half * __restrict__ x, const __half * __restrict__ x_lo,
                   float * __restrict__ logits, const int n_expert, const int k) {
     const int e = blockIdx.x * kRouterWaves + (int) (threadIdx.x / kWave);
     const int lane = (int) (threadIdx.x % kWave);
@@ -56,11 +56,13 @@ moe_router_kernel(const __half * __restrict__ w, const __half * __restrict__ x,
     }
     const __half2 * wr = reinterpret_cast<const __half2 *>(w + (size_t) e * (size_t) k);
     const __half2 * xr = reinterpret_cast<const __half2 *>(x + (size_t) t * (size_t) k);
+    const __half2 * lr = reinterpret_cast<const __half2 *>(x_lo + (size_t) t * (size_t) k);
     float acc = 0.0f;
     for (int j = lane; j < k / 2; j += kWave) {
         const float2 a = __half22float2(wr[j]);
         const float2 b = __half22float2(xr[j]);
-        acc += a.x * b.x + a.y * b.y;
+        const float2 c = __half22float2(lr[j]);
+        acc += a.x * (b.x + c.x) + a.y * (b.y + c.y);
     }
     acc = wave_sum(acc);
     if (lane == 0) {
@@ -75,7 +77,7 @@ constexpr int kTopkThreads = 256;
 constexpr int kTopkWaves = kTopkThreads / kWave;
 
 __global__ void __launch_bounds__(kTopkThreads)
-moe_topk_kernel(const float * __restrict__ logits, int * __restrict__ ids,
+moe_topk_kernel(const float * __restrict__ logits, const float * __restrict__ logits_lo, int * __restrict__ ids,
                 float * __restrict__ weights, const int n_expert, const int topk) {
     __shared__ float s_v[kTopkWaves];
     __shared__ int s_i[kTopkWaves];
@@ -83,7 +85,8 @@ moe_topk_kernel(const float * __restrict__ logits, int * __restrict__ ids,
     const int e = threadIdx.x;
     const int lane = e % kWave;
     const int wv = e / kWave;
-    const float l = e < n_expert ? logits[(size_t) t * (size_t) n_expert + e] : -INFINITY;
+    const size_t at = (size_t) t * (size_t) n_expert + (size_t) e;
+    const float l = e < n_expert ? logits[at] + (logits_lo != nullptr ? logits_lo[at] : 0.0f) : -INFINITY;
 
     // softmax over all the experts (expf: the reference's soft_max is the f32 one)
     float m = wave_max(l);
@@ -291,27 +294,29 @@ moe_finish_kernel(float * __restrict__ out, const float * __restrict__ xo, const
 
 } // namespace
 
-bool moe_topk(const void * logits, int * ids, float * weights, const int64_t tokens,
+bool moe_topk(const void * logits, const void * logits_lo, int * ids, float * weights, const int64_t tokens,
               const int64_t n_expert, const int topk, hipStream_t stream) {
     if (logits == nullptr || ids == nullptr || weights == nullptr || tokens <= 0 || n_expert <= 0 ||
         n_expert > kTopkThreads || topk <= 0 || topk > n_expert) {
         return false;
     }
     moe_topk_kernel<<<(unsigned) tokens, kTopkThreads, 0, stream>>>(
-        static_cast<const float *>(logits), ids, weights, (int) n_expert, topk);
+        static_cast<const float *>(logits), static_cast<const float *>(logits_lo), ids, weights, (int) n_expert,
+        topk);
     return hipGetLastError() == hipSuccess;
 }
 
-bool moe_router(const void * w_f16, const void * x_f16, float * logits, const int64_t tokens,
+bool moe_router(const void * w_f16, const void * x_f16, const void * x_lo_f16, float * logits, const int64_t tokens,
                 const int64_t n_expert, const int64_t k, hipStream_t stream) {
-    if (w_f16 == nullptr || x_f16 == nullptr || logits == nullptr || tokens <= 0 || n_expert <= 0 ||
+    if (w_f16 == nullptr || x_f16 == nullptr || x_lo_f16 == nullptr || logits == nullptr || tokens <= 0 ||
+        n_expert <= 0 ||
         k <= 0 || k % 2 != 0) {
         return false;
     }
     const dim3 grid((unsigned) ((n_expert + kRouterWaves - 1) / kRouterWaves), (unsigned) tokens);
     moe_router_kernel<<<grid, kRouterWaves * kWave, 0, stream>>>(
-        static_cast<const __half *>(w_f16), static_cast<const __half *>(x_f16), logits,
-        (int) n_expert, (int) k);
+        static_cast<const __half *>(w_f16), static_cast<const __half *>(x_f16),
+        static_cast<const __half *>(x_lo_f16), logits, (int) n_expert, (int) k);
     return hipGetLastError() == hipSuccess;
 }
 

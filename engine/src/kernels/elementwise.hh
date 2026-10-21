@@ -22,8 +22,11 @@ bool add_out(const float * x, const float * y, float * out, int64_t n, hipStream
 
 // y (f16) = rms_norm(a + b) * w per row of n; b and sum_out may be null, else
 // sum_out (f32) receives a + b, the residual stream. n % 4 == 0, n <= 8192.
+// y_lo (f16, optional) receives what y's rounding lost, f16(v - f32(y)): the
+// MoE router reads y + y_lo, an f32 input to within 2^-22 (#547).
 bool add_rms_norm_f16(const float * a, const float * b, float * sum_out, const float * w,
-                      void * y_f16, int64_t rows, int64_t n, float eps, hipStream_t stream);
+                      void * y_f16, int64_t rows, int64_t n, float eps, hipStream_t stream,
+                      void * y_lo_f16 = nullptr);
 
 // Greedy argmax of x[0..n) on the device (#102): *key = max over i of
 // argmax_key_pack(x[i], i) (kernels/argmax_key.hh), so the token is
