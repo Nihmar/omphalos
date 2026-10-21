@@ -30,6 +30,7 @@ bool Runner::gemv_one(const int type, const void * w, const void * x, float * y,
         case 2: return omph::kernels::gemv_q4_0(w, x, y, n_out, k, st);
         case 8: return omph::kernels::gemv_q8_0(w, x, y, n_out, k, st);
         case 10: return omph::kernels::gemv_q2k(w, x, y, n_out, k, st);
+        case 11: return omph::kernels::gemv_q3k(w, x, y, n_out, k, st);
         case 12: return omph::kernels::gemv_q4k(w, x, y, n_out, k, st);
         case 13: return omph::kernels::gemv_q5k(w, x, y, n_out, k, st);
         case 14: return omph::kernels::gemv_q6k(w, x, y, n_out, k, st);

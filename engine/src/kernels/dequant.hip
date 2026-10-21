@@ -258,25 +258,6 @@ __global__ void dequant_q5_k_kernel(const uint8_t * __restrict__ src, T * __rest
 
 // -------------------------------------------------------------------- Q3_K
 
-// The 16 6-bit scales of a Q3_K block, unpacked from the 12 bytes at `p` the
-// way the reference's aux[] shuffle does: byte `s` is in 0..63, the reference
-// subtracts 32 (a scale in -32..31).
-__device__ __forceinline__ uint8_t q3k_scale(const uint8_t * p, const int s) {
-    constexpr uint32_t kmask1 = 0x03030303u;
-    constexpr uint32_t kmask2 = 0x0f0f0f0fu;
-    const uint32_t a0 = u32_at(p);
-    const uint32_t a1 = u32_at(p + 4);
-    const uint32_t a2 = u32_at(p + 8);
-    uint32_t w;
-    switch (s >> 2) {
-        case 0: w = (a0 & kmask2) | (((a2 >> 0) & kmask1) << 4); break;
-        case 1: w = (a1 & kmask2) | (((a2 >> 2) & kmask1) << 4); break;
-        case 2: w = ((a0 >> 4) & kmask2) | (((a2 >> 4) & kmask1) << 4); break;
-        default: w = ((a1 >> 4) & kmask2) | (((a2 >> 6) & kmask1) << 4); break;
-    }
-    return (uint8_t) (w >> (8 * (s & 3)));
-}
-
 template <typename T>
 __global__ void dequant_q3_k_kernel(const uint8_t * __restrict__ src, T * __restrict__ dst,
                                     const long long n) {
@@ -295,7 +276,7 @@ __global__ void dequant_q3_k_kernel(const uint8_t * __restrict__ src, T * __rest
     const int half = within >> 4;  // qs[l] then qs[l + 16], hmask as well
 
     const float d_all = f16_at(blk + 108);
-    const int sc = (int) q3k_scale(blk + 96, half_block * 8 + 2 * j + half) - 32;
+    const int sc = (int) qd::q3k_scale(blk + 96, half_block * 8 + 2 * j + half) - 32;
     const uint8_t q = blk[32 + half_block * 32 + (half ? 16 : 0) + l];
     const uint8_t hm = blk[(half ? 16 : 0) + l];
     // the hmask bit: `m` in the reference walks 1..128 across both 128-weight

@@ -230,9 +230,9 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 std::memcpy(embd_host_, file_.tensor_data(t), (size_t) t.nbytes);
                 continue;
             }
-            if (t.layout == omph::gguf::kLayoutGguf && (t.type == 2 || t.type == 8 || t.type == 13)) {
-                // Q4_0 / Q8_0 keep the GGUF blocks and their GEMV reads them as
-                // they are (#492)
+            if (t.layout == omph::gguf::kLayoutGguf && (t.type == 2 || t.type == 8 || t.type == 11 || t.type == 13)) {
+                // Q4_0 / Q8_0 / Q3_K / Q5_K keep the GGUF blocks and their GEMV
+                // reads them as they are (#492, #541)
                 GemvEntry e;
                 e.bytes = (size_t) t.nbytes;
                 e.rows = omph::format::quant_rows(t.type, (int64_t) t.ne[0], t.nbytes);
@@ -1263,7 +1263,9 @@ const void * Runner::raw_bytes(const std::string & name) {
 
 // Types that have a fused GEMV kernel: for these the f16 form is never worth
 // keeping (it would be two to four times the quantized size, and they are the
-// bulk of the model).
+// bulk of the model). Q3_K is not one of them: its GEMV (#541) is the
+// decode's, and a prefill's per-expert matmuls of a few tokens each keep the
+// dequant + GEMM rather than one GEMV launch per token.
 bool Runner::has_gemv_type(const uint32_t type) {
     switch (type) {
         case 2:

@@ -3107,12 +3107,15 @@ bool launch_moe_gu(const uint8_t * const * gate, const uint8_t * const * up, con
 
 } // namespace
 
-// Q8_0 / Q4_0 experts (#540: the MoE MTP block's), defined with the legacy kernels below
+// Q8_0 / Q4_0 experts (#540: the MoE MTP block's) and Q3_K ones (#541: the
+// Q2_K_L's down projections), defined with their kernels below
 bool moe_legacy32(bool q8, const uint8_t * const * exps, const int * ids, const __half * x, float * y, int64_t rows,
                   int64_t k, int64_t slots, int64_t slots_per_x, hipStream_t stream);
 bool moe_legacy32_gu(bool q8, const uint8_t * const * gate, const uint8_t * const * up, const int * ids,
                      const __half * x, __half * out, int64_t rows, int64_t k, int64_t slots, int64_t slots_per_x,
                      hipStream_t stream);
+bool moe_q3k(const uint8_t * const * exps, const int * ids, const __half * x, float * y, int64_t rows, int64_t k,
+             int64_t slots, int64_t slots_per_x, hipStream_t stream);
 
 bool gemv_moe_gu(const uint32_t type, const void * const * gate, const void * const * up, const void * ids,
                  const void * x_f16, void * out_f16, const int64_t rows, const int64_t k, const int64_t slots,
@@ -3170,6 +3173,7 @@ bool gemv_moe(const uint32_t type, const void * const * exps, const void * ids,
         case 14: return run(qd::TileQ6k{});
         case 8:
         case 2: return moe_legacy32(type == 8, wt, id, x, y, rows, k, slots, slots_per_x, stream);
+        case 11: return moe_q3k(wt, id, x, y, rows, k, slots, slots_per_x, stream);
         default: return false;
     }
 }
@@ -3598,6 +3602,91 @@ bool gemv_q5k_n(const void * blocks, const void * x_f16, float * y, const int64_
         case 3: gemv_q5k_kernel<3><<<grid, 256, smem, stream>>>(b, x, y, rows, n_sub, chunk); break;
         default: gemv_q5k_kernel<4><<<grid, 256, smem, stream>>>(b, x, y, rows, n_sub, chunk); break;
     }
+    return hipGetLastError() == hipSuccess;
+}
+
+
+// -------------------------------------------------------------- Q3_K
+//
+// 110-byte blocks (32 hmask bytes, 64 qs bytes, 12 scale bytes, d) read from
+// the GGUF layout (#541: the Q2_K_L's down experts, which mostly sit in pinned
+// host memory, #512). A warp takes a row's blocks one at a time and lane
+// (hb, l) = (lane / 16, lane % 16) the bytes qs[hb * 32 + l], qs[hb * 32 + 16 +
+// l], hmask[l], hmask[16 + l]: the 32 lanes read the block's bytes back to
+// back, one PCIe read per block instead of one per byte. Each qs byte holds the
+// four 2-bit planes j, so a lane has weights hb * 128 + j * 32 + h * 16 + l
+// (h = 0, 1): ((q >> 2j) & 3) - 4, plus 4 when hmask bit hb * 4 + j is set,
+// times d * (scale[hb * 8 + 2j + h] - 32).
+__device__ inline void q3k_body(const uint8_t * __restrict__ blocks, const __half * __restrict__ x,
+                                float * __restrict__ y, const long long rows, const long long nblk) {
+    const int warp = (int) threadIdx.x / 32;
+    const int lane = (int) threadIdx.x % 32;
+    const int hb = lane >> 4;
+    const int l = lane & 15;
+    const long long row0 = ((long long) blockIdx.x * (blockDim.x / 32) + warp) * kLegacyRows;
+    for (int r = 0; r < kLegacyRows && row0 + r < rows; ++r) {
+        const long long row = row0 + r;
+        float acc = 0.0f;
+        for (long long bi = 0; bi < nblk; ++bi) {
+            const uint8_t * b = blocks + (row * nblk + bi) * 110;
+            const __half * xb = x + bi * 256 + hb * 128 + l;
+            const float d = __half2float(*reinterpret_cast<const __half *>(b + 108));
+            const int q0 = b[32 + hb * 32 + l];
+            const int q1 = b[32 + hb * 32 + 16 + l];
+            const int m0 = b[l];
+            const int m1 = b[16 + l];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int bit = hb * 4 + j;
+                const int v0 = ((q0 >> (2 * j)) & 3) - ((m0 >> bit) & 1 ? 0 : 4);
+                const int v1 = ((q1 >> (2 * j)) & 3) - ((m1 >> bit) & 1 ? 0 : 4);
+                const float s0 = (float) ((int) qd::q3k_scale(b + 96, hb * 8 + 2 * j) - 32);
+                const float s1 = (float) ((int) qd::q3k_scale(b + 96, hb * 8 + 2 * j + 1) - 32);
+                acc = fmaf(d * s0, (float) v0 * __half2float(xb[j * 32]), acc);
+                acc = fmaf(d * s1, (float) v1 * __half2float(xb[j * 32 + 16]), acc);
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down(acc, off);
+        }
+        if (lane == 0) {
+            y[row] = acc;
+        }
+    }
+}
+
+__global__ void gemv_q3k_kernel(const uint8_t * __restrict__ blocks, const __half * __restrict__ x,
+                                float * __restrict__ y, const long long rows, const long long nblk) {
+    q3k_body(blocks, x, y, rows, nblk);
+}
+
+// gemv_moe's Q3_K body (#541): grid.z is the slot, as gemv_moe_legacy32_kernel
+__global__ void gemv_moe_q3k_kernel(const uint8_t * const * __restrict__ exps, const int * __restrict__ ids,
+                                    const __half * __restrict__ x, float * __restrict__ y, const long long rows,
+                                    const long long nblk, const int slots_per_x) {
+    const long long slot = blockIdx.z;
+    q3k_body(exps[ids[slot]], x + (slot / slots_per_x) * (nblk * 256), y + slot * rows, rows, nblk);
+}
+
+bool gemv_q3k(const void * blocks, const void * x_f16, float * y, const int64_t rows, const int64_t k,
+              hipStream_t stream) {
+    if (blocks == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 || k % 256 != 0) {
+        return false;
+    }
+    const dim3 grid((unsigned) ((rows + 8 * kLegacyRows - 1) / (8 * kLegacyRows)));
+    gemv_q3k_kernel<<<grid, 256, 0, stream>>>(static_cast<const uint8_t *>(blocks),
+                                              static_cast<const __half *>(x_f16), y, rows, k / 256);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool moe_q3k(const uint8_t * const * exps, const int * ids, const __half * x, float * y, const int64_t rows,
+             const int64_t k, const int64_t slots, const int64_t slots_per_x, hipStream_t stream) {
+    if (k % 256 != 0) {
+        return false;
+    }
+    const dim3 grid((unsigned) ((rows + 8 * kLegacyRows - 1) / (8 * kLegacyRows)), 1, (unsigned) slots);
+    gemv_moe_q3k_kernel<<<grid, 256, 0, stream>>>(exps, ids, x, y, rows, k / 256, (int) slots_per_x);
     return hipGetLastError() == hipSuccess;
 }
 

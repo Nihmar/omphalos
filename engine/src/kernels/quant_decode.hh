@@ -49,6 +49,26 @@ __device__ inline void scale_min_k4(const int j, const uint8_t * q, uint8_t & d,
     }
 }
 
+// Q3_K: the 16 6-bit scales of a GGUF block, unpacked from the 12 bytes at `p`
+// the way the reference's aux[] shuffle does: byte `s` is in 0..63, the
+// reference subtracts 32 (a scale in -32..31). Shared by the dequant and the
+// GEMV (#541).
+__device__ __forceinline__ uint8_t q3k_scale(const uint8_t * p, const int s) {
+    constexpr uint32_t kmask1 = 0x03030303u;
+    constexpr uint32_t kmask2 = 0x0f0f0f0fu;
+    const uint32_t a0 = *reinterpret_cast<const uint32_t *>(p);
+    const uint32_t a1 = *reinterpret_cast<const uint32_t *>(p + 4);
+    const uint32_t a2 = *reinterpret_cast<const uint32_t *>(p + 8);
+    uint32_t w;
+    switch (s >> 2) {
+        case 0: w = (a0 & kmask2) | (((a2 >> 0) & kmask1) << 4); break;
+        case 1: w = (a1 & kmask2) | (((a2 >> 2) & kmask1) << 4); break;
+        case 2: w = ((a0 >> 4) & kmask2) | (((a2 >> 4) & kmask1) << 4); break;
+        default: w = ((a1 >> 4) & kmask2) | (((a2 >> 6) & kmask1) << 4); break;
+    }
+    return (uint8_t) (w >> (8 * (s & 3)));
+}
+
 // Q4_K: d * scale and dmin * min of sub-block j (0..7) from a block's 16-byte
 // meta record: the GGUF 12-byte 6-bit scale/min area (ggml's
 // get_scale_min_k4), then d and dmin (#94).
