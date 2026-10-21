@@ -1,0 +1,60 @@
+# llama.cpp's MoE expert cache (--moe-cache-mib) on Ornith-1.5-35B-A3B-Q4_K_M (#542)
+
+llama.cpp: v0.7.0 @ 620d2225cc (llama_commit 620d2225cc436ab0b001e3200e590e3b286ef9ab), plain
+upstream, HIP gfx1200, built as the pin's build-hip-pin (Release, GGML_HIP_GRAPHS, NO_VMM,
+FA on). NOT the pin (v0.6.0 has no MoE cache, ggml-org/llama.cpp#29887 landed in b11480):
+these rows are a preview of the next refresh (#396), not a moved baseline.
+omphalos: main 5bf5672 (after #540, #541, #547), the calibrated expert set.
+RX 9060 XT 16 GB, desktop active. KV Q4/Q4 on both sides (omphalos OMPH_KV_K4=1, llama.cpp
+-ctk q4_0 -ctv q4_0), ctx 32768. tools/scenario_speed.py, greedy, the prompt sent as the same
+token ids to both engines, one server per (spec, n-gram) cell; omphalos' MTP drafts 1 token per
+step (#496), llama.cpp's 3 (the tool's setting).
+
+llama.cpp configurations:
+- cache:    --cpu-moe --moe-cache-mib 13000 --load-mode none (every expert in host memory, not
+            mapped: the loader warns that mmap'd CPU overrides are slower; 13 GB of VRAM slots,
+            the most that helped: 12000 / 13000 / 13600 MiB gave 20.77 / 20.42 / 20.42 ms/token
+            on a 1023-token prompt + 256 tokens, the second of two requests)
+- no cache: -ncmoe 16 --load-mode none (the #513 placement)
+
+## Decode rate (t/s), each cell's own greedy text
+
+| scenario | engine | plain | MTP | MTP + n-gram | n-gram alone |
+|---|---|---:|---:|---:|---:|
+| edit-cc | llama.cpp no cache | 39.1 | 38.5 | - | - |
+| edit-cc | llama.cpp cache | 42.8 | 42.4 | 46.2 | 41.1 |
+| edit-cc | omphalos | 68.7 | 84.6 | **97.7** | (no drafter) |
+| edit-py | llama.cpp no cache | 36.7 | 39.4 | - | - |
+| edit-py | llama.cpp cache | 40.4 | 48.8 | 136.2 | **142.7** |
+| edit-py | omphalos | 73.8 | **90.2** | 78.7 | (no drafter) |
+| prose | llama.cpp no cache | 40.3 | 30.2 | - | - |
+| prose | llama.cpp cache | 48.6 | 42.1 | 42.2 | 48.6 |
+| prose | omphalos | 88.1 | **95.4** | 89.2 | (no drafter) |
+
+Tokens generated (plain): llama.cpp cache 261 / 4151 / 1217, no cache 65 / 4155 / 1083,
+omphalos 2047 / 1432 / 1057 (edit-cc / edit-py / prose). The engines write different texts
+(other numerics), so the n-gram cells are not comparable across engines: llama.cpp's edit-py
+copies the file back (4055 tokens, 3895 of 4032 drafts kept, ~25 tokens per step), omphalos'
+is shorter and less of a copy (934 of 1697 drafts kept).
+
+Prefill (prompt t/s, the same prompts): llama.cpp no cache 867 / 941 (edit-cc 2114 tokens /
+edit-py 4073), cache 527 / 805; omphalos 1241-1295 / 1380-1401.
+
+## Findings
+
+1. The cache gives llama.cpp +9.5 % (edit-cc), +10 % (edit-py), +21 % (prose) plain decode
+   over -ncmoe 16 at v0.7.0, and costs prefill -39 % / -14 % (large batches only read the
+   cache; the misses run where the experts live, in host memory).
+2. omphalos stays ahead on plain decode (1.6-1.8x) and on the best cell of edit-cc (2.1x) and
+   prose. On edit-py llama.cpp's n-gram cell (142.7 t/s) beats omphalos' best (90.2): its text
+   is a long copy and its n-gram drafts are long; omphalos' MoE verification reads an expert
+   once per (token, expert) slot (#496), ~6.5 ms per verified row vs llama.cpp's ~2.8 ms
+   (#551), and its n-gram drafts lose on edit-py (-13 % against MTP alone).
+3. The first omphalos MTP + n-gram run of edit-cc stalled for ~8 s at the start (100 tokens at
+   11.9 t/s, then 88-110 t/s; 71.8 t/s for the request) right after the llama.cpp cells
+   released ~19 GB of pinned memory; a rerun of the cell (same text, same 1897 / 2221 drafts)
+   ran at 96.1 and 97.7 t/s from the first token. The table has the rerun; the stalled run's
+   rows were 71.8 / 77.7 / 89.9 t/s.
+
+Raw rows: moe-cache-542-llama-cache.jsonl, moe-cache-542-llama-nocache.jsonl,
+moe-cache-542-omphalos.jsonl.
