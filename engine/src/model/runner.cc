@@ -460,6 +460,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
         alloc(&moe_logits_, (size_t) 2 * T * h_.n_expert * 4);
         alloc(&h16lo_, (size_t) T * ne * 2);
         alloc(&moe_cnt_max_, sizeof(int));
+        alloc(&moe_act_, ((size_t) h_.n_expert + 1) * sizeof(int));
         moe_host_ids_.resize((size_t) T * h_.n_expert_used);
         moe_counts_.resize((size_t) h_.n_expert);
     }
