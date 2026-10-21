@@ -256,14 +256,13 @@ constexpr int kFinishThreads = 256;
 __global__ void __launch_bounds__(kFinishThreads)
 moe_finish_kernel(float * __restrict__ out, const float * __restrict__ xo, const float * __restrict__ weights,
                   const int topk, const float * __restrict__ ysh, const float * __restrict__ wg,
-                  const __half * __restrict__ x, const __half * __restrict__ x_lo, const long long ne) {
+                  const __half * __restrict__ x, const long long ne) {
     __shared__ float s_sum[kFinishThreads / kWave];
     const long long t = blockIdx.y;
     const __half * xr = x + (size_t) t * (size_t) ne;
-    const __half * lr = x_lo + (size_t) t * (size_t) ne;
     float d = 0.0f;
     for (long long j = threadIdx.x; j < ne; j += kFinishThreads) {
-        d += (__half2float(xr[j]) + __half2float(lr[j])) * wg[j];
+        d += __half2float(xr[j]) * wg[j];
     }
     d = wave_sum(d);
     if (threadIdx.x % kWave == 0) {
@@ -384,18 +383,15 @@ bool moe_scatter_store(float * xo, const float * y, const int * slot, const int 
 }
 
 bool moe_finish(float * out, const float * xo, const float * weights, const int topk, const float * ysh,
-                const void * wg, const void * x_f16, const void * x_lo_f16, const int64_t tokens, const int64_t ne,
-                hipStream_t stream) {
-    if (out == nullptr || ysh == nullptr || wg == nullptr || x_f16 == nullptr || x_lo_f16 == nullptr || tokens <= 0 ||
-        ne <= 0 ||
+                const void * wg, const void * x_f16, const int64_t tokens, const int64_t ne, hipStream_t stream) {
+    if (out == nullptr || ysh == nullptr || wg == nullptr || x_f16 == nullptr || tokens <= 0 || ne <= 0 ||
         (xo != nullptr && (weights == nullptr || topk <= 0))) {
         return false;
     }
     const dim3 grid((unsigned) ((ne + kFinishThreads - 1) / kFinishThreads), (unsigned) tokens);
     moe_finish_kernel<<<grid, kFinishThreads, 0, stream>>>(out, xo, weights, topk, ysh,
                                                            static_cast<const float *>(wg),
-                                                           static_cast<const __half *>(x_f16),
-                                                           static_cast<const __half *>(x_lo_f16), (long long) ne);
+                                                           static_cast<const __half *>(x_f16), (long long) ne);
     return hipGetLastError() == hipSuccess;
 }
 

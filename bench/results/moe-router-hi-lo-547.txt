@@ -1,0 +1,21 @@
+# #547: the MoE router reads the FFN input as f16 hi + lo; Ornith-1.5-35B-A3B-Q4_K_M
+# engine: main 76657ac vs fix/547-router-hi-lo; llama.cpp v0.6.0 b11429 @ d8123504 (pin), CPU (-ngl 0) for the references
+# RX 9060 XT 16 GB, gfx1200
+
+## routing (offline, tools/moe_router_precision.py, bench/results/moe-router-f16-544.txt): picks differing from an exact router
+# f16 input 59 / 40880 -> hi + lo 0 / 40880 (llama.cpp f32: 2)
+
+## vs llama.cpp, every position of the 1022-token prompt (dump_tensors --all-logits; omph-run --logits-tail 1022 / --tokens 64 --gen-force)
+# prefill (GEMM router): KL mean main 0.02086 new 0.02145, paired new-main +0.00059 +- 0.00068 (1 s.e.); top-1 93.24 -> 94.03 %
+# decode (GEMV router, 957 forced steps): KL mean main 0.02053 new 0.02174, paired +0.00121 +- 0.00126; top-1 93.52 -> 93.42 %
+# NLL of the true tokens: prefill main 2.2806 new 2.2728 (paired -0.0078 +- 0.0035); decode 2.1669 / 2.1675 (+0.0005 +- 0.0041); llama.cpp 2.2896 / 2.1777
+# (measured with the shared gate on hi + lo too; that part was reverted, its sigmoid moves by < 1e-4)
+
+## cost
+# decode (first version, shared gate on hi + lo too), the same 128 forced tokens, 5 alternated runs, median step wall: 21-token prompt 11.74 -> 11.72 ms, 2065-token 12.47 -> 12.44 ms
+# prefill, 2065 tokens, 10 alternated runs (prefill wall, ms):
+#   main [1541.1, 1737.1, 1595.2, 1595.6, 1593.1, 1654.5, 1561.7, 1529.6, 1526.8, 1592.0] median 1592.5
+#   new  [1661.6, 1625.2, 1631.4, 1560.4, 1757.2, 1559.9, 1556.2, 1702.7, 1668.9, 1616.2] median 1628.3
+#   paired new-main mean 41.3 +- 33.2 ms (1 s.e.)
+# rocprofv3 (one pair): the second router GEMM 200 x 34 us = +6.9 ms of GPU time per 2065 tokens (+0.45 %)
+# output: --draft-mtp 1 == plain greedy on Q4_K_M and Q2_K_L (OMPH_SPEC_CHECK=1); Qwen3.8 dense logits and ids identical to main

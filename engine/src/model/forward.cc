@@ -510,8 +510,8 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
 // routed rows xo (or cur_ itself when xo is null) + sigmoid(x . gate) * ysh.
 bool Runner::moe_finish(const LayerWeights & L, const int64_t T, const float * xo, const float * ysh) {
     if (!omph::kernels::moe_finish(static_cast<float *>(cur_), xo, static_cast<const float *>(moe_w_),
-                                   (int) h_.n_expert_used, ysh, L.ffn_gate_inp_shexp, h16_, h16lo_, T,
-                                   h_.n_embd, hipStreamPerThread)) {
+                                   (int) h_.n_expert_used, ysh, L.ffn_gate_inp_shexp, h16_, T, h_.n_embd,
+                                   hipStreamPerThread)) {
         return fail("moe finish failed");
     }
     return true;

@@ -70,11 +70,10 @@ bool moe_scatter_store(float * xo, const float * y, const int * slot, const int 
 // The end of a MoE layer (#522): out[t][j] = sum_e weights[t * topk + e] *
 // xo[(t * topk + e) * ne + j] in slot order (or out as it is when xo is null)
 // + sigmoid(x_t . wg) * ysh[t * ne + j]; wg the shared expert's F32 gate row
-// (ffn_gate_inp_shexp), x the layer's FFN input as f16 hi + lo (#547). One
-// launch for the routed sum, the shared gate and the shared expert's
-// accumulate.
+// (ffn_gate_inp_shexp), x the layer's f16 FFN input (its rounding moves the
+// gate by < 1e-4, #544; the router reads hi + lo, #547). One launch for the
+// routed sum, the shared gate and the shared expert's accumulate.
 bool moe_finish(float * out, const float * xo, const float * weights, int topk, const float * ysh,
-                const void * wg, const void * x_f16, const void * x_lo_f16, int64_t tokens, int64_t ne,
-                hipStream_t stream);
+                const void * wg, const void * x_f16, int64_t tokens, int64_t ne, hipStream_t stream);
 
 } // namespace omph::kernels
