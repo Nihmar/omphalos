@@ -798,8 +798,8 @@ private:
         const uint8_t * dev[3] = {};   // the slot pool of gate / up / down
         const uint8_t * host[3] = {};  // their pinned copies of experts fixed..n-1
         size_t pe[3] = {};             // bytes per expert
-        std::vector<int> owner;        // per slot: the expert in it
-        std::vector<int> slot_of;      // per expert: its slot, -1 if read from host
+        int pool = -1;                 // its LRU slots' pool in moe_pools_
+        std::vector<int> slot_of;      // per expert: its slot (fixed + pool index past the fixed), -1 if read from host
         std::vector<int> hidx;         // per expert: its pinned copy's index, -1 for a fixed one
         std::vector<int64_t> count;    // per expert: this run's logged picks
         int blk = -1;
@@ -807,6 +807,15 @@ private:
         std::vector<int64_t> missed;   // per expert: the last step it was read from host
     };
     std::vector<MoeTab> moe_tabs_;  // only for a cached model; the MTP layer is not logged
+    // The LRU slots of the logged layers of one expert layout, shared (#550:
+    // a layer gets the slots its recent picks claim; OMPH_MOE_LAYER_LRU, one
+    // pool per layer). A slot is slot `s` of table `mem`'s pools, holding
+    // expert `e` of table `tab`.
+    struct MoePool {
+        std::vector<std::pair<int, int>> slot;   // (mem, s)
+        std::vector<std::pair<int, int>> owner;  // (tab, e)
+    };
+    std::vector<MoePool> moe_pools_;
     int64_t moe_log_tabs_ = 0;      // the logged tables (the stack's layers)
     int * moe_log_ = nullptr;       // pinned: moe_log_tabs_ x kMoeLogTokens x topk
     int64_t moe_log_T_ = 0;         // the tokens of the logged step, 0: none pending

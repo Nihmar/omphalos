@@ -93,6 +93,7 @@ struct EnvOptions {
     bool spec_pointmass = false;  // OMPH_SPEC_POINTMASS: sampled MTP drafts keep the point-mass rule (#394, A/B)
     bool no_group = false;      // OMPH_NO_GROUP: sibling GEMVs as separate launches (#214)
     bool moe_no_rows = false;   // OMPH_MOE_NO_ROWS: MoE verifications per (token, expert) slot (#551)
+    bool moe_layer_lru = false; // OMPH_MOE_LAYER_LRU: the expert cache's LRU slots per layer (#550)
     bool no_swiglu_gemm = false;  // OMPH_NO_SWIGLU_GEMM: the FFN's up GEMM writes f32, then swiglu_f16 (#221)
     int64_t mtp_window = 16384;  // OMPH_MTP_WINDOW=N: the MTP block attends 16 sinks + the last N..2N positions (0: all; #171)
     int64_t draft_vocab = 98304;  // OMPH_DRAFT_VOCAB=N: MTP drafts over the first N token ids (0: all; the head's tile height rounds N down, #340)

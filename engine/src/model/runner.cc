@@ -1650,7 +1650,6 @@ void Runner::moe_tables() {
         if (cached) {
             MoeTab & c = moe_tabs_[i];
             c.blk = blk;
-            c.owner.assign(order.begin(), order.begin() + moe_cap_);
             c.slot_of.assign((size_t) n, -1);
             c.hidx.assign((size_t) n, -1);
             c.last.assign((size_t) n, 0);
@@ -1661,7 +1660,38 @@ void Runner::moe_tables() {
                 c.slot_of[(size_t) e] = p < moe_cap_ ? (int) p : -1;
                 c.hidx[(size_t) e] = p >= moe_fixed_ ? (int) (p - moe_fixed_) : -1;
             }
+            // the logged layers' LRU slots go to the pool of their layout (or
+            // their own); the MTP block's are never updated
+            if ((int64_t) i < moe_log_tabs_) {
+                int pool = -1;
+                for (size_t j = 0; j < i && !env_.moe_layer_lru; ++j) {
+                    const LayerWeights & o = *ls[j];
+                    if (o.ffn_gate_exps.t->type == L.ffn_gate_exps.t->type &&
+                        o.ffn_up_exps.t->type == L.ffn_up_exps.t->type &&
+                        o.ffn_down_exps.t->type == L.ffn_down_exps.t->type &&
+                        moe_tabs_[j].pe[0] == c.pe[0] && moe_tabs_[j].pe[1] == c.pe[1] && moe_tabs_[j].pe[2] == c.pe[2]) {
+                        pool = moe_tabs_[j].pool;
+                        break;
+                    }
+                }
+                if (pool < 0) {
+                    pool = (int) moe_pools_.size();
+                    moe_pools_.emplace_back();
+                }
+                c.pool = pool;
+                MoePool & P = moe_pools_[(size_t) pool];
+                for (int64_t s = moe_fixed_; s < moe_cap_; ++s) {
+                    const int e = order[(size_t) s];
+                    c.slot_of[(size_t) e] = (int) (moe_fixed_ + (int64_t) P.slot.size());
+                    P.slot.emplace_back((int) i, (int) s);
+                    P.owner.emplace_back((int) i, e);
+                }
+            }
         }
+    }
+    if (env_.timing && !moe_pools_.empty()) {
+        std::fprintf(stderr, "expert cache: %zu LRU pools of %zu slots (#550)\n", moe_pools_.size(),
+                     moe_pools_[0].slot.size());
     }
     if (hipMemcpy(moe_eptr_, moe_eptr_host_.data(), moe_eptr_host_.size() * sizeof(void *),
                   hipMemcpyHostToDevice) != hipSuccess) {
