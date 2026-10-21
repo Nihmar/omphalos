@@ -1,0 +1,38 @@
+# #540: Q4_0 experts in gemv_moe / gemv_moe_gu (the Ornith MTP block)
+# engine: main d456662 vs perf/540-moe-legacy32 32133b1; llama.cpp: not involved
+# omph-run models/Ornith-1.5-35B-A3B-Q4_K_M.omph <prompt> --last-logits --gemv --generate 128 --draft-mtp 1, OMPH_TIMING=1
+# RX 9060 XT 16 GB, gfx1200; 5 runs per binary, alternated; draft_ms = median 'spec cycle: draft' of a run
+# prompts: tok = 21-token code request, prose = 28-token Italian story request, long = 2065 tokens of PLAN.md
+# medians: tok 9.55 -> 9.43 ms/token (draft 1.19 -> 0.98); prose 12.95 -> 12.80 (2.005 -> 1.79); long 11.91 -> 11.79 (1.215 -> 1.005)
+# output: greedy ids with --draft-mtp 1 == plain greedy, Q4_K_M and Q2_K_L (128 tokens, OMPH_SPEC_CHECK=1); accepted drafts unchanged (57 / 71)
+prompt,binary,run,ms_per_token,draft_ms_median
+tok,main,0,9.55,1.19
+tok,new,0,9.25,0.98
+tok,main,1,9.55,1.19
+tok,new,1,9.43,0.98
+tok,main,2,9.56,1.21
+tok,new,2,9.43,0.99
+tok,main,3,9.54,1.2
+tok,new,3,9.25,0.97
+tok,main,4,9.54,1.19
+tok,new,4,9.44,0.98
+prose,main,0,12.79,1.99
+prose,new,0,12.81,1.78
+prose,main,1,12.96,2.01
+prose,new,1,12.8,1.79
+prose,main,2,12.94,2.01
+prose,new,2,12.8,1.7850000000000001
+prose,main,3,12.96,2.005
+prose,new,3,12.79,1.79
+prose,main,4,12.95,2.0
+prose,new,4,12.8,1.79
+long,main,0,11.91,1.2149999999999999
+long,new,0,11.81,1.005
+long,main,1,11.9,1.21
+long,new,1,11.79,1.005
+long,main,2,11.91,1.22
+long,new,2,11.8,1.0
+long,main,3,11.92,1.2149999999999999
+long,new,3,11.78,1.01
+long,main,4,11.92,1.22
+long,new,4,11.78,1.005
