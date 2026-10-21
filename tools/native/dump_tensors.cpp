@@ -6,7 +6,10 @@
 // tokens are saved to tokens.txt.
 //
 // build: tools/native/build.sh <llama.cpp-dir>
-// usage: dump_tensors -m model.gguf -p "prompt" -o outdir [-ngl 0] [-c 512]
+// usage: dump_tensors -m model.gguf -p "prompt" -o outdir [-ngl 0] [-c 512] [--only P1,P2,...]
+//
+// --only keeps the tensors whose name starts with one of the prefixes (#544: a
+// long prompt's router inputs and logits without the rest of the graph).
 
 #include "llama.h"
 #include "ggml.h"
@@ -17,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 struct dump_state {
@@ -25,6 +29,7 @@ struct dump_state {
     int counter = 0;
     long long saved = 0;
     long long bytes = 0;
+    std::vector<std::string> only;  // name prefixes to keep (empty: all)
 };
 
 static std::string sanitize(const char * name) {
@@ -48,6 +53,11 @@ static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     }
     if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) {
         return true;  // activations only
+    }
+    if (!st->only.empty() && std::none_of(st->only.begin(), st->only.end(), [t](const std::string & p) {
+            return std::strncmp(t->name, p.c_str(), p.size()) == 0;
+        })) {
+        return true;
     }
     if (t->buffer == nullptr) {
         return true;
@@ -117,7 +127,7 @@ static void log_cb(enum ggml_log_level level, const char * text, void * /*user_d
 }
 
 static void usage(const char * prog) {
-    std::fprintf(stderr, "usage: %s -m model.gguf -p \"prompt\" -o outdir [-ngl N] [-c N]\n",
+    std::fprintf(stderr, "usage: %s -m model.gguf -p \"prompt\" -o outdir [-ngl N] [-c N] [--only P1,P2,...]\n",
                  prog);
 }
 
@@ -127,6 +137,7 @@ int main(int argc, char ** argv) {
     std::string outdir = "golden";
     int ngl = 0;
     int n_ctx = 512;
+    std::vector<std::string> only;
 
     for (int i = 1; i < argc; ++i) {
         const std::string key = argv[i];
@@ -147,6 +158,13 @@ int main(int argc, char ** argv) {
             ngl = std::atoi(value().c_str());
         } else if (key == "-c" || key == "--ctx-size") {
             n_ctx = std::atoi(value().c_str());
+        } else if (key == "--only") {
+            const std::string v = value();
+            for (size_t b = 0; b <= v.size();) {
+                const size_t e = std::min(v.find(',', b), v.size());
+                if (e > b) only.push_back(v.substr(b, e - b));
+                b = e + 1;
+            }
         } else if (key == "-h" || key == "--help") {
             usage(argv[0]);
             return 0;
@@ -168,6 +186,7 @@ int main(int argc, char ** argv) {
     }
 
     dump_state st;
+    st.only = only;
     st.outdir = outdir;
     st.index = std::fopen((outdir + "/index.jsonl").c_str(), "w");
     if (st.index == nullptr) {
