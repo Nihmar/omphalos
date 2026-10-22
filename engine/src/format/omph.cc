@@ -157,7 +157,7 @@ ConvertStats convert_to_omph(const std::string & in_path, const std::string & ou
         const uint8_t * gguf_bytes = src.tensor_data(t);
         if (layouts[i] != gguf::kLayoutGguf) {
             const int64_t k = (int64_t) t.ne[0];
-            const int64_t rows = (int64_t) (t.nbytes / (uint64_t) quant_block_bytes(t.type)) / (k / 256);
+            const int64_t rows = quant_rows(t.type, k, t.nbytes);  // the 32-wide blocks too (#563)
             packed.clear();  // the layouts' padding is left unwritten: zeros, not the previous tensor
             if (!to_engine_layout(t.type, gguf_bytes, rows, k, packed) || packed.size() != stored[i]) {
                 fail("repack failed for " + t.name);

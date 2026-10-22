@@ -231,8 +231,9 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 continue;
             }
             if (t.layout == omph::gguf::kLayoutGguf && (t.type == 2 || t.type == 8 || t.type == 11 || t.type == 13)) {
-                // Q4_0 / Q8_0 / Q3_K / Q5_K keep the GGUF blocks and their GEMV
-                // reads them as they are (#492, #541)
+                // Q4_0 / Q3_K (and Q8_0 / Q5_K whose rows are not a multiple
+                // of 16, #563) keep the GGUF blocks and their GEMV reads them
+                // as they are (#492, #541)
                 GemvEntry e;
                 e.bytes = (size_t) t.nbytes;
                 e.rows = omph::format::quant_rows(t.type, (int64_t) t.ne[0], t.nbytes);

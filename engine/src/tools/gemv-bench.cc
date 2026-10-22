@@ -65,6 +65,17 @@ bool launch(const Case & c, const void * x, float * y, hipStream_t stream) {
         return omph::kernels::gemv_tokens(c.t->type, c.dev, x, g_ny, c.rows, c.k, g_nt, stream) ||
                omph::kernels::gemv_multi(c.t->type, c.dev, x, g_ny, c.rows, c.k, g_nt, stream);
     }
+    // the legacy block types: the same entry points the model dispatches to
+    // (dispatch.cc), so --all-of-type 2 / 8 / 13 measures and checks them too
+    if (c.t->type == 2) {
+        return omph::kernels::gemv_q4_0(c.dev, x, y, c.rows, c.k, stream);
+    }
+    if (c.t->type == 8) {
+        return omph::kernels::gemv_q8_0(c.dev, x, y, c.rows, c.k, stream);
+    }
+    if (c.t->type == 13) {
+        return omph::kernels::gemv_q5k(c.dev, x, y, c.rows, c.k, stream);
+    }
     if (c.t->type == 12) {
         return omph::kernels::gemv_q4k(c.dev, x, y, c.rows, c.k, stream);
     }

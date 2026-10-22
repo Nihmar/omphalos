@@ -62,8 +62,8 @@ enum Layout : uint32_t {
     kLayoutTile = 2,    // WMMA tiles (every GEMV type; repack.hh, #178, #219, #244, #253, #258, #275)
 };
 // 2: IQ3_S in kLayoutTile; 3: IQ3_XXS too; 4: IQ4_XS and Q4_K too; 5: IQ2_S, Q2_K, IQ2_XS, IQ2_XXS too;
-// 6: Q6_K too; 7: IQ1_M too (format/repack.hh's engine_layout)
-constexpr uint32_t kOmphFormatVersion = 7;
+// 6: Q6_K too; 7: IQ1_M too; 8: Q8_0 and Q5_K too (format/repack.hh's engine_layout)
+constexpr uint32_t kOmphFormatVersion = 8;
 
 struct TensorInfo {
     std::string name;

@@ -995,8 +995,8 @@ bool Runner::head_chunked(const void * x16, const int64_t T, float * out) {
         void * wh = head16;
         timer_stage_.start();
         // the repacked head's rows v0.. straight from its layout (M8)
-        // a GemvEntry's bytes are a repacked layout *unless* it is one of the
-        // legacy types, which keep the GGUF blocks (#492)
+        // a GemvEntry's bytes are a repacked layout *unless* it keeps the GGUF
+        // blocks (Q4_0, Q3_K, rows % 16 != 0 of Q8_0 / Q5_K; #492, #563)
         const bool head_dq =
             head_.gemv != nullptr && !head_.gemv->gguf
                 ? omph::kernels::dequant_repacked(head_.gemv->type, head_src, wh, h_.n_vocab, ne,
