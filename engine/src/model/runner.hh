@@ -317,8 +317,8 @@ private:
     // slot-ordered weighted sum.
     bool moe_ffn_batched(const LayerWeights & L, const int64_t T);
     // The routed gate's selection (#509): a GEMV for up to kMoeRouterGemvMax
-    // tokens (a step, a verification), the f16 GEMM above.
-    static constexpr int64_t kMoeRouterGemvMax = 16;
+    // tokens (a step, a verification: 32 rows since #555), the f16 GEMM above.
+    static constexpr int64_t kMoeRouterGemvMax = 32;
     bool moe_route(const LayerWeights & L, const int64_t T);
     // This layer's selection: moe_ids_ keeps one T x topk row per MoE layer,
     // so a step's selections are all there at its end (#512).

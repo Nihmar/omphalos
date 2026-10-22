@@ -442,10 +442,10 @@ bool Runner::moe_ffn(const LayerWeights & L, const int64_t T) {
         if (!omph::kernels::moe_order(ids, n_rows, h_.n_expert, topk, moe_cnt_, moe_off_, xgi, slot, moe_cnt_max_,
                                       hipStreamPerThread, moe_act_) ||
             !omph::kernels::gemv_moe_rows_gu(ge.t->type, ge.experts, L.ffn_up_exps.experts, moe_act_, moe_off_,
-                                             moe_cnt_, xgi, h16_, ffn16_, (int64_t) ge.t->ne[1], ne, max_act,
+                                             moe_cnt_, xgi, h16_, ffn16_, (int64_t) ge.t->ne[1], ne, max_act, T,
                                              hipStreamPerThread) ||
             !omph::kernels::gemv_moe_rows(de.t->type, de.experts, moe_act_, moe_off_, moe_cnt_, nullptr, ffn16_,
-                                          down_out, (int64_t) de.t->ne[1], ffn, max_act, hipStreamPerThread) ||
+                                          down_out, (int64_t) de.t->ne[1], ffn, max_act, T, hipStreamPerThread) ||
             !omph::kernels::moe_scatter_store(xo, down_out, slot, xgi, n_rows, ne, topk, hipStreamPerThread)) {
             return fail("moe grouped verification failed");
         }

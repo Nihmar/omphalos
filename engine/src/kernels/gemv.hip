@@ -3107,14 +3107,15 @@ bool launch_moe_gu(const uint8_t * const * gate, const uint8_t * const * up, con
 
 
 // The verification's experts grouped (#551): grid.z is the a-th chosen expert
-// (act[1 + a], act[0] of them), whose n = counts[e] <= 16 gathered rows
-// offs[e] .. offs[e] + n - 1 are the WMMA's B columns: the expert's weights are
-// read once for all of its tokens. Column t reads x row xrows[r0 + t] (a
-// token, for gate / up) or r0 + t (a gathered row, for the down projection)
-// and writes row r0 + t. A WMMA output column does not depend on the other
-// columns and the k split's sums do not depend on n, so each (token, expert)
-// is gemv_moe's / gemv_moe_gu's result for that slot bit for bit.
-template <class TD, int KW>
+// (act[1 + a], act[0] of them), whose n = counts[e] <= 16 * NC gathered rows
+// offs[e] .. offs[e] + n - 1 are the WMMA's B columns, NC tiles of 16 (#555:
+// 2 for a 17..32-token block): the expert's weights are read once for all of
+// its tokens. Column t reads x row xrows[r0 + t] (a token, for gate / up) or
+// r0 + t (a gathered row, for the down projection) and writes row r0 + t. A
+// WMMA output column does not depend on the other columns and the k split's
+// sums do not depend on n, so each (token, expert) is gemv_moe's /
+// gemv_moe_gu's result for that slot bit for bit.
+template <class TD, int KW, int NC>
 __global__ __launch_bounds__(256, 8) void gemv_moe_rows_kernel(
     const uint8_t * const * __restrict__ exps, const int * __restrict__ act, const int * __restrict__ offs,
     const int * __restrict__ counts, const int * __restrict__ xrows, const __half * __restrict__ x,
@@ -3143,9 +3144,14 @@ __global__ __launch_bounds__(256, 8) void gemv_moe_rows_kernel(
     const long long per = (blocks + KW - 1) / KW;
     const long long b0 = kp * per;
     const long long b1 = valid ? (b0 + per < blocks ? b0 + per : blocks) : b0;
-    const __half * xc = t < n ? x + (xrows != nullptr ? (long long) xrows[r0 + t] : r0 + t) * k : nullptr;
+    const __half * xc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const int col = c * 16 + t;
+        xc[c] = col < n ? x + (xrows != nullptr ? (long long) xrows[r0 + col] : r0 + col) * k : nullptr;
+    }
     const uint8_t * wt = exps[e];
-    tile_f8 acc = {};
+    tile_f8 acc[NC] = {};
     for (long long b = b0; b < b1; ++b) {
         const typename TD::Blk kb = TD::load(wt + (tile * blocks + b) * TD::kBytes, lane);
 #pragma unroll
@@ -3154,37 +3160,48 @@ __global__ __launch_bounds__(256, 8) void gemv_moe_rows_kernel(
 #pragma unroll
             for (int gl = 0; gl < 2; ++gl) {
                 const tile_h8 a = TD::frag(lds, kb, sb, gl, h);
-                tile_h8 bv = {};
-                if (xc != nullptr) {
-                    bv = *reinterpret_cast<const tile_h8 *>(xc + s * 32 + h * 16 + gl * 8);
+#pragma unroll
+                for (int c = 0; c < NC; ++c) {
+                    tile_h8 bv = {};
+                    if (xc[c] != nullptr) {
+                        bv = *reinterpret_cast<const tile_h8 *>(xc[c] + s * 32 + h * 16 + gl * 8);
+                    }
+                    acc[c] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bv, acc[c]);
                 }
-                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bv, acc);
             }
         }
     }
+    // one column tile at a time through the same LDS sums
 #pragma unroll
-    for (int v = 0; v < 8; ++v) {
-        red[wv][h * 8 + v][t] = acc[v];
-    }
-    __syncthreads();
-    for (int idx = tid; idx < kTiles * 16 * n; idx += blockDim.x) {
-        const int tt2 = idx / (16 * n);
-        const int m = (idx / n) % 16;
-        const int tt = idx % n;
-        float sum = red[tt2 * KW][m][tt];
-#pragma unroll
-        for (int i = 1; i < KW; ++i) {
-            sum += red[tt2 * KW + i][m][tt];
+    for (int c = 0; c < NC; ++c) {
+        const int nc = n - c * 16 < 16 ? n - c * 16 : 16;
+        if (c > 0) {
+            __syncthreads();
         }
-        const long long row = ((long long) blockIdx.x * kTiles + tt2) * 16 + m;
-        if (row < rows) {
-            y[(r0 + tt) * rows + row] = sum;
+#pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            red[wv][h * 8 + v][t] = acc[c][v];
+        }
+        __syncthreads();
+        for (int idx = tid; idx < kTiles * 16 * nc; idx += blockDim.x) {
+            const int tt2 = idx / (16 * nc);
+            const int m = (idx / nc) % 16;
+            const int tt = idx % nc;
+            float sum = red[tt2 * KW][m][tt];
+#pragma unroll
+            for (int i = 1; i < KW; ++i) {
+                sum += red[tt2 * KW + i][m][tt];
+            }
+            const long long row = ((long long) blockIdx.x * kTiles + tt2) * 16 + m;
+            if (row < rows) {
+                y[(r0 + c * 16 + tt) * rows + row] = sum;
+            }
         }
     }
 }
 
 // ... gate, up and SwiGLU, gemv_moe_gu_kernel's arithmetic per column
-template <class TD>
+template <class TD, int NC>
 __global__ __launch_bounds__(256, 8) void gemv_moe_rows_gu_kernel(
     const uint8_t * const * __restrict__ gate, const uint8_t * const * __restrict__ up, const int * __restrict__ act,
     const int * __restrict__ offs, const int * __restrict__ counts, const int * __restrict__ xrows,
@@ -3213,8 +3230,13 @@ __global__ __launch_bounds__(256, 8) void gemv_moe_rows_gu_kernel(
     const long long per = (blocks + kTileKW - 1) / kTileKW;
     const long long b0 = kp * per;
     const long long b1 = valid ? (b0 + per < blocks ? b0 + per : blocks) : b0;
-    const __half * xc = t < n ? x + (long long) xrows[r0 + t] * k : nullptr;
-    tile_f8 acc = {};
+    const __half * xc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const int col = c * 16 + t;
+        xc[c] = col < n ? x + (long long) xrows[r0 + col] * k : nullptr;
+    }
+    tile_f8 acc[NC] = {};
     for (long long b = b0; b < b1; ++b) {
         const typename TD::Blk kb = TD::load(wt + (tile * blocks + b) * TD::kBytes, lane);
 #pragma unroll
@@ -3223,32 +3245,42 @@ __global__ __launch_bounds__(256, 8) void gemv_moe_rows_gu_kernel(
 #pragma unroll
             for (int gl = 0; gl < 2; ++gl) {
                 const tile_h8 a = TD::frag(lds, kb, sb, gl, h);
-                tile_h8 bv = {};
-                if (xc != nullptr) {
-                    bv = *reinterpret_cast<const tile_h8 *>(xc + s * 32 + h * 16 + gl * 8);
+#pragma unroll
+                for (int c = 0; c < NC; ++c) {
+                    tile_h8 bv = {};
+                    if (xc[c] != nullptr) {
+                        bv = *reinterpret_cast<const tile_h8 *>(xc[c] + s * 32 + h * 16 + gl * 8);
+                    }
+                    acc[c] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bv, acc[c]);
                 }
-                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bv, acc);
             }
         }
     }
 #pragma unroll
-    for (int v = 0; v < 8; ++v) {
-        red[wv][h * 8 + v][t] = acc[v];
-    }
-    __syncthreads();
-    for (int idx = tid; idx < 16 * n; idx += blockDim.x) {
-        const int m = idx / n;
-        const int tt = idx % n;
-        float g = red[0][m][tt];
-        float u = red[kTileKW][m][tt];
-#pragma unroll
-        for (int i = 1; i < kTileKW; ++i) {
-            g += red[i][m][tt];
-            u += red[kTileKW + i][m][tt];
+    for (int c = 0; c < NC; ++c) {
+        const int nc = n - c * 16 < 16 ? n - c * 16 : 16;
+        if (c > 0) {
+            __syncthreads();
         }
-        const long long row = tile * 16 + m;
-        if (row < rows) {
-            out[(r0 + tt) * rows + row] = __float2half((g / (1.0f + expf(-g))) * u);
+#pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            red[wv][h * 8 + v][t] = acc[c][v];
+        }
+        __syncthreads();
+        for (int idx = tid; idx < 16 * nc; idx += blockDim.x) {
+            const int m = idx / nc;
+            const int tt = idx % nc;
+            float g = red[0][m][tt];
+            float u = red[kTileKW][m][tt];
+#pragma unroll
+            for (int i = 1; i < kTileKW; ++i) {
+                g += red[i][m][tt];
+                u += red[kTileKW + i][m][tt];
+            }
+            const long long row = tile * 16 + m;
+            if (row < rows) {
+                out[(r0 + c * 16 + tt) * rows + row] = __float2half((g / (1.0f + expf(-g))) * u);
+            }
         }
     }
 }
@@ -3256,18 +3288,23 @@ __global__ __launch_bounds__(256, 8) void gemv_moe_rows_gu_kernel(
 template <class TD>
 bool launch_moe_rows(const uint8_t * const * exps, const int * act, const int * offs, const int * counts,
                      const int * xrows, const __half * x, float * y, const int64_t rows, const int64_t k,
-                     const int max_act, hipStream_t stream) {
-    if (rows % 16 != 0 || k % 256 != 0 || max_act <= 0) {
+                     const int max_act, const int max_n, hipStream_t stream) {
+    if (rows % 16 != 0 || k % 256 != 0 || max_act <= 0 || max_n <= 0 || max_n > 32) {
         return false;
     }
     // the same k split as launch_moe_tile, so the sums are its own
+    const auto run = [&](auto kw, auto nc) {
+        constexpr int KW = decltype(kw)::value;
+        const unsigned grid = (unsigned) ((rows / 16 + 8 / KW - 1) / (8 / KW));
+        gemv_moe_rows_kernel<TD, KW, decltype(nc)::value><<<dim3(grid, 1, (unsigned) max_act), 256, 0, stream>>>(
+            exps, act, offs, counts, xrows, x, y, rows, k / 256);
+    };
     if (k / 256 <= 2) {
-        gemv_moe_rows_kernel<TD, 2><<<dim3((unsigned) ((rows / 16 + 3) / 4), 1, (unsigned) max_act), 256, 0,
-                                       stream>>>(exps, act, offs, counts, xrows, x, y, rows, k / 256);
+        if (max_n > 16) run(std::integral_constant<int, 2>{}, std::integral_constant<int, 2>{});
+        else run(std::integral_constant<int, 2>{}, std::integral_constant<int, 1>{});
     } else {
-        gemv_moe_rows_kernel<TD, kTileKW>
-            <<<dim3((unsigned) ((rows / 16 + kTileTiles - 1) / kTileTiles), 1, (unsigned) max_act), 256, 0,
-               stream>>>(exps, act, offs, counts, xrows, x, y, rows, k / 256);
+        if (max_n > 16) run(std::integral_constant<int, kTileKW>{}, std::integral_constant<int, 2>{});
+        else run(std::integral_constant<int, kTileKW>{}, std::integral_constant<int, 1>{});
     }
     return hipGetLastError() == hipSuccess;
 }
@@ -3275,12 +3312,18 @@ bool launch_moe_rows(const uint8_t * const * exps, const int * act, const int * 
 template <class TD>
 bool launch_moe_rows_gu(const uint8_t * const * gate, const uint8_t * const * up, const int * act, const int * offs,
                         const int * counts, const int * xrows, const __half * x, __half * out, const int64_t rows,
-                        const int64_t k, const int max_act, hipStream_t stream) {
-    if (rows % 16 != 0 || k % 256 != 0 || max_act <= 0) {
+                        const int64_t k, const int max_act, const int max_n, hipStream_t stream) {
+    if (rows % 16 != 0 || k % 256 != 0 || max_act <= 0 || max_n <= 0 || max_n > 32) {
         return false;
     }
-    gemv_moe_rows_gu_kernel<TD><<<dim3((unsigned) (rows / 16), 1, (unsigned) max_act), 256, 0, stream>>>(
-        gate, up, act, offs, counts, xrows, x, out, rows, k / 256);
+    const dim3 grid((unsigned) (rows / 16), 1, (unsigned) max_act);
+    if (max_n > 16) {
+        gemv_moe_rows_gu_kernel<TD, 2><<<grid, 256, 0, stream>>>(gate, up, act, offs, counts, xrows, x, out, rows,
+                                                                 k / 256);
+    } else {
+        gemv_moe_rows_gu_kernel<TD, 1><<<grid, 256, 0, stream>>>(gate, up, act, offs, counts, xrows, x, out, rows,
+                                                                 k / 256);
+    }
     return hipGetLastError() == hipSuccess;
 }
 
@@ -3366,7 +3409,7 @@ bool gemv_moe_rows_type(const uint32_t type) {
 
 bool gemv_moe_rows(const uint32_t type, const void * const * exps, const void * act, const void * offs,
                    const void * counts, const void * xrows, const void * x_f16, float * y, const int64_t rows,
-                   const int64_t k, const int64_t max_act, hipStream_t stream) {
+                   const int64_t k, const int64_t max_act, const int64_t max_n, hipStream_t stream) {
     if (exps == nullptr || act == nullptr || offs == nullptr || counts == nullptr || x_f16 == nullptr || y == nullptr ||
         rows <= 0 || k <= 0 || max_act <= 0 || max_act > 65535) {
         return false;
@@ -3375,7 +3418,8 @@ bool gemv_moe_rows(const uint32_t type, const void * const * exps, const void * 
     const auto run = [&](const auto td) {
         return launch_moe_rows<decltype(td)>(wt, static_cast<const int *>(act), static_cast<const int *>(offs),
                                              static_cast<const int *>(counts), static_cast<const int *>(xrows),
-                                             static_cast<const __half *>(x_f16), y, rows, k, (int) max_act, stream);
+                                             static_cast<const __half *>(x_f16), y, rows, k, (int) max_act,
+                                             (int) max_n, stream);
     };
     switch (type) {
         case 21: return run(qd::TileIq3s{});
@@ -3393,7 +3437,8 @@ bool gemv_moe_rows(const uint32_t type, const void * const * exps, const void * 
 
 bool gemv_moe_rows_gu(const uint32_t type, const void * const * gate, const void * const * up, const void * act,
                       const void * offs, const void * counts, const void * xrows, const void * x_f16, void * out_f16,
-                      const int64_t rows, const int64_t k, const int64_t max_act, hipStream_t stream) {
+                      const int64_t rows, const int64_t k, const int64_t max_act, const int64_t max_n,
+                      hipStream_t stream) {
     if (gate == nullptr || up == nullptr || act == nullptr || offs == nullptr || counts == nullptr ||
         xrows == nullptr || x_f16 == nullptr || out_f16 == nullptr || rows <= 0 || k <= 0 || max_act <= 0 ||
         max_act > 65535) {
@@ -3405,7 +3450,7 @@ bool gemv_moe_rows_gu(const uint32_t type, const void * const * gate, const void
         return launch_moe_rows_gu<decltype(td)>(g, u, static_cast<const int *>(act), static_cast<const int *>(offs),
                                                 static_cast<const int *>(counts), static_cast<const int *>(xrows),
                                                 static_cast<const __half *>(x_f16), static_cast<__half *>(out_f16),
-                                                rows, k, (int) max_act, stream);
+                                                rows, k, (int) max_act, (int) max_n, stream);
     };
     switch (type) {
         case 21: return run(qd::TileIq3s{});

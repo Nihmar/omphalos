@@ -111,7 +111,7 @@ bool gemv_iq2_s(const void * packed, const void * x_f16, float * y, int64_t rows
 // depend on the slot count, so T tokens give each token's decode result bit for
 // bit (#496). False for a type without a tile body, a legacy 32-wide one
 // (Q8_0 / Q4_0, #540) or Q3_K (#541).
-constexpr int64_t kMoeMaxSlots = 128;
+constexpr int64_t kMoeMaxSlots = 256;  // 32 verified tokens x topk 8 (#555)
 // The gate and up projections of the same slots and their SwiGLU in one
 // launch (#522): out_f16[slot * rows + r] = f16(silu(gate . x) * (up . x)), the
 // sums bit for bit those of two gemv_moe calls and the SwiGLU swiglu_f16's.
@@ -124,19 +124,20 @@ bool gemv_moe(uint32_t type, const void * const * exps, const void * ids,
               const void * x_f16, float * y, int64_t rows, int64_t k, int64_t slots,
               int64_t slots_per_x, hipStream_t stream);
 // A verification's experts grouped (#551): moe_order's table (act: the chosen
-// experts; offs / counts: each one's gathered rows, at most 16) and one
-// workgroup column per chosen expert (max_act bounds act[0]), so an expert's
-// weights are read once for all of its tokens. Gathered row r reads x row
-// xrows[r] (gate / up: the token) or r (xrows null: the down projection) and
-// writes row r; each row is gemv_moe's / gemv_moe_gu's result for its slot
-// bit for bit. Tile types only (false otherwise).
+// experts; offs / counts: each one's gathered rows, at most max_n <= 32, the
+// block's tokens, #555) and one workgroup column per chosen expert (max_act
+// bounds act[0]), so an expert's weights are read once for all of its tokens.
+// Gathered row r reads x row xrows[r] (gate / up: the token) or r (xrows null:
+// the down projection) and writes row r; each row is gemv_moe's /
+// gemv_moe_gu's result for its slot bit for bit. Tile types only (false
+// otherwise).
 bool gemv_moe_rows(uint32_t type, const void * const * exps, const void * act, const void * offs,
                    const void * counts, const void * xrows, const void * x_f16, float * y, int64_t rows,
-                   int64_t k, int64_t max_act, hipStream_t stream);
+                   int64_t k, int64_t max_act, int64_t max_n, hipStream_t stream);
 bool gemv_moe_rows_type(uint32_t type);  // the types gemv_moe_rows / _gu take
 bool gemv_moe_rows_gu(uint32_t type, const void * const * gate, const void * const * up, const void * act,
                       const void * offs, const void * counts, const void * xrows, const void * x_f16,
-                      void * out_f16, int64_t rows, int64_t k, int64_t max_act, hipStream_t stream);
+                      void * out_f16, int64_t rows, int64_t k, int64_t max_act, int64_t max_n, hipStream_t stream);
 
 bool gemv_bf16(const void * w, const void * x_f16, float * y, int64_t rows, int64_t k,
                hipStream_t stream);
