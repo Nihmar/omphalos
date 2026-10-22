@@ -70,7 +70,8 @@ bool gemv_iq2_xxs(const void * packed, const void * x_f16, float * y, int64_t ro
 // into a 1024-entry grid, sign masks, 4-bit scales).
 // IQ1_M on the GGUF blocks as they are (identity "repack").
 // The legacy 32-wide types from their GGUF blocks (#492): Q8_0's d f16 plus 32
-// int8, Q4_0's d f16 plus 16 nibble bytes (the low ones first).
+// int8, Q4_0's d f16 plus 16 nibble bytes (the low ones first); Q8_0 with
+// rows % 16 == 0 is in tiles (#563) and takes the tile GEMV.
 bool gemv_q8_0(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k,
                hipStream_t stream);
 bool gemv_q4_0(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k,
@@ -79,8 +80,8 @@ bool gemv_q4_0(const void * blocks, const void * x_f16, float * y, int64_t rows,
 // Q3_K from its GGUF blocks (#541: the Q2_K_L's down experts), single token.
 bool gemv_q3k(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k, hipStream_t stream);
 
-// Q5_K from its GGUF blocks (#492): d, dmin, the 6-bit scales and the fifth
-// bit of each weight (qh).
+// Q5_K: the tile GEMV when rows % 16 == 0 (#563), else from its GGUF blocks
+// (#492): d, dmin, the 6-bit scales and the fifth bit of each weight (qh).
 bool gemv_q5k(const void * blocks, const void * x_f16, float * y, int64_t rows, int64_t k,
               hipStream_t stream);
 // 1..4 tokens per weight read of the GGUF-block types (Q8_0 8, Q4_0 2, Q5_K

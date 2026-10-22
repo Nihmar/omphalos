@@ -3496,8 +3496,9 @@ bool gemv_moe_rows_gu(const uint32_t type, const void * const * gate, const void
 
 // -------------------------------------------------------------- Q8_0 / Q4_0
 //
-// The two legacy 32-wide types of the second model (#492): their .omph keeps
-// the GGUF blocks (no tiles), so the kernels read the blocks as they are - the
+// The two legacy 32-wide types of the second model (#492): Q4_0 (and Q8_0 whose
+// rows are not a multiple of 16; the rest is in tiles, #563) keeps the GGUF
+// blocks, so the kernels read the blocks as they are - the
 // same shape as IQ1_M's kernel. Q8_0: 34 bytes per 32 weights (d f16 + 32
 // int8); Q4_0: 18 bytes (d f16 + 16 bytes of nibbles, the low ones first).
 constexpr long long kLegacyRows = 4;
