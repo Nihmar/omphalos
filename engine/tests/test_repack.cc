@@ -127,6 +127,22 @@ int main() {
           "Q6_K takes the tiles when rows %% 16 == 0 (#258)");
     CHECK(omph::format::engine_layout_bytes(29, 16, 512) == 2 * 16 * 56 && omph::format::engine_layout(29, 8) == 1,
           "IQ1_M takes the tiles when rows %% 16 == 0 (#275)");
+    // #563: Q8_0 and Q5_K in tiles from their GGUF blocks (Q8_0: 32-wide blocks)
+    for (const uint32_t type : {8u, 13u}) {
+        const int64_t k = 512;
+        const int64_t rows = 48;
+        std::vector<uint8_t> src((size_t) (rows * k / omph::format::quant_block_weights(type) *
+                                           omph::format::quant_block_bytes(type)));
+        for (auto & c : src) c = (uint8_t) rng();
+        std::vector<uint8_t> lay, back;
+        CHECK(omph::format::engine_layout(type, rows) == 2 &&
+                  omph::format::engine_layout_bytes(type, rows, k) == (int64_t) src.size() &&
+                  omph::format::to_engine_layout(type, src.data(), rows, k, lay) && lay.size() == src.size(),
+              "type %u: tile layout size", type);
+        CHECK(omph::format::from_engine_layout(type, lay.data(), rows, k, back) && back == src,
+              "type %u: tile layout round trip", type);
+        CHECK(omph::format::engine_layout(type, 8) == 0, "type %u: rows %% 16 != 0 keep the GGUF blocks", type);
+    }
     // #491: the row count of a quantized tensor, for the types of the second
     // model (a 3-D expert tensor counts ne[1] x ne[2] rows) and for the
     // 32-wide legacy blocks

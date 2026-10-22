@@ -90,7 +90,8 @@ cmake -S engine -B engine/build -DOMPH_LLAMA_DIR=<llama.cpp> -DOMPH_LLAMA_LIB=/v
 # the metadata (tokenizer, chat template) copied, the source SHA-256 recorded; ~1 min, 11.3 GiB.
 # The engine refuses an .omph of another format version (IQ3_S tiles: 2; IQ3_XXS tiles: 3;
 # IQ4_XS and Q4_K tiles: 4, #244; IQ2_S, Q2_K, IQ2_XS, IQ2_XXS tiles: 5, #253;
-# Q6_K tiles: 6, #258; IQ1_M tiles: 7, #275): reconvert (the DFlash2 drafter .omph too)
+# Q6_K tiles: 6, #258; IQ1_M tiles: 7, #275; Q8_0 and Q5_K tiles: 8, #563):
+# reconvert (the DFlash2 drafter .omph too)
 engine/build/omph-convert <model.gguf> [<model.omph>]
 
 # the MoE model's expert cache (#512): when its experts do not fit VRAM, each layer keeps a

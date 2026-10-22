@@ -1179,12 +1179,16 @@ constexpr TileSec kIq2xsSecs[] = {{true, 32}, {false, 8}, {false, 2}};
 constexpr TileSec kIq2xxsSecs[] = {{true, 16}, {false, 32}, {false, 2}};
 constexpr TileSec kQ6kSecs[] = {{true, 64}, {true, 32}, {true, 8}, {false, 2}};
 constexpr TileSec kIq1mSecs[] = {{true, 16}, {true, 8}, {false, 8}};
+constexpr TileSec kQ8Secs[] = {{true, 128}, {false, 16}};
+constexpr TileSec kQ5kSecs[] = {{true, 64}, {true, 16}, {false, 16}};
 
-// IQ1_M has no repacked layout: the blocks as they are (qs 32 B, qh 16 B, scales 8 B)
-struct Iq1mBlocks {
+// IQ1_M, Q8_0 and Q5_K have no repacked layout: the tiles take the GGUF blocks
+// as they are (a "block" here is 256 weights: one IQ1_M / Q5_K block, eight Q8_0)
+struct RawBlocks {
     int64_t total;
 };
-void iq1m_copy(const void * src, const int64_t n_blocks, void * dst) { std::memcpy(dst, src, (size_t) n_blocks * 56); }
+template <int64_t B>
+void raw_copy(const void * src, const int64_t n_blocks, void * dst) { std::memcpy(dst, src, (size_t) (n_blocks * B)); }
 
 // Q2_K / IQ2_XS / IQ2_XXS record <-> repacked layout: one function both ways
 // (out = true: layout -> record)
@@ -1242,7 +1246,7 @@ void q6k_rec(const Q6kLayout & l, uint8_t * r, const int i, const int64_t blk, c
     }
 }
 
-void iq1m_rec(const Iq1mBlocks &, uint8_t * r, const int i, const int64_t blk, const int h, uint8_t * rec,
+void iq1m_rec(const RawBlocks &, uint8_t * r, const int i, const int64_t blk, const int h, uint8_t * rec,
               const bool out) {
     const auto mv = [out](uint8_t * a, uint8_t * b, const size_t n) { out ? std::memcpy(b, a, n) : std::memcpy(a, b, n); };
     uint8_t * b = r + blk * 56;
@@ -1251,6 +1255,36 @@ void iq1m_rec(const Iq1mBlocks &, uint8_t * r, const int i, const int64_t blk, c
         if (i == 1) mv(b + 32 + 2 * sb + h, rec + sb, 1);
     }
     if (i == 2) mv(b + 48, rec, 8);
+}
+
+// Q8_0 (#563): the eight 34-byte blocks of a 256-weight run; lane half h takes
+// bytes 16 h .. 16 h + 15 of each block's quants, row r the eight f16 scales
+void q8_rec(const RawBlocks &, uint8_t * r, const int i, const int64_t blk, const int h, uint8_t * rec,
+            const bool out) {
+    const auto mv = [out](uint8_t * a, uint8_t * b, const size_t n) { out ? std::memcpy(b, a, n) : std::memcpy(a, b, n); };
+    uint8_t * b = r + blk * 272;
+    for (int sb = 0; sb < 8; ++sb) {
+        if (i == 0) mv(b + 34 * sb + 2 + 16 * h, rec + 16 * sb, 16);
+        if (i == 1) mv(b + 34 * sb, rec + 2 * sb, 2);
+    }
+}
+
+// Q5_K (#563), the 176-byte block (d, dmin, 12 scale bytes, qh 32, qs 128): lane
+// half h takes bytes 16 h .. 16 h + 15 of each 32-byte quant run j (sub-blocks
+// 2 j, 2 j + 1: low, high nibbles) and of qh (bit sb: sub-block sb's 5th bit);
+// row r the 12 scale bytes, then d and dmin (Q4_K's repacked meta)
+void q5k_rec(const RawBlocks &, uint8_t * r, const int i, const int64_t blk, const int h, uint8_t * rec,
+             const bool out) {
+    const auto mv = [out](uint8_t * a, uint8_t * b, const size_t n) { out ? std::memcpy(b, a, n) : std::memcpy(a, b, n); };
+    uint8_t * b = r + blk * 176;
+    if (i == 0) {
+        for (int j = 0; j < 4; ++j) mv(b + 48 + 32 * j + 16 * h, rec + 16 * j, 16);
+    } else if (i == 1) {
+        mv(b + 16 + 16 * h, rec, 16);
+    } else {
+        mv(b + 4, rec, 12);
+        mv(b, rec + 12, 4);
+    }
 }
 
 // repack -> tiles and back for one of the three types
@@ -1288,7 +1322,7 @@ uint32_t engine_layout(const uint32_t type, const int64_t rows) {
     // tile layout's size is 0 otherwise, and this used to ask for it anyway
     // (omph-convert then failed "does not fit")
     if ((type == 21 || type == 18 || type == 23 || type == 12 || type == 22 || type == 10 || type == 17 ||
-         type == 16 || type == 14 || type == 29) &&
+         type == 16 || type == 14 || type == 29 || type == 8 || type == 13) &&
         rows % 16 == 0) {
         return 2;
     }
@@ -1312,6 +1346,8 @@ int64_t engine_layout_bytes(const uint32_t type, const int64_t rows, const int64
                 case 16: return rows / 16 * (k / 256) * kIq2xxsTileBytes;
                 case 14: return rows / 16 * (k / 256) * kQ6kTileBytes;
                 case 29: return rows / 16 * (k / 256) * kIq1mTileBytes;
+                case 8: return rows / 16 * (k / 256) * kQ8TileBytes;
+                case 13: return rows / 16 * (k / 256) * kQ5kTileBytes;
                 default: return iq3s_tiles_bytes(rows, k / 256);
             }
         case 1: return repacked_bytes(type, rows * (k / 256));
@@ -1335,7 +1371,9 @@ bool to_engine_layout(const uint32_t type, const void * gguf, const int64_t rows
                 case 17: return tiles_via(gguf, rows, k / 256, iq2_xs_layout(rows * (k / 256)), kIq2xsSecs, iq2xs_rec, repack_iq2_xs, dst);
                 case 16: return tiles_via(gguf, rows, k / 256, iq2_xxs_layout(rows * (k / 256)), kIq2xxsSecs, iq2xxs_rec, repack_iq2_xxs, dst);
                 case 14: return tiles_via(gguf, rows, k / 256, q6k_layout(rows * (k / 256)), kQ6kSecs, q6k_rec, repack_q6k, dst);
-                case 29: return tiles_via(gguf, rows, k / 256, Iq1mBlocks{rows * (k / 256) * 56}, kIq1mSecs, iq1m_rec, iq1m_copy, dst);
+                case 29: return tiles_via(gguf, rows, k / 256, RawBlocks{rows * (k / 256) * 56}, kIq1mSecs, iq1m_rec, raw_copy<56>, dst);
+                case 8: return tiles_via(gguf, rows, k / 256, RawBlocks{rows * (k / 256) * 272}, kQ8Secs, q8_rec, raw_copy<272>, dst);
+                case 13: return tiles_via(gguf, rows, k / 256, RawBlocks{rows * (k / 256) * 176}, kQ5kSecs, q5k_rec, raw_copy<176>, dst);
                 default: return repack_iq3_s_tiles(gguf, rows, k / 256, dst);
             }
         case 1: return repack_any(type, gguf, rows * (k / 256), dst);
@@ -1359,7 +1397,9 @@ bool from_engine_layout(const uint32_t type, const void * src, const int64_t row
                 case 17: return untiles_via(src, rows, k / 256, iq2_xs_layout(rows * (k / 256)), kIq2xsSecs, iq2xs_rec, unrepack_iq2_xs, 74, gguf);
                 case 16: return untiles_via(src, rows, k / 256, iq2_xxs_layout(rows * (k / 256)), kIq2xxsSecs, iq2xxs_rec, unrepack_iq2_xxs, 66, gguf);
                 case 14: return untiles_via(src, rows, k / 256, q6k_layout(rows * (k / 256)), kQ6kSecs, q6k_rec, unrepack_q6k, 210, gguf);
-                case 29: return untiles_via(src, rows, k / 256, Iq1mBlocks{rows * (k / 256) * 56}, kIq1mSecs, iq1m_rec, iq1m_copy, 56, gguf);
+                case 29: return untiles_via(src, rows, k / 256, RawBlocks{rows * (k / 256) * 56}, kIq1mSecs, iq1m_rec, raw_copy<56>, 56, gguf);
+                case 8: return untiles_via(src, rows, k / 256, RawBlocks{rows * (k / 256) * 272}, kQ8Secs, q8_rec, raw_copy<272>, 272, gguf);
+                case 13: return untiles_via(src, rows, k / 256, RawBlocks{rows * (k / 256) * 176}, kQ5kSecs, q5k_rec, raw_copy<176>, 176, gguf);
                 default: return unrepack_iq3_s_tiles(src, rows, k / 256, gguf);
             }
         case 1: {

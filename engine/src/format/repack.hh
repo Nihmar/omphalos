@@ -336,12 +336,23 @@ constexpr int64_t kQ6kTileBytes = 3360;
 //                     [ qh 256 ] lane l: 8 B, at sb the byte 2 sb + h
 //                     [ sc 128 ] row r: the block's 8 scale bytes
 constexpr int64_t kIq1mTileBytes = 896;
+// Q8_0 (4352 B, #563), from the GGUF blocks, 256 weights = 8 blocks per row:
+//                     [ qs 4096 ] lane l: 128 B, at 16 sb block sb's quants 16 h .. 16 h + 15
+//                     [ d   256 ] row r: the 8 blocks' f16 scales
+// Q5_K (2816 B, #563), from the GGUF blocks: [ qs 2048 ] lane l: 64 B, at 16 j the
+//                     bytes 16 h .. 16 h + 15 of quant run j (sub-blocks 2 j, 2 j + 1:
+//                     low, high nibbles)
+//                     [ qh 512 ] lane l: 16 B, the qh bytes 16 h .. 16 h + 15 (bit sb:
+//                     sub-block sb)
+//                     [ meta 256 ] row r: the 12 scale bytes, d, dmin (Q4_K's meta)
+constexpr int64_t kQ8TileBytes = 4352;
+constexpr int64_t kQ5kTileBytes = 2816;
 
 // ------------------------------------------------------- the engine's layout
 //
-// The layout the engine's kernels read a tensor of `type` in (format version 5,
-// #178, #219, #244, #253): 2 (WMMA tiles) for IQ3_S, IQ3_XXS, IQ4_XS, Q4_K,
-// IQ2_S, Q2_K, IQ2_XS, IQ2_XXS, Q6_K and IQ1_M when the rows are a multiple of
+// The layout the engine's kernels read a tensor of `type` in (format version 8,
+// #178, #219, #244, #253, #563): 2 (WMMA tiles) for IQ3_S, IQ3_XXS, IQ4_XS, Q4_K,
+// IQ2_S, Q2_K, IQ2_XS, IQ2_XXS, Q6_K, IQ1_M, Q8_0 and Q5_K when the rows are a multiple of
 // 16, 1 (the repacked layout above) for the other types with one, 0 (the GGUF
 // bytes) otherwise; its size, and the conversions both ways (rows x k weights,
 // row-major). Takes the rows: a tensor whose rows are not a multiple of 16

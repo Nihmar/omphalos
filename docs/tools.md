@@ -53,8 +53,9 @@ source's SHA-256 recorded. ~1 minute and 11.3 GiB for the 27B model.
 
 The format version follows the tile types the model uses (IQ3_S tiles: 2,
 IQ3_XXS: 3, IQ4_XS and Q4_K: 4, IQ2_S/Q2_K/IQ2_XS/IQ2_XXS: 5, Q6_K: 6, IQ1_M:
-7); an `.omph` of another version is refused by every reader, so a model has to
-be reconverted -- the DFlash2 drafter's `.omph` too -- after a format change.
+7, Q8_0 and Q5_K: 8); an `.omph` of another version is refused by every reader,
+so a model has to be reconverted -- the DFlash2 drafter's `.omph` too -- after a
+format change.
 
 No options besides the output path.
 
