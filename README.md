@@ -94,7 +94,8 @@ they are the answers for anyone about to try the same thing.
 plus a shared one, an MTP block; #490) runs through the same binaries. Its
 Q4_K_M is 20.4 GiB against the card's 16 GiB: every layer keeps its hottest
 experts in VRAM and pins the others in host RAM (~7.2 GiB at a short context,
-~8.7 at 160k reserved), with an LRU over 32 VRAM slots per layer (#512).
+~8.7 at 160k reserved), with an LRU over 32 VRAM slots per layer, pooled across
+the layers of one expert layout (#512, #550).
 
 ```sh
 engine/build/omph-convert models/Ornith-1.5-35B-A3B-Q4_K_M.gguf
@@ -110,11 +111,18 @@ engine/build/omph-server $O --ctx 131072 --chunk 1024
 
 Measured on this card (desktop active; `bench/results/`): decode 11.2-11.7
 ms/token plain and 9.4-9.8 with MTP (llama.cpp on the same file: 23 ms,
-`-ncmoe 16`; moe-fewer-launches-522.txt); 96 t/s on code edits with MTP +
-n-gram drafts against llama.cpp's 41 (moe-ngram-513.txt); a 128k prefill in
-97 s with 160k of context reserved (llama.cpp: 201 s; moe-kv-516.txt). The KL
-against llama.cpp's own dump is 0.0041, top-1 100 %; the per-layer check
-(`tools/check_gpu_run.py --dump`) passes for both files.
+`-ncmoe 16`; moe-fewer-launches-522.txt); 118-121 t/s on a code edit with MTP
++ n-gram drafts, a speculative block's experts read once per block (#551,
+moe-grouped-verify-551.txt), against 46 t/s for llama.cpp v0.7.0 with its own
+MoE expert cache (`--moe-cache-mib`; on an edit whose text is a long copy its
+n-gram drafts reach 143 t/s against our 90, moe-cache-542.txt); a 128k prefill
+in 97 s with 160k of context reserved (llama.cpp: 201 s; moe-kv-516.txt). The
+Q2_K_L decodes at ~9.6 ms/token (moe-q3k-gemv-541.csv). Against llama.cpp's
+own CPU reference: KL 0.0041 on the last token of the 5-token golden prompt,
+top-1 100 % (#497), and 0.02 nats mean over every position of a 1022-token
+prompt, top-1 93-94 % (moe-router-hi-lo-547.txt, where the router's f16
+rounding was fixed); the per-layer check (`tools/check_gpu_run.py --dump`)
+passes for both files.
 
 ## Build
 
