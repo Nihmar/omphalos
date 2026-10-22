@@ -2637,8 +2637,14 @@ bool gemv_multi(const uint32_t type, const void * packed, const void * x_f16, fl
     }
     switch (type) {
         case 8:
-        case 2:
         case 13:
+            // in tiles when rows % 16 == 0 (#563), else the GGUF blocks
+            if (rows % 16 == 0) {
+                return type == 8 ? launch_tiles_n<qd::TileQ8>(nt, packed, x_f16, y, rows, k, stream)
+                                 : launch_tiles_n<qd::TileQ5k>(nt, packed, x_f16, y, rows, k, stream);
+            }
+            return gemv_legacy_n(type, packed, x_f16, y, rows, k, nt, stream);
+        case 2:
             // the GGUF-block types (#492): their NT kernels (#496)
             return gemv_legacy_n(type, packed, x_f16, y, rows, k, nt, stream);
         case 21:
@@ -2704,6 +2710,8 @@ bool gemv_tokens(const uint32_t type, const void * packed, const void * x_f16, f
     if (rows % 16 == 0 && type == 16) return launch_tiles_n<qd::TileIq2xxs>(nt, packed, x_f16, y, rows, k, stream);
     if (rows % 16 == 0 && type == 14) return launch_tiles_n<qd::TileQ6k>(nt, packed, x_f16, y, rows, k, stream);
     if (rows % 16 == 0 && type == 29) return launch_tiles_n<qd::TileIq1m>(nt, packed, x_f16, y, rows, k, stream);
+    if (rows % 16 == 0 && type == 8) return launch_tiles_n<qd::TileQ8>(nt, packed, x_f16, y, rows, k, stream);
+    if (rows % 16 == 0 && type == 13) return launch_tiles_n<qd::TileQ5k>(nt, packed, x_f16, y, rows, k, stream);
     if (nt <= 4 || k % 256 != 0) {
         return false;  // 2..4: gemv_multi's kernels (and gemv_group); 5..16 below (#244)
     }
@@ -2809,6 +2817,8 @@ __device__ __forceinline__ void group_body(const GroupItem & t, const __half * _
         case 22: tiles_body<qd::TileIq2s, NT>(t.w, x, t.y, t.rows, t.n, b, lds); break;
         case 10: tiles_body<qd::TileQ2k, NT>(t.w, x, t.y, t.rows, t.n, b, lds); break;
         case 14: tiles_body<qd::TileQ6k, NT>(t.w, x, t.y, t.rows, t.n, b, lds); break;
+        case 8: tiles_body<qd::TileQ8, NT>(t.w, x, t.y, t.rows, t.n, b, lds); break;
+        case 13: tiles_body<qd::TileQ5k, NT>(t.w, x, t.y, t.rows, t.n, b, lds); break;
         default: break;
     }
 }
@@ -2830,7 +2840,7 @@ __global__ __launch_bounds__(256, 8) void gemv_group_kernel(const GroupArgs g, c
 // LDS cost the grouped launch more than the one launch it saves, #226).
 bool group_item(const GemvGroupItem & in, GroupItem & o) {
     switch (in.type) {
-        case 21: case 18: case 12: case 23: case 22: case 10: case 17: case 16: case 14: break;
+        case 21: case 18: case 12: case 23: case 22: case 10: case 17: case 16: case 14: case 8: case 13: break;
         default: return false;
     }
     if (in.rows % 16 != 0) return false;
@@ -2974,6 +2984,14 @@ bool dequant_repacked(const uint32_t type, const void * packed, void * dst_f16,
         case 29:
             if (rows % 16 == 0) launch(qd::DecIq1mTile::make(base, n_blocks, blocks));
             else launch(qd::DecIq1m::make(base, n_blocks, blocks));
+            break;
+        case 8:  // #563: tiles only (other row counts keep the GGUF blocks: dequantize)
+            if (rows % 16 != 0) return false;
+            launch(qd::DecQ8Tile::make(base, n_blocks, blocks));
+            break;
+        case 13:
+            if (rows % 16 != 0) return false;
+            launch(qd::DecQ5kTile::make(base, n_blocks, blocks));
             break;
         default: return false;
     }
@@ -3364,7 +3382,10 @@ bool gemv_moe_gu(const uint32_t type, const void * const * gate, const void * co
         case 22: return run(qd::TileIq2s{});
         case 10: return run(qd::TileQ2k{});
         case 14: return run(qd::TileQ6k{});
+        case 13: return run(qd::TileQ5k{});
         case 8:
+            if (rows % 16 == 0) return run(qd::TileQ8{});  // #563
+            [[fallthrough]];
         case 2: return moe_legacy32_gu(type == 8, g, u, id, x, o, rows, k, slots, slots_per_x, stream);
         default: return false;
     }
@@ -3393,7 +3414,10 @@ bool gemv_moe(const uint32_t type, const void * const * exps, const void * ids,
         case 22: return run(qd::TileIq2s{});
         case 10: return run(qd::TileQ2k{});
         case 14: return run(qd::TileQ6k{});
+        case 13: return run(qd::TileQ5k{});
         case 8:
+            if (rows % 16 == 0) return run(qd::TileQ8{});  // #563
+            [[fallthrough]];
         case 2: return moe_legacy32(type == 8, wt, id, x, y, rows, k, slots, slots_per_x, stream);
         case 11: return moe_q3k(wt, id, x, y, rows, k, slots, slots_per_x, stream);
         default: return false;
@@ -3402,7 +3426,7 @@ bool gemv_moe(const uint32_t type, const void * const * exps, const void * ids,
 
 bool gemv_moe_rows_type(const uint32_t type) {
     switch (type) {
-        case 21: case 18: case 12: case 23: case 17: case 16: case 22: case 10: case 14: return true;
+        case 21: case 18: case 12: case 23: case 17: case 16: case 22: case 10: case 14: case 8: case 13: return true;
         default: return false;
     }
 }
@@ -3431,6 +3455,8 @@ bool gemv_moe_rows(const uint32_t type, const void * const * exps, const void * 
         case 22: return run(qd::TileIq2s{});
         case 10: return run(qd::TileQ2k{});
         case 14: return run(qd::TileQ6k{});
+        case 8: return rows % 16 == 0 && run(qd::TileQ8{});
+        case 13: return run(qd::TileQ5k{});
         default: return false;
     }
 }
@@ -3462,6 +3488,8 @@ bool gemv_moe_rows_gu(const uint32_t type, const void * const * gate, const void
         case 22: return run(qd::TileIq2s{});
         case 10: return run(qd::TileQ2k{});
         case 14: return run(qd::TileQ6k{});
+        case 8: return rows % 16 == 0 && run(qd::TileQ8{});
+        case 13: return run(qd::TileQ5k{});
         default: return false;
     }
 }
@@ -3740,6 +3768,9 @@ bool moe_legacy32_gu(const bool q8, const uint8_t * const * gate, const uint8_t 
 
 bool gemv_q8_0(const void * blocks, const void * x_f16, float * y, const int64_t rows, const int64_t k,
                hipStream_t stream) {
+    if (rows % 16 == 0) {
+        return launch_tiles<qd::TileQ8, 1>(blocks, x_f16, y, rows, k, stream);  // #563
+    }
     return gemv_legacy32<true, 1>(blocks, x_f16, y, rows, k, stream);
 }
 
@@ -3836,6 +3867,9 @@ bool gemv_q5k(const void * blocks, const void * x_f16, float * y, const int64_t 
     if (blocks == nullptr || x_f16 == nullptr || y == nullptr || rows <= 0 || k <= 0 ||
         k % 256 != 0) {
         return false;
+    }
+    if (rows % 16 == 0) {
+        return launch_tiles<qd::TileQ5k, 1>(blocks, x_f16, y, rows, k, stream);  // #563
     }
     return gemv_q5k_n(blocks, x_f16, y, rows, k, 1, stream);
 }
