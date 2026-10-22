@@ -1,0 +1,32 @@
+# Ornith-1.5-35B-A3B-Q4_K_M end to end after the Q8_0 / Q5_K tiles (#565)
+
+engine: main 300f657 (#551 grouped verification, #550 pooled LRU, #563 k split + tiles).
+RX 9060 XT 16 GB, desktop active, the calibrated expert set. tools/scenario_speed.py, greedy,
+KV Q4/Q4 (k4q4), ctx 32768, one server per (spec, n-gram) cell, two full runs. Every cell of a
+scenario wrote the same text in both runs (text_sha256 per scenario: edit-cc f8af78b7cd628a38,
+edit-py 46c98363f03604bc, prose e165f668285fac5b): speculation does not change the output.
+
+## Decode rate (t/s), run 1 / run 2
+
+| scenario | tokens | plain | MTP | MTP + n-gram |
+|---|---:|---:|---:|---:|
+| edit-cc | 2119 | 72.1 / 72.5 | 88.2 / 89.4 | **129.9 / 130.6** |
+| edit-py | 4261 | 71.1 / 70.5 | 87.1 / 87.7 | **127.5 / 128.4** |
+| prose | 1125 | 93.0 / 92.3 | **97.9 / 96.8** | 95.8 / 95.9 |
+
+Drafts kept: MTP 1058 / 1060, 2113 / 2147, 347 / 777; MTP + n-gram 1954 / 2320, 3819 / 4556,
+347 / 931. With spec plain the n-gram drafts never run (they replace a drafter's), so the plain
+n-gram = 1 cells equal plain (72.0 / 70.5 / 92.0 t/s in run 2).
+
+Prefill (prompt t/s): edit-cc 2150 tokens 1338, edit-py 4073 tokens 1366.
+
+## Against earlier rows
+
+- #551 (moe-grouped-verify-551.txt), MTP + n-gram: edit-cc 117.8 / 121.0, edit-py 88.5 / 87.9,
+  prose 91.2 / 90.4. The edit-py text differs since (the k split and the tiles moved the
+  numerics): it is now a long copy of the file, as llama.cpp's was, so its n-gram drafts are long.
+- llama.cpp v0.7.0 with its MoE cache (moe-cache-542.txt; its own texts): plain 42.8 / 40.4 /
+  48.6, best cell 46.2 (edit-cc, MTP + n-gram), 142.7 (edit-py, n-gram alone; 4055 tokens, a copy),
+  48.6 (prose, plain). Prefill 527 / 805 t/s with the cache, 867 / 941 without.
+
+Raw rows: ornith-final-565-{1,2}.jsonl.
