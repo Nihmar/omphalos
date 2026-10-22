@@ -1,0 +1,26 @@
+# The weight load through pread() instead of the file mapping (#558)
+
+engine: main 76657ac..e72fa42 (origin/main) vs fix/558-load-pread; RX 9060 XT 16 GB, a 31 GiB
+machine with other applications open (7.5 GiB in zram swap during the runs). Peak RSS sampled
+every 0.1 s from /proc/<pid>/status (VmHWM, RssFile, RssAnon); wall = the whole command.
+
+Ornith-1.5-35B-A3B-Q4_K_M.omph: omph-run <model> <code prompt> /dev/null --last-logits --gemv
+--generate 64, alternated main / new / main / new:
+
+| | peak RSS | of which file pages | anon (pinned experts, embedding) | wall |
+|---|---:|---:|---:|---:|
+| main | 22.27 / 23.07 GiB | 14.52 / 15.43 GiB | 7.69 GiB | 60.6 / 83.5 s |
+| pread | **7.75 / 7.75 GiB** | 0.06 GiB | 7.69 GiB | 52.6 / 49.2 s |
+
+Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.omph, a 1022-token prompt, --logits-tail 4 --gemv --generate 32:
+
+| | peak RSS | of which file pages | wall |
+|---|---:|---:|---:|
+| main | 8.75 GiB | 8.18 GiB | 11.8 s |
+| pread | **1.04 GiB** | 0.06 GiB | 10.3 s |
+
+Generated tokens identical (Ornith), logits and tokens identical (Qwen3.8): the same bytes.
+
+Before this change, under the same kind of memory pressure, two Ornith loads read the file at
+~1.5 MB/s for 25-30 min (14.3 GB read for an 11.3 GB file: mapped pages evicted and faulted
+back while 7.2 GiB of pinned experts were being filled), and one omph-server load took 16 min.

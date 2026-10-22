@@ -111,10 +111,16 @@ public:
     // which pushed the kernel into swapping the pinned experts' neighbours).
     // A later tensor_data() read faults the pages back in from the file.
     void release_data() const;
+    // Bytes [from, from + n) of a tensor's stored data into dst with pread(),
+    // not through the mapping (#558): the pages land in the page cache only,
+    // unmapped and reclaimable, so a load does not hold the whole file in its
+    // RSS next to what it copies the data into. Throws on a short read.
+    void read_data(const TensorInfo & t, uint64_t from, void * dst, size_t n) const;
 
 private:
     const uint8_t * base_ = nullptr;
     size_t size_ = 0;
+    int fd_ = -1;  // kept open for read_data
     uint32_t version_ = 0;
     bool omph_ = false;
     uint64_t kv_begin_ = 0;

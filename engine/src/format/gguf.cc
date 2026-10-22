@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cerrno>
 #include <cstring>
 
 namespace omph::gguf {
@@ -203,10 +204,11 @@ File::File(const std::string & path) {
     }
     size_ = (size_t) st.st_size;
     void * map = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
     if (map == MAP_FAILED) {
+        ::close(fd);
         fail("mmap failed for " + path);
     }
+    fd_ = fd;
     base_ = static_cast<const uint8_t *>(map);
     // The destructor does not run when the constructor throws: unmap here.
     try {
@@ -309,6 +311,7 @@ File::File(const std::string & path) {
         }
     } catch (...) {
         ::munmap(map, size_);
+        ::close(fd_);
         base_ = nullptr;
         throw;
     }
@@ -317,6 +320,29 @@ File::File(const std::string & path) {
 File::~File() {
     if (base_ != nullptr) {
         ::munmap(const_cast<uint8_t *>(base_), size_);
+    }
+    if (fd_ >= 0) {
+        ::close(fd_);
+    }
+}
+
+void File::read_data(const TensorInfo & t, const uint64_t from, void * dst, size_t n) const {
+    auto * d = static_cast<uint8_t *>(dst);
+    uint64_t at = data_offset_ + t.offset + from;
+    if (at + n > size_) {
+        fail("read past the end of the file: " + t.name);
+    }
+    while (n > 0) {
+        const ssize_t r = ::pread(fd_, d, n, (off_t) at);
+        if (r < 0 && errno == EINTR) {
+            continue;
+        }
+        if (r <= 0) {
+            fail("cannot read " + t.name);
+        }
+        d += r;
+        at += (uint64_t) r;
+        n -= (size_t) r;
     }
 }
 
