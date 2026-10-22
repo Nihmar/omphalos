@@ -227,7 +227,7 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                     throw std::runtime_error("token_embd.weight is not stored in the GGUF layout");
                 }
                 embd_host_ = mem_.host((size_t) t.nbytes, "cannot allocate the host embedding");
-                std::memcpy(embd_host_, file_.tensor_data(t), (size_t) t.nbytes);
+                file_.read_data(t, 0, embd_host_, (size_t) t.nbytes);
                 continue;
             }
             if (t.layout == omph::gguf::kLayoutGguf && (t.type == 2 || t.type == 8 || t.type == 11 || t.type == 13)) {
@@ -325,17 +325,18 @@ Runner::Runner(const std::string & path, const int64_t max_tokens, const bool us
                 throw std::runtime_error("cannot allocate the upload buffers");
             }
         }
-        // bytes [from, from + n) of what a place holds, into dst
+        // bytes [from, from + n) of what a place holds, into dst: read from
+        // the file, not the mapping (#558), so the load's RSS is what it
+        // copies into and the file's pages stay reclaimable page cache
         const auto read = [](const Place & p, uint8_t * dst, size_t from, size_t n) {
-            const uint8_t * src = p.f->tensor_data(*p.t);
             if (p.experts.empty()) {
-                std::memcpy(dst, src + p.src + from, n);
+                p.f->read_data(*p.t, p.src + from, dst, n);
                 return;
             }
             while (n > 0) {
                 const size_t o = from % p.pe;
                 const size_t m = std::min(n, p.pe - o);
-                std::memcpy(dst, src + (size_t) p.experts[from / p.pe] * p.pe + o, m);
+                p.f->read_data(*p.t, (size_t) p.experts[from / p.pe] * p.pe + o, dst, m);
                 dst += m;
                 from += m;
                 n -= m;
