@@ -1,0 +1,22 @@
+# Verification blocks of more than 16 rows on the MoE model (#555)
+
+Ornith-1.5-35B-A3B-Q4_K_M; omph-run <model> <code prompt, 38 tokens> /dev/null --last-logits --gemv
+--generate 400 --draft-oracle <plain greedy ids> --draft-k K, OMPH_TIMING=1 (every draft accepted;
+a step verifies K + 1 rows). RX 9060 XT 16 GB.
+
+| K (rows) | main (d0a142e) | #555 |
+|---:|---|---|
+| 15 (16) | 3.95 ms/token, identical | 3.94 ms/token, identical (63.0 ms per step) |
+| 23 (24) | 19.78 ms/token, 337 / 1173 drafts kept, **text diverges at token 252** | 4.81 ms/token, identical (115.4 ms per step) |
+| 31 (32) | 21.27 ms/token, 341 / 1333 drafts kept, **text diverges at token 252** | 4.56 ms/token, identical (145.9 ms per step) |
+
+Before #555 a block of 17..32 rows took the MoE prefill path (the router's GEMM, the grouped
+expert GEMM): not the decode's numerics, so drafts equal to the greedy text were rejected and
+the text changed. #555: the router's GEMV and the decode-shaped MoE path up to 32 rows (the
+grouped expert kernels of #551 with two 16-column WMMA tiles per expert), and the dense GEMVs in
+16-row passes instead of 4-token ones: bit-identical at 24 and 32 rows.
+
+Per row, 24 and 32 rows cost more than 16 (4.81 / 4.56 vs 3.94 ms): the dense matmuls take two
+weight passes past 16 rows, and the delta-net's exact rule and the attention grow with the rows.
+The default stays at 16 rows (OMPH_SPEC_ROWS); a longer block would need the dense GEMVs at
+NT = 24 / 32 in one pass first (#454's step 1).
