@@ -109,15 +109,19 @@ engine/build/omph-run $O prompt-ids.txt /tmp/x.f32 --last-logits --gemv --genera
 engine/build/omph-server $O --ctx 131072 --chunk 1024
 ```
 
-Measured on this card (desktop active; `bench/results/`): decode 11.2-11.7
-ms/token plain and 9.4-9.8 with MTP (llama.cpp on the same file: 23 ms,
-`-ncmoe 16`; moe-fewer-launches-522.txt); 118-121 t/s on a code edit with MTP
-+ n-gram drafts, a speculative block's experts read once per block (#551,
-moe-grouped-verify-551.txt), against 46 t/s for llama.cpp v0.7.0 with its own
-MoE expert cache (`--moe-cache-mib`; on an edit whose text is a long copy its
-n-gram drafts reach 143 t/s against our 90, moe-cache-542.txt); a 128k prefill
-in 97 s with 160k of context reserved (llama.cpp: 201 s; moe-kv-516.txt). The
-Q2_K_L decodes at ~9.6 ms/token (moe-q3k-gemv-541.csv). Against llama.cpp's
+Measured on this card (desktop active; `bench/results/`), greedy, KV Q4/Q4:
+plain decode 70-93 t/s (11.7 ms/token on a code prompt), MTP 87-98 t/s, MTP +
+n-gram drafts 128-131 t/s on code edits whose text copies the context (2119 and
+4261 tokens; ornith-final-565.txt). llama.cpp v0.7.0 on the same file with its
+MoE expert cache (`--moe-cache-mib`) decodes 40-49 t/s plain; its best cells are
+46 t/s on the C++ edit and 143 t/s with n-gram drafts on the Python edit, its own
+text being a copy of the file too (moe-cache-542.txt). Prefill runs at 1340-1370
+t/s on 2-4k prompts (llama.cpp: 527-941) and a 128k prompt in 97 s with 160k of
+context reserved (llama.cpp: 201 s; moe-kv-516.txt). Speculative blocks read
+each chosen expert once (#551) and the Q8_0 / Q5_K matrices are in WMMA tiles
+like the k-quants (#563, tiles-q8-q5k-563.txt): a 16-token verification costs
+3.2 ms per token. The
+Q2_K_L decodes at ~9.3 ms/token (tiles-q8-q5k-563.txt). Against llama.cpp's
 own CPU reference: KL 0.0041 on the last token of the 5-token golden prompt,
 top-1 100 % (#497), and 0.02 nats mean over every position of a 1022-token
 prompt, top-1 93-94 % (moe-router-hi-lo-547.txt, where the router's f16
