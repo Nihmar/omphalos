@@ -544,6 +544,9 @@ Codebook tables (**[verify]** sizes): IQ2_XS grid 512 × 8 B, IQ2_S grid 1024 ×
   - GEMM at 512 tokens 57.7 -> 56.6 ms over the four types. Decode KL vs the exact f32 KV: 0.000468 -> 0.000484.
   - End to end: plain step 42.34 -> 42.20 ms, MTP step -3.1 %, DFlash2 step -7.7 %; DFlash2 + n-gram 193.5 -> 262.1 t/s on edit-cc (`bench/results/tiles-iq2-253.txt`).
 - **Q6_K (#258, format 6) is done:** the DFlash2 drafter's 8-token GEMVs 1.19 -> 0.50 ms, the MTP block's 1-token ones 1.20 -> 1.12 ms; DFlash2 step -1.4 % (`bench/results/tiles-q6k-258.txt`). IQ1_M (#275, format 7) followed: 16 tokens 0.80 -> 0.12 ms, 8 tokens 0.41 -> 0.12 ms; every GEMV type of the model is now in tiles.
+- **Q8_0 and Q5_K (#563, format 8) are done**, for the second model (Ornith), whose attention K/V, shared experts, `ssm_out` and Q2_K_L head are Q8_0 and attention output Q5_K. Their GGUF-block GEMVs were bound by byte loads and scalar dequant (a k split gave 1.3 %). The tiles take the GGUF blocks as they are (4352 / 2816 B per tile and 256 weights).
+  - Decode -2.2 % (Q4_K_M), -1.7 % (Q2_K_L); 16-row verification -17.5 %, MTP K = 3 -8.7 %; prefill unchanged.
+  - KL vs llama.cpp 0.0212 -> 0.0228 (+0.0016 +- 0.0010; `bench/results/tiles-q8-q5k-563.txt`).
 
 ---
 
