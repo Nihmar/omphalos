@@ -3,8 +3,9 @@
 A from-scratch inference engine for one GPU: `Qwen3.8-27B` (GSQ-RCO IQ3_S
 GGUF), and a second model, the mixture-of-experts `Ornith-1.5-35B-A3B`
 (qwen35moe, Q4_K_M / Q2_K_L GGUF; see [The second model](#the-second-model)),
-on an AMD Radeon RX 9060 XT 16 GB (RDNA4, `gfx1200`, ROCm/HIP). The priorities, in order: VRAM, decode speed, prefill speed. The
-weights stay bit-exact with the GGUF (lossless re-layouts only).
+on an AMD Radeon RX 9060 XT 16 GB (RDNA4, `gfx1200`, ROCm/HIP). The
+priorities, in order: VRAM, decode speed, prefill speed. The weights stay
+bit-exact with the GGUF (lossless re-layouts only).
 
 - [PLAN.md](PLAN.md): the design and its rationale, the milestones, and the
   measured status;
@@ -25,23 +26,69 @@ weights stay bit-exact with the GGUF (lossless re-layouts only).
 | Prefill | fused dequant + WMMA GEMM, WMMA flash attention, token-parallel delta net |
 | KV cache | V in Q4; K in Q4 on the 8 least sensitive of the 16 attention layers and Q8 on the rest (#175); the last 512 tokens exact in an FP16 ring |
 | Text | the GGUF's byte-level BPE tokenizer and its chat template (thinking, reasoning effort, tool calls), reimplemented in C++ and checked against llama.cpp and jinja2 |
-| Sampling | greedy, or temperature / top-k / top-p / min-p with a seed; both decode speculatively (code at temperature 0.6: 18.5 vs 44.4 ms/token) |
+| Sampling | greedy, or temperature / top-k / top-p / min-p with a seed; both decode speculatively, the sampled one with plain sampling's distribution (speculative sampling, #197) |
 | Cache reuse | a prompt that extends the cached sequence prefills only its new tokens; checkpoints in host RAM let a retried answer or an edited history resume from an earlier point; a prompt that leaves the cached sequence saves its whole conversation in host RAM (`--kv-ram`, default 8 GiB) and returns to it with an upload |
 | Vision | images encoded on the CPU by llama.cpp's mtmd (no VRAM), fed as embeddings with M-RoPE positions |
 | Interfaces | `omph-generate` (CLI), `omph-server` (OpenAI-compatible HTTP), `libomphalos.so` with a C ABI (`engine/include/omphalos.h`), `tools/omph_tui.py` (a terminal UI around the server) |
 
-Measured on the RX 9060 XT (details and conditions in `bench/results/`):
+## Measured on this card
+
+Every figure is on the RX 9060 XT, CachyOS, desktop session active; the
+conditions and the raw rows are in `bench/results/`.
+
+### Decode and prefill
+
+| path | rate (t/s) | conditions |
+|---|---:|---|
+| decode, plain, K8/V4 | 22.5-24.4 | 40.9-44.4 ms/token at 0-32k (llama.cpp: 16.7-20.6 t/s) |
+| decode, speculative greedy, MTP k = 3 | 40-52 | 19-25 ms/token, depending on the text |
+| decode, speculative greedy, DFlash2 + n-gram (#245) | 79-265 | code, quotes and edits; 46 t/s on prose |
+| decode, sampled, temperature 0.6, code | 54 | 18.5 ms/token, against 44.4 without speculation |
+| prefill, K8/V4, fresh prompt | 913-1031 | 512-32k tokens (llama.cpp: 544-634 t/s) |
+
+### VRAM and the context it allows
+
+Device total, the desktop included.
+
+| KV + drafter | context | prompt | VRAM after load (GiB) | VRAM peak (GiB) | prefill (t/s) | decode (t/s) |
+|---|---:|---:|---:|---:|---:|---:|
+| the default mix, MTP | 8k | — | 12.0 | | | |
+| the default mix, none | 8k | — | 11.7 | | | |
+| K4/V4, DFlash2 | 128k | 99,639 | | 15.0 | 658 | 53.1 |
+| K4/V4, MTP | 128k | 99,639 | | 14.4 | 655 | 54.9 |
+| K4/V4, none | 128k | 99,639 | | 13.6 | 660 | 19.9 |
+| K4/V4, MTP | 196k | 195,584 | | 15.3 | 511 | 67 |
+| K4/V4, MTP | 205k | 203,776 | | 15.5 | 500 | 37 |
+| K4/V4, MTP | 217k | 216,064 | | 15.7 | 483 | 22 |
+
+The 128k rows peak over their prompt and the decode; the 8k ones are an empty
+context. 196k is the comfortably usable maximum: 205k and 217k load, but the
+decode falls to 37 and 22 t/s as the driver starts evicting the desktop. A
+190k needle-in-a-haystack finds 4 of 4 needles (#237,
+[bench/results/max-context-237.txt](bench/results/max-context-237.txt)).
+
+### A long reasoning task (#229)
+
+An animated SVG, 15-65k tokens of thinking, 64K context
+([bench/results/pelican-229](bench/results/pelican-229/README.md)):
+
+| engine | drafter | temperature | decode (t/s) | peak VRAM (GiB) |
+|---|---|---:|---:|---:|
+| omphalos | MTP | 0 | 60.7 | 13.5 |
+| omphalos | MTP | 1 | 47.0 | 13.5 |
+| omphalos | DFlash2 | 0 | 77.5 | 13.9 |
+| omphalos | DFlash2 | 1 | 47.3 | 13.9 |
+| llama.cpp | MTP | 0 | 30.1 | 15.0 |
+| llama.cpp | MTP | 1 | 27.4 | 15.1 |
+
+The greedy output is byte-identical to plain greedy over 34k tokens.
+
+### Load and images
 
 | | |
 |---|---|
-| decode, speculative greedy (MTP, k = 3) | 19-25 ms/token (40-52 t/s), depending on the text |
-| decode, speculative greedy (DFlash2 + n-gram, #245) | 79-265 t/s on code, quotes and edits, 46 on prose |
-| decode, plain, K8/V4 | 40.9-44.4 ms/token (22.5-24.4 t/s at 0-32k; llama.cpp 16.7-20.6 t/s) |
-| prefill, K8/V4 | 961 t/s at 512 tokens, 1031 at 4k, 981 at 16k, 913 at 32k (llama.cpp 634 / 620 / 585 / 544) |
-| VRAM | 12.0 GiB of the 16 in use after load with an 8k context and the MTP head, 11.7 without it; at a 128K context (K4/V4) a 100k-token prompt peaks at 15.0 GiB with DFlash2, 14.4 with MTP, 13.6 plain — it fits (device total, the desktop included). A full 196k-token prompt with K4/V4 + MTP loads at 15.3 GiB, prefills at 511 t/s and decodes at 67 t/s, and a 190k NIAH haystack finds 4/4 needles (#237, [bench/results/max-context-237.txt](bench/results/max-context-237.txt)); 205k and 217k load too, but the decode falls to 37 and 22 t/s as the driver starts evicting the desktop |
-| a long reasoning task (#229: an animated SVG, 15-65k tokens of thinking, 64K context) | speculative 60.7 / 47.0 t/s at temperature 0 / 1 with MTP and 77.5 / 47.3 with DFlash2, vs llama.cpp's MTP 30.1 / 27.4, peak VRAM 13.8 vs 15.5 GB; greedy output byte-identical to plain greedy over 34k tokens ([bench/results/pelican-229](bench/results/pelican-229/README.md)) |
-| model load | <1 s from the `.omph` file (in the page cache): a 3-token run takes 0.89 s |
-| an image (640x488, 300 tokens) | 2.8 s to encode on the CPU, overlapping the prefill of the text before it (first token -22 % to -41 %, #180), then a normal prefill |
+| model load | <1 s from the `.omph` in the page cache: a 3-token run takes 0.89 s |
+| an image (640x488, 300 tokens) | 2.8 s encoded on the CPU, overlapping the prefill of the text before it; the first token comes 22-41 % sooner (#180) |
 
 ## Measured against llama.cpp (K8/V4)
 
@@ -56,23 +103,50 @@ llama.cpp is the pin's **RX 9060 XT overlay** (`f19c20f9`, `bench/llama.cpp.pin`
 pin build (d8123504) was built without the `q8_0-q4_0` flash-attention kernel, converts K and V
 to f16 instead and loses 15 % of tg at 32k (its cells are in the same result file).
 
-| | omphalos | llama.cpp |
-|---|---:|---:|
-| prefill, fresh prompt, 512 / 4k / 16k / 32k tokens | **961 / 1031 / 981 / 913 t/s** | 634 / 620 / 585 / 544 t/s |
-| prefill, a 512-token chunk at depth 0 / 4k / 16k / 32k | **1051 / 1013 / 905 / 793 t/s** | 634 / 593 / 527 / 461 t/s |
-| decode, tg128, at depth ~0 / 4k / 16k / 32k | **24.4 / 24.0 / 23.4 / 22.5 t/s** | 20.6 / 20.1 / 18.6 / 16.7 t/s |
+Prefill of a fresh prompt, t/s, by prompt length:
 
-Speculative decoding on the #262 scenarios (prose / edit-cc / edit-py), n-gram drafts on:
+| engine | 512 | 4k | 16k | 32k |
+|---|---:|---:|---:|---:|
+| omphalos | 961 | 1031 | 981 | 913 |
+| llama.cpp | 634 | 620 | 585 | 544 |
 
-| spec | omphalos | llama.cpp |
-|---|---:|---:|
-| plain | 24.2 / 24.1 / 23.9 t/s | 20.6 / 175.4 / 117.2 t/s |
-| MTP | **43.0 / 266.5 / 229.1 t/s** | 23.3 / 200.0 / 109.4 t/s |
-| DFlash2 | **43.3 / 258.9 / 244.0 t/s** | 20.1 / 205.7 / 160.1 t/s |
+Prefill of a 512-token chunk, t/s, by the depth of the cache it appends to:
 
-Without the n-gram (the drafter alone, prose / edit-cc / edit-py): MTP 43.3 / 78.5 / 75.7
-against 23.2 / 40.2 / 39.0, DFlash2 42.9 / 134.9 / 93.4 against 20.0 / 49.8 / 38.4. llama.cpp's
-DFlash2 is at parity with its own plain decode on prose (20.0 against 20.5 t/s).
+| engine | 0 | 4k | 16k | 32k |
+|---|---:|---:|---:|---:|
+| omphalos | 1051 | 1013 | 905 | 793 |
+| llama.cpp | 634 | 593 | 527 | 461 |
+
+Decode, tg128, t/s, by depth:
+
+| engine | ~0 | 4k | 16k | 32k |
+|---|---:|---:|---:|---:|
+| omphalos | 24.4 | 24.0 | 23.4 | 22.5 |
+| llama.cpp | 20.6 | 20.1 | 18.6 | 16.7 |
+
+omphalos is ahead in every cell. At depth 0 the chunk prefills a fresh cache,
+which is llama.cpp's `llama-bench pp512`, the run in the first table.
+
+Speculative decoding on the #262 scenarios: t/s, one run per cell, greedy, the
+same three texts (prose / edit-cc / edit-py) through both servers.
+
+| spec | n-gram | engine | prose | edit-cc | edit-py |
+|---|:---:|---|---:|---:|---:|
+| plain | off | omphalos | 24.1 | 24.0 | 23.9 |
+| plain | off | llama.cpp | 20.5 | 20.0 | 19.8 |
+| plain | on | omphalos | 24.2 | 24.1 | 23.9 |
+| plain | on | llama.cpp | 20.6 | 175.4 | 117.2 |
+| MTP | off | omphalos | 43.3 | 78.5 | 75.7 |
+| MTP | off | llama.cpp | 23.2 | 40.2 | 39.0 |
+| MTP | on | omphalos | 43.0 | 266.5 | 229.1 |
+| MTP | on | llama.cpp | 23.3 | 200.0 | 109.4 |
+| DFlash2 | off | omphalos | 42.9 | 134.9 | 93.4 |
+| DFlash2 | off | llama.cpp | 20.0 | 49.8 | 38.4 |
+| DFlash2 | on | omphalos | 43.3 | 258.9 | 244.0 |
+| DFlash2 | on | llama.cpp | 20.1 | 205.7 | 160.1 |
+
+llama.cpp's DFlash2 is at parity with its own plain decode on prose (20.0
+against 20.5 t/s).
 
 ### Measured, not adopted
 
@@ -92,10 +166,16 @@ they are the answers for anyone about to try the same thing.
 
 `Ornith-1.5-35B-A3B` (qwen35moe: 40 layers, 256 experts of which 8 per token
 plus a shared one, an MTP block; #490) runs through the same binaries. Its
-Q4_K_M is 20.4 GiB against the card's 16 GiB: every layer keeps its hottest
-experts in VRAM and pins the others in host RAM (~7.2 GiB at a short context,
-~8.7 at 160k reserved), with an LRU over 32 VRAM slots per layer, pooled across
-the layers of one expert layout (#512, #550).
+weights do not fit the card, so they live in two pools:
+
+| | Q4_K_M |
+|---|---:|
+| the file | 20.4 GiB |
+| the card | 16 GiB |
+| each layer, in VRAM | its hottest experts plus 32 LRU slots |
+| the rest, pinned in host RAM | ~7.2 GiB at a short context, ~8.7 at 160k reserved |
+
+The slots are pooled across the layers of one expert layout (#512, #550).
 
 ```sh
 engine/build/omph-convert models/Ornith-1.5-35B-A3B-Q4_K_M.gguf
@@ -109,24 +189,60 @@ engine/build/omph-run $O prompt-ids.txt /tmp/x.f32 --last-logits --gemv --genera
 engine/build/omph-server $O --ctx 131072 --chunk 1024
 ```
 
-Measured on this card (desktop active; `bench/results/`), greedy, KV Q4/Q4:
-plain decode 70-93 t/s (11.7 ms/token on a code prompt), MTP 87-98 t/s, MTP +
-n-gram drafts 128-131 t/s on code edits whose text copies the context (2119 and
-4261 tokens; ornith-final-565.txt). llama.cpp v0.7.0 on the same file with its
-MoE expert cache (`--moe-cache-mib`) decodes 40-49 t/s plain; its best cells are
-46 t/s on the C++ edit and 143 t/s with n-gram drafts on the Python edit, its own
-text being a copy of the file too (moe-cache-542.txt). Prefill runs at 1340-1370
-t/s on 2-4k prompts (llama.cpp: 527-941) and a 128k prompt in 97 s with 160k of
-context reserved (llama.cpp: 201 s; moe-kv-516.txt). Speculative blocks read
-each chosen expert once (#551) and the Q8_0 / Q5_K matrices are in WMMA tiles
-like the k-quants (#563, tiles-q8-q5k-563.txt): a 16-token verification costs
-3.2 ms per token. The
-Q2_K_L decodes at ~9.3 ms/token (tiles-q8-q5k-563.txt). Against llama.cpp's
-own CPU reference: KL 0.0041 on the last token of the 5-token golden prompt,
-top-1 100 % (#497), and 0.02 nats mean over every position of a 1022-token
-prompt, top-1 93-94 % (moe-router-hi-lo-547.txt, where the router's f16
-rounding was fixed); the per-layer check (`tools/check_gpu_run.py --dump`)
-passes for both files.
+### Measured
+
+Greedy, KV Q4/Q4, desktop active (`bench/results/`). Decode, t/s, two full
+runs per cell, the best drafter of each text in bold
+([ornith-final-565.txt](bench/results/ornith-final-565.txt)):
+
+| scenario | prompt tokens | plain | MTP | MTP + n-gram |
+|---|---:|---:|---:|---:|
+| edit-cc | 2,119 | 72.1 / 72.5 | 88.2 / 89.4 | **129.9 / 130.6** |
+| edit-py | 4,261 | 71.1 / 70.5 | 87.1 / 87.7 | **127.5 / 128.4** |
+| prose | 1,125 | 93.0 / 92.3 | **97.9 / 96.8** | 95.8 / 95.9 |
+
+llama.cpp v0.7.0 on the same file with its own MoE expert cache
+(`--moe-cache-mib 13000`; v0.6.0, the pin, has none yet). It writes different
+greedy texts, so the n-gram cells are not comparable across engines; the
+plain and MTP rates are
+([moe-cache-542.txt](bench/results/moe-cache-542.txt)):
+
+| scenario | plain | MTP | MTP + n-gram | n-gram alone |
+|---|---:|---:|---:|---:|
+| edit-cc | 42.8 | 42.4 | 46.2 | 41.1 |
+| edit-py | 40.4 | 48.8 | 136.2 | **142.7** |
+| prose | 48.6 | 42.1 | 42.2 | 48.6 |
+
+Prefill: a 2-4k prompt, and one of 128k tokens with 160k of context reserved
+([moe-kv-516.txt](bench/results/moe-kv-516.txt),
+[moe-budget-chunk-525.txt](bench/results/moe-budget-chunk-525.txt)).
+
+| configuration | a 2-4k prompt | a 128k prompt |
+|---|---:|---:|
+| omphalos | 1338-1366 t/s | 97.1 s (1350 t/s) |
+| omphalos, `--chunk 2048` (#525) | | 80.4 s (1631 t/s) |
+| llama.cpp v0.7.0, its MoE expert cache | 527-805 t/s | |
+| llama.cpp, no cache | 867-941 t/s | 201 s (651 t/s) |
+
+The speculative blocks read each chosen expert once (#551) and the Q8_0 /
+Q5_K matrices are in WMMA tiles like the k-quants (#563,
+[tiles-q8-q5k-563.txt](bench/results/tiles-q8-q5k-563.txt)). What a step of
+the Q4_K_M costs:
+
+| | ms/token |
+|---|---:|
+| decode, code prompt | 11.7 |
+| a 16-token verification | 3.2 |
+| decode, Q2_K_L | ~9.3 |
+
+Against llama.cpp's own CPU reference (`-ngl 0`), Q4_K_M:
+
+| check | result |
+|---|---|
+| the last token of the 5-token golden prompt | KL 0.0041, top-1 100 % (#497) |
+| every position of a 1022-token prompt | KL 0.021-0.023, top-1 93-94 %, NLL 2.167 against 2.178 (moe-router-hi-lo-547.txt) |
+| the router's 40,880 picks against an exact f32 router | 0 differ (#547; the f16 input: 59) |
+| the per-layer check (`tools/check_gpu_run.py --dump`) | passes, Q4_K_M and Q2_K_L |
 
 ## Build
 
